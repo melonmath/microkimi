@@ -1,0 +1,21 @@
+# build artifacts & binaries
+target/
+*.bin
+*.pt
+
+# generated data & caches
+out_*/
+data/
+ckpt/
+__pycache__/
+*.pyc
+tiktoken.model
+golden.json
+golden*.json
+parity_golden.json
+nano/out_dev/
+nano/out_night/
+nano/eval/TinyStoriesV2-GPT4-valid.txt
+
+# Moonshot reference files: downloaded at runtime, never committed (license)
+nano/vendor/moonshot/
