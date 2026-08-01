@@ -1,6 +1,6 @@
 # microkimi
 
-A zero-dependency Rust engine that runs and trains miniature versions of two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. It runs on a plain laptop CPU (no CUDA, no BLAS, no external crates), and uses the GPU directly through Metal on macOS. Also included: **nanokimi**, a small K3-architecture model trained from scratch overnight on CPU, and **nanodeepseek**, its DeepSeek counterpart (being trained).
+A zero-dependency Rust engine for two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - both verified 1:1 against the official reference code. Runs on a plain laptop CPU (no CUDA, no BLAS, no crates); uses the GPU via Metal on macOS. Also included: **nanokimi**, a small K3 model trained from scratch overnight on CPU, and **nanodeepseek**, its DeepSeek counterpart (being trained).
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
@@ -58,21 +58,7 @@ Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in 
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
-## Benchmarks
-
-Measured on a 10-core ARM64 Linux workstation and an Apple M5 (16 GB), greedy decoding.
-
-| model | workload | hardware | ms/token | tok/s |
-|---|---|---|---|---|
-| microkimi | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
-| microkimi | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
-| microdeepseek | decode (43 layers, 2.0 GB f32+FP4) | 10-core ARM64 | 39 | ~26 |
-| nanokimi | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
-| nanokimi | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
-| - | `microkimi build` (fetch + quant + write 2.5 GB) | 10-core ARM64 | - | ~65 s |
-| - | `microkimi build-ds` (fetch + quant + write 2.0 GB) | 10-core ARM64 | - | ~86 s |
-
-GPU (macOS/Metal): `--gpu` offloads the large matvecs to the GPU with weights cached on device. At micro dims the model runs ~1,200 small matvecs per token and per-dispatch sync dominates, so the GPU only takes matvecs ≥ 2M elements (lm_head) - the rest stays faster on the CPU thread pool. At real K3 dims (88M-MAC matvecs) the balance flips in the GPU's favor.
+GPU (macOS/Metal): `--gpu` sends the large matvecs (≥ 2M elements) to the GPU; the rest stays on CPU, which is faster at micro dims. See the per-model benchmarks in [KIMI.md](KIMI.md) and [DEEPSEEK.md](DEEPSEEK.md).
 
 ## Repository layout
 

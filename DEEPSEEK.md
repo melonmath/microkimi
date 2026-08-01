@@ -28,3 +28,11 @@ python3 ref/make_ds_parity.py                 # regenerates ref/ds_parity_golden
 ```
 
 Same caveat as microkimi: output is deterministic gibberish by design (untrained synthetic weights) - the point is the engine.
+
+## Benchmarks
+
+Greedy decode.
+
+| model | workload | hardware | ms/token | tok/s |
+|---|---|---|---|---|
+| microdeepseek | decode (43 layers, 2.0 GB f32+FP4) | 10-core ARM64 | 39 | ~26 |

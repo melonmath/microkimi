@@ -72,3 +72,14 @@ More prompts (raw, unedited): `"Tom was a small boy who loved to play outside."`
 Only 3 % of the corpus was seen and the loss was still descending at the end - the full corpus is ~12 days on the same box, or ~1 day on 12 with data parallelism. The pipeline is `nano/`: `prepare.py`, `model_nano.py`, `train.py`, `export.py`, `ops/` (preemptible-proof watchdog).
 
 Training also runs on Apple Silicon GPUs: `train.py --device mps` (torch MPS backend, plus `--device cpu|auto` and `--bench N` to compare). Honest caveat: the KDA recurrence is a sequential Python loop, so MPS does not help there - measure with `--bench` before choosing.
+
+## Benchmarks
+
+Greedy decode.
+
+| model | workload | hardware | ms/token | tok/s |
+|---|---|---|---|---|
+| microkimi | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
+| microkimi | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
+| nanokimi | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
+| nanokimi | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
