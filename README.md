@@ -1,6 +1,6 @@
 # microkimi
 
-A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. Runs on a plain laptop CPU; uses the GPU via Metal on macOS.
+A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code.
 
 **This is a framework for developers, including an end-to-end engine and a test model - not a model for end-users.**
 
@@ -29,44 +29,28 @@ cargo build --release
 ./target/release/microkimi chat --model nanokimi.bin --raw      # interactive stories
 ./target/release/microkimi run "One day, a cat found a ball." \
   --model nanokimi.bin --max-new 10 --raw --debug-routing       # watch the MoE router pick experts
-
-# on macOS: Metal GPU for the large matvecs
-./target/release/microkimi metaltest                            # GPU sanity check
-./target/release/microkimi run "Once upon a time" --model nanokimi.bin --max-new 12 --raw --gpu
 ```
 
 ## Models
 
-| model             | architecture                        | details                    |
-| ----------------- | ----------------------------------- | -------------------------- |
-| **microkimi**     | Kimi K3 (micro dims)                | [KIMI.md](KIMI.md)         |
-| **nanokimi**      | Kimi K3, trained from scratch       | [KIMI.md](KIMI.md)         |
+| model | architecture | details |
+|---|---|---|
+| **microkimi** | Kimi K3 (micro dims) | [KIMI.md](KIMI.md) |
+| **nanokimi** | Kimi K3, trained from scratch | [KIMI.md](KIMI.md) |
 | **microdeepseek** | DeepSeek-V4-Flash-0731 (micro dims) | [DEEPSEEK.md](DEEPSEEK.md) |
-| **nanodeepseek**  | DeepSeek-V4, trained from scratch   | being trained              |
+| **nanodeepseek** | DeepSeek-V4, trained from scratch | being trained |
 
 ## Commands
 
-| task                        | Kimi K3                                     | DeepSeek-V4-Flash-0731                          |
-| --------------------------- | ------------------------------------------- | ----------------------------------------------- |
-| assemble weights            | `microkimi build`                           | `microkimi build --arch dsv4`                   |
-| verify 1:1 vs official code | `microkimi paritytest`                      | `microkimi parity --arch dsv4`                  |
-| all mechanism self-tests    | `microkimi selftest` (covers both)          | `microkimi selftest` (covers both)              |
-| generate                    | `microkimi run "..." --model microkimi.bin` | `microkimi run "..." --model microdeepseek.bin` |
-| interactive                 | `microkimi chat --model nanokimi.bin --raw` | `microkimi chat --model microdeepseek.bin`      |
-| GPU checks (macOS)          | `metaltest`, `gputest`                      | `dstest`                                        |
+| task | Kimi K3 | DeepSeek-V4-Flash-0731 |
+|---|---|---|
+| assemble weights | `microkimi build` | `microkimi build --arch dsv4` |
+| verify 1:1 vs official code | `microkimi paritytest` | `microkimi parity --arch dsv4` |
+| all mechanism self-tests | `microkimi selftest` (covers both) | `microkimi selftest` (covers both) |
+| generate | `microkimi run "..." --model microkimi.bin` | `microkimi run "..." --model microdeepseek.bin` |
+| interactive | `microkimi chat --model nanokimi.bin --raw` | `microkimi chat --model microdeepseek.bin` |
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
-
-## Repository layout
-
-```
-src/            the Rust engine (K3 + DeepSeek-V4, zero dependencies)
-nano/           training pipeline
-ref/            test tooling
-docs/           training curve
-KIMI.md         Kimi K3 details (architecture, parity proof, benchmarks)
-DEEPSEEK.md     DeepSeek-V4 details (architecture, parity proof, benchmarks)
-```
 
 ## License
 
