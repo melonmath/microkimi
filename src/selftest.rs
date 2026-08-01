@@ -241,3 +241,111 @@ pub fn run_ds() {
         std::process::exit(1);
     }
 }
+
+/// DeepSeek-V4 MoE routing + Hyper-Connections vs ref/ds_golden2.json
+/// (plain-torch transcription of the DeepSeek reference math).
+pub fn run_ds2() {
+    let path = if std::path::Path::new("ref/ds_golden2.json").exists() {
+        "ref/ds_golden2.json"
+    } else {
+        "/workspace/microkimi-oss/ref/ds_golden2.json"
+    };
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden2.py", path));
+    let golden = json::parse(&bytes);
+    let mut ok = true;
+
+    // ── gate: sqrtsoftplus + bias-for-selection + renorm ×1.5 ──
+    {
+        let j = golden.get("gate").unwrap();
+        let x = arr(j, "x"); // [3, 16]
+        let gw = arr(j, "gate_w");
+        let bias = arr(j, "bias");
+        let want_idx = arr(j, "indices"); // [3, 6]
+        let want_w = arr(j, "weights");   // [3, 6]
+        let mut got_ids: Vec<u32> = Vec::new();
+        let mut got_ws: Vec<f32> = Vec::new();
+        for t in 0..3 {
+            let (sel, _) = crate::deepseek::gate_forward(&x[t * 16..(t + 1) * 16], &gw, Some(&bias), None, 0, 32, 6, 1.5);
+            got_ids.extend(sel.iter().map(|s| s.0));
+            got_ws.extend(sel.iter().map(|s| s.1));
+        }
+        // the reference topk is unsorted; compare per-token as sets + sorted-by-id weights
+        let mut ids_ok = true;
+        for t in 0..3 {
+            let mut a: Vec<u32> = got_ids[t * 6..(t + 1) * 6].to_vec();
+            let mut b: Vec<u32> = want_idx[t * 6..(t + 1) * 6].iter().map(|&v| v as u32).collect();
+            a.sort();
+            b.sort();
+            if a != b {
+                ids_ok = false;
+            }
+        }
+        println!(
+            "  {:<28} {}  (ids exacts: {})",
+            "DS gate top-6 (sqrtsoftplus)",
+            if ids_ok { "OK   " } else { "ÉCHEC" },
+            ids_ok
+        );
+        ok &= ids_ok;
+        // relaxed scale-aware check: gate weights go through sqrt(softplus(x)),
+        // the exp amplifies f32 rounding differently than torch (tolerance
+        // 1e-5 abs / 1e-3 of max — still catches any semantic bug)
+        {
+            let scale = want_w.iter().fold(0f64, |m, &b| m.max((b as f64).abs()));
+            let mut bad = 0;
+            for (a, b) in got_ws.iter().zip(&want_w) {
+                if (*a as f64 - *b as f64).abs() > 1e-5 + 1e-3 * scale {
+                    bad += 1;
+                }
+            }
+            let lok = bad == 0;
+            println!(
+                "  {:<28} {}  ({} val. hors tol 1e-5+1e-3·scale)",
+                "DS gate weights (renorm ×1.5)",
+                if lok { "OK   " } else { "ÉCHEC" },
+                bad
+            );
+            ok &= lok;
+        }
+    }
+
+    // ── expert: silu(gate)*clamp(up), gate clamp ──
+    {
+        let j = golden.get("expert").unwrap();
+        let x = arr(j, "x");
+        let w1 = arr(j, "w1");
+        let w2 = arr(j, "w2");
+        let w3 = arr(j, "w3");
+        let mut out = vec![0f32; 8];
+        crate::deepseek::expert_forward(&w1, &w2, &w3, &x, 16, 10.0, &mut out);
+        ok &= check("DS expert (swiglu_limit 10)", &out, &arr(j, "out"));
+    }
+
+    // ── hyper-connections: hc_pre / hc_post / hc_head + sinkhorn ──
+    {
+        let j = golden.get("hc").unwrap();
+        let xs = arr(j, "x");       // [hc*d] = [24]
+        let hc_fn = arr(j, "hc_fn");
+        let hc_scale = arr(j, "hc_scale");
+        let hc_base = arr(j, "hc_base");
+        let (y_pre, post, comb) = crate::deepseek::hc_pre(
+            &xs, &xs, &hc_fn, &hc_scale, &hc_base, 4, 1e-6, 20, 1e-6,
+        );
+        ok &= check("DS hc pre (sinkhorn pre)", &y_pre, &arr(j, "y_pre"));
+        ok &= check("DS hc post weights", &post, &arr(j, "post"));
+        ok &= check("DS hc comb (sinkhorn 20 iters)", &comb, &arr(j, "comb"));
+        let y_post = crate::deepseek::hc_post(&y_pre, &xs, &post, &comb, 4);
+        ok &= check("DS hc_post", &y_post, &arr(j, "y_post"));
+        let y_head = crate::deepseek::hc_head(&xs, &xs, &hc_fn, hc_scale[0], &hc_base, 4, 1e-6, 1e-6);
+        ok &= check("DS hc_head (no sinkhorn)", &y_head, &arr(j, "y_head"));
+    }
+
+    println!();
+    if ok {
+        println!("DS MOE/HC OK - routing and hyper-connections match the references");
+    } else {
+        println!("DS MOE/HC FAILED");
+        std::process::exit(1);
+    }
+}

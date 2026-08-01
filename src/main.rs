@@ -5,6 +5,7 @@
 // reduced dims. std only.
 
 mod build;
+mod deepseek;
 mod dequant;
 mod config;
 mod http;
@@ -29,7 +30,7 @@ fn main() {
 
     match cmd {
         "build" => build::run(),
-        "selftest" => { selftest::run(); selftest::run_ds(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
         "gpubench" => gpubench_cmd(&args),

@@ -32,6 +32,9 @@ pub struct Config {
     pub rms_eps: f32,
     pub eos_id: u32,            // end_of_msg (generation stop)
     pub bos_id: u32,
+    /// Present when the MKIM0002 config JSON declares arch "deepseek_v4"
+    /// (parsed from the "ds" object). None for K3 (microkimi/nanokimi).
+    pub ds: Option<DsConfig>,
 }
 
 impl Config {
@@ -64,6 +67,7 @@ impl Config {
             rms_eps: 1e-5,
             eos_id: 163_586,
             bos_id: 163_584,
+            ds: None,
         }
     }
 
@@ -102,6 +106,9 @@ impl Config {
             c.eos_id = Self::num(sp, "end_of_msg", c.eos_id as f64) as u32;
             c.bos_id = Self::num(sp, "bos", c.bos_id as f64) as u32;
         }
+        if j.get("arch").and_then(|x| x.as_str()) == Some("deepseek_v4") {
+            c.ds = Some(DsConfig::from_json(j));
+        }
         c
     }
 
@@ -122,5 +129,138 @@ impl Config {
     }
     pub fn mla_kvb(&self) -> usize {
         self.mla_heads * (self.mla_nope + self.mla_v)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DeepSeek-V4 (microdeepseek) — micro dims, exact architecture
+// ════════════════════════════════════════════════════════════════════════════
+
+/// DeepSeek-V4 configuration (micro scale: same layer count, same expert
+/// counts, same attention structure; reduced widths). Parsed from the
+/// MKIM0002 config JSON ("arch": "deepseek_v4", fields under "ds").
+#[derive(Debug, Clone)]
+pub struct DsConfig {
+    pub n_layers: usize,       // 43 (kept)
+    pub d: usize,              // hidden 512 (real: 4096)
+    pub vocab: usize,          // 129280 (real vocab kept)
+    pub n_heads: usize,        // 8 (real: 64)
+    pub head_dim: usize,       // 128 (real: 512)
+    pub rope_head_dim: usize,  // 64 (kept)
+    pub q_lora_rank: usize,    // 128 (real: 1024)
+    pub o_lora_rank: usize,    // 128 (real: 1024)
+    pub o_groups: usize,       // 8 (kept)
+    pub window_size: usize,    // 128 (kept)
+    pub compress_ratios: Vec<i32>, // per layer: 0,0,4,128,4,128,... (kept)
+    pub rope_theta: f64,           // 10000 (window layers)
+    pub compress_rope_theta: f64,  // 160000 (compressed layers)
+    pub yarn_factor: f64,          // 16
+    pub yarn_beta_fast: i32,       // 32
+    pub yarn_beta_slow: i32,       // 1
+    pub yarn_orig_seq_len: i32,    // 65536
+    pub index_n_heads: usize,  // 8 (real: 64)
+    pub index_head_dim: usize, // 128 (kept)
+    pub index_topk: usize,     // 64 (real: 512)
+    pub n_routed_experts: usize, // 256 (kept)
+    pub n_activated_experts: usize, // 6 (kept)
+    pub n_shared_experts: usize,  // 1 (kept)
+    pub moe_inter_dim: usize,     // 128 (real: 2048)
+    pub n_hash_layers: usize,     // 3 (kept)
+    pub route_scale: f64,         // 1.5
+    pub swiglu_limit: f64,        // 10.0
+    pub hc_mult: usize,           // 4 (kept)
+    pub hc_sinkhorn_iters: usize, // 20 (kept)
+    pub hc_eps: f64,              // 1e-6
+    pub norm_eps: f64,            // 1e-6
+    pub max_seq_len: usize,       // 4096 (micro)
+}
+
+impl DsConfig {
+    pub fn microdeepseek() -> DsConfig {
+        let mut compress_ratios = vec![0i32, 0];
+        for i in 2..43 {
+            compress_ratios.push(if i % 2 == 0 { 4 } else { 128 });
+        }
+        compress_ratios.extend_from_slice(&[0, 0, 0]);
+        DsConfig {
+            n_layers: 43,
+            d: 512,
+            vocab: 129_280,
+            n_heads: 8,
+            head_dim: 128,
+            rope_head_dim: 64,
+            q_lora_rank: 128,
+            o_lora_rank: 128,
+            o_groups: 8,
+            window_size: 128,
+            compress_ratios,
+            rope_theta: 10000.0,
+            compress_rope_theta: 160000.0,
+            yarn_factor: 16.0,
+            yarn_beta_fast: 32,
+            yarn_beta_slow: 1,
+            yarn_orig_seq_len: 65536,
+            index_n_heads: 8,
+            index_head_dim: 128,
+            index_topk: 64,
+            n_routed_experts: 256,
+            n_activated_experts: 6,
+            n_shared_experts: 1,
+            moe_inter_dim: 128,
+            n_hash_layers: 3,
+            route_scale: 1.5,
+            swiglu_limit: 10.0,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            norm_eps: 1e-6,
+            max_seq_len: 4096,
+        }
+    }
+
+    fn num(j: &Json, key: &str, default: f64) -> f64 {
+        j.get(key).and_then(|x| x.as_num()).unwrap_or(default)
+    }
+
+    pub fn from_json(j: &Json) -> DsConfig {
+        let mut c = DsConfig::microdeepseek();
+        let d = j.get("ds").unwrap_or(j);
+        c.n_layers = Self::num(d, "n_layers", c.n_layers as f64) as usize;
+        c.d = Self::num(d, "hidden", c.d as f64) as usize;
+        c.vocab = Self::num(d, "vocab", c.vocab as f64) as usize;
+        c.n_heads = Self::num(d, "n_heads", c.n_heads as f64) as usize;
+        c.head_dim = Self::num(d, "head_dim", c.head_dim as f64) as usize;
+        c.rope_head_dim = Self::num(d, "qk_rope_head_dim", c.rope_head_dim as f64) as usize;
+        c.q_lora_rank = Self::num(d, "q_lora_rank", c.q_lora_rank as f64) as usize;
+        c.o_lora_rank = Self::num(d, "o_lora_rank", c.o_lora_rank as f64) as usize;
+        c.o_groups = Self::num(d, "o_groups", c.o_groups as f64) as usize;
+        c.window_size = Self::num(d, "sliding_window", c.window_size as f64) as usize;
+        if let Some(Json::Arr(a)) = d.get("compress_ratios") {
+            c.compress_ratios = a.iter().filter_map(|x| x.as_num().map(|n| n as i32)).collect();
+        }
+        c.rope_theta = Self::num(d, "rope_theta", c.rope_theta);
+        c.compress_rope_theta = Self::num(d, "compress_rope_theta", c.compress_rope_theta);
+        c.index_n_heads = Self::num(d, "index_n_heads", c.index_n_heads as f64) as usize;
+        c.index_head_dim = Self::num(d, "index_head_dim", c.index_head_dim as f64) as usize;
+        c.index_topk = Self::num(d, "index_topk", c.index_topk as f64) as usize;
+        c.n_routed_experts = Self::num(d, "n_routed_experts", c.n_routed_experts as f64) as usize;
+        c.n_activated_experts = Self::num(d, "num_experts_per_tok", c.n_activated_experts as f64) as usize;
+        c.moe_inter_dim = Self::num(d, "moe_intermediate_size", c.moe_inter_dim as f64) as usize;
+        c.n_hash_layers = Self::num(d, "num_hash_layers", c.n_hash_layers as f64) as usize;
+        c.route_scale = Self::num(d, "routed_scaling_factor", c.route_scale);
+        c.swiglu_limit = Self::num(d, "swiglu_limit", c.swiglu_limit);
+        c.norm_eps = Self::num(d, "rms_norm_eps", c.norm_eps);
+        c
+    }
+
+    pub fn compress_ratio(&self, layer: usize) -> i32 {
+        self.compress_ratios.get(layer).copied().unwrap_or(0)
+    }
+}
+
+impl Config {
+    /// DeepSeek-V4 config if the MKIM0002 JSON declares arch "deepseek_v4".
+    pub fn ds_arch(&self) -> Option<DsConfig> {
+        self.ds.clone()
     }
 }

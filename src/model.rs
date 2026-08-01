@@ -35,7 +35,7 @@ fn as_f32(bytes: &[u8]) -> &[f32] {
 // ── math kernels ──
 
 #[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
     let mut ca = a.chunks_exact(8);
     let mut cb = b.chunks_exact(8);
