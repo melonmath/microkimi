@@ -469,6 +469,95 @@ pub enum AnyTokenizer {
     Full(Tokenizer),
     Nano(NanoTokenizer),
     Ds(crate::dstok::DsTokenizer),
+    DsNano(DsNanoTokenizer),
+}
+
+/// DeepSeek-V4 nano remap (nanodeepseek): real V4 BPE → nano ids (top-8192
+/// of the training corpus + contiguous specials), loaded from
+/// vocab_ds_nano.json produced by nano_ds/prepare.py.
+pub struct DsNanoTokenizer {
+    pub full: crate::dstok::DsTokenizer,
+    pub vocab_size: usize,
+    pub nano_to_ds: Vec<u32>,
+    pub ds_to_nano: Vec<u32>, // 129280, out-of-vocab → unk
+    pub bos: u32,
+    pub eos: u32,
+    pub unk: u32,
+}
+
+impl DsNanoTokenizer {
+    pub fn load(vocab_path: &str, full: crate::dstok::DsTokenizer) -> Self {
+        let bytes = std::fs::read(vocab_path).expect("vocab_ds_nano.json unreadable");
+        let j = crate::json::parse(&bytes);
+        let nano_to_ds: Vec<u32> = j
+            .get("nano_to_ds")
+            .and_then(|x| x.as_arr())
+            .expect("vocab_ds_nano.json: nano_to_ds missing")
+            .iter()
+            .map(|x| x.as_num().unwrap() as u32)
+            .collect();
+        let vocab_size = j
+            .get("vocab_size")
+            .and_then(|x| x.as_num())
+            .unwrap_or(nano_to_ds.len() as f64 + 8.0) as usize;
+        let sp = j.get("specials").expect("vocab_ds_nano.json: specials missing");
+        let get = |k: &str| sp.get(k).and_then(|x| x.as_num()).unwrap() as u32;
+        let (bos, eos, unk) = (get("bos"), get("eos"), get("unk"));
+        let mut ds_to_nano = vec![unk; 129_280];
+        for (n, &k) in nano_to_ds.iter().enumerate() {
+            ds_to_nano[k as usize] = n as u32;
+        }
+        DsNanoTokenizer { full, vocab_size, nano_to_ds, ds_to_nano, bos, eos, unk }
+    }
+
+    fn encode_nano(&self, text: &str) -> Vec<u32> {
+        self.full
+            .encode(text)
+            .iter()
+            .map(|&id| self.ds_to_nano[id as usize])
+            .collect()
+    }
+
+    /// Raw completion: nano BOS + remapped BPE (nanodeepseek is raw-only).
+    fn encode_raw_nano(&self, text: &str) -> Vec<u32> {
+        let mut ids = vec![self.bos];
+        ids.extend(self.encode_nano(text));
+        ids
+    }
+
+    fn decode_nano_id(&self, id: u32) -> String {
+        if id == self.bos {
+            return "[BOS]".to_string();
+        }
+        if id == self.eos {
+            return "[EOS]".to_string();
+        }
+        if id == self.unk {
+            return "[UNK]".to_string();
+        }
+        if (id as usize) < self.nano_to_ds.len() {
+            return self.full.decode_id(self.nano_to_ds[id as usize]);
+        }
+        format!("<|dsnano_{}|>", id)
+    }
+
+    fn decode_nano(&self, ids: &[u32]) -> String {
+        let ds_ids: Vec<u32> = ids
+            .iter()
+            .map(|&id| {
+                if (id as usize) < self.nano_to_ds.len() {
+                    self.nano_to_ds[id as usize]
+                } else {
+                    match id {
+                        x if x == self.bos => crate::dstok::DS_BOS,
+                        x if x == self.eos => crate::dstok::DS_EOS,
+                        _ => 2, // <｜▁pad▁｜> (unused slot)
+                    }
+                }
+            })
+            .collect();
+        self.full.decode(&ds_ids)
+    }
 }
 
 const FULL_MARKERS: Markers = Markers { open: OPEN, close: CLOSE, sep: SEP, end_of_msg: END_OF_MSG };
@@ -479,6 +568,7 @@ impl AnyTokenizer {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.markers.end_of_msg,
             AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
+            AnyTokenizer::DsNano(n) => n.eos,
         }
     }
 
@@ -488,6 +578,7 @@ impl AnyTokenizer {
             AnyTokenizer::Full(_) => 163_840,
             AnyTokenizer::Nano(n) => n.vocab_size,
             AnyTokenizer::Ds(_) => 129_280,
+            AnyTokenizer::DsNano(n) => n.vocab_size,
         }
     }
 
@@ -510,6 +601,7 @@ impl AnyTokenizer {
                 ids.extend(t.encode(text));
                 ids
             }
+            AnyTokenizer::DsNano(n) => n.encode_raw_nano(text),
         }
     }
 
@@ -519,6 +611,7 @@ impl AnyTokenizer {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.eos,
             AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
+            AnyTokenizer::DsNano(n) => n.eos,
         }
     }
 
@@ -527,6 +620,8 @@ impl AnyTokenizer {
             AnyTokenizer::Full(t) => build_chat(history, question, FULL_MARKERS, |s| t.encode(s)),
             AnyTokenizer::Nano(n) => build_chat(history, question, n.markers, |s| n.encode_nano(s)),
             AnyTokenizer::Ds(t) => t.encode_chat(history, question),
+            // nanodeepseek is trained on raw stories: chat == raw completion
+            AnyTokenizer::DsNano(n) => n.encode_raw_nano(question),
         }
     }
 
@@ -543,6 +638,7 @@ impl AnyTokenizer {
                 format!("<|nano_{}|>", id)
             }
             AnyTokenizer::Ds(t) => t.decode_id(id),
+            AnyTokenizer::DsNano(n) => n.decode_nano_id(id),
         }
     }
 
@@ -571,6 +667,7 @@ impl AnyTokenizer {
                 n.full.decode(&kimi_ids)
             }
             AnyTokenizer::Ds(t) => t.decode(ids),
+            AnyTokenizer::DsNano(n) => n.decode_nano(ids),
         }
     }
 }

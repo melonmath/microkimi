@@ -343,7 +343,13 @@ def main():
             print(f"  layer {l}/{NLAY} loaded", flush=True)
 
     rng = np.random.default_rng(20260731)
-    ids = [0] + rng.integers(3, 16384, T - 5).tolist() + [50000, 100000, 129279, 2]
+    # DS_PARITY_HI (test override): cap the generated ids for small-vocab bins
+    # (nanodeepseek selfcheck); unset → the historical microdeepseek sequence.
+    hi = int(os.environ.get("DS_PARITY_HI", "0"))
+    if hi:
+        ids = [0] + rng.integers(3, hi, T - 5).tolist() + [hi // 3, 2 * hi // 3, hi - 1, 2]
+    else:
+        ids = [0] + rng.integers(3, 16384, T - 5).tolist() + [50000, 100000, 129279, 2]
     assert len(ids) == T
 
     hiddens = {}

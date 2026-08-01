@@ -309,8 +309,9 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
-    if crate::weights::read_config(&mp).ds.is_some() {
-        let tok = tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(&ds_tokenizer_path(&mp, vocab)));
+    let mp_cfg = crate::weights::read_config(&mp);
+    if mp_cfg.ds.is_some() {
+        let tok = load_ds_any_tokenizer(&mp, vocab, mp_cfg.vocab);
         let mut model = deepseek::DsModel::load(&mp);
         println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
         println!("cores used for matvecs: {}", model::n_threads());
@@ -388,7 +389,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
 fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool) {
     use std::io::Write;
     let tl = Instant::now();
-    let tok = tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(&ds_tokenizer_path(mp, vocab)));
+    let tok = load_ds_any_tokenizer(mp, vocab, crate::weights::read_config(mp).vocab);
     let mut model = deepseek::DsModel::load(mp);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     if raw {
@@ -422,6 +423,46 @@ fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool)
             history.push((q.to_string(), answer));
         }
     }
+}
+
+/// Loads the tokenizer for a DeepSeek-V4 model: explicit --vocab (a full
+/// tokenizer.json OR a vocab_ds_nano.json remap), then vocab_ds_nano.json next
+/// to the bin when its vocab size matches the model's, otherwise the full V4
+/// tokenizer (tokenizer.json next to the bin / cache / HF download).
+fn load_ds_any_tokenizer(mp: &str, vocab: Option<String>, model_vocab: usize) -> tokenizer::AnyTokenizer {
+    let full = || dstok::DsTokenizer::load(&ds_tokenizer_path(mp, None));
+    let try_nano = |p: &str| -> Option<tokenizer::AnyTokenizer> {
+        let bytes = std::fs::read(p).ok()?;
+        let j = crate::json::parse(&bytes);
+        j.get("nano_to_ds")?;
+        let vs = j.get("vocab_size").and_then(|x| x.as_num()).map(|n| n as usize);
+        if vs != Some(model_vocab) {
+            eprintln!(
+                "warning: ignoring {} (nano vocab {} != model vocab {}) - using the full V4 tokenizer",
+                p,
+                vs.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
+                model_vocab
+            );
+            return None;
+        }
+        println!("DS nano vocabulary (remap): {}", p);
+        Some(tokenizer::AnyTokenizer::DsNano(tokenizer::DsNanoTokenizer::load(p, full())))
+    };
+    if let Some(p) = &vocab {
+        // explicit --vocab: nano remap or a plain tokenizer.json
+        if let Some(t) = try_nano(p) {
+            return t;
+        }
+        return tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(p));
+    }
+    let dir = std::path::Path::new(mp).parent().unwrap_or(std::path::Path::new("."));
+    let cand = dir.join("vocab_ds_nano.json");
+    if cand.exists() {
+        if let Some(t) = try_nano(&cand.to_string_lossy()) {
+            return t;
+        }
+    }
+    tokenizer::AnyTokenizer::Ds(full())
 }
 
 /// Locates the DeepSeek-V4 tokenizer.json: explicit --vocab, then next to the
