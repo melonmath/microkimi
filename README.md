@@ -1,13 +1,10 @@
 # microkimi
 
-> [!NOTE]
-> **This project started as an experiment: can you distribute LLM inference over a peer-to-peer network?**
-> (MoE experts are the natural unit for that.)
->
-> **Almost all of the code was written by Kimi K3 itself**, with human guidance and review.
-> So the model effectively gave birth to its own reimplementation - a strangely poetic loop: an architecture explaining itself well enough to be rebuilt from first principles.
+**What this is.** A zero-dependency Rust engine that runs and trains miniature versions of two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. It runs on a plain laptop CPU: no CUDA, no BLAS, no external crates. On macOS it can also use the GPU directly through Metal.
 
-**Run and train miniature frontier MoE architectures - Kimi K3 and DeepSeek-V4-Flash-0731 - in pure Rust, zero dependencies, both verified 1:1 against the official reference code. Includes nanokimi, a small model trained from scratch overnight on CPU. Talks straight to the Metal API for GPU on macOS - CPU mode stays the fastest at small model sizes.**
+**Why.** To understand frontier architectures well enough to rebuild them from first principles - small enough to run anywhere, exact enough to trust. Also included: nanokimi, a small K3-architecture model trained from scratch overnight on CPU, and nanodeepseek, its DeepSeek counterpart (being trained).
+
+> Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
 > _The moon loved the sun, but they could never meet,_
 > _so every night, they would go to the park to play._
@@ -17,13 +14,11 @@
 >
 > - nanokimi, running on microkimi
 
-|                   |                                                                                                                                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Engine**        | Zero-dependency Rust inference engine for frontier MoE architectures, verified 1:1 against the official reference code. Pure `std` Rust: no crates, no BLAS, no CUDA. See [KIMI.md](KIMI.md) and [DEEPSEEK.md](DEEPSEEK.md) for the per-model details. |
-| **microkimi**     | The **Kimi K3** architecture at micro dims (93 layers kept, 896 experts top-16 kept; widths reduced) - verified 1:1 against Moonshot's code. → [KIMI.md](KIMI.md) |
-| **microdeepseek** | The **DeepSeek-V4-Flash-0731** architecture at micro dims (43 layers kept, 256 experts top-6 kept; widths reduced) - verified 1:1 against DeepSeek's code. → [DEEPSEEK.md](DEEPSEEK.md) |
-| **nanokimi**      | A small K3-architecture model trained from scratch (random weights → English stories) by the included `nano/` pipeline, overnight on CPU. **nanodeepseek** (the V4 counterpart) is being trained. |
-| **Scope**         | Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine. |
+| | |
+|---|---|
+| **microkimi** | The **Kimi K3** architecture at micro dims, verified 1:1 against Moonshot's code. Details in [KIMI.md](KIMI.md). |
+| **microdeepseek** | The **DeepSeek-V4-Flash-0731** architecture at micro dims, verified 1:1 against DeepSeek's code. Details in [DEEPSEEK.md](DEEPSEEK.md). |
+| **Scope** | Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine. |
 
 ## Run it in 30 seconds
 
