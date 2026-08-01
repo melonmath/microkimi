@@ -79,6 +79,16 @@ pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
 /// Matvec with on-the-fly dequantization (weights stay packed in RAM):
 /// out[r] = Σ_c W[r,c] · x[c]. Per group of 32: Σ(lut·x) × scale - same
 /// mathematical result, one floating-point multiplication per group. Multithreaded over rows.
+///
+/// --gpu (macOS): at rows*cols ≥ GPU_MIN_ELEMS the fused Metal fp4 kernel
+/// takes over (metal::gpu_matvec_fp4, weights cached on device). Below the
+/// threshold the CPU path wins — a Metal dispatch costs ~0.25 ms, far more
+/// than these small matvecs. Micro models keep every expert on the CPU
+/// (128×512 = 65 K params ≪ 2 M); the GPU path only kicks in at real V4
+/// expert dims (2048×4096 = 8.4 M). NOTE: the three expert matvecs
+/// (w1, w3, w2) are NOT batched into one dispatch — each is routed
+/// independently; batching would be the next optimization if real-dim
+/// profiles show dispatch overhead dominating.
 pub fn matvec_packed(
     packed: &[u8],
     scales: &[u8],
@@ -88,6 +98,13 @@ pub fn matvec_packed(
     out: &mut [f32],
     n_threads: usize,
 ) {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::model::gpu_on() && rows * cols >= crate::model::GPU_MIN_ELEMS && crate::metal::gpu_available() {
+            crate::metal::gpu_matvec_fp4(packed, scales, rows, cols, x, out);
+            return;
+        }
+    }
     let nt = n_threads.min(rows);
     if nt <= 1 {
         // direct single-threaded path (small matvecs: experts)

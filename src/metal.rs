@@ -1138,6 +1138,43 @@ pub fn dstest() {
         all_ok &= check(format!("synthetic [{rows}x{cols}]"), p, s, rows, cols);
     }
 
+    // 1b) routing proof: with --gpu, a ≥ GPU_MIN_ELEMS fp4 matvec must land in
+    // the fp4 device cache; a sub-threshold one must NOT.
+    {
+        crate::model::set_gpu(true);
+        let (rows, cols) = (2048usize, 4096usize); // 8.4M params ≥ 2M → GPU
+        let w: Vec<f32> = (0..rows * cols).map(|i| pattern(i + 77)).collect();
+        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        let x: Vec<f32> = (0..cols).map(|i| pattern(i + 88)).collect();
+        let mut y_routed = vec![0f32; rows];
+        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_routed, 1);
+        let on_device = ctx()
+            .map(|c| c.cache_fp4.lock().unwrap().map.contains_key(&(p.as_ptr() as usize, rows, cols)))
+            .unwrap_or(false);
+        // sub-threshold: 128x512 = 65K params → must stay on the CPU
+        let (r2, c2) = (128usize, 512usize);
+        let w2: Vec<f32> = (0..r2 * c2).map(|i| pattern(i + 99)).collect();
+        let (p2, s2) = crate::mxfp4::quantize(&w2, r2, c2);
+        let x2: Vec<f32> = (0..c2).map(|i| pattern(i + 111)).collect();
+        let mut y2 = vec![0f32; r2];
+        crate::mxfp4::matvec_packed(&p2, &s2, r2, c2, &x2, &mut y2, 1);
+        let small_on_device = ctx()
+            .map(|c| c.cache_fp4.lock().unwrap().map.contains_key(&(p2.as_ptr() as usize, r2, c2)))
+            .unwrap_or(false);
+        crate::model::set_gpu(false);
+        let mut y_ref = vec![0f32; rows];
+        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, 1);
+        let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        let max_abs = y_routed.iter().zip(&y_ref).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let ok = on_device && !small_on_device && max_abs / scale <= 1e-3;
+        all_ok &= ok;
+        println!(
+            "  {:<44} max_abs={:.3e} big_on_gpu={} small_on_gpu={}  {}",
+            "matvec_packed routing (--gpu, threshold 2M)", max_abs, on_device, small_on_device,
+            if ok { "OK" } else { "FAIL" }
+        );
+    }
+
     // 2) real expert blobs + 3) lm_head routing (need microdeepseek.bin)
     let ds_path = ["microdeepseek.bin", "/workspace/microkimi-oss/microdeepseek.bin"]
         .iter()
