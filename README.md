@@ -2,7 +2,7 @@
 
 A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. Runs on a plain laptop CPU; uses the GPU via Metal on macOS.
 
-**This is a framework for developers, not a model.**
+**This is a framework for developers, including an end-to-end engine and a test model - not a production model.**
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
