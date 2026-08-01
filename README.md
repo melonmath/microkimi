@@ -4,7 +4,7 @@ A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** a
 
 **This is a framework for developers, including an end-to-end engine and a test model - not a model for end-users.**
 
-> Almost all of the code was written by Kimi K3 itself, with human guidance and review.
+> _Almost all of the code was written by Kimi K3 itself - the quiet beauty of an LLM giving birth to another._
 
 > _The moon loved the sun, but they could never meet,_
 > _so every night, they would go to the park to play._
