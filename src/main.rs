@@ -30,7 +30,7 @@ fn main() {
 
     match cmd {
         "build" => build::run(),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
         "gpubench" => gpubench_cmd(&args),

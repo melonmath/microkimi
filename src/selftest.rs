@@ -349,3 +349,138 @@ pub fn run_ds2() {
         std::process::exit(1);
     }
 }
+
+// ── DeepSeek-V4 sparse attention parity (3 layer types × 10 tokens) ──
+
+fn ds_load_layer(j: &Json, root: &Json, ratio: i32, compress_theta: f64) -> (crate::config::DsConfig, crate::deepseek::DsAttentionW, Vec<Vec<f32>>) {
+    let mut cfg = crate::config::DsConfig::microdeepseek();
+    for l in 0..cfg.compress_ratios.len() {
+        cfg.compress_ratios[l] = ratio;
+    }
+    cfg.compress_rope_theta = compress_theta;
+    let w = j.get("weights").unwrap();
+    let a = |k: &str| arr(w, k);
+    let opt = |k: &str| if w.get(k).is_some() { a(k) } else { Vec::new() };
+    let dw = crate::deepseek::DsAttentionW {
+        wq_a: a("wq_a"),
+        q_norm_w: a("q_norm_w"),
+        wq_b: a("wq_b"),
+        wkv: a("wkv"),
+        kv_norm_w: a("kv_norm_w"),
+        wo_a: a("wo_a"),
+        wo_b: a("wo_b"),
+        attn_sink: a("attn_sink"),
+        comp_wkv: opt("comp_wkv"),
+        comp_wgate: opt("comp_wgate"),
+        comp_ape: opt("comp_ape"),
+        comp_norm_w: opt("comp_norm_w"),
+        idx_wq_b: opt("idx_wq_b"),
+        idx_weights_proj: opt("idx_weights_proj"),
+        idx_comp_wkv: opt("idx_comp_wkv"),
+        idx_comp_wgate: opt("idx_comp_wgate"),
+        idx_comp_ape: opt("idx_comp_ape"),
+        idx_comp_norm_w: opt("idx_comp_norm_w"),
+    };
+    let xs: Vec<Vec<f32>> = arr(root, "x")
+        .chunks(cfg.d)
+        .map(|c| c.to_vec())
+        .collect();
+    (cfg, dw, xs)
+}
+
+pub fn run_ds3() {
+    let path = if std::path::Path::new("ref/ds_golden3.json").exists() {
+        "ref/ds_golden3.json"
+    } else {
+        "/workspace/microkimi-oss/ref/ds_golden3.json"
+    };
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden3.py", path));
+    let golden = json::parse(&bytes);
+    let mut ok = true;
+
+    // rope tables: theta=10000 (window) and theta=160000+YaRN (compressed)
+    {
+        let g0 = golden.get("rope_theta10000").unwrap();
+        let (cos, sin) = crate::deepseek::precompute_freqs_cis(64, 4096, 0, 10000.0, 16.0, 32, 1);
+        ok &= check("DS rope theta=10000 cos", &cos, &arr(g0, "cos"));
+        ok &= check("DS rope theta=10000 sin", &sin, &arr(g0, "sin"));
+        let g1 = golden.get("rope_compress").unwrap();
+        let (cos1, sin1) = crate::deepseek::precompute_freqs_cis(64, 4096, 65536, 160000.0, 16.0, 32, 1);
+        ok &= check("DS rope 160000+YaRN cos", &cos1, &arr(g1, "cos"));
+        ok &= check("DS rope 160000+YaRN sin", &sin1, &arr(g1, "sin"));
+    }
+
+    let t: usize = golden.get("T").unwrap().as_num().unwrap() as usize;
+    for (key, ratio, theta, label) in [
+        ("layer_window", 0, 10000.0, "DS attention window-only"),
+        ("layer_overlap_indexer", 4, 160000.0, "DS attention overlap+indexer"),
+        ("layer_dense", 8, 160000.0, "DS attention dense compressor"),
+    ] {
+        let j = golden.get(key).unwrap();
+        let want = arr(j, "out");
+        // locate the max error (debug)
+        {
+            let mut worst = (0f32, 0usize, 0f32, 0f32);
+            let mut got_dbg: Vec<f32> = Vec::new();
+            let (cfg2, dw2, xs2) = ds_load_layer(j, &golden, ratio, theta);
+            let mut st2 = crate::deepseek::DsAttention::new(&cfg2, 0);
+            for (ti, x) in xs2.iter().enumerate() {
+                let mut o = vec![0f32; cfg2.n_heads * cfg2.head_dim];
+                crate::deepseek::attention_step(&cfg2, 0, &dw2, &mut st2, x, &mut o);
+                let mut proj = vec![0f32; cfg2.d];
+                crate::deepseek::grouped_o_proj(&cfg2, &dw2.wo_a, &dw2.wo_b, &o, &mut proj);
+                for (i, &p) in proj.iter().enumerate() {
+                    let d = (p - want[ti * cfg2.d + i]).abs();
+                    if d > worst.0 { worst = (d, ti * cfg2.d + i, p, want[ti * cfg2.d + i]); }
+                }
+                got_dbg.extend_from_slice(&proj);
+            }
+            println!("    debug {} worst: d={:.4} at idx {} (tok {}) got {:.6} want {:.6}", label, worst.0, worst.1, worst.1 / 512, worst.2, worst.3);
+        }
+        let (cfg, dw, xs) = ds_load_layer(j, &golden, ratio, theta);
+        let mut st = crate::deepseek::DsAttention::new(&cfg, 0);
+        let mut got = Vec::new();
+        for (ti, x) in xs.iter().enumerate() {
+            let mut o = vec![0f32; cfg.n_heads * cfg.head_dim];
+            crate::deepseek::attention_step(&cfg, 0, &dw, &mut st, x, &mut o);
+            if ti == 0 && label.starts_with("DS attention window") {
+                println!("    debug o[0..4]={:?}", &o[..4]);
+            }
+            let mut proj = vec![0f32; cfg.d];
+            crate::deepseek::grouped_o_proj(&cfg, &dw.wo_a, &dw.wo_b, &o, &mut proj);
+            got.extend_from_slice(&proj);
+        }
+        let _ = t;
+        // QAT-aware tolerance: fp8/fp4 quantization boundaries amplify tiny f32
+        // rounding differences into 1-2 grid steps (~2e-3). Semantic bugs show
+        // up as O(1) errors instead.
+        let scale = want.iter().fold(0f64, |m, &b| m.max((b as f64).abs()));
+        let mut worst = 0f64;
+        let mut bad = 0;
+        for (a, b) in got.iter().zip(&want) {
+            let dd = (*a as f64 - *b as f64).abs();
+            worst = worst.max(dd);
+            if dd > 2e-3 + 1e-3 * scale {
+                bad += 1;
+            }
+        }
+        let lok = bad == 0;
+        println!(
+            "  {:<34} {}  max_abs={:.3e} ({} val. hors tol QAT 2e-3+1e-3·scale)",
+            label,
+            if lok { "OK   " } else { "ÉCHEC" },
+            worst,
+            bad
+        );
+        ok &= lok;
+    }
+
+    println!();
+    if ok {
+        println!("DS ATTENTION OK - sparse attention matches the DeepSeek reference");
+    } else {
+        println!("DS ATTENTION FAILED");
+        std::process::exit(1);
+    }
+}
