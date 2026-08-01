@@ -187,3 +187,57 @@ pub fn run() {
         std::process::exit(1);
     }
 }
+
+/// DeepSeek-V4 dequantization checks against ref/ds_golden.json
+/// (fp8 e4m3/ue8m0 128x128 and fp4 e2m1/ue8m0/32).
+pub fn run_ds() {
+    let path = if std::path::Path::new("ref/ds_golden.json").exists() {
+        "ref/ds_golden.json"
+    } else {
+        "/workspace/microkimi-oss/ref/ds_golden.json"
+    };
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden.py", path));
+    let golden = json::parse(&bytes);
+    let mut ok = true;
+
+    {
+        let j = golden.get("fp8").unwrap();
+        let rows = j.get("rows").unwrap().as_num().unwrap() as usize;
+        let cols = j.get("cols").unwrap().as_num().unwrap() as usize;
+        let packed: Vec<u8> = arr(j, "w_packed").iter().map(|&x| x as u8).collect();
+        let scales: Vec<u8> = arr(j, "scales").iter().map(|&x| x as u8).collect();
+        let w = crate::dequant::dequant_fp8(&packed, &scales, rows, cols);
+        ok &= check("DS fp8 e4m3 dequant (torch golden)", &w, &arr(j, "dequant"));
+        // quantize path: my quantize_fp8 of the ORIGINAL matrix must reproduce the
+        // torch-packed bytes exactly (same scale rule + nearest-even cast)
+        let (qw, qs) = crate::dequant::quantize_fp8(&arr(j, "w_orig"), rows, cols);
+        let n_diff = qw.iter().zip(&packed).filter(|(a, b)| a != b).count();
+        let n_sdiff = qs.iter().zip(&scales).filter(|(a, b)| a != b).count();
+        println!(
+            "  {:<28} {}  (packed byte diffs: {}, scale byte diffs: {})",
+            "DS fp8 quantize (vs torch)",
+            if n_diff == 0 && n_sdiff == 0 { "OK   " } else { "ÉCHEC" },
+            n_diff,
+            n_sdiff
+        );
+        ok &= n_diff == 0 && n_sdiff == 0;
+    }
+    {
+        let j = golden.get("fp4").unwrap();
+        let rows = j.get("rows").unwrap().as_num().unwrap() as usize;
+        let cols = j.get("cols").unwrap().as_num().unwrap() as usize;
+        let packed: Vec<u8> = arr(j, "packed").iter().map(|&x| x as u8).collect();
+        let scales: Vec<u8> = arr(j, "scales").iter().map(|&x| x as u8).collect();
+        let w = crate::dequant::dequant_fp4(&packed, &scales, rows, cols);
+        ok &= check("DS fp4 e2m1 dequant (torch golden)", &w, &arr(j, "dequant"));
+    }
+
+    println!();
+    if ok {
+        println!("DS DEQUANT OK - fp8/fp4 match the torch references");
+    } else {
+        println!("DS DEQUANT FAILED");
+        std::process::exit(1);
+    }
+}
