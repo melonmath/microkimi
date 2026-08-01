@@ -29,7 +29,7 @@ pub type Id = *mut c_void;
 pub type Sel = *mut c_void;
 
 #[link(name = "objc", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
     fn sel_registerName(name: *const c_char) -> Sel;
     // Declared variadic like the real symbol; always used through a typed
@@ -38,7 +38,7 @@ extern "C" {
 }
 
 #[link(name = "Metal", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn MTLCreateSystemDefaultDevice() -> Id;
 }
 
@@ -69,14 +69,14 @@ fn class(name: &str) -> Id {
 /// SAFETY: `obj` must be a valid Objective-C object (or a class for class
 /// methods) that responds to `s` with a signature `() -> id`.
 unsafe fn msg_id(obj: Id, s: Sel) -> Id {
-    let f: extern "C" fn(Id, Sel) -> Id = std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+    let f: extern "C" fn(Id, Sel) -> Id = unsafe { std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend) };
     f(obj, s)
 }
 
 /// Send a no-argument message returning nothing.
 /// SAFETY: `obj` must respond to `s` with a signature `() -> void`.
 unsafe fn msg_void(obj: Id, s: Sel) {
-    let f: extern "C" fn(Id, Sel) = std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+    let f: extern "C" fn(Id, Sel) = unsafe { std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend) };
     f(obj, s)
 }
 
@@ -721,13 +721,13 @@ pub fn gpu_prof_print() {
 unsafe fn ensure_buf(ctx: &MetalCtx, slot: &mut (Id, usize), bytes: usize) -> (*mut c_void, Id) {
     if slot.1 < bytes {
         let f: extern "C" fn(Id, Sel, u64, u64) -> Id =
-            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            unsafe { std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend) };
         let b = f(ctx.device, sel("newBufferWithLength:options:"), bytes as u64, 0);
         if !b.is_null() {
             retain(b);
             if !slot.0.is_null() {
                 // release the old, too-small buffer (it is retained by us)
-                msg_void(slot.0, sel("release"));
+                unsafe { msg_void(slot.0, sel("release")) };
             }
             *slot = (b, bytes);
         } else if slot.0.is_null() {
@@ -737,7 +737,7 @@ unsafe fn ensure_buf(ctx: &MetalCtx, slot: &mut (Id, usize), bytes: usize) -> (*
         // only if it still fits (it doesn't) → caller must check
     }
     let f: extern "C" fn(Id, Sel) -> *mut c_void =
-        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        unsafe { std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend) };
     (f(slot.0, sel("contents")), slot.0)
 }
 
