@@ -1,0 +1,8 @@
+[Unit]
+Description=nanokimi watchdog (relance train.py si mort, sauf NIGHT_DONE)
+[Service]
+ExecStart=%h/nanokimi_watchdog.sh
+Restart=always
+RestartSec=30
+[Install]
+WantedBy=default.target
