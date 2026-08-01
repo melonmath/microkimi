@@ -1,6 +1,8 @@
 # microkimi
 
-A zero-dependency Rust engine for two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - both verified 1:1 against the official reference code. Runs on a plain laptop CPU (no CUDA, no BLAS, no crates); uses the GPU via Metal on macOS. Also included: **nanokimi**, a small K3 model trained from scratch overnight on CPU, and **nanodeepseek**, its DeepSeek counterpart (being trained).
+A zero-dependency Rust engine for two frontier MoE **architectures** - **Kimi K3** and **DeepSeek-V4-Flash-0731** - both verified 1:1 against the official reference code. Runs on a plain laptop CPU (no CUDA, no BLAS, no crates); uses the GPU via Metal on macOS.
+
+**This is the architecture, not a usable model.** The point is to learn how these models work and to manipulate them - not to run a quantized Kimi or DeepSeek you could chat with. Separately, the pipeline also trains small models from scratch: **nanokimi** (K3, trained) and **nanodeepseek** (V4, being trained) - those are tiny and tell simple stories, they are not the frontier models either.
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
