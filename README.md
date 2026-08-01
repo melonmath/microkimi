@@ -35,15 +35,13 @@ cargo build --release
 
 Naming rule: **nano** models are trained from scratch here; **micro** models are pruned from the real weights; **-debug** files are synthetic fixtures for parity tests and engine tracing.
 
-| model | what it is | details |
+| model | what it is | how to get it |
 |---|---|---|
-| **nanokimi-0.2b** | small Kimi K3 model, trained from scratch (in Releases) | [KIMI.md](KIMI.md) |
-| **nanokimi-0.2b-chat** | chat-tuned nanokimi-0.2b | being trained |
-| **nanodeepseek-0.2b** | small DeepSeek-V4 model, trained from scratch | paused |
-| **microkimi-0.2b / 1b** | pruned from real K3 weights | planned |
-| **microdeepseek-*** | pruned from real DeepSeek-V4 weights | planned |
-| **microkimi-debug** | Kimi K3 architecture demo (synthetic weights, `microkimi build`) | [KIMI.md](KIMI.md) |
-| **microdeepseek-debug** | DeepSeek-V4 architecture demo (synthetic weights, `build --arch dsv4`) | [DEEPSEEK.md](DEEPSEEK.md) |
+| **nanokimi-0.2b** | 0.2B Kimi K3 model, trained from scratch | [Releases](https://github.com/microkimi/microkimi/releases) - see [KIMI.md](KIMI.md) |
+| **microkimi-debug** | full 93-layer K3 skeleton, synthetic weights | `microkimi build` - see [KIMI.md](KIMI.md) |
+| **microdeepseek-debug** | DeepSeek-V4 skeleton, synthetic weights | `microkimi build --arch dsv4` - see [DEEPSEEK.md](DEEPSEEK.md) |
+
+Coming next: nanokimi-0.2b-chat (in training), micro models pruned from real K3 weights.
 
 ## Commands
 
