@@ -1,8 +1,6 @@
 # microkimi
 
-**What this is.** A zero-dependency Rust engine that runs and trains miniature versions of two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. It runs on a plain laptop CPU: no CUDA, no BLAS, no external crates. On macOS it can also use the GPU directly through Metal.
-
-**Why.** To understand frontier architectures well enough to rebuild them from first principles - small enough to run anywhere, exact enough to trust. Also included: nanokimi, a small K3-architecture model trained from scratch overnight on CPU, and nanodeepseek, its DeepSeek counterpart (being trained).
+A zero-dependency Rust engine that runs and trains miniature versions of two frontier MoE models - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. It runs on a plain laptop CPU (no CUDA, no BLAS, no external crates), and uses the GPU directly through Metal on macOS. Also included: **nanokimi**, a small K3-architecture model trained from scratch overnight on CPU, and **nanodeepseek**, its DeepSeek counterpart (being trained).
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
@@ -14,13 +12,7 @@
 >
 > - nanokimi, running on microkimi
 
-| | |
-|---|---|
-| **microkimi** | The **Kimi K3** architecture at micro dims, verified 1:1 against Moonshot's code. Details in [KIMI.md](KIMI.md). |
-| **microdeepseek** | The **DeepSeek-V4-Flash-0731** architecture at micro dims, verified 1:1 against DeepSeek's code. Details in [DEEPSEEK.md](DEEPSEEK.md). |
-| **Scope** | Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine. |
-
-## Run it in 30 seconds
+## Quickstart
 
 You need nothing but a Rust toolchain (`rustup`).
 
@@ -42,6 +34,17 @@ cargo build --release
 ./target/release/microkimi run "Once upon a time" --model nanokimi.bin --max-new 12 --raw --gpu
 ```
 
+## Supported models
+
+| model | architecture | verified | details |
+|---|---|---|---|
+| **microkimi** | Kimi K3 (micro dims) | 1:1 vs Moonshot's code | [KIMI.md](KIMI.md) |
+| **microdeepseek** | DeepSeek-V4-Flash-0731 (micro dims) | 1:1 vs DeepSeek's code | [DEEPSEEK.md](DEEPSEEK.md) |
+| **nanokimi** | Kimi K3, trained from scratch | - | [KIMI.md](KIMI.md) |
+| **nanodeepseek** | DeepSeek-V4, trained from scratch | - | being trained |
+
+Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine.
+
 ## Commands (unified for both architectures)
 
 | task | Kimi K3 | DeepSeek-V4-Flash-0731 |
@@ -55,19 +58,21 @@ cargo build --release
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
-## Measured performance
+## Benchmarks
 
-| workload                                            | hardware        | ms/token | tok/s    |
-| --------------------------------------------------- | --------------- | -------- | -------- |
-| microkimi decode (93 layers, 2.5 GB f32+MXFP4)      | 10-core ARM64   | 59       | ~17      |
-| microkimi decode (93 layers)                        | Apple M5, 16 GB | 34       | ~29      |
-| nanokimi decode (8 layers, 113 MB)                  | 10-core ARM64   | 7.5      | ~134     |
-| microdeepseek decode (43 layers, 2.0 GB f32+FP4)    | 10-core ARM64   | 39       | ~26      |
-| nanokimi training (batch 32×256)                    | 32 vCPU x86-64  | -        | ~130-290 |
-| `microkimi build` (fetch + quant + write 2.5 GB)    | 10-core ARM64   | -        | ~65 s    |
-| `microkimi build-ds` (fetch + quant + write 2.0 GB) | 10-core ARM64   | -        | ~86 s    |
+Measured on a 10-core ARM64 Linux workstation and an Apple M5 (16 GB), greedy decoding.
 
-GPU note (macOS/Metal): `--gpu` offloads the large matvecs to the GPU with weights cached on device. At micro dims the model runs ~1,200 small matvecs per token and per-dispatch sync dominates, so the GPU only takes matvecs ≥ 2M elements (lm_head) - the rest stays faster on the CPU thread pool. At real K3 dims (88M-MAC matvecs) the balance flips in the GPU's favor.
+| model | workload | hardware | ms/token | tok/s |
+|---|---|---|---|---|
+| microkimi | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
+| microkimi | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
+| microdeepseek | decode (43 layers, 2.0 GB f32+FP4) | 10-core ARM64 | 39 | ~26 |
+| nanokimi | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
+| nanokimi | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
+| - | `microkimi build` (fetch + quant + write 2.5 GB) | 10-core ARM64 | - | ~65 s |
+| - | `microkimi build-ds` (fetch + quant + write 2.0 GB) | 10-core ARM64 | - | ~86 s |
+
+GPU (macOS/Metal): `--gpu` offloads the large matvecs to the GPU with weights cached on device. At micro dims the model runs ~1,200 small matvecs per token and per-dispatch sync dominates, so the GPU only takes matvecs ≥ 2M elements (lm_head) - the rest stays faster on the CPU thread pool. At real K3 dims (88M-MAC matvecs) the balance flips in the GPU's favor.
 
 ## Repository layout
 
@@ -81,6 +86,16 @@ KIMI.md         Kimi K3 details (architecture, parity proof, nanokimi training)
 DEEPSEEK.md     DeepSeek-V4-Flash-0731 details (architecture, parity proof, what's here / not)
 ```
 
-## License & acknowledgments
+## License
 
-MIT (see `LICENSE`). Kimi K3 architecture and reference code: **Moonshot AI** (downloaded at runtime, never vendored). DeepSeek-V4 architecture, reference code and tokenizer: **DeepSeek AI** (MIT, downloaded at runtime, never vendored). `nano/vendor/fla`: **flash-linear-attention**, MIT, © Songlin Yang, Yu Zhang, Zhiyuan Li. Weight pools for `microkimi build`: **Qwen2.5-0.5B-Instruct** (Apache 2.0). Training data: **TinyStories** (Ronen Eldan, Microsoft Research).
+MIT - see [LICENSE](LICENSE).
+
+## Acknowledgments
+
+| | |
+|---|---|
+| Kimi K3 architecture & reference code | **Moonshot AI** (downloaded at runtime, never vendored) |
+| DeepSeek-V4 architecture, reference code & tokenizer | **DeepSeek AI** (MIT, downloaded at runtime, never vendored) |
+| `nano/vendor/fla` shim | **flash-linear-attention** (MIT, © Songlin Yang, Yu Zhang, Zhiyuan Li) |
+| Weight pools for `microkimi build` | **Qwen2.5-0.5B-Instruct** (Apache 2.0) |
+| Training data | **TinyStories** (Ronen Eldan, Microsoft Research) |
