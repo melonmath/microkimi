@@ -283,19 +283,20 @@ struct LayerW {
 
 // ── caches ──
 
-struct KdaCache {
-    conv_q: Vec<f32>, // 3 × 512 (raw pre-conv)
-    conv_k: Vec<f32>,
-    conv_v: Vec<f32>,
-    s: Vec<f32>, // 4 × 128 × 128
+// pub(crate): read/rewritten by mkmem.rs (.mkmem state snapshots)
+pub(crate) struct KdaCache {
+    pub conv_q: Vec<f32>, // 3 × 512 (raw pre-conv)
+    pub conv_k: Vec<f32>,
+    pub conv_v: Vec<f32>,
+    pub s: Vec<f32>, // 4 × 128 × 128
 }
 
-struct MlaCache {
-    k: Vec<f32>, // pos × (4×192)
-    v: Vec<f32>, // pos × (4×128)
+pub(crate) struct MlaCache {
+    pub k: Vec<f32>, // pos × (4×192)
+    pub v: Vec<f32>, // pos × (4×128)
 }
 
-enum Cache {
+pub(crate) enum Cache {
     Kda(KdaCache),
     Mla(MlaCache),
 }
@@ -354,7 +355,8 @@ pub struct Model {
     norm_f: T,
     out_res_w: Vec<f32>,
     layers: Vec<LayerW>,
-    caches: Vec<Cache>,
+    pub(crate) caches: Vec<Cache>, // pub(crate): saved/restored by mkmem.rs
+    pub last_logits: Vec<f32>,     // logits of the last forward (source for mkmem --save)
     pub prof: Prof,
 }
 
@@ -460,7 +462,19 @@ impl Model {
             };
             layers.push(LayerW { input_ln, post_ln, sa_res_w, mlp_res_w, attn, ffn });
         }
-        Model { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, prof: Prof::default() }
+        Model { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default() }
+    }
+
+    /// Number of tokens already represented in the caches (from the first MLA
+    /// layer; 0 for a KDA-only model). Only seeds the debug position counter:
+    /// K3 has no positional encoding, so the math does not depend on it.
+    fn cached_tokens(&self) -> usize {
+        for c in &self.caches {
+            if let Cache::Mla(m) = c {
+                return m.k.len() / (self.cfg.mla_heads * self.cfg.mla_qh());
+            }
+        }
+        0
     }
 
     pub fn reset_cache(&mut self) {
@@ -888,7 +902,7 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, prof } = self;
+        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let embed = Self::t(data, embed);
@@ -990,6 +1004,7 @@ impl Model {
         let mut logits = vec![0f32; cfg.vocab];
         matvec(Self::t(data, &lm_head), cfg.vocab, cfg.d, &xf, &mut logits);
         prof.t_lm_head += tm.elapsed().as_secs_f64();
+        *last_logits = logits.clone();
         logits
     }
 }
@@ -1036,9 +1051,21 @@ fn py_repr(s: &str) -> String {
 
 pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32) -> String {
     model.reset_cache();
+    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, false, None)
+}
+
+/// Same as run_turn but keeps the current caches (restored from a .mkmem
+/// snapshot via --memory): the prompt tokens are fed on top of the loaded
+/// state and `init_logits` (the logits stored in the snapshot) seed the
+/// decoding when the prompt is empty - a pure continuation.
+pub fn run_turn_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>) -> String {
+    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, true, init_logits)
+}
+
+fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, resumed: bool, init_logits: Option<Vec<f32>>) -> String {
     model.prof = Prof::default();
-    let mut pos = 0usize;
-    let answer = run_turn_core(
+    let mut pos = if resumed { model.cached_tokens() } else { 0 };
+    let answer = run_turn_core_resume(
         ids,
         max_new,
         tok,
@@ -1050,6 +1077,7 @@ pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mod
         debug,
         debug_routing,
         stop_id,
+        init_logits,
     );
     model.prof.print_cfg(model.cfg.d, model.cfg.vocab, model.cfg.n_experts);
     answer
@@ -1059,6 +1087,13 @@ pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mod
 /// `fwd` closure (one forward per token, position tracked by the caller).
 /// Shared by the K3 Model (run_turn) and the DeepSeek DsModel (ds_run_turn).
 pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32) -> String {
+    run_turn_core_resume(ids, max_new, tok, fwd, debug, debug_routing, stop_id, None)
+}
+
+/// run_turn_core + optional initial logits restored from a .mkmem snapshot:
+/// with an empty prompt the decoding starts straight from them (pure
+/// continuation, no token is re-ingested).
+pub fn run_turn_core_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>) -> String {
     if debug_routing {
         ROUTING.with(|r| *r.borrow_mut() = Some(RoutingDebug::default()));
     }
@@ -1074,9 +1109,13 @@ pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut 
 
     // ── sequential prefill (simple) ──
     let t2 = Instant::now();
-    let mut logits = Vec::new();
+    let mut logits = init_logits.unwrap_or_default();
     for &id in ids {
         logits = fwd(id);
+    }
+    if logits.is_empty() {
+        eprintln!("error: nothing to continue from (empty prompt and no logits stored in the .mkmem snapshot)");
+        std::process::exit(1);
     }
     let t_prefill = t2.elapsed();
     if debug {
@@ -1084,7 +1123,11 @@ pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut 
         println!("{}", "=".repeat(64));
         println!("STEP 1 - sequential PREFILL  (caches filled)");
         println!("{}", "=".repeat(64));
-        println!("⏱  {:.2} s  for {} tokens ({:.1} ms/token)", t_prefill.as_secs_f64(), ids.len(), t_prefill.as_secs_f64() / ids.len() as f64 * 1000.0);
+        if ids.is_empty() {
+            println!("⏱  skipped: pure continuation from the .mkmem snapshot");
+        } else {
+            println!("⏱  {:.2} s  for {} tokens ({:.1} ms/token)", t_prefill.as_secs_f64(), ids.len(), t_prefill.as_secs_f64() / ids.len() as f64 * 1000.0);
+        }
         println!();
         println!("{}", "=".repeat(64));
         println!("STEP 2 - GENERATION  (greedy: softmax → argmax, stop = token {})", stop_id);

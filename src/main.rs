@@ -14,6 +14,7 @@ mod http;
 mod json;
 #[cfg(target_os = "macos")]
 mod metal;
+mod mkmem;
 mod model;
 mod mxfp4;
 mod parity;
@@ -54,6 +55,7 @@ fn main() {
         "dsparity" => parity::run_ds(), // alias for `parity --arch dsv4`
         "run" => {
             // microkimi run "prompt" [--max-new N] [--model X.bin] [--vocab V.json]
+            //                        [--memory mem.mkmem] [--save mem.mkmem]
             let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
             let prompt = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "Hello".to_string());
             let max_new = args
@@ -63,11 +65,22 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20);
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"));
+            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"));
         }
         "chat" => {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"));
+            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), value_flag(&args, "--memory"), value_flag(&args, "--save"));
+        }
+        // microkimi prefill "text" --save mem.mkmem [--model X.bin] [--vocab V.json] [--chat]
+        "prefill" => {
+            let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
+            let text = positional.first().map(|s| s.to_string()).unwrap_or_default();
+            let Some(save) = value_flag(&args, "--save") else {
+                eprintln!("error: prefill requires --save mem.mkmem");
+                std::process::exit(1);
+            };
+            model::set_gpu(args.iter().any(|a| a == "--gpu"));
+            prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"));
         }
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
@@ -101,8 +114,10 @@ fn main() {
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
+            println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
             println!("  run/chat options: --model X.bin --vocab vocab_nano.json (auto if next to the .bin)");
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
+            println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
@@ -255,6 +270,29 @@ fn vocab_flag(args: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// Generic --flag value extractor (--memory, --save).
+fn value_flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Drops the leading BOS of a freshly encoded prompt when resuming from a
+/// .mkmem snapshot: BOS belongs to the stream start, already ingested when
+/// the snapshot was taken. For the nano tokenizer encode_raw("") is just
+/// [BOS], so an empty prompt becomes a pure continuation.
+fn strip_bos(ids: &mut Vec<u32>, tok: &tokenizer::AnyTokenizer) {
+    let bos = match tok {
+        tokenizer::AnyTokenizer::Full(_) => Some(tokenizer::BOS),
+        tokenizer::AnyTokenizer::Nano(n) => Some(n.bos),
+        _ => None,
+    };
+    if ids.first() == bos.as_ref() {
+        ids.remove(0);
+    }
+}
+
 /// Loads the tokenizer matching the model: explicit --vocab, otherwise vocab_nano.json
 /// next to the .bin — but ONLY when its vocab size matches the model's (a stray
 /// vocab_nano.json next to microkimi-debug.bin must NOT hijack the full tokenizer),
@@ -305,7 +343,7 @@ fn check_tok_compat(tok: &tokenizer::AnyTokenizer, model: &model::Model) {
 }
 
 /// Loads tokenizer + weights, runs one inference turn with detailed output.
-fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool) -> String {
+fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>) -> String {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
@@ -329,17 +367,77 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     println!("cores used for matvecs: {}", model::n_threads());
     gpu_status_line();
 
-    let (ids, stop) = if raw {
+    let mut init_logits = None;
+    if let Some(m) = memory {
+        match crate::mkmem::load(&mut model, m) {
+            Ok(l) => {
+                println!("memory loaded: {}", m);
+                init_logits = Some(l);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    let (mut ids, stop) = if raw {
         (tok.encode_raw(question), tok.raw_stop())
     } else {
         (tok.encode_chat_user(question), tok.end_of_msg())
     };
-    let answer = model::run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
+    let answer = if init_logits.is_some() {
+        strip_bos(&mut ids, &tok);
+        model::run_turn_resume(&ids, max_new, &tok, &mut model, debug, debug_routing, stop, init_logits)
+    } else {
+        model::run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop)
+    };
+    if let Some(s) = save {
+        save_memory(&model, s);
+    }
     gpu_prof_maybe_print();
     answer
 }
 
-fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool) {
+/// Snapshots the current state (caches + last logits) to a .mkmem file.
+fn save_memory(model: &model::Model, path: &str) {
+    match crate::mkmem::save(model, &model.last_logits, path) {
+        Ok(()) => println!("memory saved: {}", path),
+        Err(e) => {
+            eprintln!("error: cannot write {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `microkimi prefill "text" --save mem.mkmem`: ingests the text (raw
+/// completion encoding by default, chat template with --chat) and snapshots
+/// the resulting state, without generating anything.
+fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Option<String>, chat: bool) {
+    let tl = Instant::now();
+    let mp = model_path.clone().unwrap_or_else(bin_path);
+    if crate::weights::read_config(&mp).ds.is_some() {
+        eprintln!("error: prefill is only supported for K3 models (not DeepSeek-V4)");
+        std::process::exit(1);
+    }
+    let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
+    let mut model = model::Model::load(&mp);
+    check_tok_compat(&tok, &model);
+    println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
+    let ids = if chat {
+        tok.encode_chat_user(text)
+    } else {
+        tok.encode_raw(text)
+    };
+    let tp = Instant::now();
+    for (pos, &id) in ids.iter().enumerate() {
+        model.forward(id, pos);
+    }
+    save_memory(&model, save);
+    let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
+    println!("prefill: {} tokens ingested in {:.1?} - state saved to {} ({:.1} KB)", ids.len(), tp.elapsed(), save, size as f64 / 1024.0);
+}
+
+fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>) {
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
@@ -351,6 +449,22 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     gpu_status_line();
+    // --memory: resume a .mkmem snapshot; turns are then fed incrementally on
+    // top of the loaded state (the history lives in the caches, no re-prefill).
+    let mut init_logits = None;
+    if let Some(m) = &memory {
+        match crate::mkmem::load(&mut model, m) {
+            Ok(l) => {
+                println!("memory loaded: {}", m);
+                init_logits = Some(l);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    let resumed = memory.is_some();
     if raw {
         println!("\nRAW interactive mode - each line is a story beginning to continue (type 'quit' to exit)");
     } else {
@@ -374,14 +488,27 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
         }
         if raw {
             // raw completion: BOS + text, stop on EOS, each turn independent
-            let ids = tok.encode_raw(q);
+            // (with --memory: one continuous stream, BOS stripped after the snapshot)
+            let mut ids = tok.encode_raw(q);
             let stop = tok.raw_stop();
-            model::run_turn(&ids, 200, &tok, &mut model, false, debug_routing, stop);
+            if resumed {
+                strip_bos(&mut ids, &tok);
+                model::run_turn_resume(&ids, 200, &tok, &mut model, false, debug_routing, stop, init_logits.take());
+            } else {
+                model::run_turn(&ids, 200, &tok, &mut model, false, debug_routing, stop);
+            }
+        } else if resumed {
+            let ids = tok.encode_chat(&[], q);
+            let answer = model::run_turn_resume(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg(), init_logits.take());
+            history.push((q.to_string(), answer));
         } else {
             let ids = tok.encode_chat(&history, q);
             let answer = model::run_turn(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg());
             history.push((q.to_string(), answer));
         }
+    }
+    if let Some(s) = &save {
+        save_memory(&model, s);
     }
 }
 
