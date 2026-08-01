@@ -99,38 +99,6 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// Full MoE forward for one token: route, run selected experts with f32
-/// accumulation, add the (single, unweighted) shared expert.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_forward(
-    x: &[f32],
-    gate_w: &[f32],
-    bias: Option<&[f32]>,
-    tid2eid: Option<&[i32]>,
-    token_id: u32,
-    experts: &dyn Fn(u32, &[f32], &mut [f32]), // (expert_id, x, out[d])
-    shared: &dyn Fn(&[f32], &mut [f32]),
-    topk: usize,
-    route_scale: f32,
-    out: &mut [f32],
-) {
-    let (sel, _) = gate_forward(x, gate_w, bias, tid2eid, token_id, gate_w.len() / x.len(), topk, route_scale);
-    let d = x.len();
-    let mut acc = vec![0f32; d];
-    for (eid, w) in &sel {
-        let mut eo = vec![0f32; d];
-        experts(*eid, x, &mut eo);
-        for j in 0..d {
-            acc[j] += w * eo[j];
-        }
-    }
-    let mut so = vec![0f32; d];
-    shared(x, &mut so);
-    for j in 0..d {
-        out[j] = acc[j] + so[j];
-    }
-}
-
 // ── Hyper-Connections (model.py:680-716, kernel.py:371-438) ──
 
 /// Sinkhorn normalization of the combination matrix (kernel.py:401-423):
@@ -717,12 +685,6 @@ pub fn indexer_step(
 }
 
 // ── full attention layer forward (model.py:490-548) ──
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum QatMode {
-    Fp8, // act_quant block 64 on non-rope dims (attention compressor)
-    Fp4, // Hadamard + fp4 roundtrip (indexer compressor)
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn attention_step(

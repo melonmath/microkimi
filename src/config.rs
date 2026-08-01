@@ -163,7 +163,6 @@ pub struct DsConfig {
     pub index_topk: usize,     // 64 (real: 512)
     pub n_routed_experts: usize, // 256 (kept)
     pub n_activated_experts: usize, // 6 (kept)
-    pub n_shared_experts: usize,  // 1 (kept)
     pub moe_inter_dim: usize,     // 128 (real: 2048)
     pub n_hash_layers: usize,     // 3 (kept)
     pub route_scale: f64,         // 1.5
@@ -205,7 +204,6 @@ impl DsConfig {
             index_topk: 64,
             n_routed_experts: 256,
             n_activated_experts: 6,
-            n_shared_experts: 1,
             moe_inter_dim: 128,
             n_hash_layers: 3,
             route_scale: 1.5,
@@ -255,12 +253,5 @@ impl DsConfig {
 
     pub fn compress_ratio(&self, layer: usize) -> i32 {
         self.compress_ratios.get(layer).copied().unwrap_or(0)
-    }
-}
-
-impl Config {
-    /// DeepSeek-V4 config if the MKIM0002 JSON declares arch "deepseek_v4".
-    pub fn ds_arch(&self) -> Option<DsConfig> {
-        self.ds.clone()
     }
 }
