@@ -134,6 +134,14 @@ The repo also assembles **microdeepseek.bin** - the DeepSeek-V4-Flash architectu
 
 Verified 1:1 against a plain-torch replica of DeepSeek's reference `model.py` driven by the very weights of microdeepseek.bin (`dsparity`): per-layer HC hidden states match at ~1e-6 over 132 positions, router selections and top-16 logit ids are **exact**. The V4 tokenizer (byte-level BPE from the official `tokenizer.json`, hand-reimplemented 3-stage pre-tokenizer) matches the HF `tokenizers` runtime **exactly** on a 74-string battery (`selftest`).
 
+What is here / not here:
+
+| | |
+|---|---|
+| **here** | Full DeepSeek-V4 architecture (43 layers, Hyper-Connections, sparse attention, 256 experts top-6, sqrtsoftplus router, fp4 experts, V4 tokenizer), verified 1:1; fragments of real weights (norms, router, `tid2eid` tables, compressors, 3 real fp4 experts); the builder to assemble it. |
+| **not here (yet)** | The real DeepSeek-V4 weights (284B params - they don't fit any machine here); a *trained* DeepSeek model. **nanodeepseek** - the trained-from-scratch V4 model, like nanokimi for K3 - is planned and will be trained once a training server is available. |
+| **not here (by design)** | The DSpark speculative-decoding module (the forward stops at the 43 layers + head). |
+
 ```bash
 ./target/release/microkimi build-ds     # assemble microdeepseek.bin (~2 GB, V4 range-request fetch + seeded pools)
 python3 ref/make_ds_parity.py           # regenerates ref/ds_parity_golden.json (torch replica)
