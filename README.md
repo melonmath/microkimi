@@ -37,23 +37,23 @@ cargo build --release
 
 ## Models
 
-| model | architecture | details |
-|---|---|---|
-| **microkimi** | Kimi K3 (micro dims) | [KIMI.md](KIMI.md) |
+| model             | architecture                        | details                    |
+| ----------------- | ----------------------------------- | -------------------------- |
+| **microkimi**     | Kimi K3 (micro dims)                | [KIMI.md](KIMI.md)         |
+| **nanokimi**      | Kimi K3, trained from scratch       | [KIMI.md](KIMI.md)         |
 | **microdeepseek** | DeepSeek-V4-Flash-0731 (micro dims) | [DEEPSEEK.md](DEEPSEEK.md) |
-| **nanokimi** | Kimi K3, trained from scratch | [KIMI.md](KIMI.md) |
-| **nanodeepseek** | DeepSeek-V4, trained from scratch | being trained |
+| **nanodeepseek**  | DeepSeek-V4, trained from scratch   | being trained              |
 
-## Commands (unified for both architectures)
+## Commands
 
-| task | Kimi K3 | DeepSeek-V4-Flash-0731 |
-|---|---|---|
-| assemble weights | `microkimi build` | `microkimi build --arch dsv4` |
-| verify 1:1 vs official code | `microkimi paritytest` | `microkimi parity --arch dsv4` |
-| all mechanism self-tests | `microkimi selftest` (covers both) | `microkimi selftest` (covers both) |
-| generate | `microkimi run "..." --model microkimi.bin` | `microkimi run "..." --model microdeepseek.bin` |
-| interactive | `microkimi chat --model nanokimi.bin --raw` | `microkimi chat --model microdeepseek.bin` |
-| GPU checks (macOS) | `metaltest`, `gputest` | `dstest` |
+| task                        | Kimi K3                                     | DeepSeek-V4-Flash-0731                          |
+| --------------------------- | ------------------------------------------- | ----------------------------------------------- |
+| assemble weights            | `microkimi build`                           | `microkimi build --arch dsv4`                   |
+| verify 1:1 vs official code | `microkimi paritytest`                      | `microkimi parity --arch dsv4`                  |
+| all mechanism self-tests    | `microkimi selftest` (covers both)          | `microkimi selftest` (covers both)              |
+| generate                    | `microkimi run "..." --model microkimi.bin` | `microkimi run "..." --model microdeepseek.bin` |
+| interactive                 | `microkimi chat --model nanokimi.bin --raw` | `microkimi chat --model microdeepseek.bin`      |
+| GPU checks (macOS)          | `metaltest`, `gputest`                      | `dstest`                                        |
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
