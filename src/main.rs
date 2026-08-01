@@ -36,6 +36,7 @@ fn main() {
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
+        "dstest" => dstest_cmd(),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" => parity::run(args.iter().any(|a| a == "--show")),
         "dsparity" => parity::run_ds(),
@@ -90,7 +91,7 @@ fn main() {
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
             println!("  run/chat options: --model X.bin --vocab vocab_nano.json (auto if next to the .bin)");
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
-            println!("  microkimi metaltest | gputest | gpubench   Metal GPU checks (macOS only)");
+            println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
     let _ = t0;
@@ -120,6 +121,16 @@ fn gputest_cmd() {
 #[cfg(not(target_os = "macos"))]
 fn gputest_cmd() {
     println!("gputest is only available on macOS (Metal GPU support)");
+}
+
+#[cfg(target_os = "macos")]
+fn dstest_cmd() {
+    metal::dstest();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dstest_cmd() {
+    println!("dstest is only available on macOS (Metal GPU support, DeepSeek fp4 kernel)");
 }
 
 #[cfg(target_os = "macos")]

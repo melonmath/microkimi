@@ -156,6 +156,55 @@ kernel void matvec(device const float* W [[buffer(0)]],
 }
 "#;
 
+// FP4 (e2m1) dequant-matvec, fused on GPU: y[r] = Σ_c dequant(W[r,c]) · x[c].
+// EXACT same layout as the CPU mxfp4::matvec_packed: packed u8 [rows, cols/2]
+// (LOW nibble = even column), one ue8m0 scale byte per 32 columns
+// (scale = 2^(byte-127)). cols is a multiple of 32 (mxfp4 invariant).
+// Same threadgroup-per-row + simd_sum structure as the f32 kernel above;
+// consecutive lanes read consecutive packed bytes (coalesced).
+// Numeric note: the CPU applies the scale AFTER summing each group of 32
+// (Σ lut·x)·s; here each element is scaled before the accumulation
+// (lut·s·x) — same math, f32-level reassociation noise (≪ 1e-3).
+const MATVEC_FP4_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void matvec_fp4(device const uchar* packed [[buffer(0)]],
+                       device const uchar* scales [[buffer(1)]],
+                       device const float* x      [[buffer(2)]],
+                       device float*       y      [[buffer(3)]],
+                       constant uint&    cols   [[buffer(4)]],
+                       uint row  [[threadgroup_position_in_grid]],
+                       uint lane [[thread_position_in_threadgroup]],
+                       uint lanes [[threads_per_threadgroup]]) {
+    // e2m1 value table (sign × 8 magnitudes) — same as mxfp4::E2M1
+    constant float LUT[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                              -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    threadgroup float partial[32];
+    device const uchar* prow = packed + (size_t)row * (cols >> 1);
+    device const uchar* srow = scales + (size_t)row * (cols >> 5);
+    float acc = 0.0f;
+    for (uint c = lane; c < cols; c += lanes) {
+        uchar byte = prow[c >> 1];
+        uint nib = (c & 1u) ? uint(byte >> 4) : uint(byte & 0x0F);
+        uchar sb = srow[c >> 5];
+        // 2^(sb-127) as an exact bit pattern (exponent field = sb), no exp call;
+        // sb == 0 → 2^-127 (subnormal 0x00400000), matching mxfp4::exp2_i.
+        float s = (sb == 0) ? as_type<float>(0x00400000u) : as_type<float>(uint(sb) << 23);
+        acc += LUT[nib] * s * x[c];
+    }
+    acc = simd_sum(acc);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 32u) {
+        uint nsg = (lanes + 31u) / 32u;
+        float v = (lane < nsg) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) y[row] = v;
+    }
+}
+"#;
+
 // ── step 1 test: GPU matvec vs CPU reference on a fixed case ──
 
 const ROWS: usize = 1024;
@@ -348,8 +397,11 @@ pub struct MetalCtx {
     device: Id,
     queue: Id,
     pipeline: Id,
+    pipeline_fp4: Id, // null if the fp4 pipeline failed to build (fp4 path then stays CPU)
     max_ttg: u64,
+    max_ttg_fp4: u64,
     cache: std::sync::Mutex<WeightCache>,
+    cache_fp4: std::sync::Mutex<WeightCacheFp4>,
     io: std::sync::Mutex<IoBufs>,
 }
 
@@ -367,11 +419,21 @@ pub struct WeightCache {
     cap_bytes: usize, // device-memory budget; usize::MAX = unlimited (default)
 }
 
+/// FP4 weight cache: (packed ptr, rows, cols) → (packed buffer, scales buffer).
+/// Same stability argument as the f32 cache (engine weights are slices into
+/// the session-stable BinFile.data); the anti-alias check compares raw bytes.
+pub struct WeightCacheFp4 {
+    map: std::collections::HashMap<(usize, usize, usize), (Id, Id)>,
+    bytes: usize,
+    cap_bytes: usize,
+}
+
 // SAFETY: MTLDevice / MTLCommandQueue are documented by Apple as thread-safe.
-// In this engine every gpu_matvec call is made from the single thread that
-// drives the forward pass (our CPU thread pool only ever runs INSIDE the CPU
-// matvec), and command buffers/encoders are created fresh per call, so no two
-// threads ever share a transient Metal object.
+// The f32 path is only driven from the single forward-pass thread; the fp4
+// path CAN be entered from several pool workers at once (MoE experts run as
+// parallel jobs) — those calls serialize on the io mutex, which is held for
+// the whole encode/wait/readback section, so no two threads ever share a
+// transient Metal object (command buffers/encoders are created fresh per call).
 unsafe impl Send for MetalCtx {}
 unsafe impl Sync for MetalCtx {}
 
@@ -442,6 +504,46 @@ fn init_ctx() -> Option<MetalCtx> {
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
             f(pipeline, sel("maxTotalThreadsPerThreadgroup"))
         };
+        // fp4 dequant-matvec pipeline (separate MSL source); a failure here
+        // only disables the fp4 GPU path, not the f32 one.
+        let mut pipeline_fp4: Id = std::ptr::null_mut();
+        let mut max_ttg_fp4: u64 = 0;
+        {
+            let src4 = ns_string(MATVEC_FP4_MSL);
+            let mut err4: Id = std::ptr::null_mut();
+            let library4 = {
+                let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(device, sel("newLibraryWithSource:options:error:"), src4, std::ptr::null_mut(), &mut err4)
+            };
+            if library4.is_null() {
+                println!("gpu: fp4 shader compilation error: {} — fp4 path stays on CPU", err_desc(err4));
+            } else {
+                let function4 = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library4, sel("newFunctionWithName:"), ns_string("matvec_fp4"))
+                };
+                let mut perr4: Id = std::ptr::null_mut();
+                pipeline_fp4 = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(device, sel("newComputePipelineStateWithFunction:error:"), function4, &mut perr4)
+                };
+                if pipeline_fp4.is_null() {
+                    println!("gpu: fp4 pipeline creation error: {} — fp4 path stays on CPU", err_desc(perr4));
+                } else {
+                    max_ttg_fp4 = {
+                        let f: extern "C" fn(Id, Sel) -> u64 =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(pipeline_fp4, sel("maxTotalThreadsPerThreadgroup"))
+                    };
+                    retain(pipeline_fp4);
+                    retain(function4);
+                }
+                retain(library4);
+            }
+        }
         let queue = msg_id(device, sel("newCommandQueue"));
 
         // Device-memory budget for the weight cache. Default: unlimited
@@ -461,8 +563,15 @@ fn init_ctx() -> Option<MetalCtx> {
             device: retain(device),
             queue: retain(queue),
             pipeline: retain(pipeline),
+            pipeline_fp4,
             max_ttg,
+            max_ttg_fp4,
             cache: std::sync::Mutex::new(WeightCache {
+                map: std::collections::HashMap::new(),
+                bytes: 0,
+                cap_bytes,
+            }),
+            cache_fp4: std::sync::Mutex::new(WeightCacheFp4 {
                 map: std::collections::HashMap::new(),
                 bytes: 0,
                 cap_bytes,
@@ -754,6 +863,160 @@ pub fn gpu_matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], y: &mut [f32])
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// fp4 (e2m1/ue8m0) dequant-matvec on GPU — mxfp4::matvec_packed's counterpart
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Returns the on-device buffers (packed, scales) for an fp4 weight matrix,
+/// uploading them on first use. None on budget overflow or allocation failure
+/// (caller falls back to the CPU path). Same aliasing defense as the f32
+/// cache: the first bytes are verified on every hit, a mismatch re-uploads.
+fn weight_buffer_fp4(ctx: &MetalCtx, packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Option<(Id, Id)> {
+    let key = (packed.as_ptr() as usize, rows, cols);
+    let mut cache = ctx.cache_fp4.lock().unwrap();
+    if let Some(&(bp, bs)) = cache.map.get(&key) {
+        // verify the cached buffers really hold THIS matrix (anti-aliasing)
+        let ok = unsafe {
+            let f: extern "C" fn(Id, Sel) -> *mut c_void =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            let pp = f(bp, sel("contents")) as *const u8;
+            let sp = f(bs, sel("contents")) as *const u8;
+            if pp.is_null() || sp.is_null() {
+                true // cannot verify; trust the key
+            } else {
+                let np = packed.len().min(16);
+                let ns = scales.len().min(4);
+                std::slice::from_raw_parts(pp, np) == &packed[..np]
+                    && std::slice::from_raw_parts(sp, ns) == &scales[..ns]
+            }
+        };
+        if ok {
+            return Some((bp, bs));
+        }
+        static WARNED_FP4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED_FP4.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            println!("gpu: pointer alias detected in fp4 weight cache (reused address) - re-uploading affected tensors");
+        }
+        cache.bytes -= packed.len() + scales.len();
+        cache.map.remove(&key);
+        unsafe {
+            msg_void(bp, sel("release"));
+            msg_void(bs, sel("release"));
+        }
+    }
+    let size = packed.len() + scales.len();
+    if cache.bytes + size > cache.cap_bytes {
+        return None; // budget exceeded → CPU fallback (by design, never fatal)
+    }
+    // SAFETY: packed/scales are valid for the whole call; the buffers are
+    // retained and owned by the cache until process exit.
+    let (bp, bs) = unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bp = f(ctx.device, sel("newBufferWithBytes:length:options:"), packed.as_ptr() as *const c_void, packed.len() as u64, 0);
+        let bs = f(ctx.device, sel("newBufferWithBytes:length:options:"), scales.as_ptr() as *const c_void, scales.len() as u64, 0);
+        (bp, bs)
+    };
+    if bp.is_null() || bs.is_null() {
+        unsafe {
+            if !bp.is_null() {
+                msg_void(bp, sel("release"));
+            }
+            if !bs.is_null() {
+                msg_void(bs, sel("release"));
+            }
+        }
+        return None;
+    }
+    retain(bp);
+    retain(bs);
+    cache.map.insert(key, (bp, bs));
+    cache.bytes += size;
+    Some((bp, bs))
+}
+
+/// FP4 matrix × vector on the GPU: y = dequant(W) · x, fused (weights stay
+/// packed on device). Called from mxfp4::matvec_packed when --gpu is set and
+/// rows*cols >= GPU_MIN_ELEMS — and directly by dstest at any size.
+/// `packed` is [rows, cols/2] (low nibble = even column), `scales` is
+/// [rows, cols/32] (ue8m0), cols a multiple of 32 — the mxfp4 invariants.
+pub fn gpu_matvec_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
+    assert_eq!(cols % 32, 0, "fp4: cols must be a multiple of 32");
+    assert_eq!(packed.len(), rows * cols / 2);
+    assert_eq!(scales.len(), rows * cols / 32);
+    assert_eq!(x.len(), cols);
+    assert_eq!(y.len(), rows);
+    let Some(ctx) = ctx() else {
+        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        return;
+    };
+    if ctx.pipeline_fp4.is_null() {
+        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        return;
+    }
+    let Some((buf_p, buf_s)) = weight_buffer_fp4(ctx, packed, scales, rows, cols) else {
+        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        return;
+    };
+
+    // SAFETY: same invariants as gpu_matvec — all Metal objects come from the
+    // live context or the retained caches; the io mutex serializes concurrent
+    // callers (MoE expert pool jobs); waitUntilCompleted before readback; a
+    // fresh autorelease pool per call frees transient command buffers/encoders.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = ctx.io.lock().unwrap();
+        let (x_ptr, buf_x) = ensure_buf(ctx, &mut io.x, x.len() * 4);
+        let (y_ptr, buf_y) = ensure_buf(ctx, &mut io.y, y.len() * 4);
+        let (c_ptr, buf_cols) = ensure_buf(ctx, &mut io.cols, 4);
+        if buf_x.is_null() || buf_y.is_null() || buf_cols.is_null() || x_ptr.is_null() || y_ptr.is_null() || c_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            println!("gpu: fp4 i/o buffer allocation failed — falling back to CPU for this matvec");
+            crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(x.as_ptr() as *const c_void, x_ptr, x.len() * 4);
+        std::ptr::copy_nonoverlapping((&(cols as u32)) as *const u32 as *const c_void, c_ptr, 4);
+
+        let cmdbuf = msg_id(ctx.queue, sel("commandBuffer"));
+        let encoder = msg_id(cmdbuf, sel("computeCommandEncoder"));
+        {
+            let f: extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(encoder, sel("setComputePipelineState:"), ctx.pipeline_fp4);
+        }
+        {
+            let f: extern "C" fn(Id, Sel, Id, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_p, 0, 0);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_s, 0, 1);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_x, 0, 2);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_y, 0, 3);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_cols, 0, 4);
+        }
+        {
+            let mut group = ctx.max_ttg_fp4.min(256);
+            group = (group / 32).max(1) * 32;
+            let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                encoder,
+                sel("dispatchThreads:threadsPerThreadgroup:"),
+                MTLSize { width: rows as u64 * group, height: 1, depth: 1 },
+                MTLSize { width: group, height: 1, depth: 1 },
+            );
+        }
+        msg_void(encoder, sel("endEncoding"));
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        y.copy_from_slice(std::slice::from_raw_parts(y_ptr as *const f32, rows));
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // gputest: real model matvecs CPU vs GPU
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -818,5 +1081,123 @@ pub fn gputest() {
         println!("GPUTEST OK — GPU matches CPU on real model matvecs (tol 1e-3)");
     } else {
         println!("GPUTEST FAIL");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// dstest: fp4 dequant-matvec Metal vs CPU (microdeepseek experts)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Compares the fused fp4 kernel against the CPU mxfp4::matvec_packed on:
+/// 1. synthetic matrices at micro dims, real V4 dims and edge shapes,
+/// 2. real expert blobs from microdeepseek.bin (SKIPPED if the bin is absent),
+/// 3. the DeepSeek lm_head routing through model::matvec (66M ≥ GPU_MIN_ELEMS).
+/// Tolerance 1e-3 (max_abs and scale-relative) — the kernel reassociates the
+/// f32 sums differently than the sequential CPU path.
+pub fn dstest() {
+    if !gpu_available() {
+        println!("dstest FAIL — no usable Metal context (see message above)");
+        return;
+    }
+    println!("dstest — fp4 dequant-matvec, Metal vs CPU (mxfp4 layout, tol 1e-3)");
+    let mut all_ok = true;
+
+    let check = |label: String, packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> bool {
+        let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
+        let mut y_cpu = vec![0f32; rows];
+        crate::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
+        let mut y_gpu = vec![0f32; rows];
+        gpu_matvec_fp4(packed, scales, rows, cols, &x, &mut y_gpu);
+        let scale = y_cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        let max_abs = y_gpu.iter().zip(&y_cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let rel = max_abs / scale;
+        let ok = rel <= 1e-3;
+        println!(
+            "  {:<44} [{}x{}] max_abs={:.3e} rel={:.3e}  {}",
+            label, rows, cols, max_abs, rel, if ok { "OK" } else { "FAIL" }
+        );
+        ok
+    };
+
+    // 1) synthetic: micro dims, edge shapes, real V4 dims (2048x4096 experts)
+    let mut keep_alive: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // cache keys on ptr:
+    // keep every blob alive so the allocator can never reuse its address
+    for (rows, cols) in [
+        (128usize, 512usize),
+        (512, 128),
+        (64, 128),
+        (3, 64),
+        (1, 32),
+        (256, 1024),
+        (2048, 4096),
+        (4096, 2048),
+    ] {
+        let w: Vec<f32> = (0..rows * cols).map(pattern).collect();
+        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        let (p, s) = &keep_alive[keep_alive.len() - 1];
+        all_ok &= check(format!("synthetic [{rows}x{cols}]"), p, s, rows, cols);
+    }
+
+    // 2) real expert blobs + 3) lm_head routing (need microdeepseek.bin)
+    let ds_path = ["microdeepseek.bin", "/workspace/microkimi-oss/microdeepseek.bin"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string());
+    match ds_path {
+        Some(path) => {
+            println!("  model: {}", path);
+            let bin = crate::weights::BinFile::open(&path);
+            if bin.config.ds.is_none() {
+                println!("  {} is not a deepseek_v4 model — real-blob checks SKIPPED", path);
+            } else {
+                for name in [
+                    "layers.0.ffn.experts.0.w1",
+                    "layers.0.ffn.experts.0.w2",
+                    "layers.5.ffn.experts.7.w3",
+                    "layers.42.ffn.experts.255.w1",
+                ] {
+                    let (p, s, rows, cols) = bin.mxfp4_parts(name);
+                    all_ok &= check(name.to_string(), p, s, rows, cols);
+                }
+                // lm_head through model::matvec with --gpu: 129280x512 = 66M
+                // MACs ≥ GPU_MIN_ELEMS → must land on the GPU (cache proof).
+                let head = bin.f32_vec("head.weight");
+                let (rows, cols) = (bin.entries["head.weight"].dims[0] as usize, bin.entries["head.weight"].dims[1] as usize);
+                let x: Vec<f32> = (0..cols).map(|i| pattern(i + 31337)).collect();
+                let mut y_cpu = vec![0f32; rows];
+                crate::model::matvec_cpu(&head, rows, cols, &x, &mut y_cpu);
+                crate::model::set_gpu(true);
+                let mut y_gpu = vec![0f32; rows];
+                crate::model::matvec(&head, rows, cols, &x, &mut y_gpu);
+                crate::model::set_gpu(false);
+                let on_device = ctx()
+                    .map(|c| c.cache.lock().unwrap().map.contains_key(&(head.as_ptr() as usize, rows, cols)))
+                    .unwrap_or(false);
+                let scale = y_cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+                let max_abs = y_gpu.iter().zip(&y_cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let ok = max_abs / scale <= 1e-3 && on_device;
+                all_ok &= ok;
+                println!(
+                    "  {:<44} [{}x{}] max_abs={:.3e} routed_to_gpu={}  {}",
+                    "head.weight via model::matvec --gpu", rows, cols, max_abs, on_device,
+                    if ok { "OK" } else { "FAIL" }
+                );
+            }
+        }
+        None => println!("  microdeepseek.bin not found — real-expert and lm_head checks SKIPPED"),
+    }
+
+    if let Some(c) = ctx() {
+        let cache = c.cache_fp4.lock().unwrap();
+        println!(
+            "  fp4 weight cache: {} matrices, {:.1} MB on device",
+            cache.map.len(),
+            cache.bytes as f64 / 1e6
+        );
+    }
+    if all_ok {
+        println!("DSTEST OK — fp4 GPU kernel matches the CPU path (tol 1e-3)");
+    } else {
+        println!("DSTEST FAIL");
     }
 }
