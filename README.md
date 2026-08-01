@@ -116,13 +116,13 @@ Training also runs on Apple Silicon GPUs: `train.py --device mps` (torch MPS bac
 
 ## Measured performance
 
-| workload | hardware | tok/s |
-|---|---|---|
-| microkimi decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | **~17** |
-| microkimi decode (93 layers) | Apple M5, 16 GB | **~29** |
-| nanokimi decode (8 layers, 113 MB) | 10-core ARM64 | **~134** |
-| nanokimi training (batch 32×256) | 32 vCPU x86-64 | ~130-290 |
-| `microkimi build` (fetch + quant + write 2.5 GB) | 10-core ARM64 | ~65 s |
+| workload | hardware | ms/token | tok/s |
+|---|---|---|---|
+| microkimi decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
+| microkimi decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
+| nanokimi decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
+| nanokimi training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
+| `microkimi build` (fetch + quant + write 2.5 GB) | 10-core ARM64 | - | ~65 s |
 
 GPU note (macOS/Metal): `--gpu` offloads the large matvecs to the GPU with weights cached on device. At micro dims the model runs ~1,200 small matvecs per token and per-dispatch sync dominates, so the GPU only takes matvecs ≥ 2M elements (lm_head) - the rest stays faster on the CPU thread pool. At real K3 dims (88M-MAC matvecs) the balance flips in the GPU's favor.
 
