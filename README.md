@@ -121,10 +121,27 @@ Training also runs on Apple Silicon GPUs: `train.py --device mps` (torch MPS bac
 | microkimi decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
 | microkimi decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
 | nanokimi decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
+| microdeepseek decode (43 layers, 2.0 GB f32+FP4) | 10-core ARM64 | 39 | ~26 |
 | nanokimi training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
 | `microkimi build` (fetch + quant + write 2.5 GB) | 10-core ARM64 | - | ~65 s |
+| `microkimi build-ds` (fetch + quant + write 2.0 GB) | 10-core ARM64 | - | ~86 s |
 
 GPU note (macOS/Metal): `--gpu` offloads the large matvecs to the GPU with weights cached on device. At micro dims the model runs ~1,200 small matvecs per token and per-dispatch sync dominates, so the GPU only takes matvecs ≥ 2M elements (lm_head) - the rest stays faster on the CPU thread pool. At real K3 dims (88M-MAC matvecs) the balance flips in the GPU's favor.
+
+## microdeepseek: same engine, DeepSeek-V4 architecture
+
+The repo also assembles **microdeepseek.bin** - the DeepSeek-V4-Flash architecture at micro dims (43 layers kept, 256 experts top-6 + 1 shared kept, real 129,280-token vocab; widths reduced), same zero-dependency Rust engine. Mechanisms, implemented exactly: **Hyper-Connections** (hc_mult 4, Sinkhorn 20 iters), **sparse attention** (ring window 128, overlap/dense KV compressors, lightning indexer with per-head Hadamard + FP4 QAT, attentional sink), **sqrtsoftplus router** with noaux_tc bias and hash-routed first 3 layers (real `tid2eid` tables), **SwiGLU clamp ±10** experts stored **FP4 e2m1** (MXFP4 layout), FP8 activation QAT round-trips, RoPE/YaRN.
+
+Verified 1:1 against a plain-torch replica of DeepSeek's reference `model.py` driven by the very weights of microdeepseek.bin (`dsparity`): per-layer HC hidden states match at ~1e-6 over 132 positions, router selections and top-16 logit ids are **exact**. The V4 tokenizer (byte-level BPE from the official `tokenizer.json`, hand-reimplemented 3-stage pre-tokenizer) matches the HF `tokenizers` runtime **exactly** on a 74-string battery (`selftest`).
+
+```bash
+./target/release/microkimi build-ds     # assemble microdeepseek.bin (~2 GB, V4 range-request fetch + seeded pools)
+python3 ref/make_ds_parity.py           # regenerates ref/ds_parity_golden.json (torch replica)
+./target/release/microkimi dsparity     # the 1:1 proof above
+./target/release/microkimi run "The capital of France is" --model microdeepseek.bin
+```
+
+Same caveat as microkimi: output is deterministic gibberish by design (untrained synthetic weights) - the point is the engine.
 
 ## Full pipeline from source
 
@@ -139,14 +156,14 @@ python3 ref/parity_ref.py              # regenerates ref/parity_golden.json
 ## Repository layout
 
 ```
-src/            the Rust engine (13 modules, zero dependencies)
+src/            the Rust engine (K3 + DeepSeek-V4, zero dependencies)
 nano/           training pipeline (prepare / model / train / export / ops / eval)
 nano/vendor/fla pure-PyTorch fla-core shim (MIT, © fla-org - see vendor/README.md)
-ref/            test tooling: make_golden.py, parity_ref.py, fetch_moonshot.py
+ref/            test tooling: make_golden.py, parity_ref.py, make_ds_parity.py, fetch_moonshot.py
 docs/           training curve
 ```
 
 ## License & acknowledgments
 
-MIT (see `LICENSE`). Kimi K3 architecture and reference code: **Moonshot AI** (downloaded at runtime, never vendored). `nano/vendor/fla`: **flash-linear-attention**, MIT, © Songlin Yang, Yu Zhang, Zhiyuan Li. Weight pools for `microkimi build`: **Qwen2.5-0.5B-Instruct** (Apache 2.0). Training data: **TinyStories** (Ronen Eldan, Microsoft Research).
+MIT (see `LICENSE`). Kimi K3 architecture and reference code: **Moonshot AI** (downloaded at runtime, never vendored). DeepSeek-V4 architecture, reference code and tokenizer: **DeepSeek AI** (MIT, downloaded at runtime, never vendored). `nano/vendor/fla`: **flash-linear-attention**, MIT, © Songlin Yang, Yu Zhang, Zhiyuan Li. Weight pools for `microkimi build`: **Qwen2.5-0.5B-Instruct** (Apache 2.0). Training data: **TinyStories** (Ronen Eldan, Microsoft Research).
 

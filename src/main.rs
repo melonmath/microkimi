@@ -8,6 +8,7 @@ mod build;
 mod build_ds;
 mod deepseek;
 mod dequant;
+mod dstok;
 mod config;
 mod http;
 mod json;
@@ -32,7 +33,7 @@ fn main() {
     match cmd {
         "build" => build::run(),
         "build-ds" => build_ds::run(),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
         "gpubench" => gpubench_cmd(&args),
@@ -284,6 +285,19 @@ fn check_tok_compat(tok: &tokenizer::AnyTokenizer, model: &model::Model) {
 fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool) -> String {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
+    // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
+    if crate::weights::read_config(&mp).ds.is_some() {
+        let tok = tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(&ds_tokenizer_path(&mp, vocab)));
+        let mut model = deepseek::DsModel::load(&mp);
+        println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
+        println!("cores used for matvecs: {}", model::n_threads());
+        let (ids, stop) = if raw {
+            (tok.encode_raw(question), tok.raw_stop())
+        } else {
+            (tok.encode_chat_user(question), tok.end_of_msg())
+        };
+        return deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
+    }
     let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
     let mut model = model::Model::load(&mp);
     check_tok_compat(&tok, &model);
@@ -305,6 +319,9 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
+    if crate::weights::read_config(&mp).ds.is_some() {
+        return chat_loop_ds(&mp, vocab, debug_routing, raw);
+    }
     let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
     let mut model = model::Model::load(&mp);
     check_tok_compat(&tok, &model);
@@ -344,8 +361,73 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     }
 }
 
-pub fn bin_path() -> String {
-    let exe_dir = std::env::current_exe()
+/// Interactive loop for DeepSeek-V4 models (DsTokenizer + DsModel).
+fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool) {
+    use std::io::Write;
+    let tl = Instant::now();
+    let tok = tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(&ds_tokenizer_path(mp, vocab)));
+    let mut model = deepseek::DsModel::load(mp);
+    println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
+    if raw {
+        println!("\nRAW interactive mode - each line is a story beginning to continue (type 'quit' to exit)");
+    } else {
+        println!("\nInteractive mode - history kept (type 'quit' to exit)");
+    }
+    let stdin = std::io::stdin();
+    let mut history: Vec<(String, String)> = Vec::new();
+    loop {
+        print!("\nYou > ");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        if stdin.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let q = line.trim();
+        if q.eq_ignore_ascii_case("quit") || q.eq_ignore_ascii_case("exit") {
+            break;
+        }
+        if q.is_empty() {
+            continue;
+        }
+        if raw {
+            let ids = tok.encode_raw(q);
+            let stop = tok.raw_stop();
+            deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, stop);
+        } else {
+            let ids = tok.encode_chat(&history, q);
+            let answer = deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg());
+            history.push((q.to_string(), answer));
+        }
+    }
+}
+
+/// Locates the DeepSeek-V4 tokenizer.json: explicit --vocab, then next to the
+/// model (written by `build-ds`), then the local cache, then downloaded.
+pub fn ds_tokenizer_path(model_path: &str, vocab: Option<String>) -> String {
+    if let Some(v) = vocab {
+        return v;
+    }
+    let dir = std::path::Path::new(model_path).parent().unwrap_or(std::path::Path::new("."));
+    let cand = dir.join("microdeepseek.tokenizer.json");
+    if cand.exists() {
+        return cand.to_string_lossy().into_owned();
+    }
+    let cache = format!("{}/.cache/microkimi", std::env::var("HOME").unwrap_or_default());
+    let dst = format!("{}/microdeepseek.tokenizer.json", cache);
+    if std::path::Path::new(&dst).exists() {
+        return dst;
+    }
+    std::fs::create_dir_all(&cache).ok();
+    println!("downloading tokenizer.json from huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731 …");
+    let data = crate::http::fetch(
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/tokenizer.json",
+    )
+    .expect("failed to download the V4 tokenizer.json (no local file found)");
+    std::fs::write(&dst, data).unwrap();
+    dst
+}
+
+pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();

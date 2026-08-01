@@ -468,6 +468,7 @@ impl NanoTokenizer {
 pub enum AnyTokenizer {
     Full(Tokenizer),
     Nano(NanoTokenizer),
+    Ds(crate::dstok::DsTokenizer),
 }
 
 const FULL_MARKERS: Markers = Markers { open: OPEN, close: CLOSE, sep: SEP, end_of_msg: END_OF_MSG };
@@ -477,6 +478,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.markers.end_of_msg,
+            AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
         }
     }
 
@@ -485,6 +487,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(_) => 163_840,
             AnyTokenizer::Nano(n) => n.vocab_size,
+            AnyTokenizer::Ds(_) => 129_280,
         }
     }
 
@@ -502,6 +505,11 @@ impl AnyTokenizer {
                 ids.extend(n.encode_nano(text));
                 ids
             }
+            AnyTokenizer::Ds(t) => {
+                let mut ids = vec![crate::dstok::DS_BOS];
+                ids.extend(t.encode(text));
+                ids
+            }
         }
     }
 
@@ -510,6 +518,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.eos,
+            AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
         }
     }
 
@@ -517,6 +526,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(t) => build_chat(history, question, FULL_MARKERS, |s| t.encode(s)),
             AnyTokenizer::Nano(n) => build_chat(history, question, n.markers, |s| n.encode_nano(s)),
+            AnyTokenizer::Ds(t) => t.encode_chat(history, question),
         }
     }
 
@@ -532,6 +542,7 @@ impl AnyTokenizer {
                 }
                 format!("<|nano_{}|>", id)
             }
+            AnyTokenizer::Ds(t) => t.decode_id(id),
         }
     }
 
@@ -559,6 +570,7 @@ impl AnyTokenizer {
                     .collect();
                 n.full.decode(&kimi_ids)
             }
+            AnyTokenizer::Ds(t) => t.decode(ids),
         }
     }
 }

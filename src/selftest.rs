@@ -484,3 +484,40 @@ pub fn run_ds3() {
         std::process::exit(1);
     }
 }
+
+// ── DS4: V4 tokenizer vs the official HF tokenizers runtime ──
+
+pub fn run_ds4() {
+    let path = if std::path::Path::new("ref/ds_tok_golden.json").exists() {
+        "ref/ds_tok_golden.json"
+    } else {
+        "/workspace/microkimi-oss/ref/ds_tok_golden.json"
+    };
+    let bytes = std::fs::read(path).unwrap_or_else(|_| panic!("{} missing", path));
+    let golden = json::parse(&bytes);
+    let tok = crate::dstok::DsTokenizer::load(&crate::ds_tokenizer_path("microdeepseek.bin", None));
+    println!("DS tokenizer ({} cases vs HF tokenizers, EXACT ids)", golden.as_arr().unwrap().len());
+    let mut ok = true;
+    for case in golden.as_arr().unwrap() {
+        let text = case.get("text").and_then(|x| x.as_str()).unwrap();
+        let want: Vec<u32> = arr(case, "ids").iter().map(|&x| x as u32).collect();
+        let got = tok.encode(text);
+        if got != want {
+            ok = false;
+            println!("  FAIL {:?}\n    rust   {:?}\n    golden {:?}", text, got, want);
+        }
+        // decode(encode(x)) round-trip
+        let back = tok.decode(&got);
+        if back != text {
+            ok = false;
+            println!("  FAIL decode round-trip {:?} → {:?}", text, back);
+        }
+    }
+    println!();
+    if ok {
+        println!("DS TOKENIZER OK - exact match with the official HF tokenizers runtime");
+    } else {
+        println!("DS TOKENIZER FAILED");
+        std::process::exit(1);
+    }
+}
