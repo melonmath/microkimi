@@ -19,10 +19,11 @@
 
 | | |
 |---|---|
-| **microkimi** | Zero-dependency Rust inference engine for the Kimi K3 architecture (KDA, MLA NoPE, latent MoE 896 experts top-16, SiTU, AttnRes, MXFP4). Verified 1:1 against Moonshot's official code. |
-| **nanokimi** | A small K3-architecture model trained from scratch (random weights → English stories) by the included `nano/` pipeline, overnight on CPU. |
-| **Dependencies** | None. Pure `std` Rust: no crates, no BLAS, no CUDA. Threads via `std::thread`, HTTP via `curl` shellout. |
-| **Scope** | Independent project, no affiliation with Moonshot AI. No weights in the repo (assembled by `microkimi build`; Moonshot files downloaded at runtime). Output of the big model is deterministic gibberish by design - the point is the engine. |
+| **Engine** | Zero-dependency Rust inference engine for frontier MoE architectures, verified 1:1 against the official reference code. Pure `std` Rust: no crates, no BLAS, no CUDA. |
+| **microkimi** | The **Kimi K3** architecture at micro dims (93 layers kept, 896 experts top-16 kept; widths reduced) - verified 1:1 against Moonshot's code. |
+| **microdeepseek** | The **DeepSeek-V4-Flash-0731** architecture at micro dims (43 layers kept, 256 experts top-6 kept; widths reduced) - verified 1:1 against DeepSeek's code. |
+| **nanokimi** | A small K3-architecture model trained from scratch (random weights → English stories) by the included `nano/` pipeline, overnight on CPU. **nanodeepseek** (the V4 counterpart) is being trained. |
+| **Scope** | Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build` / `build-ds`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine. |
 
 ## Run it in 30 seconds
 
@@ -46,7 +47,7 @@ cargo build --release
 ./target/release/microkimi run "Once upon a time" --model nanokimi.bin --max-new 12 --raw --gpu
 ```
 
-## Architecture
+## Architecture: Kimi K3
 
 **microkimi is the Kimi K3 architecture, unchanged** - only tensor dimensions are scaled down to fit in RAM. Layer counts, expert counts, mechanisms, tokenizer: identical.
 
