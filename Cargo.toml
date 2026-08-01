@@ -1,0 +1,13 @@
+[package]
+name = "microkimi"
+version = "0.1.0"
+# Rust 2021 edition: the engine needs no 2024 features, so we stay on the
+# edition with the widest toolchain support.
+edition = "2021"
+
+[[bin]]
+name = "microkimi"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
