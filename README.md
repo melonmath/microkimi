@@ -1,8 +1,8 @@
 # microkimi
 
-A zero-dependency Rust engine for two frontier MoE **architectures** - **Kimi K3** and **DeepSeek-V4-Flash-0731** - both verified 1:1 against the official reference code. Runs on a plain laptop CPU (no CUDA, no BLAS, no crates); uses the GPU via Metal on macOS.
+A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code. Runs on a plain laptop CPU; uses the GPU via Metal on macOS.
 
-**This is a framework for developers, not a model.** The point is to learn how these models work and to manipulate them - not to run a quantized Kimi or DeepSeek you could chat with. The pipeline also trains small models from scratch (**nanokimi**, **nanodeepseek**) - tiny, simple-story tellers, not the frontier models.
+**This is a framework for developers, not a model.**
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
@@ -32,20 +32,17 @@ cargo build --release
 
 # on macOS: Metal GPU for the large matvecs
 ./target/release/microkimi metaltest                            # GPU sanity check
-./target/release/microkimi gputest                              # GPU vs CPU on real model matvecs
 ./target/release/microkimi run "Once upon a time" --model nanokimi.bin --max-new 12 --raw --gpu
 ```
 
-## Supported models
+## Models
 
-| model | architecture | verified | details |
-|---|---|---|---|
-| **microkimi** | Kimi K3 (micro dims) | 1:1 vs Moonshot's code | [KIMI.md](KIMI.md) |
-| **microdeepseek** | DeepSeek-V4-Flash-0731 (micro dims) | 1:1 vs DeepSeek's code | [DEEPSEEK.md](DEEPSEEK.md) |
-| **nanokimi** | Kimi K3, trained from scratch | - | [KIMI.md](KIMI.md) |
-| **nanodeepseek** | DeepSeek-V4, trained from scratch | - | being trained |
-
-Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime).
+| model | architecture | details |
+|---|---|---|
+| **microkimi** | Kimi K3 (micro dims) | [KIMI.md](KIMI.md) |
+| **microdeepseek** | DeepSeek-V4-Flash-0731 (micro dims) | [DEEPSEEK.md](DEEPSEEK.md) |
+| **nanokimi** | Kimi K3, trained from scratch | [KIMI.md](KIMI.md) |
+| **nanodeepseek** | DeepSeek-V4, trained from scratch | being trained |
 
 ## Commands (unified for both architectures)
 
@@ -60,30 +57,17 @@ Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in 
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
-GPU (macOS/Metal): `--gpu` sends the large matvecs (≥ 2M elements) to the GPU; the rest stays on CPU, which is faster at micro dims. See the per-model benchmarks in [KIMI.md](KIMI.md) and [DEEPSEEK.md](DEEPSEEK.md).
-
 ## Repository layout
 
 ```
 src/            the Rust engine (K3 + DeepSeek-V4, zero dependencies)
-nano/           training pipeline (prepare / model / train / export / ops / eval)
-nano/vendor/fla pure-PyTorch fla-core shim (MIT, © fla-org - see vendor/README.md)
-ref/            test tooling: make_golden.py, parity_ref.py, make_ds_parity.py, fetch_moonshot.py
+nano/           training pipeline
+ref/            test tooling
 docs/           training curve
-KIMI.md         Kimi K3 details (architecture, parity proof, nanokimi training)
-DEEPSEEK.md     DeepSeek-V4-Flash-0731 details (architecture, parity proof, what's here / not)
+KIMI.md         Kimi K3 details (architecture, parity proof, benchmarks)
+DEEPSEEK.md     DeepSeek-V4 details (architecture, parity proof, benchmarks)
 ```
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
-
-## Acknowledgments
-
-| | |
-|---|---|
-| Kimi K3 architecture & reference code | **Moonshot AI** (downloaded at runtime, never vendored) |
-| DeepSeek-V4 architecture, reference code & tokenizer | **DeepSeek AI** (MIT, downloaded at runtime, never vendored) |
-| `nano/vendor/fla` shim | **flash-linear-attention** (MIT, © Songlin Yang, Yu Zhang, Zhiyuan Li) |
-| Weight pools for `microkimi build` | **Qwen2.5-0.5B-Instruct** (Apache 2.0) |
-| Training data | **TinyStories** (Ronen Eldan, Microsoft Research) |
+MIT - see [LICENSE](LICENSE). Credits in [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
