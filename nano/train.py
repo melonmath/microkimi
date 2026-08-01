@@ -125,6 +125,10 @@ def main():
     ap.add_argument("--fresh-opt", action="store_true",
                     help="with --resume: keep ONLY the checkpoint weights "
                          "(SFT from a base model) - optimizer, step and rng restart from scratch")
+    ap.add_argument("--ignore-unk", action="store_true",
+                    help="exclude UNK (8198) targets from the loss (ignore_index). For chat SFT on "
+                         "the nano vocab: structural XTML tags and out-of-vocab words map to UNK, "
+                         "so without this the model learns to EMIT [UNK] and greedy decoding collapses")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -205,7 +209,8 @@ def main():
         y = y.to(dev)
         logits = model(x)
         loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1)
+            logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
+            ignore_index=8198 if args.ignore_unk else -100,
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
