@@ -2,7 +2,7 @@
 
 A zero-dependency Rust engine for two frontier MoE **architectures** - **Kimi K3** and **DeepSeek-V4-Flash-0731** - both verified 1:1 against the official reference code. Runs on a plain laptop CPU (no CUDA, no BLAS, no crates); uses the GPU via Metal on macOS.
 
-**This is the architecture, not a usable model.** The point is to learn how these models work and to manipulate them - not to run a quantized Kimi or DeepSeek you could chat with. Separately, the pipeline also trains small models from scratch: **nanokimi** (K3, trained) and **nanodeepseek** (V4, being trained) - those are tiny and tell simple stories, they are not the frontier models either.
+**This is a framework for developers, not a model.** The point is to learn how these models work and to manipulate them - not to run a quantized Kimi or DeepSeek you could chat with. The pipeline also trains small models from scratch (**nanokimi**, **nanodeepseek**) - tiny, simple-story tellers, not the frontier models.
 
 > Almost all of the code was written by Kimi K3 itself, with human guidance and review.
 
@@ -45,7 +45,7 @@ cargo build --release
 | **nanokimi** | Kimi K3, trained from scratch | - | [KIMI.md](KIMI.md) |
 | **nanodeepseek** | DeepSeek-V4, trained from scratch | - | being trained |
 
-Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime). Outputs of the big models are deterministic gibberish by design - the point is the engine.
+Independent project, no affiliation with Moonshot AI or DeepSeek. No weights in the repo (assembled by `microkimi build`; reference files downloaded at runtime).
 
 ## Commands (unified for both architectures)
 
