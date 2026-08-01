@@ -322,3 +322,154 @@ pub fn run(show: bool) {
         std::process::exit(1);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// DeepSeek-V4 end-to-end parity (`microkimi dsparity`): microdeepseek.bin
+// forward vs the plain-torch replica of the reference Transformer
+// (ref/make_ds_parity.py → ref/ds_parity_golden.json).
+// QAT-aware tolerance (same as the DS attention selftest): 2e-3 + 1e-3·scale —
+// fp8/fp4 quantization boundaries amplify tiny f32 rounding differences into
+// 1-2 grid steps; semantic bugs produce O(1) discrepancies.
+// Router selections (layers 1/3/42) and top-16 logit ids: EXACT.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn qat_diff(got: &[f32], want: &[f32]) -> (f64, usize) {
+    assert_eq!(got.len(), want.len(), "sizes {} vs {}", got.len(), want.len());
+    let scale = want.iter().fold(0f64, |m, &b| m.max((b as f64).abs()));
+    let mut max_abs = 0f64;
+    let mut bad = 0;
+    for (a, b) in got.iter().zip(want) {
+        let d = (*a as f64 - *b as f64).abs();
+        max_abs = max_abs.max(d);
+        if d > 2e-3 + 1e-3 * scale {
+            bad += 1;
+        }
+    }
+    (max_abs, bad)
+}
+
+fn qat_report(name: &str, got: &[f32], want: &[f32]) -> bool {
+    let (ma, bad) = qat_diff(got, want);
+    let ok = bad == 0;
+    println!(
+        "  {:<46} {}  max_abs={:.3e}{}",
+        name,
+        if ok { "OK   " } else { "FAIL " },
+        ma,
+        if bad > 0 { format!("  ({} vals beyond QAT tol 2e-3+1e-3·scale!)", bad) } else { String::new() }
+    );
+    ok
+}
+
+pub fn run_ds() {
+    let path = if std::path::Path::new("ref/ds_parity_golden.json").exists() {
+        "ref/ds_parity_golden.json"
+    } else {
+        "/workspace/microkimi-oss/ref/ds_parity_golden.json"
+    };
+    let bytes = std::fs::read(path).unwrap_or_else(|_| {
+        panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_parity.py", path)
+    });
+    let golden = json::parse(&bytes);
+    let ids: Vec<u32> = arr(&golden, "ids").iter().map(|&x| x as u32).collect();
+    let t_max = ids.len();
+    println!("microkimi dsparity - {} vs Rust forward (QAT-aware tol 2e-3+1e-3·scale)", path);
+    println!("sequence: {} positions", t_max);
+
+    let bin = if std::path::Path::new("microdeepseek.bin").exists() {
+        "microdeepseek.bin".to_string()
+    } else {
+        "/workspace/microkimi-oss/microdeepseek.bin".to_string()
+    };
+    let mut model = crate::deepseek::DsModel::load(&bin);
+    model.reset();
+    crate::deepseek::DS_PARITY.with(|p| *p.borrow_mut() = Some(crate::deepseek::DsParityDump::default()));
+    let mut logits = Vec::new();
+    let mut logits_all: Vec<Vec<f32>> = Vec::new();
+    for (pos, &id) in ids.iter().enumerate() {
+        logits = model.forward(id, pos);
+        logits_all.push(logits.clone());
+    }
+    let dump = crate::deepseek::DS_PARITY.with(|p| p.borrow_mut().take()).expect("dump missing");
+
+    let mut ok = true;
+
+    // ── final logits (last position, full vector) ──
+    ok &= qat_report("final logits (last position)", &logits, &arr(&golden, "logits_last"));
+
+    // ── logits top-16 at each position: EXACT ids + values ──
+    {
+        let gtop = golden.get("logits_top").and_then(|x| x.as_arr()).unwrap();
+        let mut ids_ok = true;
+        let mut worst = 0f64;
+        for (pos, g) in gtop.iter().enumerate() {
+            let gids: Vec<u32> = g.get("ids").and_then(|x| x.as_arr()).unwrap().iter().map(|v| v.as_num().unwrap() as u32).collect();
+            let gvals: Vec<f32> = g.get("vals").and_then(|x| x.as_arr()).unwrap().iter().map(|v| v.as_num().unwrap() as f32).collect();
+            let mine = top_k(&logits_all[pos], 16);
+            let mut my_sorted: Vec<u32> = mine.iter().map(|t| t.0).collect();
+            my_sorted.sort();
+            let mut g_sorted = gids.clone();
+            g_sorted.sort();
+            if my_sorted != g_sorted {
+                ids_ok = false;
+                println!("    pos {}: top-16 ids DIFFER\n      rust   {:?}\n      golden {:?}", pos, my_sorted, g_sorted);
+            }
+            let (ma, _) = qat_diff(&mine.iter().map(|t| t.1).collect::<Vec<_>>(), &gvals);
+            worst = worst.max(ma);
+        }
+        println!(
+            "  {:<46} {}  max_abs={:.3e} (exact ids: {})",
+            "top-16 logits per position",
+            if ids_ok { "OK   " } else { "FAIL " },
+            worst,
+            ids_ok
+        );
+        ok &= ids_ok;
+    }
+
+    // ── hiddens after dumped layers (full HC state [hc*d]) ──
+    {
+        let gh = golden.get("hiddens").unwrap();
+        let pos_dump: Vec<usize> = arr(&golden, "pos_dump").iter().map(|&x| x as usize).collect();
+        let layer_dump: Vec<usize> = arr(&golden, "layer_dump").iter().map(|&x| x as usize).collect();
+        for &l in &layer_dump {
+            for &pos in &pos_dump {
+                let key = format!("{},{}", pos, l);
+                let g = arr(gh, &key);
+                let mine = &dump.hiddens[&(pos, l)];
+                ok &= qat_report(&format!("hidden pos {} after layer {}", pos, l), mine, &g);
+            }
+        }
+    }
+
+    // ── router: EXACT sorted expert ids (layers 1/3/42, all positions) ──
+    {
+        let gr = golden.get("router").unwrap();
+        let mut exact = true;
+        for &l in &crate::deepseek::DS_ROUTER_LAYERS {
+            for pos in 0..t_max {
+                let key = format!("{},{}", pos, l);
+                let want: Vec<u32> = arr(gr, &key).iter().map(|&x| x as u32).collect();
+                let mine = &dump.router[&(pos, l)];
+                if *mine != want {
+                    exact = false;
+                    println!("    router layer {} pos {}: DIFFERS\n      rust   {:?}\n      golden {:?}", l, pos, mine, want);
+                }
+            }
+        }
+        println!(
+            "  {:<46} {}",
+            format!("router top-{} (layers {:?}, all pos)", model.cfg.n_activated_experts, crate::deepseek::DS_ROUTER_LAYERS),
+            if exact { "OK    (exact match)" } else { "FAIL " }
+        );
+        ok &= exact;
+    }
+
+    println!();
+    if ok {
+        println!("DSPARITY OK - Rust forward ≡ DeepSeek-V4 reference replica (QAT-aware threshold)");
+    } else {
+        println!("DSPARITY: discrepancies detected (see above)");
+        std::process::exit(1);
+    }
+}

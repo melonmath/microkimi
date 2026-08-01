@@ -21,7 +21,7 @@ const SIGMA: f32 = 0.02;
 pub struct Rng(u64);
 
 impl Rng {
-    fn for_tensor(name: &str) -> Rng {
+    pub fn for_tensor(name: &str) -> Rng {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for b in name.as_bytes() {
             h ^= *b as u64;
@@ -29,7 +29,7 @@ impl Rng {
         }
         Rng((h ^ SEED_BASE) | 1)
     }
-    fn next_u64(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -40,12 +40,12 @@ impl Rng {
     fn uniform(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
-    fn gauss(&mut self) -> f32 {
+    pub fn gauss(&mut self) -> f32 {
         let u1 = self.uniform().max(1e-300);
         let u2 = self.uniform();
         ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
     }
-    fn pick(&mut self, pool: &[f32]) -> f32 {
+    pub fn pick(&mut self, pool: &[f32]) -> f32 {
         pool[(self.next_u64() % pool.len() as u64) as usize]
     }
 }

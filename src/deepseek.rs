@@ -804,7 +804,7 @@ pub fn attention_step(
             let ctop = indexer_step(
                 &w.idx_wq_b, &w.idx_weights_proj, cfg.index_n_heads, cfg.index_head_dim, rd,
                 &qn, x, pos, &st.cos, &st.sin, &st.idx_compressed, st.idx_n_compressed,
-                cfg.index_topk, win, 1.0 / (hd as f32).sqrt(),
+                cfg.index_topk, win, 1.0 / (cfg.index_head_dim as f32).sqrt(),
             );
             topk.extend(ctop);
         } else {
@@ -850,4 +850,316 @@ pub fn grouped_o_proj(cfg: &DsConfig, wo_a: &[f32], wo_b: &[f32], o: &[f32], out
         );
     }
     crate::model::matvec(wo_b, cfg.d, cfg.o_groups * r, &lat, out);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DsModel: full microdeepseek forward (model.py Transformer, lines 877-926)
+// embed → expand ×hc_mult → n_layers × Block(hc_pre/attn/hc_post, hc_pre/MoE/
+// hc_post) → hc_head → RMSNorm → lm_head. f32 throughout, experts stay fp4
+// packed (MXFP4 layout) and are dequantized on the fly by matvec_packed.
+// ════════════════════════════════════════════════════════════════════════════
+
+use crate::weights::{BinFile, Entry};
+
+fn as_f32(bytes: &[u8]) -> &[f32] {
+    let (pre, mid, post) = unsafe { bytes.align_to::<f32>() };
+    assert!(pre.is_empty() && post.is_empty(), "unexpected f32 alignment");
+    mid
+}
+
+/// Per-layer weight bundle (small tensors copied out of the bin at load,
+/// routed experts kept as packed-blob offsets).
+pub struct DsLayerW {
+    pub attn_norm_w: Vec<f32>,
+    pub ffn_norm_w: Vec<f32>,
+    pub hc_attn_fn: Vec<f32>,   // [mix_hc, hc*d]
+    pub hc_attn_base: Vec<f32>, // [mix_hc]
+    pub hc_attn_scale: Vec<f32>, // [3]
+    pub hc_ffn_fn: Vec<f32>,
+    pub hc_ffn_base: Vec<f32>,
+    pub hc_ffn_scale: Vec<f32>,
+    pub attn: DsAttentionW,
+    pub gate_w: Vec<f32>,               // [n_routed, d]
+    pub gate_bias: Option<Vec<f32>>,    // score-routing layers (>= n_hash_layers)
+    pub tid2eid: Option<Vec<i32>>,      // hash layers (< n_hash_layers) [vocab, topk]
+    pub shared: [Vec<f32>; 3],          // w1 [inter,d], w2 [d,inter], w3 [inter,d]
+    pub experts: Vec<[u64; 3]>,         // packed blob offsets [w1, w2, w3] per expert
+}
+
+pub struct DsModel {
+    pub cfg: DsConfig,
+    bin: BinFile,
+    embed: Entry, // f32 [vocab, d]
+    head: Entry,  // f32 [vocab, d]
+    norm_w: Vec<f32>,
+    hc_head_fn: Vec<f32>,   // [hc, hc*d]
+    hc_head_base: Vec<f32>, // [hc]
+    hc_head_scale: f32,
+    layers: Vec<DsLayerW>,
+    states: Vec<DsAttention>,
+}
+
+impl DsModel {
+    fn f32v(bin: &BinFile, name: &str) -> Vec<f32> {
+        bin.f32_vec(name)
+    }
+
+    pub fn load(path: &str) -> Self {
+        let bin = BinFile::open(path);
+        let cfg = bin
+            .config
+            .ds
+            .clone()
+            .unwrap_or_else(|| panic!("{}: not a deepseek_v4 model (no ds config block)", path));
+        let get = |name: &str| -> Entry {
+            bin.entries.get(name).unwrap_or_else(|| panic!("missing tensor: {}", name)).clone()
+        };
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for l in 0..cfg.n_layers {
+            let p = format!("layers.{}.", l);
+            let ratio = cfg.compress_ratio(l);
+            let attn = DsAttentionW {
+                wq_a: Self::f32v(&bin, &format!("{}attn.wq_a.weight", p)),
+                q_norm_w: Self::f32v(&bin, &format!("{}attn.q_norm.weight", p)),
+                wq_b: Self::f32v(&bin, &format!("{}attn.wq_b.weight", p)),
+                wkv: Self::f32v(&bin, &format!("{}attn.wkv.weight", p)),
+                kv_norm_w: Self::f32v(&bin, &format!("{}attn.kv_norm.weight", p)),
+                wo_a: Self::f32v(&bin, &format!("{}attn.wo_a.weight", p)),
+                wo_b: Self::f32v(&bin, &format!("{}attn.wo_b.weight", p)),
+                attn_sink: Self::f32v(&bin, &format!("{}attn.attn_sink", p)),
+                comp_wkv: if ratio > 0 { Self::f32v(&bin, &format!("{}attn.compressor.wkv.weight", p)) } else { Vec::new() },
+                comp_wgate: if ratio > 0 { Self::f32v(&bin, &format!("{}attn.compressor.wgate.weight", p)) } else { Vec::new() },
+                comp_ape: if ratio > 0 { Self::f32v(&bin, &format!("{}attn.compressor.ape", p)) } else { Vec::new() },
+                comp_norm_w: if ratio > 0 { Self::f32v(&bin, &format!("{}attn.compressor.norm.weight", p)) } else { Vec::new() },
+                idx_wq_b: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.wq_b.weight", p)) } else { Vec::new() },
+                idx_weights_proj: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.weights_proj.weight", p)) } else { Vec::new() },
+                idx_comp_wkv: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.compressor.wkv.weight", p)) } else { Vec::new() },
+                idx_comp_wgate: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.compressor.wgate.weight", p)) } else { Vec::new() },
+                idx_comp_ape: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.compressor.ape", p)) } else { Vec::new() },
+                idx_comp_norm_w: if ratio == 4 { Self::f32v(&bin, &format!("{}attn.indexer.compressor.norm.weight", p)) } else { Vec::new() },
+            };
+            let hash = l < cfg.n_hash_layers;
+            let experts: Vec<[u64; 3]> = (0..cfg.n_routed_experts)
+                .map(|e| {
+                    ["w1", "w2", "w3"].map(|wn| get(&format!("{}ffn.experts.{}.{}", p, e, wn)).offset)
+                })
+                .collect();
+            layers.push(DsLayerW {
+                attn_norm_w: Self::f32v(&bin, &format!("{}attn_norm.weight", p)),
+                ffn_norm_w: Self::f32v(&bin, &format!("{}ffn_norm.weight", p)),
+                hc_attn_fn: Self::f32v(&bin, &format!("{}hc_attn_fn", p)),
+                hc_attn_base: Self::f32v(&bin, &format!("{}hc_attn_base", p)),
+                hc_attn_scale: Self::f32v(&bin, &format!("{}hc_attn_scale", p)),
+                hc_ffn_fn: Self::f32v(&bin, &format!("{}hc_ffn_fn", p)),
+                hc_ffn_base: Self::f32v(&bin, &format!("{}hc_ffn_base", p)),
+                hc_ffn_scale: Self::f32v(&bin, &format!("{}hc_ffn_scale", p)),
+                attn,
+                gate_w: Self::f32v(&bin, &format!("{}ffn.gate.weight", p)),
+                gate_bias: if hash { None } else { Some(Self::f32v(&bin, &format!("{}ffn.gate.bias", p))) },
+                tid2eid: if hash { Some(bin.i32_vec(&format!("{}ffn.gate.tid2eid", p))) } else { None },
+                shared: [
+                    Self::f32v(&bin, &format!("{}ffn.shared_experts.w1.weight", p)),
+                    Self::f32v(&bin, &format!("{}ffn.shared_experts.w2.weight", p)),
+                    Self::f32v(&bin, &format!("{}ffn.shared_experts.w3.weight", p)),
+                ],
+                experts,
+            });
+        }
+        let states = (0..cfg.n_layers).map(|l| DsAttention::new(&cfg, l)).collect();
+        let hc_head_scale = Self::f32v(&bin, "hc_head_scale");
+        DsModel {
+            cfg,
+            embed: get("embed.weight"),
+            head: get("head.weight"),
+            norm_w: Self::f32v(&bin, "norm.weight"),
+            hc_head_fn: Self::f32v(&bin, "hc_head_fn"),
+            hc_head_base: Self::f32v(&bin, "hc_head_base"),
+            hc_head_scale: hc_head_scale[0],
+            layers,
+            states,
+            bin,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.states = (0..self.cfg.n_layers).map(|l| DsAttention::new(&self.cfg, l)).collect();
+    }
+
+    /// MoE forward for one token (model.py:614-649): gate routing, fp4 packed
+    /// routed experts (routing weight applied BEFORE w2, as in Expert.forward),
+    /// plus the single unweighted shared expert.
+    #[allow(dead_code)]
+    fn moe(&self, w: &DsLayerW, x: &[f32], token: u32) -> Vec<f32> {
+        ds_moe(&self.cfg, &self.bin.data[..], w, x, token, 0, 0)
+    }
+
+    /// One decode step: token id → logits [vocab] (model.py Transformer.forward).
+    pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        let Self { cfg, bin, embed, head, norm_w, hc_head_fn, hc_head_base, hc_head_scale, layers, states } = self;
+        let cfg = &*cfg;
+        let d = cfg.d;
+        let hc = cfg.hc_mult;
+        let data = &bin.data[..];
+        // embed + expand to hc_mult identical copies (model.py:914-916)
+        let erow = &as_f32(&data[embed.offset as usize..(embed.offset + embed.size) as usize])
+            [token as usize * d..(token as usize + 1) * d];
+        let mut state = vec![0f32; hc * d];
+        for j in 0..hc {
+            state[j * d..(j + 1) * d].copy_from_slice(erow);
+        }
+
+        for l in 0..cfg.n_layers {
+            let w = &layers[l];
+            // ── attention sublayer (model.py:696-700) ──
+            let (y, post, comb) = hc_pre(&state, &state, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, hc, cfg.norm_eps as f32, cfg.hc_sinkhorn_iters, cfg.hc_eps as f32);
+            let mut yn = vec![0f32; d];
+            ds_rmsnorm(&y, &w.attn_norm_w, cfg.norm_eps as f32, &mut yn);
+            let mut attn_pre = vec![0f32; cfg.n_heads * cfg.head_dim];
+            attention_step(cfg, l, &w.attn, &mut states[l], &yn, &mut attn_pre);
+            let mut attn_out = vec![0f32; d];
+            grouped_o_proj(cfg, &w.attn.wo_a, &w.attn.wo_b, &attn_pre, &mut attn_out);
+            state = hc_post(&attn_out, &state, &post, &comb, hc);
+            // ── ffn sublayer (model.py:702-706) ──
+            let (y, post, comb) = hc_pre(&state, &state, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, hc, cfg.norm_eps as f32, cfg.hc_sinkhorn_iters, cfg.hc_eps as f32);
+            ds_rmsnorm(&y, &w.ffn_norm_w, cfg.norm_eps as f32, &mut yn);
+            let moe_out = ds_moe(cfg, data, w, &yn, token, l, pos);
+            state = hc_post(&moe_out, &state, &post, &comb, hc);
+            ds_parity_rec(pos, l, &state);
+        }
+
+        // head: hc_head → final rmsnorm → lm_head (model.py:922-923)
+        let h = hc_head(&state, &state, hc_head_fn, *hc_head_scale, hc_head_base, hc, cfg.norm_eps as f32, cfg.hc_eps as f32);
+        let mut xn = vec![0f32; d];
+        ds_rmsnorm(&h, norm_w, cfg.norm_eps as f32, &mut xn);
+        let mut logits = vec![0f32; cfg.vocab];
+        let hrow = as_f32(&data[head.offset as usize..(head.offset + head.size) as usize]);
+        crate::model::matvec(hrow, cfg.vocab, d, &xn, &mut logits);
+        logits
+    }
+}
+
+// ── DS parity dump (thread-local, inactive during normal inference) ──
+
+// ── DS parity dump (thread-local, inactive during normal inference) ──
+// Records the full HC state [hc*d] after selected blocks and the router
+// selections of selected layers, for the end-to-end comparison against the
+// torch replica (ref/make_ds_parity.py).
+
+pub const DS_DUMP_LAYERS: [usize; 6] = [0, 1, 2, 3, 21, 42];
+pub const DS_ROUTER_LAYERS: [usize; 3] = [1, 3, 42];
+
+#[derive(Default)]
+pub struct DsParityDump {
+    pub hiddens: std::collections::HashMap<(usize, usize), Vec<f32>>, // (pos, layer)
+    pub router: std::collections::HashMap<(usize, usize), Vec<u32>>,  // (pos, layer) sorted experts
+}
+
+thread_local! {
+    pub static DS_PARITY: std::cell::RefCell<Option<DsParityDump>> = std::cell::RefCell::new(None);
+}
+
+fn ds_parity_rec(pos: usize, layer: usize, state: &[f32]) {
+    if !DS_DUMP_LAYERS.contains(&layer) {
+        return;
+    }
+    DS_PARITY.with(|p| {
+        if let Some(d) = p.borrow_mut().as_mut() {
+            d.hiddens.insert((pos, layer), state.to_vec());
+        }
+    });
+}
+
+/// MoE forward for one token (model.py:614-649): gate routing, fp4 packed
+/// routed experts (routing weight applied BEFORE w2, as in Expert.forward),
+/// plus the single unweighted shared expert. The top-k experts run as
+/// independent pool jobs (like the K3 engine).
+fn ds_moe(cfg: &DsConfig, data: &[u8], w: &DsLayerW, x: &[f32], token: u32, layer: usize, pos: usize) -> Vec<f32> {
+    let d = cfg.d;
+    let inter = cfg.moe_inter_dim;
+    let (sel, _) = gate_forward(
+        x,
+        &w.gate_w,
+        w.gate_bias.as_deref(),
+        w.tid2eid.as_deref(),
+        token,
+        cfg.n_routed_experts,
+        cfg.n_activated_experts,
+        cfg.route_scale as f32,
+    );
+    if DS_ROUTER_LAYERS.contains(&layer) {
+        let mut ids: Vec<u32> = sel.iter().map(|s| s.0).collect();
+        ids.sort();
+        DS_PARITY.with(|p| {
+            if let Some(d) = p.borrow_mut().as_mut() {
+                d.router.insert((pos, layer), ids);
+            }
+        });
+    }
+    let packed = inter * d / 2;
+    let blob = packed + inter * d / 32;
+    let limit = cfg.swiglu_limit as f32;
+    let mut outs = vec![0f32; sel.len() * d];
+    {
+        let dp = crate::pool::SPtrU8(data.as_ptr());
+        let dlen = data.len();
+        let xp = crate::pool::SPtr(x.as_ptr());
+        let op = crate::pool::MPtr(outs.as_mut_ptr());
+        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(sel.len());
+        for (ei, &(eid, wgt)) in sel.iter().enumerate() {
+            let offs = w.experts[eid as usize];
+            jobs.push(Box::new(move || {
+                let (dp, xp, op) = (dp, xp, op);
+                unsafe {
+                    let data = std::slice::from_raw_parts(dp.0, dlen);
+                    let x = std::slice::from_raw_parts(xp.0, d);
+                    let blob_at = |i: usize| &data[offs[i] as usize..offs[i] as usize + blob];
+                    let mut gate = vec![0f32; inter];
+                    let mut up = vec![0f32; inter];
+                    crate::mxfp4::matvec_packed(&blob_at(0)[..packed], &blob_at(0)[packed..], inter, d, x, &mut gate, 1);
+                    crate::mxfp4::matvec_packed(&blob_at(2)[..packed], &blob_at(2)[packed..], inter, d, x, &mut up, 1);
+                    let mut act = vec![0f32; inter];
+                    for j in 0..inter {
+                        let g = gate[j].min(limit);
+                        let u = up[j].clamp(-limit, limit);
+                        act[j] = wgt * (g / (1.0 + (-g).exp())) * u; // wgt * silu(g) * u
+                    }
+                    let o = std::slice::from_raw_parts_mut(op.0.add(ei * d), d);
+                    crate::mxfp4::matvec_packed(&blob_at(1)[..packed], &blob_at(1)[packed..], d, inter, &act, o, 1);
+                }
+            }));
+        }
+        crate::pool::pool().run(jobs);
+    }
+    let mut out = vec![0f32; d];
+    for ei in 0..sel.len() {
+        for j in 0..d {
+            out[j] += outs[ei * d + j];
+        }
+    }
+    // shared expert (unweighted, f32)
+    let mut sout = vec![0f32; d];
+    expert_forward(&w.shared[0], &w.shared[1], &w.shared[2], x, inter, limit, &mut sout);
+    for j in 0..d {
+        out[j] += sout[j];
+    }
+    out
+}
+
+/// Greedy turn on a DsModel (shares model::run_turn_core with the K3 engine).
+pub fn ds_run_turn(ids: &[u32], max_new: usize, tok: &crate::tokenizer::AnyTokenizer, model: &mut DsModel, debug: bool, debug_routing: bool, stop_id: u32) -> String {
+    model.reset();
+    let mut pos = 0usize;
+    crate::model::run_turn_core(
+        ids,
+        max_new,
+        tok,
+        &mut |id| {
+            let l = model.forward(id, pos);
+            pos += 1;
+            l
+        },
+        debug,
+        debug_routing,
+        stop_id,
+    )
 }

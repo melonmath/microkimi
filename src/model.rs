@@ -1037,6 +1037,28 @@ fn py_repr(s: &str) -> String {
 pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32) -> String {
     model.reset_cache();
     model.prof = Prof::default();
+    let mut pos = 0usize;
+    let answer = run_turn_core(
+        ids,
+        max_new,
+        tok,
+        &mut |id| {
+            let l = model.forward(id, pos);
+            pos += 1;
+            l
+        },
+        debug,
+        debug_routing,
+        stop_id,
+    );
+    model.prof.print_cfg(model.cfg.d, model.cfg.vocab, model.cfg.n_experts);
+    answer
+}
+
+/// Generic greedy generation loop: prefill then argmax decode through the
+/// `fwd` closure (one forward per token, position tracked by the caller).
+/// Shared by the K3 Model (run_turn) and the DeepSeek DsModel (ds_run_turn).
+pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32) -> String {
     if debug_routing {
         ROUTING.with(|r| *r.borrow_mut() = Some(RoutingDebug::default()));
     }
@@ -1053,21 +1075,19 @@ pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mod
     // ── sequential prefill (simple) ──
     let t2 = Instant::now();
     let mut logits = Vec::new();
-    let mut pos = 0usize;
     for &id in ids {
-        logits = model.forward(id, pos);
-        pos += 1;
+        logits = fwd(id);
     }
     let t_prefill = t2.elapsed();
     if debug {
         println!();
         println!("{}", "=".repeat(64));
-        println!("STEP 1 - sequential PREFILL  (93 layers, KDA state + KV cache filled)");
+        println!("STEP 1 - sequential PREFILL  (caches filled)");
         println!("{}", "=".repeat(64));
         println!("⏱  {:.2} s  for {} tokens ({:.1} ms/token)", t_prefill.as_secs_f64(), ids.len(), t_prefill.as_secs_f64() / ids.len() as f64 * 1000.0);
         println!();
         println!("{}", "=".repeat(64));
-        println!("STEP 2 - GENERATION  (greedy: softmax → argmax, stop = <|end_of_msg|>)");
+        println!("STEP 2 - GENERATION  (greedy: softmax → argmax, stop = token {})", stop_id);
         println!("{}", "=".repeat(64));
     }
 
@@ -1100,8 +1120,7 @@ pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mod
             break;
         }
         let ta = Instant::now();
-        logits = model.forward(next_id, pos);
-        pos += 1;
+        logits = fwd(next_id);
         let dt = ta.elapsed().as_secs_f64();
         gen_times.push(dt);
         generated.push(next_id);
@@ -1144,7 +1163,6 @@ pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mod
     }
 
     let answer = tok.decode(&generated);
-    model.prof.print_cfg(model.cfg.d, model.cfg.vocab, model.cfg.n_experts);
     if debug {
         println!();
         println!("{}", "=".repeat(64));

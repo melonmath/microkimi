@@ -20,3 +20,5 @@ nano/eval/TinyStoriesV2-GPT4-valid.txt
 # Moonshot reference files: downloaded at runtime, never committed (license)
 nano/vendor/moonshot/
 vocab_nano.json
+ds_parity_golden.json
+microdeepseek.tokenizer.json

@@ -5,6 +5,7 @@
 // reduced dims. std only.
 
 mod build;
+mod build_ds;
 mod deepseek;
 mod dequant;
 mod config;
@@ -30,11 +31,13 @@ fn main() {
 
     match cmd {
         "build" => build::run(),
+        "build-ds" => build_ds::run(),
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" => parity::run(args.iter().any(|a| a == "--show")),
+        "dsparity" => parity::run_ds(),
         "run" => {
             // microkimi run "prompt" [--max-new N] [--model X.bin] [--vocab V.json]
             let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
@@ -80,6 +83,7 @@ fn main() {
             println!("microkimi - micro K3 inference engine, zero dependencies");
             println!("usage:");
             println!("  microkimi build                      builds microkimi.bin (K3 fetch + generation)");
+            println!("  microkimi build-ds                   builds microdeepseek.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");

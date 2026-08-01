@@ -1,10 +1,11 @@
 // microkimi.bin format:
 //   magic "MKIM0001" (8 bytes)
 //   u32 n_tensors
-//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4) |
+//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32) |
 //                   u8 n_dims | u32 dims[n_dims] | u64 offset | u64 size
 //   raw data (offsets from start of file, 64-aligned)
 // mxfp4 dtype: blob = packed (R×C/2 bytes) then scales (R×C/32), dims = logical [R,C].
+// MKIM0002: u32 config_len + JSON config right after the magic.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,6 +14,7 @@ pub const MAGIC: &[u8; 8] = b"MKIM0001";
 pub const MAGIC_V2: &[u8; 8] = b"MKIM0002";
 pub const DTYPE_F32: u8 = 0;
 pub const DTYPE_MXFP4: u8 = 1;
+pub const DTYPE_I32: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -27,6 +29,7 @@ pub fn blob_size(dtype: u8, dims: &[u32]) -> u64 {
     let n: u64 = dims.iter().map(|&d| d as u64).product();
     match dtype {
         DTYPE_F32 => n * 4,
+        DTYPE_I32 => n * 4,
         DTYPE_MXFP4 => {
             let (r, c) = (dims[0] as u64, dims[1] as u64);
             r * c / 2 + r * c / 32
@@ -54,15 +57,16 @@ impl BinWriter {
         self.names_order.push((name.to_string(), dtype, dims));
     }
 
-    /// Computes the directory (64-aligned offsets) and writes it with the header.
-    /// Returns the offsets in the same order as names_order.
-    pub fn write_header(&self, f: &mut std::fs::File) -> Vec<u64> {
+    /// Computes the 64-aligned offsets in write order; `prefix` = number of
+    /// bytes before the u32 tensor count (8 for MKIM0001, 8+4+config_len for
+    /// MKIM0002).
+    fn layout(&self, prefix: u64) -> Vec<u64> {
         let dir_size: u64 = self
             .names_order
             .iter()
             .map(|(n, _, d)| dir_entry_size(n, d))
             .sum();
-        let data_start = 8 + 4 + dir_size;
+        let data_start = prefix + 4 + dir_size;
         let mut offsets = Vec::with_capacity(self.names_order.len());
         let mut pos = data_start;
         for (_, dtype, dims) in &self.names_order {
@@ -70,9 +74,12 @@ impl BinWriter {
             offsets.push(pos);
             pos += blob_size(*dtype, dims);
         }
-        f.write_all(MAGIC).unwrap();
+        offsets
+    }
+
+    fn write_directory(&self, f: &mut std::fs::File, offsets: &[u64]) {
         f.write_all(&(self.names_order.len() as u32).to_le_bytes()).unwrap();
-        for ((name, dtype, dims), &off) in self.names_order.iter().zip(&offsets) {
+        for ((name, dtype, dims), &off) in self.names_order.iter().zip(offsets) {
             f.write_all(&(name.len() as u16).to_le_bytes()).unwrap();
             f.write_all(name.as_bytes()).unwrap();
             f.write_all(&[*dtype]).unwrap();
@@ -83,6 +90,24 @@ impl BinWriter {
             f.write_all(&off.to_le_bytes()).unwrap();
             f.write_all(&blob_size(*dtype, dims).to_le_bytes()).unwrap();
         }
+    }
+
+    /// Computes the directory (64-aligned offsets) and writes it with the header.
+    /// Returns the offsets in the same order as names_order.
+    pub fn write_header(&self, f: &mut std::fs::File) -> Vec<u64> {
+        let offsets = self.layout(8);
+        f.write_all(MAGIC).unwrap();
+        self.write_directory(f, &offsets);
+        offsets
+    }
+
+    /// MKIM0002 header: magic + u32 config_len + JSON config + directory.
+    pub fn write_header_v2(&self, f: &mut std::fs::File, config_json: &str) -> Vec<u64> {
+        let offsets = self.layout(8 + 4 + config_json.len() as u64);
+        f.write_all(MAGIC_V2).unwrap();
+        f.write_all(&(config_json.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(config_json.as_bytes()).unwrap();
+        self.write_directory(f, &offsets);
         offsets
     }
 
@@ -208,6 +233,17 @@ impl BinFile {
         let b = self.blob(name);
         let np = r * c / 2;
         (&b[..np], &b[np..], r, c)
+    }
+
+    /// i32 tensor → Vec<i32> (copy).
+    #[allow(dead_code)]
+    pub fn i32_vec(&self, name: &str) -> Vec<i32> {
+        let e = self.entries.get(name).unwrap_or_else(|| panic!("missing tensor: {}", name));
+        assert_eq!(e.dtype, DTYPE_I32, "{} is not i32", name);
+        self.blob(name)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 
