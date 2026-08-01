@@ -86,10 +86,10 @@ pub fn run(show: bool) {
     let path = if std::path::Path::new("ref/parity_golden.json").exists() {
         "ref/parity_golden.json"
     } else {
-        "/workspace/microkimi/ref/parity_golden.json"
+        "ref/parity_golden.json"
     };
     let bytes = std::fs::read(path).unwrap_or_else(|_| {
-        panic!("{} missing - run first: /home/node/venv/bin/python3 ref/parity_ref.py", path)
+        panic!("{} missing - run first: python3 ref/parity_ref.py", path)
     });
     let golden = json::parse(&bytes);
     let ids: Vec<u32> = arr(&golden, "ids").iter().map(|&x| x as u32).collect();
@@ -365,10 +365,10 @@ pub fn run_ds() {
     let path = if std::path::Path::new("ref/ds_parity_golden.json").exists() {
         "ref/ds_parity_golden.json"
     } else {
-        "/workspace/microkimi-oss/ref/ds_parity_golden.json"
+        "ref/ds_parity_golden.json"
     };
     let bytes = std::fs::read(path).unwrap_or_else(|_| {
-        panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_parity.py", path)
+        panic!("{} missing - run first: python3 ref/make_ds_parity.py", path)
     });
     let golden = json::parse(&bytes);
     let ids: Vec<u32> = arr(&golden, "ids").iter().map(|&x| x as u32).collect();
@@ -379,7 +379,7 @@ pub fn run_ds() {
     let bin = if std::path::Path::new("microdeepseek.bin").exists() {
         "microdeepseek.bin".to_string()
     } else {
-        "/workspace/microkimi-oss/microdeepseek.bin".to_string()
+        "microdeepseek.bin".to_string()
     };
     let mut model = crate::deepseek::DsModel::load(&bin);
     model.reset();

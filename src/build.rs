@@ -288,7 +288,7 @@ fn gather_sources() -> Sources {
 fn qwen_path() -> String {
     let cache_dir = format!(
         "{}/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots",
-        std::env::var("HOME").unwrap_or_else(|_| "/home/node".to_string())
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
     );
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for e in entries.flatten() {

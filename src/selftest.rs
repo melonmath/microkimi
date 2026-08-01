@@ -120,10 +120,10 @@ pub fn run() {
     let path = if std::path::Path::new("ref/golden.json").exists() {
         "ref/golden.json"
     } else {
-        "/workspace/microkimi/ref/golden.json"
+        "ref/golden.json"
     };
     let bytes = std::fs::read(path)
-        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_golden.py", path));
+        .unwrap_or_else(|_| panic!("{} missing - run first: python3 ref/make_golden.py", path));
     let golden = json::parse(&bytes);
     let mut all_ok = true;
     println!("microkimi selftest - comparison against {} (rel tol {:.0e})", path, RTOL);
@@ -194,10 +194,10 @@ pub fn run_ds() {
     let path = if std::path::Path::new("ref/ds_golden.json").exists() {
         "ref/ds_golden.json"
     } else {
-        "/workspace/microkimi-oss/ref/ds_golden.json"
+        "ref/ds_golden.json"
     };
     let bytes = std::fs::read(path)
-        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden.py", path));
+        .unwrap_or_else(|_| panic!("{} missing - run first: python3 ref/make_ds_golden.py", path));
     let golden = json::parse(&bytes);
     let mut ok = true;
 
@@ -248,10 +248,10 @@ pub fn run_ds2() {
     let path = if std::path::Path::new("ref/ds_golden2.json").exists() {
         "ref/ds_golden2.json"
     } else {
-        "/workspace/microkimi-oss/ref/ds_golden2.json"
+        "ref/ds_golden2.json"
     };
     let bytes = std::fs::read(path)
-        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden2.py", path));
+        .unwrap_or_else(|_| panic!("{} missing - run first: python3 ref/make_ds_golden2.py", path));
     let golden = json::parse(&bytes);
     let mut ok = true;
 
@@ -392,10 +392,10 @@ pub fn run_ds3() {
     let path = if std::path::Path::new("ref/ds_golden3.json").exists() {
         "ref/ds_golden3.json"
     } else {
-        "/workspace/microkimi-oss/ref/ds_golden3.json"
+        "ref/ds_golden3.json"
     };
     let bytes = std::fs::read(path)
-        .unwrap_or_else(|_| panic!("{} missing - run first: /home/node/venv/bin/python3 ref/make_ds_golden3.py", path));
+        .unwrap_or_else(|_| panic!("{} missing - run first: python3 ref/make_ds_golden3.py", path));
     let golden = json::parse(&bytes);
     let mut ok = true;
 
@@ -491,7 +491,7 @@ pub fn run_ds4() {
     let path = if std::path::Path::new("ref/ds_tok_golden.json").exists() {
         "ref/ds_tok_golden.json"
     } else {
-        "/workspace/microkimi-oss/ref/ds_tok_golden.json"
+        "ref/ds_tok_golden.json"
     };
     let bytes = std::fs::read(path).unwrap_or_else(|_| panic!("{} missing", path));
     let golden = json::parse(&bytes);

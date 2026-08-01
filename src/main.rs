@@ -452,7 +452,7 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
 }
 
 pub fn tokenizer_path() -> String {
-    for c in ["ref/tiktoken.model", "/workspace/microkimi/ref/tiktoken.model"] {
+    for c in ["ref/tiktoken.model", "ref/tiktoken.model"] {
         if std::path::Path::new(c).exists() {
             return c.to_string();
         }
