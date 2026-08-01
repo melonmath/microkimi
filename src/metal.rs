@@ -1032,7 +1032,7 @@ pub fn gputest() {
     println!("gputest — real model matvecs, CPU vs GPU ({})", path);
     let bin = crate::weights::BinFile::open(&path);
 
-    // Tensors present in BOTH microkimi.bin and nanokimi.bin (any config):
+    // Tensors present in BOTH microkimi-debug.bin and nanokimi-0.2b.bin (any config):
     // a KDA projection, an MLA projection, the MoE router, a routed projection,
     // the dense MLP of layer 0, and lm_head (the big one).
     let names = [
@@ -1090,7 +1090,7 @@ pub fn gputest() {
 
 /// Compares the fused fp4 kernel against the CPU mxfp4::matvec_packed on:
 /// 1. synthetic matrices at micro dims, real V4 dims and edge shapes,
-/// 2. real expert blobs from microdeepseek.bin (SKIPPED if the bin is absent),
+/// 2. real expert blobs from microdeepseek-debug.bin (SKIPPED if the bin is absent),
 /// 3. the DeepSeek lm_head routing through model::matvec (66M ≥ GPU_MIN_ELEMS).
 /// Tolerance 1e-3 (max_abs and scale-relative) — the kernel reassociates the
 /// f32 sums differently than the sequential CPU path.
@@ -1175,8 +1175,8 @@ pub fn dstest() {
         );
     }
 
-    // 2) real expert blobs + 3) lm_head routing (need microdeepseek.bin)
-    let ds_path = ["microdeepseek.bin", "/workspace/microkimi-oss/microdeepseek.bin"]
+    // 2) real expert blobs + 3) lm_head routing (need microdeepseek-debug.bin)
+    let ds_path = ["microdeepseek-debug.bin", "microdeepseek.bin"]
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .map(|s| s.to_string());
@@ -1221,7 +1221,7 @@ pub fn dstest() {
                 );
             }
         }
-        None => println!("  microdeepseek.bin not found — real-expert and lm_head checks SKIPPED"),
+        None => println!("  microdeepseek-debug.bin not found — real-expert and lm_head checks SKIPPED"),
     }
 
     if let Some(c) = ctx() {

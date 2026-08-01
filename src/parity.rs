@@ -1,6 +1,6 @@
 // `microkimi paritytest`: compares the full Rust forward pass against the dump in
 // ref/parity_golden.json produced by ref/parity_ref.py (genuine Moonshot code,
-// micro dims, same microkimi.bin weights, strict fp32).
+// micro dims, same microkimi-debug.bin weights, strict fp32).
 // Hard criteria: |a-b| ≤ 1e-6 + 1e-3·max|tensor| on logits/hiddens/sub-blocks
 // (beyond that → semantic bug; the real bugs observed produced O(1) discrepancies);
 // the 1e-4 target threshold is reported for information only (f32 summation noise);
@@ -324,7 +324,7 @@ pub fn run(show: bool) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DeepSeek-V4 end-to-end parity (`microkimi dsparity`): microdeepseek.bin
+// DeepSeek-V4 end-to-end parity (`microkimi dsparity`): microdeepseek-debug.bin
 // forward vs the plain-torch replica of the reference Transformer
 // (ref/make_ds_parity.py → ref/ds_parity_golden.json).
 // QAT-aware tolerance (same as the DS attention selftest): 2e-3 + 1e-3·scale —
@@ -376,10 +376,10 @@ pub fn run_ds() {
     println!("microkimi dsparity - {} vs Rust forward (QAT-aware tol 2e-3+1e-3·scale)", path);
     println!("sequence: {} positions", t_max);
 
-    let bin = if std::path::Path::new("microdeepseek.bin").exists() {
-        "microdeepseek.bin".to_string()
+    let bin = if std::path::Path::new("microdeepseek-debug.bin").exists() {
+        "microdeepseek-debug.bin".to_string()
     } else {
-        "microdeepseek.bin".to_string()
+        "microdeepseek.bin".to_string() // legacy name from older builds
     };
     let mut model = crate::deepseek::DsModel::load(&bin);
     model.reset();

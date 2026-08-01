@@ -1,4 +1,4 @@
-// `microkimi build-ds`: builds microdeepseek.bin (MKIM0002, arch "deepseek_v4").
+// `microkimi build-ds`: builds microdeepseek-debug.bin (MKIM0002, arch "deepseek_v4").
 // Same philosophy as build.rs (K3): small REAL DeepSeek-V4 fragments fetched by
 // HTTP range requests (leading rows of row-major tensors are contiguous ranges),
 // a few real fp4 experts → value pools, reproducible xorshift64* generation
@@ -14,7 +14,7 @@ use crate::weights::{self, BinWriter, DTYPE_F32, DTYPE_I32, DTYPE_MXFP4};
 use std::collections::HashMap;
 
 const DS_BASE: &str = "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/";
-const OUT: &str = "microdeepseek.bin";
+const OUT: &str = "microdeepseek-debug.bin";
 const SIGMA: f32 = 0.02;
 const REAL_ROWS: usize = 16384; // embed/head: this many real leading rows
 
@@ -680,7 +680,7 @@ pub fn run() {
 
     let size = std::fs::metadata(OUT).unwrap().len();
     println!();
-    println!("══ microdeepseek.bin: {:.2} GB in {:.0?} ══", size as f64 / 1e9, t0.elapsed());
+    println!("══ microdeepseek-debug.bin: {:.2} GB in {:.0?} ══", size as f64 / 1e9, t0.elapsed());
     println!("weight provenance:");
     for line in &src.report {
         println!("{}", line);

@@ -495,7 +495,7 @@ pub fn run_ds4() {
     };
     let bytes = std::fs::read(path).unwrap_or_else(|_| panic!("{} missing", path));
     let golden = json::parse(&bytes);
-    let tok = crate::dstok::DsTokenizer::load(&crate::ds_tokenizer_path("microdeepseek.bin", None));
+    let tok = crate::dstok::DsTokenizer::load(&crate::ds_tokenizer_path("microdeepseek-debug.bin", None));
     println!("DS tokenizer ({} cases vs HF tokenizers, EXACT ids)", golden.as_arr().unwrap().len());
     let mut ok = true;
     for case in golden.as_arr().unwrap() {

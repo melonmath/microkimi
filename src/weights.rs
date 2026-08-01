@@ -1,4 +1,4 @@
-// microkimi.bin format:
+// microkimi .bin format (microkimi-debug.bin, nanokimi-0.2b.bin, ...):
 //   magic "MKIM0001" (8 bytes)
 //   u32 n_tensors
 //   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32) |

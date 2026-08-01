@@ -1,4 +1,4 @@
-// `microkimi build`: builds microkimi.bin.
+// `microkimi build`: builds microkimi-debug.bin.
 // Sources: small REAL K3 tensors via HTTP range requests (index → shard
 // header → offsets → bytes), 3 real MXFP4 experts → value pools,
 // Qwen2.5-0.5B (local HF cache) for embedding/lm_head + projection pools,
@@ -12,7 +12,7 @@ use crate::weights::{self, BinWriter, DTYPE_F32, DTYPE_MXFP4};
 use std::collections::HashMap;
 
 const K3_BASE: &str = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/";
-const OUT: &str = "microkimi.bin";
+const OUT: &str = "microkimi-debug.bin";
 const SEED_BASE: u64 = 0x4B49_4D49_5EED_0001; // "KIMI"^seed - reproducible
 const SIGMA: f32 = 0.02;
 
@@ -576,7 +576,7 @@ pub fn run() {
 
     let size = std::fs::metadata(OUT).unwrap().len();
     println!();
-    println!("══ microkimi.bin: {:.2} GB in {:.0?} ══", size as f64 / 1e9, t0.elapsed());
+    println!("══ microkimi-debug.bin: {:.2} GB in {:.0?} ══", size as f64 / 1e9, t0.elapsed());
     println!("weight provenance:");
     for line in &src.report {
         println!("{}", line);

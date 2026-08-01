@@ -1,8 +1,8 @@
-# Kimi K3 (microkimi)
+# Kimi K3 (via microkimi)
 
-**microkimi is the Kimi K3 architecture, unchanged** - only tensor dimensions are scaled down to fit in RAM. Layer counts, expert counts, mechanisms, tokenizer: identical.
+**microkimi implements the Kimi K3 architecture, unchanged** - only tensor dimensions are scaled down to fit in RAM. Layer counts, expert counts, mechanisms, tokenizer: identical.
 
-| component                       | real K3              | microkimi                      | nanokimi                   |
+| component                       | real K3              | microkimi-debug                | nanokimi-0.2b              |
 | ------------------------------- | -------------------- | ------------------------------ | -------------------------- |
 | layers                          | 93 (69 KDA + 24 MLA) | **93 (same)**                  | 8-12                       |
 | hidden                          | 7168                 | **512**                        | 512                        |
@@ -38,21 +38,21 @@ What is scaled down: tensor dims (for RAM) and the training budget - not the arc
 `paritytest --show` prints the concrete side-by-side values.
 
 ```bash
-./target/release/microkimi build       # assemble microkimi.bin (~2.5 GB, K3 fetch + Qwen pools)
+./target/release/microkimi build       # assemble microkimi-debug.bin (~2.5 GB, K3 fetch + Qwen pools)
 ./target/release/microkimi selftest    # mechanism self-tests (torch once: ref/make_golden.py)
 python3 ref/parity_ref.py              # regenerates ref/parity_golden.json
 ./target/release/microkimi paritytest  # the 1:1 proof above
 ```
 
-## nanokimi: from noise to stories
+## nanokimi-0.2b: from noise to stories
 
 Same engine, same greedy decoding, same prompt - only the weights change:
 
 | model          | weights                      | `"Once upon a time, there was a little girl named Lily."`                                                                                                                                 |
 | -------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| microkimi      | synthetic, untrained         | `增进食欲蚕食蚕食蚕食蚕食…`                                                                                                                                                               |
+| microkimi-debug | synthetic, untrained        | `增进食欲蚕食蚕食蚕食蚕食…`                                                                                                                                                               |
 | nanokimi smoke | 200 steps (~0.1 M tokens)    | `". She wanted to play with the toy, but the park was very happy."` - grammatical, but the _same sentence for every prompt_                                                               |
-| **nanokimi**   | **560 steps (4.3 M tokens)** | `" She loved to play with her toys and her favorite toy was a big, red ball. One day, Lily's mom asked her to help clean the park. Lily was so happy and excited to play with the ball."` |
+| **nanokimi-0.2b** | **560 steps (4.3 M tokens)** | `" She loved to play with her toys and her favorite toy was a big, red ball. One day, Lily's mom asked her to help clean the park. Lily was so happy and excited to play with the ball."` |
 
 More prompts (raw, unedited): `"Tom was a small boy who loved to play outside."` → `" One day, he went to the park to play with his friends."` · `"One day, a cat named Whiskers found a shiny red ball."` → `" He wanted to play with it, but he was too small… He asked his friend, a little bird, to help him."` The router learned too: expert usage is differentiated without collapse (top expert ≈ 8 % of calls), visible live with `--debug-routing`.
 
@@ -79,7 +79,7 @@ Greedy decode.
 
 | model | workload | hardware | ms/token | tok/s |
 |---|---|---|---|---|
-| microkimi | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
-| microkimi | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
-| nanokimi | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
-| nanokimi | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
+| microkimi-debug | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
+| microkimi-debug | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
+| nanokimi-0.2b | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
+| nanokimi-0.2b | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |

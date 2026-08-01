@@ -96,8 +96,8 @@ fn main() {
         _ => {
             println!("microkimi - micro K3 inference engine, zero dependencies");
             println!("usage:");
-            println!("  microkimi build                      builds microkimi.bin (K3 fetch + generation)");
-            println!("  microkimi build-ds                   builds microdeepseek.bin (DeepSeek-V4 fetch + generation)");
+            println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
+            println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
@@ -257,7 +257,7 @@ fn vocab_flag(args: &[String]) -> Option<String> {
 
 /// Loads the tokenizer matching the model: explicit --vocab, otherwise vocab_nano.json
 /// next to the .bin — but ONLY when its vocab size matches the model's (a stray
-/// vocab_nano.json next to microkimi.bin must NOT hijack the full tokenizer),
+/// vocab_nano.json next to microkimi-debug.bin must NOT hijack the full tokenizer),
 /// otherwise the full Kimi vocabulary.
 fn load_any_tokenizer(model_path: &str, vocab: Option<String>, model_vocab: usize) -> tokenizer::AnyTokenizer {
     let full = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -495,9 +495,10 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
-    // Default model: nanokimi (the pretrained demo shipped in the GitHub
-    // release), then microkimi (the 93-layer architecture demo from `build`).
-    for name in ["nanokimi.bin", "microkimi.bin"] {
+    // Default model: nanokimi-0.2b (the pretrained demo shipped in the GitHub
+    // release), then microkimi-debug (the 93-layer architecture demo from
+    // `build`). Legacy file names are kept as fallbacks.
+    for name in ["nanokimi-0.2b.bin", "nanokimi.bin", "microkimi-debug.bin", "microkimi.bin"] {
         let candidates = [
             std::path::PathBuf::from(name),
             exe_dir.join(name),
@@ -510,8 +511,8 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
         }
     }
     eprintln!("error: no model found.");
-    eprintln!("  download nanokimi.bin + vocab_nano.json from the GitHub Releases page into the repo root,");
-    eprintln!("  or run 'microkimi build' to assemble microkimi.bin (93-layer architecture demo).");
+    eprintln!("  download nanokimi-0.2b.bin + vocab_nano.json from the GitHub Releases page into the repo root,");
+    eprintln!("  or run 'microkimi build' to assemble microkimi-debug.bin (93-layer architecture demo).");
     std::process::exit(1);
 }
 
