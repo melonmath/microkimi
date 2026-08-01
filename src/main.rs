@@ -30,16 +30,28 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let t0 = Instant::now();
 
+    // unified arch selector: --arch k3 (default) | dsv4
+    let arch = args
+        .iter()
+        .position(|a| a == "--arch")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+        .unwrap_or("k3");
+
     match cmd {
-        "build" => build::run(),
-        "build-ds" => build_ds::run(),
+        "build" => {
+            if arch == "dsv4" { build_ds::run() } else { build::run() }
+        }
+        "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
         "dstest" => dstest_cmd(),
         "gpubench" => gpubench_cmd(&args),
-        "paritytest" => parity::run(args.iter().any(|a| a == "--show")),
-        "dsparity" => parity::run_ds(),
+        "paritytest" | "parity" => {
+            if arch == "dsv4" { parity::run_ds() } else { parity::run(args.iter().any(|a| a == "--show")) }
+        }
+        "dsparity" => parity::run_ds(), // alias for `parity --arch dsv4`
         "run" => {
             // microkimi run "prompt" [--max-new N] [--model X.bin] [--vocab V.json]
             let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
