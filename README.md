@@ -39,10 +39,11 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 |---|---|---|
 | **nanokimi-0.2b** | small Kimi K3 model, trained from scratch (in Releases) | [KIMI.md](KIMI.md) |
 | **nanokimi-0.2b-chat** | chat-tuned nanokimi-0.2b | being trained |
-| **microkimi-debug** | Kimi K3 architecture demo (synthetic weights, `microkimi build`) | [KIMI.md](KIMI.md) |
-| **microdeepseek-debug** | DeepSeek-V4 architecture demo (synthetic weights, `build --arch dsv4`) | [DEEPSEEK.md](DEEPSEEK.md) |
 | **nanodeepseek-0.2b** | small DeepSeek-V4 model, trained from scratch | paused |
 | **microkimi-0.2b / 1b** | pruned from real K3 weights | planned |
+| **microdeepseek-*** | pruned from real DeepSeek-V4 weights | planned |
+| **microkimi-debug** | Kimi K3 architecture demo (synthetic weights, `microkimi build`) | [KIMI.md](KIMI.md) |
+| **microdeepseek-debug** | DeepSeek-V4 architecture demo (synthetic weights, `build --arch dsv4`) | [DEEPSEEK.md](DEEPSEEK.md) |
 
 ## Commands
 

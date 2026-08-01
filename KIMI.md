@@ -2,17 +2,17 @@
 
 **microkimi implements the Kimi K3 architecture, unchanged** - only tensor dimensions are scaled down to fit in RAM. Layer counts, expert counts, mechanisms, tokenizer: identical.
 
-| component                       | real K3              | microkimi-debug                | nanokimi-0.2b              |
-| ------------------------------- | -------------------- | ------------------------------ | -------------------------- |
-| layers                          | 93 (69 KDA + 24 MLA) | **93 (same)**                  | 8-12                       |
-| hidden                          | 7168                 | **512**                        | 512                        |
-| vocab                           | 163 840              | **163 840 (real tokenizer)**   | 8 192 + 8 specials (remap) |
-| KDA heads × dim                 | 96 × 128             | **4 × 128**                    | 4 × 128                    |
-| MLA (NoPE) heads                | 96                   | **4** (q_lora 128, kv_lora 64) | 4                          |
-| experts routed / top-k / shared | 896 / 16 / 2         | **896 / 16 / 2 (same)**        | 896 / 16 / 2               |
-| expert hidden / inter           | 3584 / 3072          | **128 / 64**                   | 128 / 64                   |
-| AttnRes block size              | 12                   | **12**                         | 4                          |
-| expert storage                  | MXFP4                | **MXFP4 (dequant on the fly)** | MXFP4                      |
+| component                       | nanokimi-0.2b              | microkimi-debug                | real K3              |
+| ------------------------------- | -------------------------- | ------------------------------ | -------------------- |
+| layers                          | 8-12                       | **93 (same)**                  | 93 (69 KDA + 24 MLA) |
+| hidden                          | 512                        | **512**                        | 7168                 |
+| vocab                           | 8 192 + 8 specials (remap) | **163 840 (real tokenizer)**   | 163 840              |
+| KDA heads × dim                 | 4 × 128                    | **4 × 128**                    | 96 × 128             |
+| MLA (NoPE) heads                | 4                          | **4** (q_lora 128, kv_lora 64) | 96                   |
+| experts routed / top-k / shared | 896 / 16 / 2               | **896 / 16 / 2 (same)**        | 896 / 16 / 2         |
+| expert hidden / inter           | 128 / 64                   | **128 / 64**                   | 3584 / 3072          |
+| AttnRes block size              | 4                          | **12**                         | 12                   |
+| expert storage                  | MXFP4                      | **MXFP4 (dequant on the fly)** | MXFP4                |
 
 Mechanisms, implemented exactly:
 
@@ -79,7 +79,7 @@ Greedy decode.
 
 | model | workload | hardware | ms/token | tok/s |
 |---|---|---|---|---|
-| microkimi-debug | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
-| microkimi-debug | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
 | nanokimi-0.2b | decode (8 layers, 113 MB) | 10-core ARM64 | 7.5 | ~134 |
 | nanokimi-0.2b | training (batch 32×256) | 32 vCPU x86-64 | - | ~130-290 |
+| microkimi-debug | decode (93 layers, 2.5 GB f32+MXFP4) | 10-core ARM64 | 59 | ~17 |
+| microkimi-debug | decode (93 layers) | Apple M5, 16 GB | 34 | ~29 |
