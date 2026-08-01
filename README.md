@@ -7,7 +7,7 @@
 > **Almost all of the code was written by Kimi K3 itself**, with human guidance and review.
 > So the model effectively gave birth to its own reimplementation - a strangely poetic loop: an architecture explaining itself well enough to be rebuilt from first principles.
 
-**Run and train your own miniature Kimi K3: a zero-dependency Rust inference engine, reimplemented from scratch - and nanokimi, a small model trained from scratch on CPU by the included training pipeline. Talks straight to the Metal API for GPU on macOS - CPU mode stays the fastest at small model sizes.**
+**Run and train miniature frontier MoE architectures - Kimi K3 and DeepSeek-V4-Flash-0731 - in pure Rust, zero dependencies, both verified 1:1 against the official reference code. Includes nanokimi, a small model trained from scratch overnight on CPU. Talks straight to the Metal API for GPU on macOS - CPU mode stays the fastest at small model sizes.**
 
 > *The moon loved the sun, but they could never meet,*
 > *so every night, they would go to the park to play.*
