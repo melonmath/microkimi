@@ -2,6 +2,8 @@
 
 A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code.
 
+Nothing else runs K3 today: llama.cpp, vLLM and transformers do not implement KDA or AttnRes, so this is currently the only way to run, train and experiment on the K3 architecture outside Moonshot's own code.
+
 **This is a framework for developers, including an end-to-end engine and a test model - not a model for end-users.**
 
 > _Almost all of the code was written by Kimi K3 itself - the quiet beauty of an LLM giving birth to another._
