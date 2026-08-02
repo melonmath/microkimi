@@ -1108,6 +1108,7 @@ fn ds_moe(cfg: &DsConfig, data: &[u8], w: &DsLayerW, x: &[f32], token: u32, laye
 }
 
 /// Greedy turn on a DsModel (shares model::run_turn_core with the K3 engine).
+/// Always greedy: the sampling flags are a no-op on the DeepSeek path.
 pub fn ds_run_turn(ids: &[u32], max_new: usize, tok: &crate::tokenizer::AnyTokenizer, model: &mut DsModel, debug: bool, debug_routing: bool, stop_id: u32) -> String {
     model.reset();
     let mut pos = 0usize;
@@ -1123,5 +1124,6 @@ pub fn ds_run_turn(ids: &[u32], max_new: usize, tok: &crate::tokenizer::AnyToken
         debug,
         debug_routing,
         stop_id,
+        &mut crate::model::Sampler::greedy(),
     )
 }

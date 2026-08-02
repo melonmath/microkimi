@@ -1740,6 +1740,86 @@ fn top_k_probs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     top
 }
 
+// ── sampling: temperature + top-p nucleus, xorshift64* RNG (build.rs style) ──
+
+/// xorshift64* RNG, same generator style as build::Rng, seedable via --seed
+/// for reproducible sampling (same seed + same prompt = same output).
+pub struct XorShift(u64);
+
+impl XorShift {
+    pub fn new(seed: u64) -> XorShift {
+        XorShift(seed | 1)
+    }
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    /// uniform in [0, 1)
+    pub fn uniform(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Decoding policy: temp <= 0 keeps the exact greedy argmax path; temp > 0
+/// samples from softmax(logits / temp) restricted to the top-p nucleus.
+pub struct Sampler {
+    pub temp: f32,
+    pub top_p: f32,
+    pub rng: XorShift,
+}
+
+impl Sampler {
+    pub fn new(temp: f32, top_p: f32, seed: u64) -> Sampler {
+        Sampler { temp, top_p, rng: XorShift::new(seed) }
+    }
+    /// Default no-op decoding: the historical greedy behavior.
+    pub fn greedy() -> Sampler {
+        Sampler::new(0.0, 1.0, 0)
+    }
+}
+
+/// Nucleus (top-p) sampling from softmax(logits / temp): sort the candidates
+/// by probability desc, keep the smallest set covering `top_p` of the mass,
+/// renormalize, draw with `rng`. Returns (token id, probability under the
+/// truncated renormalized distribution).
+fn sample_top_p(logits: &[f32], temp: f32, top_p: f32, rng: &mut XorShift) -> (u32, f32) {
+    let inv_t = 1.0 / temp;
+    let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut probs: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as u32, ((l - m) * inv_t).exp()))
+        .collect();
+    probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let total: f32 = probs.iter().map(|&(_, p)| p).sum();
+    // smallest prefix covering top_p of the mass
+    let top_p = top_p.clamp(0.0, 1.0);
+    let mut keep = probs.len();
+    let mut cum = 0f32;
+    for (i, &(_, p)) in probs.iter().enumerate() {
+        cum += p / total;
+        if cum >= top_p {
+            keep = i + 1;
+            break;
+        }
+    }
+    let nucleus = &probs[..keep.max(1)];
+    let nsum: f32 = nucleus.iter().map(|&(_, p)| p).sum();
+    let mut r = rng.uniform() as f32 * nsum;
+    for &(id, p) in nucleus {
+        r -= p;
+        if r <= 0.0 {
+            return (id, p / nsum);
+        }
+    }
+    let (id, p) = nucleus[nucleus.len() - 1];
+    (id, p / nsum)
+}
+
 fn py_repr(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -1756,20 +1836,20 @@ fn py_repr(s: &str) -> String {
     out
 }
 
-pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32) -> String {
+pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, sampler: &mut Sampler) -> String {
     model.reset_cache();
-    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, false, None)
+    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, false, None, sampler)
 }
 
 /// Same as run_turn but keeps the current caches (restored from a .mkmem
 /// snapshot via --memory): the prompt tokens are fed on top of the loaded
 /// state and `init_logits` (the logits stored in the snapshot) seed the
 /// decoding when the prompt is empty - a pure continuation.
-pub fn run_turn_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>) -> String {
-    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, true, init_logits)
+pub fn run_turn_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
+    run_turn_impl(ids, max_new, tok, model, debug, debug_routing, stop_id, true, init_logits, sampler)
 }
 
-fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, resumed: bool, init_logits: Option<Vec<f32>>) -> String {
+fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, resumed: bool, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
     model.prof = Prof::default();
     let mut pos = if resumed { model.cached_tokens() } else { 0 };
     let answer = run_turn_core_batch(
@@ -1785,6 +1865,7 @@ fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mo
         debug_routing,
         stop_id,
         init_logits,
+        sampler,
     );
     model.prof.print_cfg(model.cfg.d, model.cfg.vocab, model.cfg.n_experts);
     answer
@@ -1792,15 +1873,16 @@ fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mo
 
 /// Generic greedy generation loop: prefill then argmax decode through the
 /// `fwd` closure (one forward per token, position tracked by the caller).
+/// With `sampler.temp > 0` the argmax becomes top-p nucleus sampling.
 /// Shared by the K3 Model (run_turn) and the DeepSeek DsModel (ds_run_turn).
-pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32) -> String {
-    run_turn_core_resume(ids, max_new, tok, fwd, debug, debug_routing, stop_id, None)
+pub fn run_turn_core(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, sampler: &mut Sampler) -> String {
+    run_turn_core_resume(ids, max_new, tok, fwd, debug, debug_routing, stop_id, None, sampler)
 }
 
 /// run_turn_core + optional initial logits restored from a .mkmem snapshot:
 /// with an empty prompt the decoding starts straight from them (pure
 /// continuation, no token is re-ingested).
-pub fn run_turn_core_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>) -> String {
+pub fn run_turn_core_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(u32) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
     run_turn_core_batch(
         ids,
         max_new,
@@ -1817,6 +1899,7 @@ pub fn run_turn_core_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd
         debug_routing,
         stop_id,
         init_logits,
+        sampler,
     )
 }
 
@@ -1825,7 +1908,7 @@ pub fn run_turn_core_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd
 /// over in ONE call (batched prefill on the K3 Model); during decoding each
 /// call carries exactly one token. Bit-identical generation as long as the
 /// closure's prefill matches n sequential single-token forwards.
-pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(&[u32]) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>) -> String {
+pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd: &mut dyn FnMut(&[u32]) -> Vec<f32>, debug: bool, debug_routing: bool, stop_id: u32, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
     if debug_routing {
         ROUTING.with(|r| *r.borrow_mut() = Some(RoutingDebug::default()));
     }
@@ -1862,7 +1945,11 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
         }
         println!();
         println!("{}", "=".repeat(64));
-        println!("STEP 2 - GENERATION  (greedy: softmax → argmax, stop = token {})", stop_id);
+        if sampler.temp > 0.0 {
+            println!("STEP 2 - GENERATION  (sampling: temp = {}, top-p = {}, stop = token {})", sampler.temp, sampler.top_p, stop_id);
+        } else {
+            println!("STEP 2 - GENERATION  (greedy: softmax → argmax, stop = token {})", stop_id);
+        }
         println!("{}", "=".repeat(64));
     }
 
@@ -1878,7 +1965,13 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
     }
     for i in 0..max_new {
         let top = top_k_probs(&logits, 5);
-        let next_id = top[0].0 as u32;
+        // temp <= 0: exact historical greedy path (argmax of the top-5);
+        // temp > 0: top-p nucleus sampling over softmax(logits / temp).
+        let (next_id, sampled_p) = if sampler.temp > 0.0 {
+            sample_top_p(&logits, sampler.temp, sampler.top_p, &mut sampler.rng)
+        } else {
+            (top[0].0 as u32, top[0].1)
+        };
         if debug {
             let candidats: Vec<String> = top
                 .iter()
@@ -1887,6 +1980,9 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
             println!();
             println!("token {:2} → {}", i + 1, py_repr(&tok.decode_id(next_id)));
             println!("  candidates: {}", candidats.join("  "));
+            if sampler.temp > 0.0 {
+                println!("  sampled: p = {:.1}% (temp = {}, top-p = {})", sampled_p * 100.0, sampler.temp, sampler.top_p);
+            }
         }
         if next_id == stop_id {
             if debug {
