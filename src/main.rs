@@ -429,8 +429,8 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
         tok.encode_raw(text)
     };
     let tp = Instant::now();
-    for (pos, &id) in ids.iter().enumerate() {
-        model.forward(id, pos);
+    if !ids.is_empty() {
+        model.prefill(&ids, 0);
     }
     save_memory(&model, save);
     let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
