@@ -15,9 +15,11 @@ examples:
 
 GPU (Apple Silicon, torch MPS backend):
   python3 train.py --data tokens.bin --out ckpt --device mps --bench 20
-  --device {cpu,mps,auto} : cpu is the default and is UNCHANGED from before;
-  auto picks mps when torch.backends.mps.is_available() else cpu.
-  Known MPS bottleneck: the KDA recurrence is a per-token Python loop (one
+GPU (NVIDIA, torch CUDA backend):
+  python3 train.py --data tokens.bin --out ckpt --device cuda --bench 20
+  --device {cpu,mps,cuda,auto} : cpu is the default and is UNCHANGED from before;
+  auto picks cuda, then mps, else cpu.
+  Known GPU bottleneck: the KDA recurrence is a per-token Python loop (one
   kernel launch per token per layer - much worse on GPU than on CPU). The
   exact fix is the chunked WY representation of the delta rule, intentionally
   NOT implemented here because it changes the float summation order (the
@@ -53,13 +55,15 @@ def load_tokens(path):
 
 
 def dev_mem_str(dev):
-    """Device memory for the bench line: MPS allocated memory when available,
+    """Device memory for the bench line: MPS/CUDA allocated memory when available,
     process RSS otherwise."""
     if dev == "mps":
         try:
             return f"mps alloc {torch.mps.current_allocated_memory() / 1e9:.2f} GB"
         except Exception:
             return "mps alloc n/a"
+    if dev == "cuda":
+        return f"cuda alloc {torch.cuda.memory_allocated() / 1e9:.2f} GB"
     return f"rss {rss_gb():.1f} GB"
 
 
@@ -111,8 +115,8 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=500)
     ap.add_argument("--ckpt-secs", type=int, default=600)
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--device", choices=["cpu", "mps", "auto"], default="cpu",
-                    help="torch device: cpu (default, unchanged) | mps (Apple Silicon GPU) | auto (mps if available else cpu)")
+    ap.add_argument("--device", choices=["cpu", "mps", "cuda", "auto"], default="cpu",
+                    help="torch device: cpu (default, unchanged) | mps (Apple Silicon GPU) | cuda (NVIDIA GPU) | auto (cuda, else mps, else cpu)")
     ap.add_argument("--bench", type=int, default=None,
                     help="bench mode: run only N steps and print tok/s + device memory at the end")
     ap.add_argument("--trim-every", type=int, default=0,
@@ -133,14 +137,17 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     torch.set_num_threads(args.threads)
-    # device resolution: cpu default is untouched; auto degrades to cpu with a note
+    # device resolution: cpu default is untouched; auto picks cuda, then mps, then cpu
     dev = "cpu"
-    if args.device == "mps":
-        dev = "mps"
+    if args.device in ("mps", "cuda"):
+        dev = args.device
     elif args.device == "auto":
-        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+        if torch.cuda.is_available():
+            dev = "cuda"
+        elif torch.backends.mps.is_available():
+            dev = "mps"
         if dev == "cpu":
-            print("device=auto: MPS unavailable -> cpu", flush=True)
+            print("device=auto: no GPU available -> cpu", flush=True)
     print(f"device: {dev}", flush=True)
     cfg = {"n_layers": args.layers} if args.layers else None
     model = NanoModel(cfg, grad_ckpt=True).float().to(dev)
