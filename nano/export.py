@@ -104,6 +104,12 @@ def main():
         "specials": {"bos": 8192, "eos": 8193, "open": 8194, "close": 8195,
                      "sep": 8196, "end_of_msg": 8197, "unk": 8198, "pad": 8199},
     }
+    # explicit layer-type lists (self-describing config, same convention as
+    # the Rust slicer; bin2pt and the Rust engine read them back)
+    mla_set = set(c["mla_layers"]) if "mla_layers" in c else {l for l in range(n_layers) if l % 4 == 3 or l == n_layers - 1}
+    dense_set = set(c["dense_layers"]) if "dense_layers" in c else set(range(c["first_k_dense"]))
+    config["mla_layers"] = sorted(mla_set)
+    config["dense_layers"] = sorted(dense_set)
 
     tensors = []
 
@@ -125,7 +131,7 @@ def main():
     add("output_attn_res_norm.weight", get("output_attn_res_norm.weight"))
     add("output_attn_res_proj.weight", get("output_attn_res_proj.weight"))
 
-    is_mla = lambda l: l % 4 == 3 or l == n_layers - 1
+    is_mla = lambda l: l in mla_set
     for l in range(n_layers):
         p = f"layers.{l}."
         add(p + "input_layernorm.weight", get(p + "input_layernorm.weight"))
@@ -156,7 +162,7 @@ def main():
             add(a + "dt_bias", get(a + "dt_bias"))
             add(a + "b_proj.weight", get(a + "b_proj.weight"))
             add(a + "o_norm.weight", get(a + "o_norm.weight"))
-        if l >= c["first_k_dense"]:
+        if l not in dense_set:
             m = p + "block_sparse_moe."
             add(m + "gate.weight", get(m + "gate.weight"))
             add(m + "gate.e_score_correction_bias", get(m + "gate.e_score_correction_bias"))

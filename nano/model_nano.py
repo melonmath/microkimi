@@ -299,10 +299,28 @@ def is_mla(l, n_layers):
     return l % 4 == 3 or l == n_layers - 1
 
 
+def layer_types(c):
+    """(mla, dense) as 0-based layer-index sets.
+
+    Explicit "mla_layers" / "dense_layers" lists (carried by sliced .bin
+    configs, e.g. a pruned K3 where the pattern no longer holds) win;
+    otherwise the legacy nano pattern (MLA if L%4==3 or last, dense prefix
+    of first_k_dense layers) applies - old checkpoints are unaffected."""
+    n = c["n_layers"]
+    mla = set(c["mla_layers"]) if "mla_layers" in c else {l for l in range(n) if is_mla(l, n)}
+    dense = set(c["dense_layers"]) if "dense_layers" in c else set(range(c["first_k_dense"]))
+    assert not (mla & dense), f"layer type overlap: {sorted(mla & dense)}"
+    return mla, dense
+
+
 def nano_config(c):
     """KimiLinearConfig for the Moonshot classes, built from the NANO dict (or override)."""
-    full_attn = [l + 1 for l in range(c["n_layers"]) if is_mla(l, c["n_layers"])]  # 1-based
-    kda_layers = [l + 1 for l in range(c["n_layers"]) if not is_mla(l, c["n_layers"])]
+    mla, dense = layer_types(c)
+    full_attn = sorted(l + 1 for l in mla)  # 1-based
+    kda_layers = sorted(l + 1 for l in range(c["n_layers"]) if l not in mla)
+    assert dense == set(range(c["first_k_dense"])), (
+        f"dense layers {sorted(dense)} are not the prefix first_k_dense={c['first_k_dense']} "
+        "the Moonshot config can express")
     return KimiLinearConfig(
         vocab_size=c["vocab"], hidden_size=c["hidden"],
         intermediate_size=c["dense_inter"],
@@ -341,6 +359,7 @@ class NanoModel(nn.Module):
         self.c = c
         self.grad_ckpt = grad_ckpt
         self.config = nano_config(c)
+        self._mla, _ = layer_types(c)  # explicit list or legacy pattern
         D, V = c["hidden"], c["vocab"]
         self.embed_tokens = nn.Embedding(V, D)
         self.layers = nn.ModuleList(
@@ -386,7 +405,7 @@ class NanoModel(nn.Module):
         )
         blocks = hidden.new_zeros(B * T, 0, D)
         for l, layer in enumerate(self.layers):
-            mask = causal if is_mla(l, c["n_layers"]) else None
+            mask = causal if l in self._mla else None
             if self.grad_ckpt and torch.is_grad_enabled():
                 # gradient checkpointing: the graph keeps only the layer
                 # boundaries; each layer's forward is recomputed during

@@ -189,6 +189,14 @@ def main():
     if args.amp and dev != "cuda":
         print("--amp requested but device is not cuda: amp is a no-op (bf16 autocast is cuda-only here)", flush=True)
     cfg = {"n_layers": args.layers} if args.layers else None
+    # --resume: the model config comes from the checkpoint itself (a ckpt
+    # converted from a .bin by bin2pt.py carries the .bin config, possibly
+    # with explicit mla_layers/dense_layers lists); peek before building.
+    ckpt_latest = os.path.join(args.out, "ckpt_latest.pt")
+    pre_ck = None
+    if args.resume and os.path.exists(ckpt_latest):
+        pre_ck = torch.load(ckpt_latest, map_location="cpu", weights_only=False)
+        cfg = pre_ck.get("cfg", cfg)
     model = NanoModel(cfg, grad_ckpt=True).float().to(dev)
     model.eval()  # required by the MoE gate assert; no dropout/BN in the arch
     total, experts = count_params(model)
@@ -206,23 +214,27 @@ def main():
         args.steps = args.bench
         print(f"bench mode: {args.bench} steps", flush=True)
     step0 = 0
-    ckpt_latest = os.path.join(args.out, "ckpt_latest.pt")
-    if args.resume and os.path.exists(ckpt_latest):
+    if pre_ck is not None:
         print(f"resuming from {ckpt_latest} ...", flush=True)
-        ck = torch.load(ckpt_latest, map_location="cpu", weights_only=False)
+        ck = pre_ck
         model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
-        # optimizer states load as CPU tensors - move them onto the run device
-        # (AdamW requires state and params on the same device)
-        if dev != "cpu":
-            for st in opt.state.values():
-                for key, val in st.items():
-                    if torch.is_tensor(val):
-                        st[key] = val.to(dev)
-        step0 = ck["step"]
-        rng.bit_generator.state = ck["rng_np"]
-        torch.set_rng_state(ck["rng_torch"])
-        print(f"  -> step {step0}", flush=True)
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+            # optimizer states load as CPU tensors - move them onto the run device
+            # (AdamW requires state and params on the same device)
+            if dev != "cpu":
+                for st in opt.state.values():
+                    for key, val in st.items():
+                        if torch.is_tensor(val):
+                            st[key] = val.to(dev)
+            step0 = ck["step"]
+            rng.bit_generator.state = ck["rng_np"]
+            torch.set_rng_state(ck["rng_torch"])
+            print(f"  -> step {step0}", flush=True)
+        else:
+            # weights-only checkpoint (e.g. bin2pt conversion): nothing to
+            # resume but the weights - optimizer, step and rng stay fresh
+            print("  weights-only checkpoint: optimizer/step/rng start fresh", flush=True)
         if args.fresh_opt:
             # SFT from a base model: keep only the weights; optimizer
             # (AdamW moments from pretraining), step counter and rng restart
