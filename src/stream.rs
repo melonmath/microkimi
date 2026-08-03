@@ -608,13 +608,15 @@ fn env_off(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1").unwrap_or(false)
 }
 
-// ── O_DIRECT (Linux): expert reads that bypass the page cache ──
+// ── Direct I/O (Linux O_DIRECT / macOS F_NOCACHE): cache-bypassing reads ──
 //
 // The streamed expert blobs are read once per cache miss and never re-read
 // through the same pages (the RAM LRU above is the cache), so the page
-// cache only pollutes. O_DIRECT requires a 4 KiB aligned buffer, offset and
-// length: read_direct widens every window to the enclosing 4 KiB boundaries
-// and copies the payload out, serving exactly the bytes a plain pread would.
+// cache only pollutes. Linux O_DIRECT requires a 4 KiB aligned buffer,
+// offset and length: read_direct widens every window to the enclosing 4 KiB
+// boundaries and copies the payload out. macOS F_NOCACHE is a plain fcntl
+// flag on the fd with no alignment constraints, so reads stay plain preads.
+// Both serve exactly the bytes a buffered pread would.
 
 /// Linux O_DIRECT open flag (hardcoded, no libc crate). The value is
 /// arch-dependent in the kernel UAPI: aarch64/arm/m68k use 0o200000, the
@@ -626,9 +628,9 @@ const O_DIRECT: i32 = 0o200000;
 #[cfg(all(target_os = "linux", not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "m68k"))))]
 const O_DIRECT: i32 = 0o40000;
 
-/// Opens `path` with O_DIRECT. None when MICROKIMI_NO_ODIRECT=1, off Linux,
-/// or when the filesystem rejects the flag: the caller falls back to plain
-/// buffered pread.
+/// Opens the direct-I/O handle for `path`: O_DIRECT on Linux, an F_NOCACHE
+/// fd on macOS. None when MICROKIMI_NO_ODIRECT=1, on other OSes, or when the
+/// open/flag is rejected: the caller falls back to plain buffered pread.
 fn open_direct(path: &str) -> Option<std::fs::File> {
     #[cfg(target_os = "linux")]
     {
@@ -638,7 +640,23 @@ fn open_direct(path: &str) -> Option<std::fs::File> {
         }
         return std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).ok();
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if env_off("MICROKIMI_NO_ODIRECT") {
+            return None;
+        }
+        // F_NOCACHE = 48: this fd bypasses the unified buffer cache.
+        // Direct FFI to the system lib, no libc crate.
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        }
+        const F_NOCACHE: i32 = 48;
+        let f = std::fs::File::open(path).ok()?;
+        let r = unsafe { fcntl(f.as_raw_fd(), F_NOCACHE, 1) };
+        return if r == 0 { Some(f) } else { None };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
         None
@@ -652,23 +670,31 @@ fn open_direct(path: &str) -> Option<std::fs::File> {
 /// pread(off, out.len()) would return.
 fn read_direct(f: &std::fs::File, off: u64, out: &mut [u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    const ALIGN: u64 = 4096;
-    let start = off & !(ALIGN - 1);
-    let end = (off + out.len() as u64).next_multiple_of(ALIGN);
-    let n = (end - start) as usize;
-    let layout = std::alloc::Layout::from_size_align(n, ALIGN as usize).unwrap();
-    let p = unsafe { std::alloc::alloc(layout) };
-    if p.is_null() {
-        return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "aligned O_DIRECT buffer"));
+    #[cfg(target_os = "macos")]
+    {
+        // F_NOCACHE fd: no alignment constraints, plain pread.
+        return f.read_exact_at(out, off);
     }
-    let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
-    let r = f.read_exact_at(buf, start);
-    if r.is_ok() {
-        let skip = (off - start) as usize;
-        out.copy_from_slice(&buf[skip..skip + out.len()]);
+    #[cfg(not(target_os = "macos"))]
+    {
+        const ALIGN: u64 = 4096;
+        let start = off & !(ALIGN - 1);
+        let end = (off + out.len() as u64).next_multiple_of(ALIGN);
+        let n = (end - start) as usize;
+        let layout = std::alloc::Layout::from_size_align(n, ALIGN as usize).unwrap();
+        let p = unsafe { std::alloc::alloc(layout) };
+        if p.is_null() {
+            return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "aligned O_DIRECT buffer"));
+        }
+        let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
+        let r = f.read_exact_at(buf, start);
+        if r.is_ok() {
+            let skip = (off - start) as usize;
+            out.copy_from_slice(&buf[skip..skip + out.len()]);
+        }
+        unsafe { std::alloc::dealloc(p, layout) };
+        r
     }
-    unsafe { std::alloc::dealloc(p, layout) };
-    r
 }
 
 /// Local .bin source: expert blobs pread from the model file itself, through
@@ -758,14 +784,15 @@ impl ExpertCache {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
         let direct = open_direct(path);
         // one-time startup lines: state of the runtime A/B toggles
+        let dio_name = if cfg!(target_os = "macos") { "F_NOCACHE" } else { "O_DIRECT" };
         if direct.is_some() {
-            println!("stream: O_DIRECT on (MICROKIMI_NO_ODIRECT=1 to disable)");
-        } else if cfg!(target_os = "linux") && env_off("MICROKIMI_NO_ODIRECT") {
-            println!("stream: O_DIRECT off (MICROKIMI_NO_ODIRECT=1)");
-        } else if cfg!(target_os = "linux") {
-            println!("stream: O_DIRECT unavailable (open failed, buffered pread fallback)");
+            println!("stream: {} on (MICROKIMI_NO_ODIRECT=1 to disable)", dio_name);
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) && env_off("MICROKIMI_NO_ODIRECT") {
+            println!("stream: {} off (MICROKIMI_NO_ODIRECT=1)", dio_name);
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+            println!("stream: {} unavailable (open failed, buffered pread fallback)", dio_name);
         } else {
-            println!("stream: O_DIRECT n/a (Linux only, buffered pread)");
+            println!("stream: direct I/O n/a (buffered pread)");
         }
         if offset_sort() {
             println!("stream: offset-sorted expert reads on (MICROKIMI_NO_OFFSORT=1 to disable)");
