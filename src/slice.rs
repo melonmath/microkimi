@@ -4,6 +4,25 @@
 // top_k, n_layers, mla_layers, dense_layers).
 //
 //   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
+//                                                [--vocab-top N <freqfile> [--vocab-base <remap.json>]]
+//
+// Vocabulary pruning (--vocab-top N freqfile): keeps the N most frequent
+// token rows of embed_tokens.weight / lm_head.weight plus ALL special tokens
+// (they have near-zero corpus frequency but are structural: <|open|>, <|sep|>,
+// <|close|>, <|end_of_msg|>, UNK, PAD...). Detection is conservative: every id
+// of the source config "specials" block is kept, and on a full Kimi vocab
+// (vocab > 163584) the whole reserved block [163584, vocab) is kept. The
+// freqfile ids index the model's CURRENT vocabulary: text format is
+// "<token_id> <count>" per line ('#' comments, blank lines ok); a JSON object
+// {"<id>": <count>, ...} is also accepted. nano/count_freq.py builds one from
+// a tokenized corpus (u32/u16 binary + .meta.json sidecar). The output config
+// carries the new (smaller) vocab size, and a runtime remap compatible with
+// the engine's --vocab mechanism is written next to the .bin as
+// <stem>.vocab.json (new_id -> kimi id via "nano_to_kimi"; dropped tokens
+// encode as UNK). When the source model is itself remapped (e.g. nano vocab),
+// the remap is composed through the base table: --vocab-base, else
+// vocab_nano.json next to the source with a matching vocab_size, else (full
+// Kimi vocab only) the identity.
 //
 // Precision tiering (--cold-vq N): no structural pruning, ALL experts stay
 // (router untouched); per MoE layer the top-N experts by Frobenius score
@@ -696,6 +715,7 @@ struct Plan {
     role: Role,
     channels: Vec<usize>,          // hidden keep-set (identity when no --hidden)
     experts: Option<Vec<usize>>,  // expert keep-set for RouterW/RouterB rows
+    vocab: Option<Vec<usize>>,    // vocab keep-set (old row ids, ascending) for embed/lm_head
 }
 
 /// Slices an f32 tensor according to its role. Returns (values, new_dims).
@@ -765,6 +785,241 @@ fn slice_f32_rows(role: Role, vals: &[f32], r0: usize, r1: usize, cols: usize, c
         }
         _ => unreachable!(),
     }
+}
+
+/// Row-chunk slicing for embed/lm_head under --vocab-top: emits only the
+/// kept vocab rows of input chunk r0..r1 (keep is ascending), with columns
+/// pruned to ch exactly like ColsD.
+fn slice_vocab_rows(vals: &[f32], r0: usize, r1: usize, cols: usize, ch: &[usize], keep: &[usize]) -> Vec<f32> {
+    let lo = keep.partition_point(|&j| j < r0);
+    let hi = keep.partition_point(|&j| j < r1);
+    let mut out = Vec::with_capacity((hi - lo) * ch.len());
+    for &j in &keep[lo..hi] {
+        let row = &vals[(j - r0) * cols..(j - r0 + 1) * cols];
+        out.extend(ch.iter().map(|&c| row[c]));
+    }
+    out
+}
+
+// ── vocabulary pruning (--vocab-top) ──
+
+/// Special tokens the runtime remap must carry (NanoTokenizer::load unwraps
+/// all of them but pad).
+const SPECIAL_NAMES: [&str; 8] = ["bos", "eos", "open", "close", "sep", "end_of_msg", "unk", "pad"];
+
+/// Id of a special token in the FULL Kimi vocabulary (163584+ reserved block).
+fn kimi_special_id(name: &str) -> Option<u32> {
+    use crate::tokenizer as t;
+    Some(match name {
+        "bos" => t::BOS,
+        "eos" => t::EOS,
+        "open" => t::OPEN,
+        "close" => t::CLOSE,
+        "sep" => t::SEP,
+        "end_of_msg" => t::END_OF_MSG,
+        "unk" => t::UNK,
+        "pad" => t::PAD,
+        _ => return None,
+    })
+}
+
+/// Old-vocab ids of every known special token: the source config "specials"
+/// block first (nano models carry all 8), completed with the full-Kimi
+/// constants when the vocab covers the reserved block [NUM_BASE, vocab).
+/// Conservative by design: anything structural is kept, never ranked.
+fn known_specials(source_json: &crate::json::Json, cfg: &Config) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    if let Some(crate::json::Json::Obj(pairs)) = source_json.get("specials") {
+        for (k, v) in pairs {
+            if let (Some(_), Some(id)) = (kimi_special_id(k), v.as_num()) {
+                out.push((k.clone(), id as u32));
+            }
+        }
+    }
+    if cfg.vocab > crate::tokenizer::NUM_BASE as usize {
+        for n in SPECIAL_NAMES {
+            if !out.iter().any(|(k, _)| k == n) {
+                out.push((n.to_string(), kimi_special_id(n).unwrap()));
+            }
+        }
+    }
+    // the config-level bos / end_of_msg are structural: never drop them
+    for (n, id) in [("bos", cfg.bos_id), ("end_of_msg", cfg.eos_id)] {
+        if !out.iter().any(|(k, _)| k == n) {
+            out.push((n.to_string(), id));
+        }
+    }
+    out.retain(|&(_, id)| (id as usize) < cfg.vocab);
+    out
+}
+
+/// Parses a freqfile into per-id counts (len = vocab). Text format:
+/// "<token_id> <count>" per line ('#' comments and blank lines ignored); a
+/// JSON object {"<id>": <count>, ...} is also accepted. Ids index the model's
+/// CURRENT vocabulary: an out-of-range id means the freqfile was built for
+/// another model and the slice would silently corrupt the embeddings.
+fn parse_freqfile(path: &str, vocab: usize) -> Vec<u64> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("freqfile {} unreadable: {}", path, e));
+    let mut counts = vec![0u64; vocab];
+    let mut put = |id: usize, c: u64, what: &str| {
+        assert!(
+            id < vocab,
+            "freqfile {}: token id {} out of range (model vocab is {}) - {}",
+            path, id, vocab, what
+        );
+        counts[id] = c;
+    };
+    if text.trim_start().starts_with('{') {
+        if let crate::json::Json::Obj(pairs) = crate::json::parse(text.as_bytes()) {
+            for (k, v) in pairs {
+                let id: usize = k.parse().unwrap_or_else(|_| panic!("freqfile {}: bad object key '{}'", path, k));
+                let c = v.as_num().unwrap_or_else(|| panic!("freqfile {}: bad count for id {}", path, id));
+                put(id, c as u64, "the freqfile must count the ids of the model's CURRENT vocabulary");
+            }
+        } else {
+            panic!("freqfile {}: expected a flat JSON object {{\"<id>\": <count>, ...}}", path);
+        }
+    } else {
+        for (ln, raw) in text.lines().enumerate() {
+            let line = raw.split('#').next().unwrap().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(id), Some(c)) = (it.next(), it.next()) else {
+                panic!("freqfile {}:{}: expected '<token_id> <count>'", path, ln + 1);
+            };
+            let id: usize = id.parse().unwrap_or_else(|_| panic!("freqfile {}:{}: bad id '{}'", path, ln + 1, id));
+            let c: u64 = c.parse().unwrap_or_else(|_| panic!("freqfile {}:{}: bad count '{}'", path, ln + 1, c));
+            put(id, c, "the freqfile must count the ids of the model's CURRENT vocabulary");
+        }
+    }
+    counts
+}
+
+/// Old row id -> kimi id table of an ALREADY remapped source vocab (e.g. the
+/// nano 8200): explicit --vocab-base, else vocab_nano.json next to the source
+/// model with a matching vocab_size. None = identity (full Kimi vocab).
+fn base_vocab_map(model: &str, base_flag: Option<String>, vocab: usize) -> Option<(crate::json::Json, Vec<u32>)> {
+    let try_load = |p: &str| -> Option<(crate::json::Json, Vec<u32>)> {
+        let bytes = std::fs::read(p).ok()?;
+        let j = crate::json::parse(&bytes);
+        let vs = j.get("vocab_size").and_then(|x| x.as_num()).map(|n| n as usize);
+        if vs != Some(vocab) {
+            return None;
+        }
+        let m: Vec<u32> = j.get("nano_to_kimi")?.as_arr()?.iter().map(|x| x.as_num().unwrap() as u32).collect();
+        Some((j, m))
+    };
+    if let Some(p) = base_flag {
+        return Some(
+            try_load(&p).unwrap_or_else(|| panic!("--vocab-base {}: not a vocab remap matching the source vocab {}", p, vocab)),
+        );
+    }
+    let dir = std::path::Path::new(model).parent().unwrap_or(std::path::Path::new("."));
+    let cand = dir.join("vocab_nano.json");
+    if let Some(bm) = cand.to_str().and_then(&try_load) {
+        println!("vocab: composing through the base remap {}", cand.display());
+        return Some(bm);
+    }
+    assert!(
+        vocab > crate::tokenizer::NUM_BASE as usize,
+        "--vocab-top on an already remapped vocab ({} ids) needs --vocab-base <remap.json> \
+(or a vocab_nano.json with a matching vocab_size next to the source model) to map rows back to kimi ids",
+        vocab
+    );
+    None
+}
+
+/// Result of the --vocab-top selection: the kept rows plus the runtime remap
+/// file (engine --vocab compatible) to write next to the .bin.
+struct VocabPlan {
+    keep: Vec<usize>,                 // old row ids kept, ascending
+    specials_new: Vec<(String, u32)>, // name -> NEW id (ascending old order)
+    remap_path: String,
+    remap_json: String,
+}
+
+/// Top-N by frequency + all specials/reserved ids, and the remap JSON.
+fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json::Json, cfg: &Config, n_top: usize, freq_path: &str, base_flag: Option<String>) -> VocabPlan {
+    let counts = parse_freqfile(freq_path, cfg.vocab);
+    let specials_old = known_specials(source_json, cfg);
+    let scores: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+    let mut keep = top_n(&scores, n_top.min(cfg.vocab));
+    let n_freq = keep.len();
+    // specials are never ranked: force-keep them all (in doubt, keep)
+    for &(_, id) in &specials_old {
+        keep.push(id as usize);
+    }
+    // full Kimi vocab: the whole reserved block [NUM_BASE, vocab) stays
+    if cfg.vocab > crate::tokenizer::NUM_BASE as usize {
+        keep.extend(crate::tokenizer::NUM_BASE as usize..cfg.vocab);
+    }
+    keep.sort_unstable();
+    keep.dedup();
+    let total: u64 = counts.iter().sum();
+    let covered: u64 = keep.iter().map(|&j| counts[j]).sum();
+    println!(
+        "vocab: keeping {}/{} rows (top-{} by frequency + {} special/reserved), {:.2}% of the counted token mass",
+        keep.len(),
+        cfg.vocab,
+        n_freq,
+        keep.len() - n_freq,
+        covered as f64 / total.max(1) as f64 * 100.0
+    );
+
+    // old row -> kimi id (through the base remap when the source is remapped)
+    let base = base_vocab_map(model, base_flag, cfg.vocab);
+    let kimi_of = |old: usize| -> u32 {
+        match &base {
+            None => old as u32,
+            Some((_, m)) => {
+                if old < m.len() {
+                    m[old]
+                } else {
+                    // special row of the base vocab: back to the kimi constant
+                    specials_old
+                        .iter()
+                        .find(|&(_, id)| *id as usize == old)
+                        .and_then(|(n, _)| kimi_special_id(n))
+                        .unwrap_or(crate::tokenizer::UNK)
+                }
+            }
+        }
+    };
+    let specials_new: Vec<(String, u32)> = specials_old
+        .iter()
+        .map(|(n, id)| {
+            let new = keep.binary_search(&(*id as usize)).expect("special token missing from the keep-set") as u32;
+            (n.clone(), new)
+        })
+        .collect();
+    for req in ["bos", "eos", "open", "close", "sep", "end_of_msg", "unk"] {
+        assert!(
+            specials_new.iter().any(|(n, _)| n == req),
+            "--vocab-top: no '{}' id found (source config specials + kimi constants) - the runtime remap would be unloadable",
+            req
+        );
+    }
+    let nano_to_kimi: Vec<u32> = keep.iter().map(|&j| kimi_of(j)).collect();
+    let specials_json = specials_new
+        .iter()
+        .map(|(n, id)| format!("\"{}\": {}", n, id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remap_json = format!(
+        "{{\n \"format\": \"microkimi-vocab-remap-1\",\n \"source_vocab\": {},\n \"vocab_size\": {},\n \"nano_to_kimi\": [{}],\n \"specials\": {{{}}},\n \"kimi_special_ids\": {{\"open\": {}, \"close\": {}, \"sep\": {}, \"end_of_msg\": {}}}\n}}\n",
+        cfg.vocab,
+        keep.len(),
+        nano_to_kimi.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
+        specials_json,
+        crate::tokenizer::OPEN,
+        crate::tokenizer::CLOSE,
+        crate::tokenizer::SEP,
+        crate::tokenizer::END_OF_MSG,
+    );
+    let remap_path = format!("{}.vocab.json", out.strip_suffix(".bin").unwrap_or(out));
+    VocabPlan { keep, specials_new, remap_path, remap_json }
 }
 
 fn value_flag(args: &[String], name: &str) -> Option<String> {
@@ -916,8 +1171,17 @@ pub fn run(args: &[String]) {
     // (cold, ~0.5 bit/weight, one global 256x16 codebook). Combined with
     // --experts M (M >= N): only the top-M experts are kept, top-N hot.
     let cold_vq: Option<usize> = value_flag(args, "--cold-vq").map(|s| s.parse().expect("bad --cold-vq"));
-    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() {
-        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq");
+    // --vocab-top N <freqfile>: vocabulary pruning (see the header comment).
+    // N rows by frequency + every special token; the remap rides next to the
+    // .bin as <stem>.vocab.json (engine --vocab compatible).
+    let vocab_top: Option<(usize, String)> = args.iter().position(|a| a == "--vocab-top").map(|i| {
+        let n: usize = args.get(i + 1).and_then(|s| s.parse().ok()).expect("--vocab-top needs N (rows to keep) and a freqfile path");
+        let f = args.get(i + 2).cloned().expect("--vocab-top needs a freqfile path after N");
+        (n, f)
+    });
+    let vocab_base = value_flag(args, "--vocab-base");
+    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() {
+        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq / --vocab-top");
         std::process::exit(1);
     }
     if let (Some(m), Some(n)) = (experts, cold_vq) {
@@ -957,12 +1221,21 @@ pub fn run(args: &[String]) {
     println!("layers: keeping {}/{} {:?}", kept_layers.len(), cfg.n_layers, kept_layers);
 
     // crash-safe resume checkpoint: model + kept layers + pruning params
+    // (vocab-top is part of the key: N and the freqfile content hash)
+    let vocabtop_key = vocab_top
+        .as_ref()
+        .map(|(n, f)| {
+            let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("freqfile {} unreadable: {}", f, e));
+            format!("{}:{:016x}", n, fnv1a(&text))
+        })
+        .unwrap_or_default();
     let ckpt_key = format!(
-        "model={}|layers={}|hidden={}|experts={}",
+        "model={}|layers={}|hidden={}|experts={}|vocabtop={}",
         model,
         join_csv(&kept_layers),
         hidden.map(|h| h.to_string()).unwrap_or_default(),
-        experts.map(|e| e.to_string()).unwrap_or_default()
+        experts.map(|e| e.to_string()).unwrap_or_default(),
+        vocabtop_key
     );
     let ckpt = SliceCkpt::open(&out, &ckpt_key);
 
@@ -1053,6 +1326,12 @@ pub fn run(args: &[String]) {
             }
         };
 
+    // ── 3c. vocabulary selection (--vocab-top): cheap, not checkpointed ──
+    let vocab_plan: Option<VocabPlan> = vocab_top.as_ref().map(|(n, freq)| {
+        assert!(*n > 0, "--vocab-top must be >= 1");
+        build_vocab_plan(&model, &out, &source.source_json(), cfg, *n, freq, vocab_base.clone())
+    });
+
     // ── 4. plan: output tensors in input directory order ──
     let mut plans: Vec<Plan> = Vec::new();
     for e in source.entries() {
@@ -1087,14 +1366,20 @@ pub fn run(args: &[String]) {
             }
         };
         let ch: Vec<usize> = channels.clone().unwrap_or_else(|| (0..d).collect());
+        // embed/lm_head rows are the vocab axis: pruned by --vocab-top
+        let vrows: Option<Vec<usize>> = match (&vocab_plan, e.name.as_str()) {
+            (Some(v), "embed_tokens.weight" | "lm_head.weight") => Some(v.keep.clone()),
+            _ => None,
+        };
         let dims = if matches!(role, Role::Copy | Role::Expert) {
             e.dims.clone()
         } else {
             // compute the sliced dims without materializing the data
             let r = e.dims[0] as usize;
+            let out_rows = vrows.as_ref().map(|k| k.len()).unwrap_or(r) as u32;
             match role {
                 Role::VecD => vec![ch.len() as u32],
-                Role::ColsD => vec![r as u32, ch.len() as u32],
+                Role::ColsD => vec![out_rows, ch.len() as u32],
                 Role::RowsD => vec![ch.len() as u32, e.dims[1]],
                 Role::BothD => vec![ch.len() as u32, ch.len() as u32],
                 Role::RouterW => vec![experts_for_tensor.as_ref().map(|k| k.len()).unwrap_or(r) as u32, ch.len() as u32],
@@ -1110,6 +1395,7 @@ pub fn run(args: &[String]) {
             role,
             channels: ch,
             experts: experts_for_tensor,
+            vocab: vrows,
         });
     }
     // the global VQ codebook rides as one extra f32 tensor (src_name "" marks it)
@@ -1122,6 +1408,7 @@ pub fn run(args: &[String]) {
             role: Role::Copy,
             channels: Vec::new(),
             experts: None,
+            vocab: None,
         });
     }
 
@@ -1130,6 +1417,19 @@ pub fn run(args: &[String]) {
     let new_d = channels.as_ref().map(|c| c.len()).unwrap_or(d);
     let new_n_experts = experts.unwrap_or(cfg.n_experts);
     let new_top_k = cfg.top_k.min(new_n_experts);
+    let new_vocab = vocab_plan.as_ref().map(|v| v.keep.len()).unwrap_or(cfg.vocab);
+    // specials: with --vocab-top every known special is recorded at its NEW
+    // id (a re-slice can then find them all again); otherwise the historical
+    // bos/end_of_msg pair, unchanged.
+    let specials_kv = match &vocab_plan {
+        Some(v) => v
+            .specials_new
+            .iter()
+            .map(|(n, id)| format!("\"{}\": {}", n, id))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => format!("\"bos\": {}, \"end_of_msg\": {}", cfg.bos_id, cfg.eos_id),
+    };
     let mla_layers: Vec<usize> = kept_layers.iter().enumerate().filter(|&(_, &l)| cfg.is_mla(l)).map(|(i, _)| i).collect();
     let dense_layers: Vec<usize> = kept_layers.iter().enumerate().filter(|&(_, &l)| !cfg.is_moe(l)).map(|(i, _)| i).collect();
     let tokenizer_kv = source
@@ -1147,18 +1447,19 @@ pub fn run(args: &[String]) {
 \"routed_hidden\": {}, \"moe_inter\": {}, \"shared_inter\": {}, \"dense_inter\": {}, \
 \"attn_res_block\": {}, \"first_k_dense\": {}, \"rms_eps\": {}{}, \
 \"mla_layers\": [{}], \"dense_layers\": [{}], \
-\"specials\": {{\"bos\": {}, \"end_of_msg\": {}}}, \
-\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"{}}}}}",
+\"specials\": {{{}}}, \
+\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"{}{}}}}}",
         arch_kv,
-        new_n_layers, new_d, cfg.vocab, new_n_experts, new_top_k, cfg.n_shared,
+        new_n_layers, new_d, new_vocab, new_n_experts, new_top_k, cfg.n_shared,
         cfg.kda_heads, cfg.kda_dim, cfg.kda_conv, cfg.kda_fa, cfg.gate_lb,
         cfg.mla_heads, cfg.mla_qa, cfg.mla_kva, cfg.mla_nope, cfg.mla_rope, cfg.mla_v,
         cfg.routed_hidden, cfg.moe_inter, cfg.shared_inter, cfg.dense_inter,
         cfg.attn_res_block, cfg.first_k_dense, cfg.rms_eps, tokenizer_kv,
         list(&mla_layers), list(&dense_layers),
-        cfg.bos_id, cfg.eos_id,
+        specials_kv,
         new_d, new_n_experts, kept_layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(","),
         cold_vq.map(|n| format!(", \"cold_vq\": {}", n)).unwrap_or_default(),
+        vocab_top.as_ref().map(|(n, _)| format!(", \"vocab_top\": {}", n)).unwrap_or_default(),
     );
 
     // ── 6. write ──
@@ -1203,7 +1504,11 @@ pub fn run(args: &[String]) {
                 let mut written = 0u64;
                 for (r0, r1) in row_chunks(rows, cols) {
                     let vals = source.f32_rows(se, r0, r1);
-                    let bytes = f32_to_bytes(&slice_f32_rows(p.role, &vals, r0, r1, cols, &p.channels));
+                    let sliced = match &p.vocab {
+                        Some(keep) => slice_vocab_rows(&vals, r0, r1, cols, &p.channels, keep),
+                        None => slice_f32_rows(p.role, &vals, r0, r1, cols, &p.channels),
+                    };
+                    let bytes = f32_to_bytes(&sliced);
                     w.write_blob_at(&mut f, off + written, &bytes);
                     written += bytes.len() as u64;
                 }
@@ -1267,5 +1572,10 @@ pub fn run(args: &[String]) {
         );
     }
     println!("  done in {:.0?}", t0.elapsed());
+    if let Some(v) = &vocab_plan {
+        std::fs::write(&v.remap_path, &v.remap_json).unwrap_or_else(|e| panic!("{} unwritable: {}", v.remap_path, e));
+        println!("  vocab: {} -> {} rows kept; runtime remap: {}", cfg.vocab, v.keep.len(), v.remap_path);
+        println!("         run with: microkimi run \"...\" --model {} --vocab {}", out, v.remap_path);
+    }
     ckpt.finish();
 }
