@@ -509,6 +509,9 @@ pub struct Model {
     pub(crate) caches: Vec<Cache>, // pub(crate): saved/restored by mkmem.rs
     pub last_logits: Vec<f32>,     // logits of the last forward (source for mkmem --save)
     pub prof: Prof,
+    /// --stream: RAM LRU of packed expert bytes over the disk/HTTP tiers
+    /// (stream.rs). None = historical full-load path, byte-identical behavior.
+    stream: Option<crate::stream::ExpertCache>,
 }
 
 impl Model {
@@ -517,7 +520,19 @@ impl Model {
     }
 
     pub fn load(path: &str) -> Self {
-        let bin = BinFile::open(path);
+        Self::from_bin(BinFile::open(path), None)
+    }
+
+    /// Streaming load (--stream): the spine is loaded compacted (expert MXFP4
+    /// blobs excluded), experts are served on demand by the three-tier cache
+    /// (RAM LRU of `ram_mb` MB -> the .bin on disk). Same weights, same
+    /// dequant, same matvec: the output is bit-identical to `load`.
+    pub fn load_streaming(path: &str, ram_mb: usize) -> Self {
+        let bin = BinFile::open_spine(path);
+        Self::from_bin(bin, Some(crate::stream::ExpertCache::local(path, ram_mb)))
+    }
+
+    fn from_bin(bin: BinFile, stream: Option<crate::stream::ExpertCache>) -> Self {
         let cfg = bin.config.clone();
         let get = |name: &str| -> T {
             T::from(bin.entries.get(name).unwrap_or_else(|| panic!("missing tensor: {}", name)))
@@ -613,7 +628,7 @@ impl Model {
             };
             layers.push(LayerW { input_ln, post_ln, sa_res_w, mlp_res_w, attn, ffn });
         }
-        Model { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default() }
+        Model { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), stream }
     }
 
     /// Number of tokens already represented in the caches (from the first MLA
@@ -1056,7 +1071,7 @@ fn mla_prefill(
 
 // ── MoE ──
 
-fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, layer: usize, pos: usize) -> Vec<f32> {
+fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, layer: usize, pos: usize, stream: Option<&crate::stream::ExpertCache>) -> Vec<f32> {
     // noaux_tc router: sigmoid, +bias for selection, weights without bias
     let tm = Instant::now();
     let gate_w = Model::t(data, &w.gate_w);
@@ -1112,34 +1127,72 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
     let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
     let (erh, emi) = (cfg.routed_hidden, cfg.moe_inter); // copies for the 'static closures
     let mut outs = vec![0f32; cfg.top_k * cfg.routed_hidden];
-    {
-        let dp = crate::pool::SPtrU8(data.as_ptr());
-        let dlen = data.len();
-        let hp = crate::pool::SPtr(h.as_ptr());
-        let op = crate::pool::MPtr(outs.as_mut_ptr());
-        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
-        for (ei, _) in weights.iter().enumerate() {
-            let offs = w.experts[sel[ei].0 as usize];
-            jobs.push(Box::new(move || {
-                let (dp, hp, op) = (dp, hp, op);
-                unsafe {
-                    let data = std::slice::from_raw_parts(dp.0, dlen);
-                    let h = std::slice::from_raw_parts(hp.0, erh);
-                    let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
-                    let mut a = vec![0f32; emi];
-                    let mut u = vec![0f32; emi];
-                    crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
-                    crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
-                    let mut act = vec![0f32; emi];
-                    for j in 0..emi {
-                        act[j] = situ(a[j], u[j]);
+    match stream {
+        // historical full-load path: expert blobs read straight from the file image
+        None => {
+            let dp = crate::pool::SPtrU8(data.as_ptr());
+            let dlen = data.len();
+            let hp = crate::pool::SPtr(h.as_ptr());
+            let op = crate::pool::MPtr(outs.as_mut_ptr());
+            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
+            for (ei, _) in weights.iter().enumerate() {
+                let offs = w.experts[sel[ei].0 as usize];
+                jobs.push(Box::new(move || {
+                    let (dp, hp, op) = (dp, hp, op);
+                    unsafe {
+                        let data = std::slice::from_raw_parts(dp.0, dlen);
+                        let h = std::slice::from_raw_parts(hp.0, erh);
+                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
+                        let mut a = vec![0f32; emi];
+                        let mut u = vec![0f32; emi];
+                        crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
+                        crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        let mut act = vec![0f32; emi];
+                        for j in 0..emi {
+                            act[j] = situ(a[j], u[j]);
+                        }
+                        let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
+                        crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
                     }
-                    let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
-                    crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
-                }
-            }));
+                }));
+            }
+            crate::pool::pool().run(jobs);
         }
-        crate::pool::pool().run(jobs);
+        // --stream: router-first prefetch. The router above already selected
+        // the 16 experts; each pool job pulls its packed bytes through the
+        // three-tier cache (RAM LRU -> disk -> HTTP) and computes as soon as
+        // its bytes land. Same bytes, same matvec sequence: bit-identical.
+        Some(cache) => {
+            let cp = cache as *const crate::stream::ExpertCache as usize;
+            let hp = crate::pool::SPtr(h.as_ptr());
+            let op = crate::pool::MPtr(outs.as_mut_ptr());
+            let layer32 = layer as u32;
+            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
+            for (ei, _) in weights.iter().enumerate() {
+                let e = sel[ei].0;
+                let offs = w.experts[e as usize];
+                jobs.push(Box::new(move || {
+                    let (hp, op) = (hp, op);
+                    unsafe {
+                        let cache = &*(cp as *const crate::stream::ExpertCache);
+                        let bytes = cache.get(layer32, e, offs, expert_blob);
+                        let h = std::slice::from_raw_parts(hp.0, erh);
+                        let blob = |i: usize| &bytes[i * expert_blob..(i + 1) * expert_blob];
+                        let mut a = vec![0f32; emi];
+                        let mut u = vec![0f32; emi];
+                        crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
+                        crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        let mut act = vec![0f32; emi];
+                        for j in 0..emi {
+                            act[j] = situ(a[j], u[j]);
+                        }
+                        let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
+                        crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
+                    }
+                }));
+            }
+            crate::pool::pool().run(jobs);
+        }
     }
     let mut y = vec![0f32; cfg.routed_hidden];
     for (ei, &wi) in weights.iter().enumerate() {
@@ -1253,6 +1306,7 @@ fn moe_prefill(
     prof: &mut Prof,
     layer: usize,
     pos0: usize,
+    stream: Option<&crate::stream::ExpertCache>,
 ) -> Vec<f32> {
     // noaux_tc router: sigmoid, +bias for selection, weights without bias
     let tm = Instant::now();
@@ -1320,50 +1374,101 @@ fn moe_prefill(
         }
     }
     let mut outs = vec![0f32; n * cfg.top_k * cfg.routed_hidden];
-    {
-        let dp = crate::pool::SPtrU8(data.as_ptr());
-        let dlen = data.len();
-        let hp = crate::pool::SPtr(h.as_ptr());
-        let op = crate::pool::MPtr(outs.as_mut_ptr());
-        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
-        for (e, pairs) in by_expert {
-            let offs = w.experts[e as usize];
-            jobs.push(Box::new(move || {
-                let (dp, hp, op) = (dp, hp, op);
-                unsafe {
-                    let data = std::slice::from_raw_parts(dp.0, dlen);
-                    let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
-                    let m = pairs.len();
-                    let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
-                    // gather the inputs of this expert's pairs, transposed [erh][m8]
-                    let mut ht = vec![0f32; m8 * erh];
-                    for (i, (t, _)) in pairs.iter().enumerate() {
-                        let h = std::slice::from_raw_parts(hp.0.add(t * erh), erh);
-                        for c in 0..erh {
-                            ht[c * m8 + i] = h[c];
+    match stream {
+        // historical full-load path: expert blobs read straight from the file image
+        None => {
+            let dp = crate::pool::SPtrU8(data.as_ptr());
+            let dlen = data.len();
+            let hp = crate::pool::SPtr(h.as_ptr());
+            let op = crate::pool::MPtr(outs.as_mut_ptr());
+            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
+            for (e, pairs) in by_expert {
+                let offs = w.experts[e as usize];
+                jobs.push(Box::new(move || {
+                    let (dp, hp, op) = (dp, hp, op);
+                    unsafe {
+                        let data = std::slice::from_raw_parts(dp.0, dlen);
+                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
+                        let m = pairs.len();
+                        let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
+                        // gather the inputs of this expert's pairs, transposed [erh][m8]
+                        let mut ht = vec![0f32; m8 * erh];
+                        for (i, (t, _)) in pairs.iter().enumerate() {
+                            let h = std::slice::from_raw_parts(hp.0.add(t * erh), erh);
+                            for c in 0..erh {
+                                ht[c * m8 + i] = h[c];
+                            }
+                        }
+                        let mut a = vec![0f32; m8 * emi];
+                        let mut u = vec![0f32; m8 * emi];
+                        matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
+                        matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        // SiTU, transposed [emi][m8]
+                        let mut act_t = vec![0f32; m8 * emi];
+                        for i in 0..m {
+                            for j in 0..emi {
+                                act_t[j * m8 + i] = situ(a[i * emi + j], u[i * emi + j]);
+                            }
+                        }
+                        let mut o = vec![0f32; m8 * erh];
+                        matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        for (i, (t, slot)) in pairs.iter().enumerate() {
+                            let dst = std::slice::from_raw_parts_mut(op.0.add((t * topk + slot) * erh), erh);
+                            dst.copy_from_slice(&o[i * erh..(i + 1) * erh]);
                         }
                     }
-                    let mut a = vec![0f32; m8 * emi];
-                    let mut u = vec![0f32; m8 * emi];
-                    matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
-                    matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
-                    // SiTU, transposed [emi][m8]
-                    let mut act_t = vec![0f32; m8 * emi];
-                    for i in 0..m {
-                        for j in 0..emi {
-                            act_t[j * m8 + i] = situ(a[i * emi + j], u[i * emi + j]);
-                        }
-                    }
-                    let mut o = vec![0f32; m8 * erh];
-                    matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
-                    for (i, (t, slot)) in pairs.iter().enumerate() {
-                        let dst = std::slice::from_raw_parts_mut(op.0.add((t * topk + slot) * erh), erh);
-                        dst.copy_from_slice(&o[i * erh..(i + 1) * erh]);
-                    }
-                }
-            }));
+                }));
+            }
+            crate::pool::pool().run(jobs);
         }
-        crate::pool::pool().run(jobs);
+        // --stream: one job per used expert, bytes pulled through the
+        // three-tier cache before the same batched matvec sequence runs.
+        Some(cache) => {
+            let cp = cache as *const crate::stream::ExpertCache as usize;
+            let hp = crate::pool::SPtr(h.as_ptr());
+            let op = crate::pool::MPtr(outs.as_mut_ptr());
+            let layer32 = layer as u32;
+            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
+            for (e, pairs) in by_expert {
+                let offs = w.experts[e as usize];
+                jobs.push(Box::new(move || {
+                    let (hp, op) = (hp, op);
+                    unsafe {
+                        let cache = &*(cp as *const crate::stream::ExpertCache);
+                        let bytes = cache.get(layer32, e, offs, expert_blob);
+                        let blob = |i: usize| &bytes[i * expert_blob..(i + 1) * expert_blob];
+                        let m = pairs.len();
+                        let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
+                        // gather the inputs of this expert's pairs, transposed [erh][m8]
+                        let mut ht = vec![0f32; m8 * erh];
+                        for (i, (t, _)) in pairs.iter().enumerate() {
+                            let h = std::slice::from_raw_parts(hp.0.add(t * erh), erh);
+                            for c in 0..erh {
+                                ht[c * m8 + i] = h[c];
+                            }
+                        }
+                        let mut a = vec![0f32; m8 * emi];
+                        let mut u = vec![0f32; m8 * emi];
+                        matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
+                        matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        // SiTU, transposed [emi][m8]
+                        let mut act_t = vec![0f32; m8 * emi];
+                        for i in 0..m {
+                            for j in 0..emi {
+                                act_t[j * m8 + i] = situ(a[i * emi + j], u[i * emi + j]);
+                            }
+                        }
+                        let mut o = vec![0f32; m8 * erh];
+                        matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        for (i, (t, slot)) in pairs.iter().enumerate() {
+                            let dst = std::slice::from_raw_parts_mut(op.0.add((t * topk + slot) * erh), erh);
+                            dst.copy_from_slice(&o[i * erh..(i + 1) * erh]);
+                        }
+                    }
+                }));
+            }
+            crate::pool::pool().run(jobs);
+        }
     }
     // combination per position in slot order, norm BEFORE up-proj
     let mut yn = vec![0f32; n * cfg.routed_hidden];
@@ -1468,7 +1573,7 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof } = self;
+        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let embed = Self::t(data, embed);
@@ -1543,7 +1648,7 @@ impl Model {
                 }
                 FfnW::Moe(w) => {
                     let mut p = Prof::default();
-                    let out = moe_forward(cfg, data, w, &x, &mut p, l, pos);
+                    let out = moe_forward(cfg, data, w, &x, &mut p, l, pos, stream.as_ref());
                     prof.t_router += p.t_router;
                     prof.t_experts += p.t_experts;
                     out
@@ -1588,7 +1693,7 @@ impl Model {
         if ids.len() == 1 {
             return self.forward(ids[0], pos0);
         }
-        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof } = self;
+        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let n = ids.len();
@@ -1679,7 +1784,7 @@ impl Model {
                 }
                 FfnW::Moe(w) => {
                     let mut p = Prof::default();
-                    let out = moe_prefill(cfg, data, w, &x, n, &mut p, l, pos0);
+                    let out = moe_prefill(cfg, data, w, &x, n, &mut p, l, pos0, stream.as_ref());
                     prof.t_router += p.t_router;
                     prof.t_experts += p.t_experts;
                     out

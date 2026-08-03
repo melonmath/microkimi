@@ -23,6 +23,7 @@ mod safetensors;
 mod selftest;
 mod slice;
 mod slice_st;
+mod stream;
 mod tokenizer;
 mod weights;
 
@@ -70,11 +71,11 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20);
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"), &mut sampler_flag(&args));
+            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args));
         }
         "chat" => {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), value_flag(&args, "--memory"), value_flag(&args, "--save"), &mut sampler_flag(&args));
+            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), value_flag(&args, "--memory"), value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args));
         }
         // microkimi prefill "text" --save mem.mkmem [--model X.bin] [--vocab V.json] [--chat]
         "prefill" => {
@@ -85,8 +86,10 @@ fn main() {
                 std::process::exit(1);
             };
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"));
+            prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"), stream_ram_flag(&args));
         }
+        // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D]
+        "streamtest" => stream::streamtest(&args),
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
             let tok = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -129,6 +132,10 @@ fn main() {
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
+            println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
+            println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
+            println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D]");
+            println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
             println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
@@ -289,6 +296,36 @@ fn value_flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// --stream / --stream-ram N: MoE expert streaming with a RAM LRU budget of
+/// N MB (default 512). Some(mb) when streaming is requested (--stream-ram
+/// implies --stream), None for the historical full load.
+fn stream_ram_flag(args: &[String]) -> Option<usize> {
+    let mb = value_flag(args, "--stream-ram").and_then(|s| s.parse().ok());
+    if args.iter().any(|a| a == "--stream") || mb.is_some() {
+        Some(mb.unwrap_or(512))
+    } else {
+        None
+    }
+}
+
+/// Loads a K3 model, streaming or full, and prints the fetch report at exit
+/// when streaming was active.
+fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
+    match stream_mb {
+        Some(mb) => {
+            println!("stream: expert streaming enabled (RAM LRU budget {} MB)", mb);
+            model::Model::load_streaming(mp, mb)
+        }
+        None => model::Model::load(mp),
+    }
+}
+
+fn stream_report_maybe(stream_mb: Option<usize>) {
+    if stream_mb.is_some() {
+        println!("{}", crate::stream::report_line());
+    }
+}
+
 /// Builds the decoding policy from --temp / --top-p / --seed.
 /// temp absent or 0 -> greedy (the exact historical path). With temp > 0 and
 /// no --seed, the RNG is seeded from the wall clock (non reproducible).
@@ -369,12 +406,16 @@ fn check_tok_compat(tok: &tokenizer::AnyTokenizer, model: &model::Model) {
 }
 
 /// Loads tokenizer + weights, runs one inference turn with detailed output.
-fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>, sampler: &mut model::Sampler) -> String {
+fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>) -> String {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
     let mp_cfg = crate::weights::read_config(&mp);
     if mp_cfg.ds.is_some() {
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
+            std::process::exit(1);
+        }
         let tok = load_ds_any_tokenizer(&mp, vocab, mp_cfg.vocab);
         let mut model = deepseek::DsModel::load(&mp);
         println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -387,7 +428,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         return deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
     }
     let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
-    let mut model = model::Model::load(&mp);
+    let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     println!("cores used for matvecs: {}", model::n_threads());
@@ -421,6 +462,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         save_memory(&model, s);
     }
     gpu_prof_maybe_print();
+    stream_report_maybe(stream_mb);
     answer
 }
 
@@ -438,7 +480,7 @@ fn save_memory(model: &model::Model, path: &str) {
 /// `microkimi prefill "text" --save mem.mkmem`: ingests the text (raw
 /// completion encoding by default, chat template with --chat) and snapshots
 /// the resulting state, without generating anything.
-fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Option<String>, chat: bool) {
+fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Option<String>, chat: bool, stream_mb: Option<usize>) {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     if crate::weights::read_config(&mp).ds.is_some() {
@@ -446,7 +488,7 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
         std::process::exit(1);
     }
     let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
-    let mut model = model::Model::load(&mp);
+    let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     let ids = if chat {
@@ -461,17 +503,22 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
     save_memory(&model, save);
     let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
     println!("prefill: {} tokens ingested in {:.1?} - state saved to {} ({:.1} KB)", ids.len(), tp.elapsed(), save, size as f64 / 1024.0);
+    stream_report_maybe(stream_mb);
 }
 
-fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>, sampler: &mut model::Sampler) {
+fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>) {
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     if crate::weights::read_config(&mp).ds.is_some() {
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
+            std::process::exit(1);
+        }
         return chat_loop_ds(&mp, vocab, debug_routing, raw);
     }
     let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
-    let mut model = model::Model::load(&mp);
+    let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     gpu_status_line();
@@ -536,6 +583,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     if let Some(s) = &save {
         save_memory(&model, s);
     }
+    stream_report_maybe(stream_mb);
 }
 
 /// Interactive loop for DeepSeek-V4 models (DsTokenizer + DsModel).

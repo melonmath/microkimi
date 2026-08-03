@@ -150,52 +150,134 @@ pub fn read_config(path: &str) -> crate::config::Config {
     crate::config::Config::from_json(&crate::json::parse(&cbuf))
 }
 
+/// True for the routed MXFP4 expert matrices (layers.N.block_sparse_moe.experts.E.wI):
+/// exactly the tensors `--stream` keeps out of RAM (see stream.rs).
+pub fn is_expert_tensor(name: &str) -> bool {
+    name.contains(".block_sparse_moe.experts.") && (name.ends_with(".w1") || name.ends_with(".w2") || name.ends_with(".w3"))
+}
+
+/// Parses the header (magic + config block) and the tensor directory, leaving
+/// the file positioned anywhere: data blobs are NOT read. Shared by open
+/// (full load) and open_spine (streaming load).
+fn read_directory(path: &str) -> (std::fs::File, crate::config::Config, HashMap<String, Entry>) {
+    let mut f = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("{} unreadable: {} (run `microkimi build` first)", path, e));
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic).unwrap();
+    let config = if magic == *MAGIC {
+        crate::config::Config::microkimi() // MKIM0001: implicit microkimi config
+    } else if magic == *MAGIC_V2 {
+        // MKIM0002: u32 config_len + explicit JSON config
+        let mut clen = [0u8; 4];
+        f.read_exact(&mut clen).unwrap();
+        let clen = u32::from_le_bytes(clen) as usize;
+        let mut cbuf = vec![0u8; clen];
+        f.read_exact(&mut cbuf).unwrap();
+        crate::config::Config::from_json(&crate::json::parse(&cbuf))
+    } else {
+        panic!("bad magic in {} (expected MKIM0001 or MKIM0002)", path)
+    };
+    let mut nbuf = [0u8; 4];
+    f.read_exact(&mut nbuf).unwrap();
+    let n = u32::from_le_bytes(nbuf) as usize;
+    let mut entries = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let mut nlen = [0u8; 2];
+        f.read_exact(&mut nlen).unwrap();
+        let nlen = u16::from_le_bytes(nlen) as usize;
+        let mut name = vec![0u8; nlen];
+        f.read_exact(&mut name).unwrap();
+        let mut fixed = [0u8; 2];
+        f.read_exact(&mut fixed).unwrap();
+        let (dtype, n_dims) = (fixed[0], fixed[1] as usize);
+        let mut dims = vec![0u32; n_dims];
+        for d in dims.iter_mut() {
+            let mut b = [0u8; 4];
+            f.read_exact(&mut b).unwrap();
+            *d = u32::from_le_bytes(b);
+        }
+        let mut b16 = [0u8; 16];
+        f.read_exact(&mut b16).unwrap();
+        let offset = u64::from_le_bytes(b16[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(b16[8..16].try_into().unwrap());
+        entries.insert(String::from_utf8(name).unwrap(), Entry { dtype, dims, offset, size });
+    }
+    (f, config, entries)
+}
+
 impl BinFile {
     pub fn open(path: &str) -> Self {
-        let mut f = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {} (run `microkimi build` first)", path, e));
-        let mut magic = [0u8; 8];
-        f.read_exact(&mut magic).unwrap();
-        let config = if magic == *MAGIC {
-            crate::config::Config::microkimi() // MKIM0001: implicit microkimi config
-        } else if magic == *MAGIC_V2 {
-            // MKIM0002: u32 config_len + explicit JSON config
-            let mut clen = [0u8; 4];
-            f.read_exact(&mut clen).unwrap();
-            let clen = u32::from_le_bytes(clen) as usize;
-            let mut cbuf = vec![0u8; clen];
-            f.read_exact(&mut cbuf).unwrap();
-            crate::config::Config::from_json(&crate::json::parse(&cbuf))
-        } else {
-            panic!("bad magic in {} (expected MKIM0001 or MKIM0002)", path)
-        };
-        let mut nbuf = [0u8; 4];
-        f.read_exact(&mut nbuf).unwrap();
-        let n = u32::from_le_bytes(nbuf) as usize;
-        let mut entries = HashMap::with_capacity(n);
-        for _ in 0..n {
-            let mut nlen = [0u8; 2];
-            f.read_exact(&mut nlen).unwrap();
-            let nlen = u16::from_le_bytes(nlen) as usize;
-            let mut name = vec![0u8; nlen];
-            f.read_exact(&mut name).unwrap();
-            let mut fixed = [0u8; 2];
-            f.read_exact(&mut fixed).unwrap();
-            let (dtype, n_dims) = (fixed[0], fixed[1] as usize);
-            let mut dims = vec![0u32; n_dims];
-            for d in dims.iter_mut() {
-                let mut b = [0u8; 4];
-                f.read_exact(&mut b).unwrap();
-                *d = u32::from_le_bytes(b);
-            }
-            let mut b16 = [0u8; 16];
-            f.read_exact(&mut b16).unwrap();
-            let offset = u64::from_le_bytes(b16[0..8].try_into().unwrap());
-            let size = u64::from_le_bytes(b16[8..16].try_into().unwrap());
-            entries.insert(String::from_utf8(name).unwrap(), Entry { dtype, dims, offset, size });
-        }
+        let (f, config, entries) = read_directory(path);
         drop(f);
         let data = std::fs::read(path).unwrap();
+        BinFile { data, entries, config }
+    }
+
+    /// Streaming load (--stream): the MXFP4 routed-expert blobs are NOT read
+    /// into RAM. `data` holds only the spine bytes (embeddings, attention,
+    /// norms, router, dense/shared MLP, lm_head) with the offsets of those
+    /// entries remapped to the compacted layout; expert entries keep their
+    /// absolute file offsets so the stream engine can pread them on demand
+    /// (stream.rs). Alignment is preserved: every expert span is extended to
+    /// the next 64-byte boundary (format-level alignment padding), so the
+    /// skipped total stays a multiple of 64 and remapped f32 tensors remain
+    /// 64-aligned.
+    pub fn open_spine(path: &str) -> Self {
+        use std::os::unix::fs::FileExt;
+        let (f, config, mut entries) = read_directory(path);
+        let file_len = f.metadata().unwrap().len();
+        // expert byte ranges held back from RAM (end padded to 64, see above)
+        let mut spans: Vec<(u64, u64)> = entries
+            .iter()
+            .filter(|(n, _)| is_expert_tensor(n))
+            .map(|(_, e)| {
+                let end = (e.offset + e.size).div_ceil(64) * 64;
+                (e.offset, end.min(file_len))
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        // skipped[i] = total expert bytes in merged[0..=i]
+        let mut skipped: Vec<u64> = Vec::with_capacity(merged.len());
+        let mut acc = 0u64;
+        for &(s, e) in &merged {
+            acc += e - s;
+            skipped.push(acc);
+        }
+        let skipped_before = |off: u64| -> u64 {
+            let i = merged.partition_point(|&(_, e)| e <= off);
+            if i == 0 { 0 } else { skipped[i - 1] }
+        };
+        // spine bytes: the whole file minus the expert ranges (64 MB chunks)
+        let mut data = Vec::with_capacity((file_len - acc) as usize);
+        let mut cursor = 0u64;
+        let read_gap = |from: u64, to: u64, data: &mut Vec<u8>| {
+            let mut pos = from;
+            while pos < to {
+                let n = ((to - pos) as usize).min(1 << 26);
+                let old = data.len();
+                data.resize(old + n, 0);
+                f.read_exact_at(&mut data[old..], pos).unwrap();
+                pos += n as u64;
+            }
+        };
+        for &(s, e) in &merged {
+            read_gap(cursor, s, &mut data);
+            cursor = e;
+        }
+        read_gap(cursor, file_len, &mut data);
+        // remap the offsets of the in-RAM entries; experts keep absolute offsets
+        for (name, e) in entries.iter_mut() {
+            if !is_expert_tensor(name) {
+                e.offset -= skipped_before(e.offset);
+            }
+        }
         BinFile { data, entries, config }
     }
 
