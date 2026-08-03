@@ -32,6 +32,17 @@ fn as_f32(bytes: &[u8]) -> &[f32] {
     mid
 }
 
+/// (bytes actually read from disk, major page faults) from /proc, Linux only.
+/// Used to show the mmap demand-paging cost of a prefill.
+fn io_stats() -> Option<(u64, u64)> {
+    let io = std::fs::read_to_string("/proc/self/io").ok()?;
+    let read_bytes = io.lines().find_map(|l| l.strip_prefix("read_bytes:"))?.trim().parse().ok()?;
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // after the ") " of comm, fields are numbered from 3: majflt is field 12
+    let majflt = stat.rsplit_once(") ")?.1.split_whitespace().nth(9)?.parse().ok()?;
+    Some((read_bytes, majflt))
+}
+
 // ── math kernels ──
 
 #[inline]
@@ -2128,6 +2139,7 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
 
     // ── prefill: the whole prompt in one batched call ──
     let t2 = Instant::now();
+    let io0 = io_stats();
     let mut logits = init_logits.unwrap_or_default();
     if !ids.is_empty() {
         logits = fwd(ids);
@@ -2146,6 +2158,12 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
             println!("⏱  skipped: pure continuation from the .mkmem snapshot");
         } else {
             println!("⏱  {:.2} s  for {} tokens ({:.1} ms/token)", t_prefill.as_secs_f64(), ids.len(), t_prefill.as_secs_f64() / ids.len() as f64 * 1000.0);
+            if let (Some((b0, f0)), Some((b1, f1))) = (io0, io_stats()) {
+                let gb = (b1 - b0) as f64 / 1e9;
+                if gb > 0.01 {
+                    println!("💾 {:.1} GB paged in from disk during prefill ({} major faults)", gb, f1 - f0);
+                }
+            }
         }
         println!();
         println!("{}", "=".repeat(64));
