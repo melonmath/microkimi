@@ -1776,6 +1776,44 @@ fn parity_rec(f: impl FnOnce(&mut ParityDump)) {
     });
 }
 
+// ── --dump-hidden collection (inactive by default) ──
+//
+// Diagnostic instrument for pruned-model collapse: the RMS of the hidden
+// state after each layer, printed ONCE at the end of the first prefill (or
+// the first generated token when the prefill is empty). Read-only: without
+// the flag the forward paths are untouched (bit-exact).
+pub static DUMP_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DUMP_HIDDEN_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_dump_hidden(on: bool) {
+    DUMP_HIDDEN.store(on, std::sync::atomic::Ordering::Relaxed);
+    DUMP_HIDDEN_DONE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dump_hidden_on() -> bool {
+    use std::sync::atomic::Ordering;
+    DUMP_HIDDEN.load(Ordering::Relaxed) && !DUMP_HIDDEN_DONE.load(Ordering::Relaxed)
+}
+
+/// RMS (sqrt of the mean of squares): the same norm rmsnorm rescales to ~1.
+fn vec_rms(v: &[f32]) -> f64 {
+    (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / v.len().max(1) as f64).sqrt()
+}
+
+/// Prints the per-layer table once, then disarms (subsequent tokens of the
+/// same run are not re-dumped).
+fn dump_hidden_print(per_layer: &[(usize, &'static str, f64)], residual_rms: f64, logits: &[f32]) {
+    let mean = logits.iter().map(|&x| x as f64).sum::<f64>() / logits.len().max(1) as f64;
+    let std = (logits.iter().map(|&x| (x as f64 - mean) * (x as f64 - mean)).sum::<f64>() / logits.len().max(1) as f64).sqrt();
+    println!("── dump-hidden: rms of the hidden state after each layer ──");
+    for (l, kind, rms) in per_layer {
+        println!("  layer {:>2} ({}): rms={:.4}", l, kind, rms);
+    }
+    println!("  final residual: rms={:.4}", residual_rms);
+    println!("  logits: std={:.4} mean={:.4}", std, mean);
+    DUMP_HIDDEN_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 // ── full forward ──
 
 impl Model {
@@ -1790,6 +1828,8 @@ impl Model {
         let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(8);
         let mut buf_res = vec![0f32; cfg.d];
         let mut x = vec![0f32; cfg.d];
+        let hd_on = dump_hidden_on();
+        let mut hd: Vec<(usize, &'static str, f64)> = Vec::new();
 
         for l in 0..cfg.n_layers {
             let prefix: Option<Vec<f32>> = Some(hidden.clone());
@@ -1866,6 +1906,10 @@ impl Model {
             for j in 0..cfg.d {
                 hidden[j] = prefix2[j] + mlp_out[j];
             }
+            if hd_on {
+                let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
+                hd.push((l, kind, vec_rms(&hidden)));
+            }
             if DUMP_LAYERS.contains(&l) {
                 let h = hidden.clone();
                 parity_rec(|d| {
@@ -1884,6 +1928,9 @@ impl Model {
         let mut logits = vec![0f32; cfg.vocab];
         matvec(Self::t(data, &lm_head), cfg.vocab, cfg.d, &xf, &mut logits);
         prof.t_lm_head += tm.elapsed().as_secs_f64();
+        if hd_on {
+            dump_hidden_print(&hd, vec_rms(&hidden), &logits);
+        }
         *last_logits = logits.clone();
         logits
     }
@@ -1915,6 +1962,8 @@ impl Model {
         let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(8); // each [n * d]
         let mut buf_res = vec![0f32; n * d];
         let mut x = vec![0f32; n * d];
+        let hd_on = dump_hidden_on();
+        let mut hd: Vec<(usize, &'static str, f64)> = Vec::new();
 
         for l in 0..cfg.n_layers {
             let layer = &layers[l];
@@ -2002,6 +2051,10 @@ impl Model {
             for j in 0..n * d {
                 hidden[j] = prefix2[j] + mlp_out[j];
             }
+            if hd_on {
+                let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
+                hd.push((l, kind, vec_rms(&hidden[(n - 1) * d..n * d])));
+            }
             if DUMP_LAYERS.contains(&l) {
                 for t in 0..n {
                     let h = hidden[t * d..(t + 1) * d].to_vec();
@@ -2025,6 +2078,11 @@ impl Model {
         let mut logits = vec![0f32; cfg.vocab];
         matvec(Self::t(data, &lm_head), cfg.vocab, d, &xf, &mut logits);
         prof.t_lm_head += tm.elapsed().as_secs_f64();
+        if hd_on {
+            // per-layer rms was taken on the LAST position (the one the
+            // logits are computed from)
+            dump_hidden_print(&hd, vec_rms(&hidden[(n - 1) * d..n * d]), &logits);
+        }
         *last_logits = logits.clone();
         logits
     }
