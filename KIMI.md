@@ -73,6 +73,30 @@ Only 3 % of the corpus was seen and the loss was still descending at the end - t
 
 Training also runs on Apple Silicon GPUs: `train.py --device mps` (torch MPS backend, plus `--device cpu|auto` and `--bench N` to compare). Honest caveat: the KDA recurrence is a sequential Python loop, so MPS does not help there - measure with `--bench` before choosing.
 
+## Memory packs: save states for a neural network
+
+A video-game save state, but for the model's mind. Because KDA layers carry a **fixed-size recurrent state** (unlike a Transformer KV cache, which grows forever), the entire working state of a conversation can be snapshotted to a small portable file - an emulator save-state for an LLM.
+
+```bash
+# snapshot at any point (during a run):
+microkimi run "One morning, a little girl found a key." --model nanokimi-0.2b.bin --max-new 10 --save fork.mkmem
+# resume from the snapshot - the continuation is bit-exact:
+microkimi run "" --model nanokimi-0.2b.bin --memory fork.mkmem --max-new 10
+# absorb a document into the state, no context window involved:
+microkimi absorb notes.txt --out pack.mkmem --model nanokimi-0.2b.bin
+microkimi run "What did my notes say?" --model nanokimi-0.2b.bin --memory pack.mkmem
+```
+
+What a pack contains: the KDA recurrent states + conv states (**fixed size, never grows** - on nanokimi: ~1.5 MB whatever the absorbed length), the MLA k/v caches (these do grow, ~10 KB/token on nanokimi - the KDA part is the constant one), and the last logits for exact continuation.
+
+Measured behavior (honest status):
+
+- **Fork/resume is bit-exact** - a resumed run reproduces the uninterrupted run token for token. Save-scumming conversations works today.
+- **Absorb injects measurable information** - with a pack loaded, 30-50% of greedy token choices change vs the same prompt/seed without it. At 0.2B, no exploitable facts are retrievable yet (the toy model cannot re-read its own compressed state); retesting on microkimi-1b is planned.
+- **Merge is destructive at 0.2B** (`mkmem-div` measured it) - two independently trained states live in differently-rotated spaces; naive averaging cancels them. Alignment (re-basing) is the open follow-up.
+
+Why this is unique: it requires a fixed-size state (KDA) and an engine that exposes it. Standard Transformers cannot do this - their "state" is an ever-growing KV cache.
+
 ## Benchmarks
 
 Greedy decode.

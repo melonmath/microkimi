@@ -55,6 +55,8 @@ Coming next: nanokimi-0.2b-chat (in training), micro models pruned from real K3 
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
+Memory packs (K3 only): `microkimi absorb doc.txt --out pack.mkmem` snapshots the model's fixed-size KDA state into a portable file; `run --memory pack.mkmem` resumes from it. A save state, video-game style - see [KIMI.md](KIMI.md#memory-packs-save-states-for-a-neural-network).
+
 ## License
 
 MIT - see [LICENSE](LICENSE). Credits in [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
