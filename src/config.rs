@@ -32,6 +32,11 @@ pub struct Config {
     pub rms_eps: f32,
     pub eos_id: u32,            // end_of_msg (generation stop)
     pub bos_id: u32,
+    /// Explicit per-layer types, written by `microkimi slice` after layer
+    /// pruning (the l%4==3 / first_k_dense patterns no longer hold on the
+    /// renumbered layers). None = derive from the historical patterns.
+    pub mla_layers: Option<Vec<usize>>,
+    pub dense_layers: Option<Vec<usize>>,
     /// Present when the MKIM0002 config JSON declares arch "deepseek_v4"
     /// (parsed from the "ds" object). None for K3 (microkimi/nanokimi).
     pub ds: Option<DsConfig>,
@@ -68,6 +73,8 @@ impl Config {
             eos_id: 163_586,
             bos_id: 163_584,
             ds: None,
+            mla_layers: None,
+            dense_layers: None,
         }
     }
 
@@ -109,14 +116,25 @@ impl Config {
         if j.get("arch").and_then(|x| x.as_str()) == Some("deepseek_v4") {
             c.ds = Some(DsConfig::from_json(j));
         }
+        let ids = |key: &str| -> Option<Vec<usize>> {
+            j.get(key).and_then(|x| x.as_arr()).map(|a| a.iter().filter_map(|v| v.as_num().map(|n| n as usize)).collect())
+        };
+        c.mla_layers = ids("mla_layers");
+        c.dense_layers = ids("dense_layers");
         c
     }
 
     pub fn is_mla(&self, l: usize) -> bool {
-        l % 4 == 3 || l == self.n_layers - 1
+        match &self.mla_layers {
+            Some(v) => v.contains(&l),
+            None => l % 4 == 3 || l == self.n_layers - 1,
+        }
     }
     pub fn is_moe(&self, l: usize) -> bool {
-        l >= self.first_k_dense
+        match &self.dense_layers {
+            Some(v) => !v.contains(&l),
+            None => l >= self.first_k_dense,
+        }
     }
     pub fn kda_proj(&self) -> usize {
         self.kda_heads * self.kda_dim

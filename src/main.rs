@@ -21,6 +21,7 @@ mod parity;
 mod pool;
 mod safetensors;
 mod selftest;
+mod slice;
 mod tokenizer;
 mod weights;
 
@@ -44,6 +45,8 @@ fn main() {
             if arch == "dsv4" { build_ds::run() } else { build::run() }
         }
         "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
+        // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
+        "slice" => slice::run(&args),
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); },
         "metaltest" => metaltest_cmd(),
         "gputest" => gputest_cmd(),
@@ -113,6 +116,8 @@ fn main() {
             println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
+            println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
+            println!("                                         structural pruning (channels / experts / layers)");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
             println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
