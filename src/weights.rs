@@ -1,10 +1,14 @@
 // microkimi .bin format (microkimi-debug.bin, nanokimi-0.2b.bin, ...):
 //   magic "MKIM0001" (8 bytes)
 //   u32 n_tensors
-//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32) |
+//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32, 3=vq1) |
 //                   u8 n_dims | u32 dims[n_dims] | u64 offset | u64 size
 //   raw data (offsets from start of file, 64-aligned)
 // mxfp4 dtype: blob = packed (R×C/2 bytes) then scales (R×C/32), dims = logical [R,C].
+// vq1 dtype: blob = R×C/16 index bytes, one u8 codebook index per vector of 16
+//   consecutive row-major values; dims = logical [R,C] with C % 16 == 0. The
+//   codebook is NOT in the blob: it is a global f32 tensor "vq_codebook"
+//   [256,16] shared by all vq1 tensors (written by `slice --cold-vq`).
 // MKIM0002: u32 config_len + JSON config right after the magic.
 
 use std::collections::HashMap;
@@ -15,6 +19,7 @@ pub const MAGIC_V2: &[u8; 8] = b"MKIM0002";
 pub const DTYPE_F32: u8 = 0;
 pub const DTYPE_MXFP4: u8 = 1;
 pub const DTYPE_I32: u8 = 2;
+pub const DTYPE_VQ1: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -33,6 +38,13 @@ pub fn blob_size(dtype: u8, dims: &[u32]) -> u64 {
         DTYPE_MXFP4 => {
             let (r, c) = (dims[0] as u64, dims[1] as u64);
             r * c / 2 + r * c / 32
+        }
+        DTYPE_VQ1 => {
+            // 1 byte index per vector of VQ_DIM consecutive values (row-major);
+            // the 256 x VQ_DIM f32 codebook lives in a separate global tensor
+            // ("vq_codebook"), shared by every VQ1 tensor of the file.
+            let (r, c) = (dims[0] as u64, dims[1] as u64);
+            r * c / crate::quant::VQ_DIM as u64
         }
         _ => panic!("unknown dtype {}", dtype),
     }

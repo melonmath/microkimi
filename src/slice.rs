@@ -3,7 +3,17 @@
 // pruned dim is recorded in the MKIM0002 JSON config (hidden, n_experts,
 // top_k, n_layers, mla_layers, dense_layers).
 //
-//   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"]
+//   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
+//
+// Precision tiering (--cold-vq N): no structural pruning, ALL experts stay
+// (router untouched); per MoE layer the top-N experts by Frobenius score
+// stay mxfp4 (hot) and the rest are requantized to VQ1 (cold): vectors of 16
+// consecutive values mapped to the nearest of 256 entries of ONE global
+// codebook (tensor "vq_codebook" [256,16] f32, 16 KB), 1 byte per vector =
+// 0.5 bit/weight vs 4.25 for mxfp4. The codebook is Lloyd k-means (seeded,
+// deterministic) over a reservoir sample of all cold-expert dequantized
+// values, raw (unnormalized) vectors. With --experts M (M >= N): the tail
+// below M is still pruned, top-N hot, ranks N..M cold VQ1.
 //
 // Ranking (v1, weight magnitude only, no activation calibration):
 //   - channels (--hidden): score[c] = sum of |w| over every tensor touching
@@ -29,7 +39,7 @@
 
 use crate::config::Config;
 use crate::slice_st::{StArch, StDir};
-use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
+use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_VQ1, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
 use std::io::Read;
 
 /// Row chunk for streaming f32 processing (~256 MB of f32 per chunk: the
@@ -556,6 +566,101 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
     results.into_iter().collect()
 }
 
+/// Per kept MoE layer: the full per-expert Frobenius scores (.bin sources
+/// only; the exact dequantized w1+w2+w3 norm, one thread per layer). Used by
+/// --cold-vq, which needs the complete ranking (hot top-N vs cold tail), not
+/// just a keep-set.
+fn expert_score_map(src: &Source, kept_layers: &[usize]) -> std::collections::HashMap<usize, Vec<f64>> {
+    let cfg = src.config();
+    let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
+    let results: Vec<(usize, Vec<f64>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for &l in &moe_layers {
+            handles.push(scope.spawn(move || {
+                let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
+                let mut scores = vec![0f64; cfg.n_experts];
+                for e in 0..cfg.n_experts {
+                    let mut blobs = [Vec::new(), Vec::new(), Vec::new()];
+                    let mut rc = [(0usize, 0usize); 3];
+                    for (i, wn) in ["w1", "w2", "w3"].iter().enumerate() {
+                        let name = format!("{}{}.{}", pfx, e, wn);
+                        let entry = src.entry(&name);
+                        assert_eq!(entry.dtype, DTYPE_MXFP4, "{} is not mxfp4", name);
+                        blobs[i] = src.raw_blob(entry);
+                        rc[i] = (entry.dims[0] as usize, entry.dims[1] as usize);
+                    }
+                    scores[e] = expert_norm_sq(&blobs[0], &blobs[1], &blobs[2], rc);
+                }
+                (l, scores)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    results.into_iter().collect()
+}
+
+/// Reservoir sample (algorithm R, seeded splitmix64) of the raw 16-vectors
+/// of every cold expert tensor, for the global VQ codebook training. Each
+/// tensor is dequantized from mxfp4 one at a time (never the whole model in
+/// RAM). `cold` = per kept MoE layer the cold expert indices (ascending).
+fn vq_reservoir(
+    src: &Source,
+    kept_layers: &[usize],
+    cold: &std::collections::HashMap<usize, Vec<usize>>,
+    cap: usize,
+    seed: u64,
+) -> Vec<f32> {
+    use crate::quant::{Rng, VQ_DIM};
+    let cfg = src.config();
+    let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
+    let mut rng = Rng::new(seed);
+    let mut res: Vec<f32> = Vec::with_capacity(cap * VQ_DIM);
+    let mut seen = 0u64; // vectors offered so far
+    let feed = |w: &[f32], res: &mut Vec<f32>, rng: &mut Rng, seen: &mut u64| {
+        for v in w.chunks_exact(VQ_DIM) {
+            let t = *seen;
+            *seen += 1;
+            if (t as usize) < cap {
+                res.extend_from_slice(v);
+            } else {
+                let j = rng.below(t as usize + 1);
+                if j < cap {
+                    res[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(v);
+                }
+            }
+        }
+    };
+    for &l in &moe_layers {
+        let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
+        for &e in &cold[&l] {
+            for wn in ["w1", "w2", "w3"] {
+                let name = format!("{}{}.{}", pfx, e, wn);
+                let entry = src.entry(&name);
+                assert_eq!(entry.dtype, DTYPE_MXFP4, "{} is not mxfp4", name);
+                let blob = src.raw_blob(entry);
+                let (r, c) = (entry.dims[0] as usize, entry.dims[1] as usize);
+                let w = crate::mxfp4::dequant(&blob[..r * c / 2], &blob[r * c / 2..], r, c);
+                feed(&w, &mut res, &mut rng, &mut seen);
+            }
+        }
+    }
+    println!("vq: reservoir sampled {}/{} cold-expert vectors (cap {})", res.len() / VQ_DIM, seen, cap);
+    res
+}
+
+/// Dequantizes one source mxfp4 expert tensor and VQ-quantizes it with the
+/// shared codebook. Returns (index bytes, relative Frobenius error).
+fn vq_quantize_tensor(src: &Source, e: &DirEntry, codebook: &[f32]) -> (Vec<u8>, f64) {
+    assert_eq!(e.dtype, DTYPE_MXFP4, "{} is not mxfp4", e.name);
+    let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
+    assert_eq!(c % crate::quant::VQ_DIM, 0, "{}: cols {} not a multiple of {}", e.name, c, crate::quant::VQ_DIM);
+    let blob = src.raw_blob(e);
+    let w = crate::mxfp4::dequant(&blob[..r * c / 2], &blob[r * c / 2..], r, c);
+    let idx = crate::quant::quantize(&w, codebook);
+    let err = crate::quant::rel_error(&w, &idx, codebook);
+    (idx, err)
+}
+
 /// One output tensor: what to write and where the data comes from.
 struct Plan {
     out_name: String,
@@ -653,12 +758,30 @@ pub fn run(args: &[String]) {
     let hidden: Option<usize> = value_flag(args, "--hidden").map(|s| s.parse().expect("bad --hidden"));
     let experts: Option<usize> = value_flag(args, "--experts").map(|s| s.parse().expect("bad --experts"));
     let layers_spec = value_flag(args, "--layers");
-    if hidden.is_none() && experts.is_none() && layers_spec.is_none() {
-        eprintln!("error: slice needs at least one of --hidden / --experts / --layers");
+    // --cold-vq N: precision-tiered expert storage. ALL experts stay in the
+    // file (the router is untouched); per MoE layer the top-N experts by
+    // Frobenius score stay mxfp4 (hot), the rest are requantized to VQ1
+    // (cold, ~0.5 bit/weight, one global 256x16 codebook). Combined with
+    // --experts M (M >= N): only the top-M experts are kept, top-N hot.
+    let cold_vq: Option<usize> = value_flag(args, "--cold-vq").map(|s| s.parse().expect("bad --cold-vq"));
+    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() {
+        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq");
         std::process::exit(1);
+    }
+    if let (Some(m), Some(n)) = (experts, cold_vq) {
+        assert!(n <= m, "--cold-vq N must be <= --experts M (hot experts are a subset of the kept ones)");
+    }
+    if cold_vq.is_some() {
+        assert!(
+            !model.starts_with("http://") && !model.starts_with("https://"),
+            "--cold-vq requires a local .bin source (mxfp4 expert blobs)"
+        );
     }
 
     let mut source = Source::open(&model, &out);
+    if cold_vq.is_some() {
+        assert!(matches!(source, Source::Bin(_)), "--cold-vq requires a .bin source (mxfp4 expert blobs)");
+    }
 
     // ── 1. layer selection (then resolve tensor shapes/byte sources) ──
     let kept_layers = match &layers_spec {
@@ -706,12 +829,60 @@ pub fn run(args: &[String]) {
         sets
     });
 
+    // ── 3b. precision tiering (--cold-vq): hot/cold split + global codebook ──
+    // vq_hot: per kept MoE layer the hot (mxfp4) expert indices, ascending.
+    // The codebook is trained on a seeded reservoir sample of ALL cold-expert
+    // dequantized values, raw 16-vectors (no per-vector normalization: the
+    // mxfp4 source already keeps per-32-group magnitudes similar enough that
+    // raw VQ works; measured in the microquant report).
+    let (vq_hot, vq_codebook): (Option<std::collections::HashMap<usize, Vec<usize>>>, Option<Vec<f32>>) =
+        match cold_vq {
+            None => (None, None),
+            Some(n_hot) => {
+                let t = std::time::Instant::now();
+                let scores = expert_score_map(&source, &kept_layers);
+                let hot: std::collections::HashMap<usize, Vec<usize>> =
+                    scores.iter().map(|(&l, s)| (l, top_n(s, n_hot.min(cfg.n_experts)))).collect();
+                // cold = kept experts minus the hot ones (with --experts M
+                // the pruned tail never reaches the file NOR the codebook)
+                let cold: std::collections::HashMap<usize, Vec<usize>> = scores
+                    .iter()
+                    .map(|(&l, s)| {
+                        let keep: std::collections::HashSet<usize> = hot[&l].iter().copied().collect();
+                        let kept: Vec<usize> = match &expert_sets {
+                            Some(sets) => sets[&l].clone(),
+                            None => (0..s.len()).collect(),
+                        };
+                        (l, kept.into_iter().filter(|e| !keep.contains(e)).collect())
+                    })
+                    .collect();
+                let n_cold: usize = cold.values().map(|v| v.len()).sum();
+                if n_cold == 0 {
+                    println!("cold-vq: hot set covers all experts, nothing to quantize (no VQ tensors written)");
+                    (Some(hot), None)
+                } else {
+                    println!(
+                        "cold-vq: {} hot mxfp4 + {} cold VQ1 experts per MoE layer (ranked in {:.1?})",
+                        n_hot.min(cfg.n_experts),
+                        n_cold / cold.len().max(1),
+                        t.elapsed()
+                    );
+                    let t = std::time::Instant::now();
+                    let seed = 0x5EED_C0DE_B00B_1E5u64;
+                    let samples = vq_reservoir(&source, &kept_layers, &cold, 300_000, seed);
+                    let cb = crate::quant::train_codebook(&samples, seed);
+                    println!("vq: global codebook ({}x{}) trained in {:.1?}", crate::quant::VQ_K, crate::quant::VQ_DIM, t.elapsed());
+                    (Some(hot), Some(cb))
+                }
+            }
+        };
+
     // ── 4. plan: output tensors in input directory order ──
     let mut plans: Vec<Plan> = Vec::new();
     for e in source.entries() {
         let role = role_of(&e.name, cfg, arch);
-        let (out_name, experts_for_tensor): (String, Option<Vec<usize>>) = match split_layer(&e.name) {
-            None => (e.name.clone(), None),
+        let (out_name, experts_for_tensor, dtype_override): (String, Option<Vec<usize>>, Option<u8>) = match split_layer(&e.name) {
+            None => (e.name.clone(), None, None),
             Some((l, rest)) => {
                 let Some(nl) = new_layer_of(l) else { continue }; // pruned layer
                 let pfx = format!("layers.{}.", nl);
@@ -728,11 +899,14 @@ pub fn run(args: &[String]) {
                         },
                         None => oe,
                     };
-                    (format!("{}block_sparse_moe.experts.{}.{}", pfx, idx, &tail[dot + 1..]), None)
+                    // cold experts (below the hot top-N) become VQ1
+                    let cold = vq_hot.as_ref().is_some_and(|h| !h[&l].contains(&oe));
+                    let dt = if cold { Some(DTYPE_VQ1) } else { None };
+                    (format!("{}block_sparse_moe.experts.{}.{}", pfx, idx, &tail[dot + 1..]), None, dt)
                 } else if matches!(role, Role::RouterW | Role::RouterB) {
-                    (format!("{}{}", pfx, rest), expert_sets.as_ref().map(|s| s[&l].clone()))
+                    (format!("{}{}", pfx, rest), expert_sets.as_ref().map(|s| s[&l].clone()), None)
                 } else {
-                    (format!("{}{}", pfx, rest), None)
+                    (format!("{}{}", pfx, rest), None, None)
                 }
             }
         };
@@ -754,12 +928,24 @@ pub fn run(args: &[String]) {
         };
         plans.push(Plan {
             out_name,
-            dtype: e.dtype,
+            dtype: dtype_override.unwrap_or(e.dtype),
             dims,
             src_name: e.name.clone(),
             role,
             channels: ch,
             experts: experts_for_tensor,
+        });
+    }
+    // the global VQ codebook rides as one extra f32 tensor (src_name "" marks it)
+    if vq_codebook.is_some() {
+        plans.push(Plan {
+            out_name: "vq_codebook".to_string(),
+            dtype: DTYPE_F32,
+            dims: vec![crate::quant::VQ_K as u32, crate::quant::VQ_DIM as u32],
+            src_name: String::new(),
+            role: Role::Copy,
+            channels: Vec::new(),
+            experts: None,
         });
     }
 
@@ -786,7 +972,7 @@ pub fn run(args: &[String]) {
 \"attn_res_block\": {}, \"first_k_dense\": {}, \"rms_eps\": {}{}, \
 \"mla_layers\": [{}], \"dense_layers\": [{}], \
 \"specials\": {{\"bos\": {}, \"end_of_msg\": {}}}, \
-\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"}}}}",
+\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"{}}}}}",
         arch_kv,
         new_n_layers, new_d, cfg.vocab, new_n_experts, new_top_k, cfg.n_shared,
         cfg.kda_heads, cfg.kda_dim, cfg.kda_conv, cfg.kda_fa, cfg.gate_lb,
@@ -796,6 +982,7 @@ pub fn run(args: &[String]) {
         list(&mla_layers), list(&dense_layers),
         cfg.bos_id, cfg.eos_id,
         new_d, new_n_experts, kept_layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(","),
+        cold_vq.map(|n| format!(", \"cold_vq\": {}", n)).unwrap_or_default(),
     );
 
     // ── 6. write ──
@@ -807,9 +994,28 @@ pub fn run(args: &[String]) {
     let offsets = w.write_header_v2(&mut f, &config_json);
     let mut done = 0usize;
     let mut last_fetch_report = 0u64;
+    let mut vq_err_sum = 0f64;
+    let mut vq_err_n = 0u64;
     for (p, &off) in plans.iter().zip(&offsets) {
+        // the codebook plan has no source tensor: its data is the trained codebook
+        if p.src_name.is_empty() {
+            let cb = vq_codebook.as_ref().expect("codebook plan without --cold-vq");
+            w.write_blob_at(&mut f, off, &f32_to_bytes(cb));
+            done += 1;
+            continue;
+        }
         let se = source.entry(&p.src_name);
         match p.role {
+            Role::Expert if p.dtype == DTYPE_VQ1 => {
+                let (idx, err) = vq_quantize_tensor(&source, se, vq_codebook.as_ref().unwrap());
+                assert_eq!(blob_size(p.dtype, &p.dims), idx.len() as u64, "{}: vq size mismatch", p.src_name);
+                w.write_blob_at(&mut f, off, &idx);
+                vq_err_sum += err;
+                vq_err_n += 1;
+                if vq_err_n % 500 == 0 {
+                    println!("  vq: {} tensors quantized, mean rel Frobenius error {:.3}", vq_err_n, vq_err_sum / vq_err_n as f64);
+                }
+            }
             Role::Copy | Role::Expert => {
                 let blob = source.raw_blob(se);
                 assert_eq!(blob_size(p.dtype, &p.dims), blob.len() as u64, "{}: size mismatch on copy", p.src_name);
@@ -867,5 +1073,13 @@ pub fn run(args: &[String]) {
         new_n_layers, mla_layers, dense_layers, new_d, new_n_experts, new_top_k);
     println!("  AttnRes: block={} re-applied on the renumbered layers", cfg.attn_res_block);
     println!("  experts: mxfp4 blobs copied verbatim (no requantization)");
+    if vq_err_n > 0 {
+        println!(
+            "  cold-vq: {} tensors requantized to VQ1 ({} B/expert-matrix + one 16 KB global codebook), mean rel Frobenius error {:.3}",
+            vq_err_n,
+            cfg.moe_inter * cfg.routed_hidden / crate::quant::VQ_DIM,
+            vq_err_sum / vq_err_n as f64
+        );
+    }
     println!("  done in {:.0?}", t0.elapsed());
 }
