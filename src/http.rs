@@ -3,8 +3,36 @@
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 const UA: &str = "microkimi/0.1 (pure-rust; curl-shellout)";
+
+// Global concurrency limit: HuggingFace rate-limits aggressive parallel range
+// requests (HTTP 429), so every fetch funnels through this semaphore.
+// Override with MICROKIMI_HTTP_CONCURRENCY.
+static SEM_N: Mutex<usize> = Mutex::new(0);
+static SEM_CV: Condvar = Condvar::new();
+
+fn max_concurrent() -> usize {
+    std::env::var("MICROKIMI_HTTP_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+fn acquire() {
+    let mut n = SEM_N.lock().unwrap();
+    while *n >= max_concurrent() {
+        n = SEM_CV.wait(n).unwrap();
+    }
+    *n += 1;
+}
+
+fn release() {
+    let mut n = SEM_N.lock().unwrap();
+    *n = n.saturating_sub(1);
+    SEM_CV.notify_one();
+}
 
 /// Total bytes / requests downloaded in this process (bandwidth accounting
 /// for the remote slice path).
@@ -26,9 +54,16 @@ pub fn fetch(url: &str) -> Option<Vec<u8>> {
 
 /// Downloads the inclusive byte range `start..=end`, or the whole file if None.
 pub fn fetch_range(url: &str, range: Option<(u64, u64)>) -> Option<Vec<u8>> {
-    for attempt in 0..4 {
+    acquire();
+    let r = fetch_range_throttled(url, range);
+    release();
+    r
+}
+
+fn fetch_range_throttled(url: &str, range: Option<(u64, u64)>) -> Option<Vec<u8>> {
+    for attempt in 0..8u32 {
         let mut cmd = Command::new("curl");
-        cmd.arg("-sL")
+        cmd.arg("-sfL")
             .arg("--max-time")
             .arg("300")
             .arg("-H")
@@ -49,7 +84,7 @@ pub fn fetch_range(url: &str, range: Option<(u64, u64)>) -> Option<Vec<u8>> {
                             want,
                             attempt + 1
                         );
-                        std::thread::sleep(std::time::Duration::from_millis(800 * (attempt as u64 + 1)));
+                        backoff(attempt);
                         continue;
                     }
                 }
@@ -58,18 +93,28 @@ pub fn fetch_range(url: &str, range: Option<(u64, u64)>) -> Option<Vec<u8>> {
                 return Some(out.stdout);
             }
             Ok(out) => {
+                // -f makes curl exit 22 on HTTP errors (429, 503, ...)
                 eprintln!(
-                    "  http: curl status {:?} (attempt {}): {}",
+                    "  http: curl exit {:?} (attempt {})",
                     out.status.code(),
-                    attempt + 1,
-                    String::from_utf8_lossy(&out.stderr).chars().take(120).collect::<String>()
+                    attempt + 1
                 );
             }
             Err(e) => {
                 eprintln!("  http: curl not found? {} (attempt {})", e, attempt + 1);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(800 * (attempt as u64 + 1)));
+        backoff(attempt);
     }
     None
+}
+
+// Exponential backoff with jitter: 1s, 2s, 4s, ... capped at ~32s.
+fn backoff(attempt: u32) {
+    let base = 1000u64 << attempt.min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 % 1000)
+        .unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(base + jitter));
 }
