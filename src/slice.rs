@@ -28,15 +28,33 @@
 // them). Zero requantization loss. All sliced tensors are f32 and stay f32.
 
 use crate::config::Config;
+use crate::slice_st::{StArch, StDir};
 use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
 use std::io::Read;
 
-struct DirEntry {
-    name: String,
-    dtype: u8,
-    dims: Vec<u32>,
-    offset: u64,
-    size: u64,
+/// Row chunk for streaming f32 processing (~256 MB of f32 per chunk: the
+/// 163840x7168 embeddings never sit in RAM as a whole).
+const CHUNK_VALS: usize = 1 << 26;
+
+fn n_rows(e: &DirEntry) -> usize {
+    if e.dims.len() <= 1 { 1 } else { e.dims[0] as usize }
+}
+
+fn row_width(e: &DirEntry) -> usize {
+    if e.dims.len() <= 1 { e.dims[0] as usize } else { e.dims[1..].iter().map(|&d| d as usize).product() }
+}
+
+fn row_chunks(rows: usize, cols: usize) -> Vec<(usize, usize)> {
+    let per = (CHUNK_VALS / cols.max(1)).max(1);
+    (0..rows).step_by(per).map(|r0| (r0, (r0 + per).min(rows))).collect()
+}
+
+pub(crate) struct DirEntry {
+    pub(crate) name: String,
+    pub(crate) dtype: u8,
+    pub(crate) dims: Vec<u32>,
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
 }
 
 /// Header + directory of a .bin, without loading the weight data (the slicer
@@ -113,13 +131,152 @@ impl BinDir {
         buf
     }
 
-    fn f32s(&self, e: &DirEntry) -> Vec<f32> {
+    /// Rows r0..r1 of an f32 tensor (whole row width).
+    fn f32_rows(&self, e: &DirEntry, r0: usize, r1: usize) -> Vec<f32> {
         assert_eq!(e.dtype, DTYPE_F32, "{} is not f32", e.name);
-        self.blob(e)
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+        use std::os::unix::fs::FileExt;
+        let cols = row_width(e);
+        let mut buf = vec![0u8; (r1 - r0) * cols * 4];
+        self.file.read_exact_at(&mut buf, e.offset + (r0 * cols * 4) as u64).unwrap();
+        buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
+
+    /// Only the scale bytes of an MXFP4 expert blob (packed ++ scales layout).
+    fn expert_scales(&self, e: &DirEntry) -> Vec<u8> {
+        assert_eq!(e.dtype, DTYPE_MXFP4, "{} is not mxfp4", e.name);
+        use std::os::unix::fs::FileExt;
+        let (r, c) = (e.dims[0] as u64, e.dims[1] as u64);
+        let mut buf = vec![0u8; (r * c / 32) as usize];
+        self.file.read_exact_at(&mut buf, e.offset + r * c / 2).unwrap();
+        buf
+    }
+}
+
+/// Slice input: a .bin (MKIM0001/0002) or a safetensors source (local
+/// file/dir, or a HuggingFace URL read through range requests).
+enum Source {
+    Bin(BinDir),
+    St(StDir),
+}
+
+impl Source {
+    fn open(model: &str, cache_hint: &str) -> Source {
+        let is_url = model.starts_with("http://") || model.starts_with("https://");
+        let is_dir = std::path::Path::new(model).is_dir();
+        if is_url || is_dir {
+            return Source::St(StDir::open(model, cache_hint));
+        }
+        let mut f = std::fs::File::open(model).unwrap_or_else(|e| panic!("{} unreadable: {}", model, e));
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic).unwrap_or_else(|_| panic!("{}: too small", model));
+        drop(f);
+        if &magic[0..4] == b"MKIM" {
+            Source::Bin(BinDir::open(model))
+        } else {
+            Source::St(StDir::open(model, cache_hint))
+        }
+    }
+
+    fn config(&self) -> &Config {
+        match self {
+            Source::Bin(b) => &b.config,
+            Source::St(s) => &s.config,
+        }
+    }
+
+    fn entries(&self) -> &[DirEntry] {
+        match self {
+            Source::Bin(b) => &b.entries,
+            Source::St(s) => &s.entries,
+        }
+    }
+
+    fn entry(&self, name: &str) -> &DirEntry {
+        match self {
+            Source::Bin(b) => b.entry(name),
+            Source::St(s) => &s.entries[*s.index.get(name).unwrap_or_else(|| panic!("missing tensor: {}", name))],
+        }
+    }
+
+    fn arch(&self) -> Arch {
+        match self {
+            // a .bin produced by an earlier dense slice re-slices as dense
+            Source::Bin(b) => {
+                if b.source_json.get("arch").and_then(|x| x.as_str()) == Some("dense") {
+                    Arch::Dense
+                } else {
+                    Arch::Micro
+                }
+            }
+            Source::St(s) => match s.arch {
+                StArch::K3 => Arch::K3Real,
+                StArch::Dense => Arch::Dense,
+            },
+        }
+    }
+
+    fn source_json(&self) -> crate::json::Json {
+        match self {
+            Source::Bin(b) => b.source_json.clone(),
+            Source::St(_) => crate::json::Json::Null,
+        }
+    }
+
+    /// MKIM0002 config "arch" marker to carry over (dense round-trips).
+    fn arch_config_key(&self) -> &'static str {
+        match self.arch() {
+            Arch::Dense => ", \"arch\": \"dense\"",
+            _ => "",
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Source::St(s) if s.is_remote())
+    }
+
+    fn resolve(&mut self, kept_layers: &[usize]) {
+        if let Source::St(s) = self {
+            s.resolve(kept_layers);
+        }
+    }
+
+    fn enable_caching(&self) {
+        if let Source::St(s) = self {
+            s.enable_caching();
+        }
+    }
+
+    fn f32_rows(&self, e: &DirEntry, r0: usize, r1: usize) -> Vec<f32> {
+        match self {
+            Source::Bin(b) => b.f32_rows(e, r0, r1),
+            Source::St(s) => s.f32_rows(e, r0, r1),
+        }
+    }
+
+    fn raw_blob(&self, e: &DirEntry) -> Vec<u8> {
+        match self {
+            Source::Bin(b) => b.blob(e),
+            Source::St(s) => s.raw_blob(e),
+        }
+    }
+
+    fn expert_scales(&self, e: &DirEntry) -> Vec<u8> {
+        match self {
+            Source::Bin(b) => b.expert_scales(e),
+            Source::St(s) => s.expert_scales(e),
+        }
+    }
+}
+
+/// Which role table applies. Micro: the historical .bin config where several
+/// dims coincide (kda_proj == d, MLA g_proj [d,d]). K3Real: the real K3
+/// safetensors dims (hidden 7168, MLA g_proj [H*v, d] -> columns only).
+/// Dense: plain llama-like models (Qwen), no MoE/KDA/MLA.
+#[derive(Clone, Copy, PartialEq)]
+enum Arch {
+    Micro,
+    K3Real,
+    Dense,
 }
 
 /// How a tensor relates to the hidden dimension d (for channel pruning) and
@@ -132,20 +289,23 @@ enum Role {
     VecD,    // [d] vector (layernorms, AttnRes norm/proj)
     ColsD,   // [R, d]: slice columns (input projections, embed, lm_head)
     RowsD,   // [d, C]: slice rows (output projections)
-    BothD,   // [d, d]: slice rows and columns (MLA g_proj)
+    BothD,   // [d, d]: slice rows and columns (micro MLA g_proj only)
     RouterW, // [n_experts, d]: expert rows + hidden columns
     RouterB, // [n_experts]: e_score_correction_bias
     Expert,  // block_sparse_moe.experts.{e}.{w1,w2,w3} (mxfp4, dims untouched)
 }
 
 /// Splits "layers.{i}.{rest}" into (layer_index, rest).
-fn split_layer(name: &str) -> Option<(usize, &str)> {
+pub(crate) fn split_layer(name: &str) -> Option<(usize, &str)> {
     let s = name.strip_prefix("layers.")?;
     let dot = s.find('.')?;
     Some((s[..dot].parse().ok()?, &s[dot + 1..]))
 }
 
-fn role_of(name: &str, cfg: &Config) -> Role {
+fn role_of(name: &str, cfg: &Config, arch: Arch) -> Role {
+    if arch == Arch::Dense {
+        return role_dense(name);
+    }
     match name {
         "embed_tokens.weight" | "lm_head.weight" => return Role::ColsD,
         "norm.weight" | "output_attn_res_norm.weight" | "output_attn_res_proj.weight" => return Role::VecD,
@@ -168,6 +328,9 @@ fn role_of(name: &str, cfg: &Config) -> Role {
         _ if r.starts_with("block_sparse_moe.experts.") => Role::Expert,
         _ if cfg.is_mla(l) => match r {
             "self_attn.q_a_proj.weight" | "self_attn.kv_a_proj_with_mqa.weight" => Role::ColsD,
+            // real K3 g_proj is [H*v, d]: only the columns are the hidden axis
+            // (the micro [d,d] coincidence allowed the historical BothD).
+            "self_attn.g_proj.weight" if arch == Arch::K3Real => Role::ColsD,
             "self_attn.g_proj.weight" => Role::BothD,
             "self_attn.o_proj.weight" => Role::RowsD,
             "self_attn.q_a_layernorm.weight" | "self_attn.q_b_proj.weight" | "self_attn.kv_a_layernorm.weight"
@@ -182,6 +345,29 @@ fn role_of(name: &str, cfg: &Config) -> Role {
             | "self_attn.f_b_proj.weight" | "self_attn.A_log" | "self_attn.dt_bias" | "self_attn.o_norm.weight" => Role::Copy,
             _ => panic!("slice: unknown KDA tensor: {}", name),
         },
+    }
+}
+
+/// Role table for plain dense models (Qwen/llama-like): q/k/v/gate/up slice
+/// columns, o/down slice rows, norms are [d] vectors, biases have no hidden
+/// axis (they index output rows) and are copied.
+fn role_dense(name: &str) -> Role {
+    match name {
+        "embed_tokens.weight" | "lm_head.weight" => return Role::ColsD,
+        "norm.weight" => return Role::VecD,
+        _ => {}
+    }
+    let Some((_, r)) = split_layer(name) else {
+        panic!("slice: unknown tensor (no layers. prefix): {}", name);
+    };
+    match r {
+        "input_layernorm.weight" | "post_attention_layernorm.weight" => Role::VecD,
+        "self_attn.q_proj.weight" | "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => Role::ColsD,
+        "self_attn.o_proj.weight" => Role::RowsD,
+        "self_attn.q_proj.bias" | "self_attn.k_proj.bias" | "self_attn.v_proj.bias" | "self_attn.o_proj.bias" => Role::Copy,
+        "mlp.gate_proj.weight" | "mlp.up_proj.weight" => Role::ColsD,
+        "mlp.down_proj.weight" => Role::RowsD,
+        _ => panic!("slice: unknown dense tensor: {}", name),
     }
 }
 
@@ -218,10 +404,13 @@ fn top_n(scores: &[f64], n: usize) -> Vec<usize> {
 }
 
 /// Channel scores: for every tensor touching d, sum |w| per channel.
-fn channel_scores(bin: &BinDir, kept_layers: &[usize], d: usize) -> Vec<f64> {
-    let cfg = &bin.config;
+/// Tensors are processed in row chunks (embeddings never sit in RAM whole;
+/// remote sources stream the same chunks).
+fn channel_scores(src: &Source, kept_layers: &[usize], d: usize) -> Vec<f64> {
+    let cfg = src.config();
+    let arch = src.arch();
     let mut s = vec![0f64; d];
-    for e in &bin.entries {
+    for e in src.entries() {
         let in_layers = match split_layer(&e.name) {
             None => true, // global tensor
             Some((l, _)) => kept_layers.contains(&l),
@@ -229,43 +418,46 @@ fn channel_scores(bin: &BinDir, kept_layers: &[usize], d: usize) -> Vec<f64> {
         if !in_layers {
             continue;
         }
-        let role = role_of(&e.name, cfg);
+        let role = role_of(&e.name, cfg, arch);
         if matches!(role, Role::Copy | Role::RouterB | Role::Expert) {
             continue;
         }
-        let w = bin.f32s(e);
+        let (rows, cols) = (n_rows(e), row_width(e));
         match role {
             Role::VecD => {
+                let w = src.f32_rows(e, 0, 1);
                 assert_eq!(w.len(), d, "{}: expected [{}]", e.name, d);
                 for (j, &x) in w.iter().enumerate() {
                     s[j] += x.abs() as f64;
                 }
             }
             Role::ColsD | Role::RouterW => {
-                let c = e.dims[1] as usize;
-                assert_eq!(c, d, "{}: expected [_, {}]", e.name, d);
-                for row in w.chunks_exact(c) {
-                    for (j, &x) in row.iter().enumerate() {
-                        s[j] += x.abs() as f64;
+                assert_eq!(cols, d, "{}: expected [_, {}]", e.name, d);
+                for (r0, r1) in row_chunks(rows, cols) {
+                    for row in src.f32_rows(e, r0, r1).chunks_exact(cols) {
+                        for (j, &x) in row.iter().enumerate() {
+                            s[j] += x.abs() as f64;
+                        }
                     }
                 }
             }
             Role::RowsD => {
-                let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
-                assert_eq!(r, d, "{}: expected [{}, _]", e.name, d);
-                for (j, row) in w.chunks_exact(c).enumerate() {
-                    s[j] += row.iter().map(|&x| x.abs() as f64).sum::<f64>();
+                assert_eq!(rows, d, "{}: expected [{}, _]", e.name, d);
+                for (r0, r1) in row_chunks(rows, cols) {
+                    for (j, row) in src.f32_rows(e, r0, r1).chunks_exact(cols).enumerate() {
+                        s[r0 + j] += row.iter().map(|&x| x.abs() as f64).sum::<f64>();
+                    }
                 }
             }
             Role::BothD => {
-                let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
-                assert_eq!((r, c), (d, d), "{}: expected [{}, {}]", e.name, d, d);
+                assert_eq!((rows, cols), (d, d), "{}: expected [{}, {}]", e.name, d, d);
+                let w = src.f32_rows(e, 0, rows);
                 // the channel appears as BOTH the output (row) and the input
                 // (column) axis: row sums + column sums
-                for (j, row) in w.chunks_exact(c).enumerate() {
+                for (j, row) in w.chunks_exact(cols).enumerate() {
                     s[j] += row.iter().map(|&x| x.abs() as f64).sum::<f64>();
                 }
-                for row in w.chunks_exact(c) {
+                for row in w.chunks_exact(cols) {
                     for (j, &x) in row.iter().enumerate() {
                         s[j] += x.abs() as f64;
                     }
@@ -288,11 +480,56 @@ fn expert_norm_sq(blob_w1: &[u8], blob_w2: &[u8], blob_w3: &[u8], rows_cols: [(u
     s
 }
 
+/// Scale-energy score: proportional to the squared Frobenius norm under the
+/// e2m1 codebook. ||W||^2 = sum over groups of 2^(2*(s-127)) * sum(lut^2);
+/// the per-group lut factor has the same expectation for every expert, so
+/// ranking on the scale energy alone ranks the same way while reading 1/17
+/// of the bytes (the weight_scale tensors only). Used for safetensors
+/// sources; the .bin path keeps the exact dequantized Frobenius.
+fn mxfp4_scale_energy(scale_bytes: &[u8]) -> f64 {
+    scale_bytes
+        .iter()
+        .map(|&s| {
+            let e = s as i32 - 127;
+            (2f64).powi(2 * e)
+        })
+        .sum()
+}
+
 /// Per kept MoE layer: the n_experts_keep expert indices to keep (ascending).
-/// Layers are scored in parallel threads (shared &File, read_exact_at).
-fn expert_keep_sets(bin: &BinDir, kept_layers: &[usize], n_keep: usize) -> std::collections::HashMap<usize, Vec<usize>> {
-    let cfg = &bin.config;
+/// .bin path: exact dequantized Frobenius, one thread per layer (disk reads).
+/// Safetensors path: scale-energy from the weight_scale tensors only; layers
+/// are processed sequentially but each layer's experts are split across 8
+/// threads (remote scoring is curl-latency bound).
+fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::collections::HashMap<usize, Vec<usize>> {
+    let cfg = src.config();
     let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
+    if matches!(src, Source::St(_)) {
+        let mut results = Vec::new();
+        for &l in &moe_layers {
+            let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
+            let mut scores = vec![0f64; cfg.n_experts];
+            let nt = 8.min(cfg.n_experts);
+            let chunk = cfg.n_experts.div_ceil(nt);
+            std::thread::scope(|scope| {
+                for (ti, sc) in scores.chunks_mut(chunk).enumerate() {
+                    let pfx = &pfx;
+                    scope.spawn(move || {
+                        for (i, slot) in sc.iter_mut().enumerate() {
+                            let e = ti * chunk + i;
+                            // scales only: the packed nibbles are never fetched
+                            *slot = ["w1", "w2", "w3"]
+                                .iter()
+                                .map(|wn| mxfp4_scale_energy(&src.expert_scales(src.entry(&format!("{}{}.{}", pfx, e, wn)))))
+                                .sum();
+                        }
+                    });
+                }
+            });
+            results.push((l, top_n(&scores, n_keep.min(cfg.n_experts))));
+        }
+        return results.into_iter().collect();
+    }
     let results: Vec<(usize, Vec<usize>)> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for &l in &moe_layers {
@@ -304,9 +541,9 @@ fn expert_keep_sets(bin: &BinDir, kept_layers: &[usize], n_keep: usize) -> std::
                     let mut rc = [(0usize, 0usize); 3];
                     for (i, wn) in ["w1", "w2", "w3"].iter().enumerate() {
                         let name = format!("{}{}.{}", pfx, e, wn);
-                        let entry = bin.entry(&name);
+                        let entry = src.entry(&name);
                         assert_eq!(entry.dtype, DTYPE_MXFP4, "{} is not mxfp4", name);
-                        blobs[i] = bin.blob(entry);
+                        blobs[i] = src.raw_blob(entry);
                         rc[i] = (entry.dims[0] as usize, entry.dims[1] as usize);
                     }
                     scores[e] = expert_norm_sq(&blobs[0], &blobs[1], &blobs[2], rc);
@@ -374,6 +611,31 @@ fn slice_f32(e: &DirEntry, w: &[f32], role: Role, ch: &[usize], experts: Option<
     }
 }
 
+/// Row-chunk slicing for ColsD/RowsD. `vals` holds input rows r0..r1 and the
+/// returned output rows are produced in ascending order (ch is sorted), so
+/// concatenating over chunks yields the full sliced tensor.
+fn slice_f32_rows(role: Role, vals: &[f32], r0: usize, r1: usize, cols: usize, ch: &[usize]) -> Vec<f32> {
+    match role {
+        Role::ColsD => {
+            let mut out = Vec::with_capacity((r1 - r0) * ch.len());
+            for row in vals.chunks_exact(cols) {
+                out.extend(ch.iter().map(|&j| row[j]));
+            }
+            out
+        }
+        Role::RowsD => {
+            let lo = ch.partition_point(|&j| j < r0);
+            let hi = ch.partition_point(|&j| j < r1);
+            let mut out = Vec::with_capacity((hi - lo) * cols);
+            for &j in &ch[lo..hi] {
+                out.extend_from_slice(&vals[(j - r0) * cols..(j - r0 + 1) * cols]);
+            }
+            out
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn value_flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
@@ -381,7 +643,7 @@ fn value_flag(args: &[String], name: &str) -> Option<String> {
 pub fn run(args: &[String]) {
     let t0 = std::time::Instant::now();
     let Some(model) = value_flag(args, "--model") else {
-        eprintln!("error: slice requires --model X.bin");
+        eprintln!("error: slice requires --model X.bin | model.safetensors | dir/ | https://huggingface.co/org/repo");
         std::process::exit(1);
     };
     let Some(out) = value_flag(args, "--out") else {
@@ -396,26 +658,33 @@ pub fn run(args: &[String]) {
         std::process::exit(1);
     }
 
-    let bin = BinDir::open(&model);
-    let cfg = &bin.config;
+    let mut source = Source::open(&model, &out);
+
+    // ── 1. layer selection (then resolve tensor shapes/byte sources) ──
+    let kept_layers = match &layers_spec {
+        Some(s) => parse_layer_spec(s, source.config().n_layers),
+        None => (0..source.config().n_layers).collect(),
+    };
+    let new_layer_of = |old: usize| kept_layers.iter().position(|&l| l == old);
+    source.resolve(&kept_layers);
+    // with --hidden the non-expert tensors are read twice (scoring, writing):
+    // cache the converted bytes on disk so remote bytes are fetched once
+    if hidden.is_some() {
+        source.enable_caching();
+    }
+    let arch = source.arch();
+    let cfg = source.config();
     let d = cfg.d;
     println!(
         "slice: {} ({} layers, hidden {}, {} experts top-{} + {} shared, vocab {})",
         model, cfg.n_layers, d, cfg.n_experts, cfg.top_k, cfg.n_shared, cfg.vocab
     );
-
-    // ── 1. layer selection ──
-    let kept_layers = match &layers_spec {
-        Some(s) => parse_layer_spec(s, cfg.n_layers),
-        None => (0..cfg.n_layers).collect(),
-    };
-    let new_layer_of = |old: usize| kept_layers.iter().position(|&l| l == old);
     println!("layers: keeping {}/{} {:?}", kept_layers.len(), cfg.n_layers, kept_layers);
 
     // ── 2. channel selection (scored on the kept layers only) ──
     let channels: Option<Vec<usize>> = hidden.map(|h| {
         assert!(h > 0 && h <= d, "--hidden must be in 1..={}", d);
-        let scores = channel_scores(&bin, &kept_layers, d);
+        let scores = channel_scores(&source, &kept_layers, d);
         let keep = top_n(&scores, h);
         println!("hidden: keeping {}/{} channels (top-|w|), score range {:.3} .. {:.3}", h, d,
             keep.iter().map(|&i| scores[i]).fold(f64::INFINITY, f64::min),
@@ -423,19 +692,24 @@ pub fn run(args: &[String]) {
         keep
     });
 
-    // ── 3. expert selection (per kept MoE layer, scored on dequantized w1+w2+w3) ──
+    // ── 3. expert selection (per kept MoE layer) ──
     let expert_sets = experts.map(|n| {
         assert!(n > 0, "--experts must be >= 1");
         let t = std::time::Instant::now();
-        let sets = expert_keep_sets(&bin, &kept_layers, n);
-        println!("experts: keeping {}/{} per MoE layer (Frobenius of w1+w2+w3), scored in {:.1?}", n, cfg.n_experts, t.elapsed());
+        let sets = expert_keep_sets(&source, &kept_layers, n);
+        let how = if matches!(source, Source::Bin(_)) {
+            "Frobenius of dequantized w1+w2+w3"
+        } else {
+            "scale-energy of w1+w2+w3 (weight_scale tensors only, 1/17 of the bytes)"
+        };
+        println!("experts: keeping {}/{} per MoE layer ({}), scored in {:.1?}", n, cfg.n_experts, how, t.elapsed());
         sets
     });
 
     // ── 4. plan: output tensors in input directory order ──
     let mut plans: Vec<Plan> = Vec::new();
-    for e in &bin.entries {
-        let role = role_of(&e.name, cfg);
+    for e in source.entries() {
+        let role = role_of(&e.name, cfg, arch);
         let (out_name, experts_for_tensor): (String, Option<Vec<usize>>) = match split_layer(&e.name) {
             None => (e.name.clone(), None),
             Some((l, rest)) => {
@@ -496,15 +770,16 @@ pub fn run(args: &[String]) {
     let new_top_k = cfg.top_k.min(new_n_experts);
     let mla_layers: Vec<usize> = kept_layers.iter().enumerate().filter(|&(_, &l)| cfg.is_mla(l)).map(|(i, _)| i).collect();
     let dense_layers: Vec<usize> = kept_layers.iter().enumerate().filter(|&(_, &l)| !cfg.is_moe(l)).map(|(i, _)| i).collect();
-    let tokenizer_kv = bin
-        .source_json
+    let tokenizer_kv = source
+        .source_json()
         .get("tokenizer")
-        .and_then(|t| t.as_str())
+        .and_then(|t| t.as_str().map(|s| s.to_string()))
         .map(|s| format!(", \"tokenizer\": \"{}\"", s))
         .unwrap_or_default();
+    let arch_kv = source.arch_config_key();
     let list = |v: &[usize]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     let config_json = format!(
-        "{{\"format\": 2, \"n_layers\": {}, \"hidden\": {}, \"vocab\": {}, \"n_experts\": {}, \"top_k\": {}, \"n_shared\": {}, \
+        "{{\"format\": 2{}, \"n_layers\": {}, \"hidden\": {}, \"vocab\": {}, \"n_experts\": {}, \"top_k\": {}, \"n_shared\": {}, \
 \"kda_heads\": {}, \"kda_dim\": {}, \"kda_conv\": {}, \"kda_fa_rank\": {}, \"gate_lower_bound\": {}, \
 \"mla_heads\": {}, \"mla_q_lora\": {}, \"mla_kv_lora\": {}, \"mla_nope\": {}, \"mla_rope\": {}, \"mla_v\": {}, \
 \"routed_hidden\": {}, \"moe_inter\": {}, \"shared_inter\": {}, \"dense_inter\": {}, \
@@ -512,6 +787,7 @@ pub fn run(args: &[String]) {
 \"mla_layers\": [{}], \"dense_layers\": [{}], \
 \"specials\": {{\"bos\": {}, \"end_of_msg\": {}}}, \
 \"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"}}}}",
+        arch_kv,
         new_n_layers, new_d, cfg.vocab, new_n_experts, new_top_k, cfg.n_shared,
         cfg.kda_heads, cfg.kda_dim, cfg.kda_conv, cfg.kda_fa, cfg.gate_lb,
         cfg.mla_heads, cfg.mla_qa, cfg.mla_kva, cfg.mla_nope, cfg.mla_rope, cfg.mla_v,
@@ -530,27 +806,63 @@ pub fn run(args: &[String]) {
     let mut f = std::fs::File::create(&out).unwrap();
     let offsets = w.write_header_v2(&mut f, &config_json);
     let mut done = 0usize;
+    let mut last_fetch_report = 0u64;
     for (p, &off) in plans.iter().zip(&offsets) {
-        let src = bin.entry(&p.src_name);
-        let blob = if matches!(p.role, Role::Copy | Role::Expert) {
-            assert_eq!(blob_size(p.dtype, &p.dims), src.size, "{}: size mismatch on copy", p.src_name);
-            bin.blob(src)
-        } else {
-            let (vals, dims) = slice_f32(src, &bin.f32s(src), p.role, &p.channels, p.experts.as_ref());
-            assert_eq!(dims, p.dims, "{}: planned dims mismatch", p.src_name);
-            f32_to_bytes(&vals)
-        };
-        w.write_blob_at(&mut f, off, &blob);
+        let se = source.entry(&p.src_name);
+        match p.role {
+            Role::Copy | Role::Expert => {
+                let blob = source.raw_blob(se);
+                assert_eq!(blob_size(p.dtype, &p.dims), blob.len() as u64, "{}: size mismatch on copy", p.src_name);
+                w.write_blob_at(&mut f, off, &blob);
+            }
+            Role::ColsD | Role::RowsD => {
+                let (rows, cols) = (n_rows(se), row_width(se));
+                let mut written = 0u64;
+                for (r0, r1) in row_chunks(rows, cols) {
+                    let vals = source.f32_rows(se, r0, r1);
+                    let bytes = f32_to_bytes(&slice_f32_rows(p.role, &vals, r0, r1, cols, &p.channels));
+                    w.write_blob_at(&mut f, off + written, &bytes);
+                    written += bytes.len() as u64;
+                }
+                assert_eq!(written, blob_size(DTYPE_F32, &p.dims), "{}: planned dims mismatch", p.src_name);
+            }
+            _ => {
+                let (vals, dims) = slice_f32(se, &source.f32_rows(se, 0, n_rows(se)), p.role, &p.channels, p.experts.as_ref());
+                assert_eq!(dims, p.dims, "{}: planned dims mismatch", p.src_name);
+                w.write_blob_at(&mut f, off, &f32_to_bytes(&vals));
+            }
+        }
         done += 1;
         if done % 20000 == 0 {
             println!("  {}/{} tensors written ({:.0?})", done, plans.len(), t0.elapsed());
         }
+        if source.is_remote() {
+            let fb = crate::http::fetched_bytes();
+            if fb - last_fetch_report >= (1 << 30) {
+                last_fetch_report = fb;
+                println!("  fetched {:.2} GB so far ({}/{} tensors written)", fb as f64 / 1e9, done, plans.len());
+            }
+        }
     }
-    let in_size = std::fs::metadata(&model).unwrap().len();
     let out_size = std::fs::metadata(&out).unwrap().len();
     println!();
     println!("══ {} : {} tensors ══", out, plans.len());
-    println!("  size: {:.2} GB -> {:.2} GB ({:.1}%)", in_size as f64 / 1e9, out_size as f64 / 1e9, out_size as f64 / in_size as f64 * 100.0);
+    match std::fs::metadata(&model).ok().map(|m| m.len()) {
+        Some(in_size) if !source.is_remote() => println!(
+            "  size: {:.2} GB -> {:.2} GB ({:.1}%)",
+            in_size as f64 / 1e9,
+            out_size as f64 / 1e9,
+            out_size as f64 / in_size as f64 * 100.0
+        ),
+        _ => println!("  input: remote safetensors via range requests (no full shard downloaded) -> {:.2} GB", out_size as f64 / 1e9),
+    }
+    if source.is_remote() {
+        println!(
+            "  bandwidth: {:.3} GB fetched in {} HTTP range requests",
+            crate::http::fetched_bytes() as f64 / 1e9,
+            crate::http::fetched_requests()
+        );
+    }
     println!("  config: {} layers (MLA {:?}, dense {:?}), hidden {}, {} experts top-{}", 
         new_n_layers, mla_layers, dense_layers, new_d, new_n_experts, new_top_k);
     println!("  AttnRes: block={} re-applied on the renumbered layers", cfg.attn_res_block);

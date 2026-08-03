@@ -2,8 +2,22 @@
 // Range requests against HuggingFace with redirect following (-L) and retries.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const UA: &str = "microkimi/0.1 (pure-rust; curl-shellout)";
+
+/// Total bytes / requests downloaded in this process (bandwidth accounting
+/// for the remote slice path).
+static FETCHED_BYTES: AtomicU64 = AtomicU64::new(0);
+static FETCHED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn fetched_bytes() -> u64 {
+    FETCHED_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn fetched_requests() -> u64 {
+    FETCHED_REQUESTS.load(Ordering::Relaxed)
+}
 
 /// Downloads `url` in full. None on failure after retries.
 pub fn fetch(url: &str) -> Option<Vec<u8>> {
@@ -39,6 +53,8 @@ pub fn fetch_range(url: &str, range: Option<(u64, u64)>) -> Option<Vec<u8>> {
                         continue;
                     }
                 }
+                FETCHED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                FETCHED_BYTES.fetch_add(out.stdout.len() as u64, Ordering::Relaxed);
                 return Some(out.stdout);
             }
             Ok(out) => {

@@ -22,6 +22,7 @@ mod pool;
 mod safetensors;
 mod selftest;
 mod slice;
+mod slice_st;
 mod tokenizer;
 mod weights;
 
@@ -118,6 +119,9 @@ fn main() {
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
             println!("                                         structural pruning (channels / experts / layers)");
+            println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
+            println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
+            println!("      and, for expert ranking, only the weight_scale bytes are fetched)");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
             println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
