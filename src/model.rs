@@ -44,9 +44,23 @@ fn io_stats() -> Option<(u64, u64)> {
 }
 
 // ── math kernels ──
+//
+// Bit-exactness contract of dot(): every path (scalar fallback, NEON, AVX2)
+// computes the SAME IEEE operations in the SAME order:
+//   - 8 parallel accumulators; element j of each 8-wide chunk goes to acc[j]
+//     (mul, then add - NEVER a fused multiply-add: FMA skips the intermediate
+//     rounding and would drift from the scalar path);
+//   - fixed reduction: pairs p01=(a0+a1), p23=(a2+a3), p45=(a4+a5),
+//     p67=(a6+a7), then ((p01 + p23) + p45) + p67, left-associative;
+//   - the remainder (< 8 elements) is accumulated sequentially into s.
+// The SIMD kernels keep the accumulators in vector lanes and replay this
+// exact reduction, so they are bit-identical to dot_scalar BY CONSTRUCTION.
 
+/// Scalar dot: the historical path, reference for the SIMD kernels and
+/// fallback when no SIMD feature is present.
 #[inline]
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+#[allow(dead_code)] // on aarch64 the dispatched dot() never reaches this
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
     let mut ca = a.chunks_exact(8);
     let mut cb = b.chunks_exact(8);
@@ -65,6 +79,91 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         s += x * y;
     }
     s
+}
+
+/// NEON dot (aarch64): the 8 accumulators live in two float32x4 registers
+/// (lanes = acc[0..4], acc[4..8]); each lane sees the same mul-then-add as
+/// the scalar loop (vaddq of vmulq, never vfmaq). The horizontal reduction
+/// replays the scalar reduction order exactly (see the contract above).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut lo = vdupq_n_f32(0.0);
+        let mut hi = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            lo = vaddq_f32(lo, vmulq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i))));
+            hi = vaddq_f32(hi, vmulq_f32(vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4))));
+            i += 8;
+        }
+        let mut acc = [0f32; 8];
+        vst1q_f32(acc.as_mut_ptr(), lo);
+        vst1q_f32(acc.as_mut_ptr().add(4), hi);
+        let (p01, p23) = (acc[0] + acc[1], acc[2] + acc[3]);
+        let (p45, p67) = (acc[4] + acc[5], acc[6] + acc[7]);
+        let mut s = ((p01 + p23) + p45) + p67;
+        while i < n {
+            s += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        s
+    }
+}
+
+/// AVX2 dot (x86_64): the 8 accumulators are the 8 lanes of one __m256
+/// (_mm256_add_ps of _mm256_mul_ps, never _mm256_fmadd_ps). Same reduction
+/// replay as NEON. Bit-identical to dot_scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut vacc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            vacc = _mm256_add_ps(vacc, _mm256_mul_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i))));
+            i += 8;
+        }
+        let mut acc = [0f32; 8];
+        _mm256_storeu_ps(acc.as_mut_ptr(), vacc);
+        let (p01, p23) = (acc[0] + acc[1], acc[2] + acc[3]);
+        let (p45, p67) = (acc[4] + acc[5], acc[6] + acc[7]);
+        let mut s = ((p01 + p23) + p45) + p67;
+        while i < n {
+            s += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        s
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2_available() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| is_x86_feature_detected!("avx2"))
+}
+
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64: unconditional, zero dispatch cost
+        return unsafe { dot_neon(a, b) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    #[allow(unreachable_code)]
+    dot_scalar(a, b)
 }
 
 // ── --gpu flag: routes large matvecs to Metal on macOS ──
@@ -2275,4 +2374,49 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
         }
     }
     answer
+}
+
+#[cfg(test)]
+mod dot_simd_tests {
+    use super::{dot, dot_scalar};
+
+    /// deterministic filler (splitmix64), no rand crate
+    struct Rng(u64);
+    impl Rng {
+        fn f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) as f64 / u64::MAX as f64 - 0.5) as f32
+        }
+    }
+
+    /// The dispatched dot() must be BIT-IDENTICAL to the scalar reference on
+    /// every length (8-chunks, awkward remainders, degenerate cases).
+    #[test]
+    fn dot_simd_bit_exact() {
+        let mut rng = Rng(0x1234567890ABCDEF);
+        for n in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 100, 127, 128, 129, 1024, 1025, 4096, 16384, 16387] {
+            let a: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            let b: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+            let (want, got) = (dot_scalar(&a, &b), dot(&a, &b));
+            assert_eq!(want.to_bits(), got.to_bits(), "bit mismatch at n={}", n);
+        }
+        // a few pathological values too (infinities, subnormals, zeros)
+        for n in [8usize, 9, 64, 1000] {
+            let a: Vec<f32> = (0..n)
+                .map(|i| match i % 5 {
+                    0 => 0.0,
+                    1 => f32::MIN_POSITIVE,
+                    2 => -f32::MIN_POSITIVE,
+                    3 => 1e30,
+                    _ => -1e-30,
+                })
+                .collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) * 1e-10).collect();
+            let (want, got) = (dot_scalar(&a, &b), dot(&a, &b));
+            assert_eq!(want.to_bits(), got.to_bits(), "bit mismatch (pathological) at n={}", n);
+        }
+    }
 }

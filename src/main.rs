@@ -128,6 +128,8 @@ fn main() {
         "streamtest" => stream::streamtest(&args),
         // microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
         "eval" => eval::run(&args),
+        // (hidden bench) matvec kernel timing: 1024x512 and 163840x1024, 100 iters
+        "dotbench" => dotbench_cmd(),
         // microkimi cache --info | microkimi cache --clean [--repo X]
         "cache" => stream::cache_cmd(&args),
         // microkimi cachereplay trace.bin [--top-k K] [--predict N]
@@ -202,6 +204,40 @@ fn main() {
     // The OS reclaims everything anyway.
     if model::gpu_on() {
         std::process::exit(0);
+    }
+}
+
+/// Hidden bench: matvec kernel timing on the two shapes that dominate the
+/// engine (a mid projection and the full-vocab lm_head), 100 iterations.
+fn dotbench_cmd() {
+    // deterministic filler (splitmix64), no rand crate
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut next_f32 = || {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        ((z ^ (z >> 31)) as f64 / u64::MAX as f64 - 0.5) as f32
+    };
+    for (rows, cols) in [(1024usize, 512usize), (163840, 1024)] {
+        let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..cols).map(|_| next_f32()).collect();
+        let mut out = vec![0f32; rows];
+        model::matvec(&w, rows, cols, &x, &mut out); // warmup
+        let iters = 100;
+        let t = Instant::now();
+        for _ in 0..iters {
+            model::matvec(&w, rows, cols, &x, &mut out);
+        }
+        let dt = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "matvec {}x{}: {:.4} ms/call ({:.2} GFLOP/s)  [checksum {:e}]",
+            rows,
+            cols,
+            dt * 1000.0,
+            2.0 * rows as f64 * cols as f64 / dt / 1e9,
+            out.iter().map(|&v| v as f64).sum::<f64>()
+        );
     }
 }
 
