@@ -510,10 +510,13 @@ fn mxfp4_scale_energy(scale_bytes: &[u8]) -> f64 {
 /// .bin path: exact dequantized Frobenius, one thread per layer (disk reads).
 /// Safetensors path: scale-energy from the weight_scale tensors only; layers
 /// are processed sequentially but each layer's experts are split across 8
-/// threads (remote scoring is curl-latency bound).
+/// threads (remote scoring is curl-latency bound). Every finished layer is
+/// logged (the scoring used to be ~1h of silence on a remote slice).
 fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::collections::HashMap<usize, Vec<usize>> {
     let cfg = src.config();
     let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
+    let total = moe_layers.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
     if matches!(src, Source::St(_)) {
         let mut results = Vec::new();
         for &l in &moe_layers {
@@ -536,13 +539,19 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
                     });
                 }
             });
-            results.push((l, top_n(&scores, n_keep.min(cfg.n_experts))));
+            let keep = top_n(&scores, n_keep.min(cfg.n_experts));
+            let lo = keep.iter().map(|&e| scores[e]).fold(f64::INFINITY, f64::min);
+            let hi = keep.iter().map(|&e| scores[e]).fold(f64::NEG_INFINITY, f64::max);
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            println!("experts: scored layer {}/{} (layer {}, kept {}/{}, top score range {:.3} .. {:.3})", n, total, l, keep.len(), cfg.n_experts, lo, hi);
+            results.push((l, keep));
         }
         return results.into_iter().collect();
     }
     let results: Vec<(usize, Vec<usize>)> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for &l in &moe_layers {
+            let done = &done;
             handles.push(scope.spawn(move || {
                 let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
                 let mut scores = vec![0f64; cfg.n_experts];
@@ -558,7 +567,10 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
                     }
                     scores[e] = expert_norm_sq(&blobs[0], &blobs[1], &blobs[2], rc);
                 }
-                (l, top_n(&scores, n_keep.min(cfg.n_experts)))
+                let keep = top_n(&scores, n_keep.min(cfg.n_experts));
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                println!("experts: scored layer {}/{} (layer {}, kept {}/{})", n, total, l, keep.len(), cfg.n_experts);
+                (l, keep)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -807,6 +819,15 @@ pub fn run(args: &[String]) {
     // ── 2. channel selection (scored on the kept layers only) ──
     let channels: Option<Vec<usize>> = hidden.map(|h| {
         assert!(h > 0 && h <= d, "--hidden must be in 1..={}", d);
+        let n_scored = source
+            .entries()
+            .iter()
+            .filter(|e| {
+                split_layer(&e.name).map(|(l, _)| kept_layers.contains(&l)).unwrap_or(true)
+                    && !matches!(role_of(&e.name, cfg, arch), Role::Copy | Role::RouterB | Role::Expert)
+            })
+            .count();
+        println!("hidden: scoring channels over {} tensors...", n_scored);
         let scores = channel_scores(&source, &kept_layers, d);
         let keep = top_n(&scores, h);
         println!("hidden: keeping {}/{} channels (top-|w|), score range {:.3} .. {:.3}", h, d,
@@ -994,6 +1015,7 @@ pub fn run(args: &[String]) {
     let offsets = w.write_header_v2(&mut f, &config_json);
     let mut done = 0usize;
     let mut last_fetch_report = 0u64;
+    let mut cur_layer: Option<usize> = None;
     let mut vq_err_sum = 0f64;
     let mut vq_err_n = 0u64;
     for (p, &off) in plans.iter().zip(&offsets) {
@@ -1039,6 +1061,14 @@ pub fn run(args: &[String]) {
             }
         }
         done += 1;
+        // one progress line per layer written (plans follow the directory
+        // order, so layers are contiguous)
+        if let Some((nl, _)) = split_layer(&p.out_name) {
+            if cur_layer != Some(nl) {
+                cur_layer = Some(nl);
+                println!("  write: layer {}/{} ({}% of tensors)", nl + 1, new_n_layers, 100 * done / plans.len());
+            }
+        }
         if done % 20000 == 0 {
             println!("  {}/{} tensors written ({:.0?})", done, plans.len(), t0.elapsed());
         }
