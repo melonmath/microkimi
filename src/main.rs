@@ -88,8 +88,10 @@ fn main() {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
             prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"), stream_ram_flag(&args));
         }
-        // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D]
+        // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]
         "streamtest" => stream::streamtest(&args),
+        // microkimi cache --info | microkimi cache --clean [--repo X]
+        "cache" => stream::cache_cmd(&args),
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
             let tok = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -134,8 +136,12 @@ fn main() {
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
-            println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D]");
+            println!("                    --stream-disk N (remote disk cache budget in MB, default 0 = unlimited;");
+            println!("                        expert-only LRU rollover, spine never evicted; env MICROKIMI_STREAM_DISK)");
+            println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]");
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
+            println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
+            println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
             println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }

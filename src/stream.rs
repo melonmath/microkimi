@@ -101,6 +101,127 @@ impl Lru {
     }
 }
 
+// ── disk tier manifest: per-repo access book-keeping for the disk LRU ──
+//
+// atime is unreliable (mount options, tmp+rename persistence), so every repo
+// cache dir keeps a tiny manifest.json: tensor name -> {size, last access
+// (unix seconds)}. It is rewritten (tmp + rename, crash-safe) on process exit
+// and every MANIFEST_FLUSH_EVERY updates to bound the IO cost. A missing or
+// corrupt manifest is rebuilt from the files on disk (size + mtime), so a
+// kill -9 mid-run loses at most the unflushed access timestamps.
+
+const MANIFEST_FLUSH_EVERY: u64 = 64;
+
+struct Manifest {
+    map: HashMap<String, (u64, u64)>, // tensor name -> (size bytes, last access unix)
+    dirty: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+impl Manifest {
+    /// Loads <dir>/manifest.json, tolerating a missing or corrupt file, then
+    /// reconciles with the files actually on disk: a crash between a tensor
+    /// write and the next manifest flush must not lose the entry.
+    fn load(dir: &std::path::Path) -> Manifest {
+        let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+        if let Ok(bytes) = std::fs::read(dir.join("manifest.json")) {
+            // the mini JSON parser panics on malformed input: catch it and
+            // fall back to the on-disk rebuild below
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::json::parse(&bytes)));
+            std::panic::set_hook(prev);
+            if let Ok(j) = parsed {
+                if let Some(crate::json::Json::Obj(tensors)) = j.get("tensors") {
+                    for (name, v) in tensors {
+                        let size = v.get("size").and_then(|x| x.as_num()).unwrap_or(0.0) as u64;
+                        let access = v.get("access").and_then(|x| x.as_num()).unwrap_or(0.0) as u64;
+                        map.insert(name.clone(), (size, access));
+                    }
+                }
+            }
+        }
+        // reconcile with the actual files: add anything the manifest missed,
+        // drop entries whose file is gone
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == "manifest.json" || name.contains(".partial-") {
+                    continue; // the manifest itself and interrupted tmp writes
+                }
+                if !map.contains_key(&name) {
+                    let md = e.metadata().ok();
+                    let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let access = md
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    map.insert(name, (size, access));
+                }
+            }
+        }
+        map.retain(|name, _| dir.join(sanitize(name)).is_file());
+        Manifest { map, dirty: 0 }
+    }
+
+    fn record(&mut self, name: &str, size: u64) {
+        self.map.insert(name.to_string(), (size, now_unix()));
+        self.dirty += 1;
+    }
+
+    fn to_json(&self) -> String {
+        let mut names: Vec<&String> = self.map.keys().collect();
+        names.sort();
+        let mut s = String::from("{\"tensors\":{");
+        for (i, n) in names.iter().enumerate() {
+            let (size, access) = self.map[*n];
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{}\":{{\"size\":{},\"access\":{}}}", n, size, access));
+        }
+        s.push_str("}}");
+        s
+    }
+
+    /// Persists the manifest (tmp + rename) when `force`, or every
+    /// MANIFEST_FLUSH_EVERY updates since the last flush.
+    fn flush_maybe(&mut self, dir: &std::path::Path, force: bool) {
+        if self.dirty == 0 || (!force && self.dirty < MANIFEST_FLUSH_EVERY) {
+            return;
+        }
+        let tmp = dir.join(format!("manifest.json.partial-{}", std::process::id()));
+        if std::fs::write(&tmp, self.to_json()).is_ok() {
+            std::fs::rename(&tmp, dir.join("manifest.json")).ok();
+            self.dirty = 0;
+        }
+    }
+}
+
+/// Routed expert tensors are the only evictable class of the disk cache:
+/// canonical layers.N.block_sparse_moe.experts.E.w{1,2,3} or their raw
+/// layers.N.mlp.experts.E.* equivalents. Shared experts (shared_experts.*),
+/// the router, attention, norms, embeddings and lm_head are spine and are
+/// NEVER evicted.
+fn is_expert_tensor(name: &str) -> bool {
+    let Some(pos) = name.find(".experts.") else {
+        return false;
+    };
+    let rest = &name[pos + ".experts.".len()..];
+    let Some(dot) = rest.find('.') else {
+        return false;
+    };
+    !rest[..dot].is_empty() && rest[..dot].bytes().all(|b| b.is_ascii_digit())
+}
+
 // ── remote source: per-tensor persistent disk cache over HTTP range fetches ──
 
 /// Sanitized cache directory name for a remote repo URL:
@@ -117,20 +238,30 @@ pub fn default_cache_root(url: &str) -> std::path::PathBuf {
 }
 
 /// Remote safetensors model (HTTP range fetches via slice_st::StDir) with a
-/// persistent per-tensor disk cache: every remote byte is fetched once, ever.
+/// persistent per-tensor disk cache: every remote byte is fetched once, ever
+/// (unless the --stream-disk rollover evicts it).
 pub struct RemoteSource {
     st: crate::slice_st::StDir,
     cache_dir: std::path::PathBuf,
+    disk_budget: u64, // bytes, 0 = unlimited (historical behavior)
+    manifest: Mutex<Manifest>,
 }
 
 impl RemoteSource {
     /// Opens a remote (or local safetensors) model; only the index, the config
     /// and the shard headers of `kept_layers` (+ global tensors) are fetched.
+    /// Unlimited disk cache (historical behavior).
     pub fn open(url: &str, cache_dir: std::path::PathBuf, kept_layers: &[usize]) -> RemoteSource {
+        Self::open_disk(url, cache_dir, kept_layers, 0)
+    }
+
+    /// Same as open, with a disk cache budget of `disk_mb` MB (0 = unlimited).
+    pub fn open_disk(url: &str, cache_dir: std::path::PathBuf, kept_layers: &[usize], disk_mb: u64) -> RemoteSource {
         let mut st = crate::slice_st::StDir::open(url, "/tmp/microkimi-stream");
         st.resolve(kept_layers);
         std::fs::create_dir_all(&cache_dir).ok();
-        RemoteSource { st, cache_dir }
+        let manifest = Mutex::new(Manifest::load(&cache_dir));
+        RemoteSource { st, cache_dir, disk_budget: disk_mb << 20, manifest }
     }
 
     fn cache_file(&self, name: &str) -> std::path::PathBuf {
@@ -144,6 +275,9 @@ impl RemoteSource {
         let path = self.cache_file(name);
         if let Ok(b) = std::fs::read(&path) {
             DISK_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed);
+            let mut m = self.manifest.lock().unwrap();
+            m.record(name, b.len() as u64);
+            m.flush_maybe(&self.cache_dir, false);
             return b;
         }
         let e = &self.st.entries[self.st.index[name]];
@@ -151,7 +285,50 @@ impl RemoteSource {
         let tmp = path.with_extension(format!("partial-{}", std::process::id()));
         std::fs::write(&tmp, &b).unwrap_or_else(|e| panic!("cannot write {:?}: {}", tmp, e));
         std::fs::rename(&tmp, &path).ok();
+        {
+            let mut m = self.manifest.lock().unwrap();
+            m.record(name, b.len() as u64);
+            m.flush_maybe(&self.cache_dir, false);
+        }
+        self.enforce_budget();
         b
+    }
+
+    /// Disk LRU rollover (--stream-disk): after a cold fetch pushed the repo
+    /// cache over the budget, evict least-recently-used EXPERT tensors until
+    /// back under budget. Spine tensors are never evicted: if only spine
+    /// remains and the budget is still exceeded, the cache stays over budget
+    /// (the budget is best-effort for experts). An evicted expert is simply
+    /// re-fetched over HTTP on its next miss (one range fetch per tensor), so
+    /// an undersized budget turns into repeated network traffic.
+    fn enforce_budget(&self) {
+        if self.disk_budget == 0 {
+            return;
+        }
+        let mut m = self.manifest.lock().unwrap();
+        let mut total: u64 = m.map.values().map(|e| e.0).sum();
+        if total <= self.disk_budget {
+            return;
+        }
+        let mut experts: Vec<(String, u64, u64)> = m
+            .map
+            .iter()
+            .filter(|(n, _)| is_expert_tensor(n))
+            .map(|(n, &(sz, at))| (n.clone(), sz, at))
+            .collect();
+        experts.sort_by_key(|e| e.2); // least recently used first
+        for (name, sz, _) in experts {
+            if total <= self.disk_budget {
+                break;
+            }
+            if std::fs::remove_file(self.cache_file(&name)).is_ok() {
+                total = total.saturating_sub(sz);
+                m.map.remove(&name);
+                m.dirty += 1;
+                println!("stream-disk: evicted {} ({})", name, mb(sz));
+            }
+        }
+        m.flush_maybe(&self.cache_dir, true);
     }
 
     /// The 3 MXFP4 blobs of one routed expert, concatenated w1 ++ w2 ++ w3.
@@ -168,6 +345,14 @@ impl RemoteSource {
     fn direct_bytes(&self, name: &str) -> Vec<u8> {
         let e = &self.st.entries[self.st.index[name]];
         self.st.raw_blob(e)
+    }
+}
+
+impl Drop for RemoteSource {
+    /// Final manifest flush at exit (a kill -9 skips this; the next open
+    /// rebuilds whatever is missing from the files on disk).
+    fn drop(&mut self) {
+        self.manifest.get_mut().unwrap().flush_maybe(&self.cache_dir, true);
     }
 }
 
@@ -198,12 +383,12 @@ impl ExpertCache {
         }
     }
 
-    /// Remote streaming source (per-tensor persistent cache).
+    /// Remote streaming source (per-tensor persistent cache, disk budget in MB).
     #[allow(dead_code)] // wired end-to-end once real-dim MLA layers run (see docs)
-    pub fn remote(url: &str, ram_mb: usize, kept_layers: &[usize]) -> ExpertCache {
+    pub fn remote(url: &str, ram_mb: usize, kept_layers: &[usize], disk_mb: u64) -> ExpertCache {
         ExpertCache {
             inner: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
-            src: Src::Remote(RemoteSource::open(url, default_cache_root(url), kept_layers)),
+            src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
         }
     }
 
@@ -245,14 +430,16 @@ impl ExpertCache {
 
 // ── streamtest: remote per-tensor cache + LRU budget proof ──
 
-/// `microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D]`
+/// `microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]`
 ///
 /// Bandwidth-safe proof of the remote tier against the real K3 repo:
 /// 1. cold fetch of 3 real tensors (one MoE router, one expert w1, one KDA
 ///    q_proj) through the per-tensor persistent cache, byte-compared against
 ///    slice_st's direct fetch;
 /// 2. warm fetch of the same tensors: served from disk, zero network bytes;
-/// 3. LRU eviction respects the --stream-ram budget.
+/// 3. LRU eviction respects the --stream-ram budget;
+/// 4. with --stream-disk N (or env MICROKIMI_STREAM_DISK): disk LRU rollover,
+///    expert-only eviction, spine survival and re-fetch of an evicted expert.
 /// Only layers 0-2 are resolved (KDA in real K3: 0 dense, 1-2 MoE), so the
 /// index, the config and a handful of shard headers are the only fixed cost.
 pub fn streamtest(args: &[String]) {
@@ -271,6 +458,14 @@ pub fn streamtest(args: &[String]) {
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(format!("/tmp/microkimi-streamtest-{}", std::process::id())));
+    // disk cache budget in MB (0 = unlimited, the historical behavior)
+    let disk_mb: u64 = args
+        .iter()
+        .position(|a| a == "--stream-disk")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .or_else(|| std::env::var("MICROKIMI_STREAM_DISK").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
     // cold start: this proof needs an empty disk cache
     let _ = std::fs::remove_dir_all(&cache_dir);
     println!("streamtest: {} (layers 0-2, cache {})", url, cache_dir.display());
@@ -334,6 +529,164 @@ pub fn streamtest(args: &[String]) {
         );
     }
     let _ = &cache; // silence unused-variable lint if asserts change
+
+    // 4) disk LRU rollover (--stream-disk N): expert-only eviction proof.
+    // Runs in a fresh subdir so the big spine tensors cached above (a real
+    // q_proj alone is ~336 MB) do not dominate the budget arithmetic.
+    if disk_mb > 0 {
+        println!("-- 4) disk rollover under a {} MB budget (expert-only, spine never evicted)", disk_mb);
+        let roll_dir = cache_dir.join("roll");
+        let _ = std::fs::remove_dir_all(&roll_dir);
+        let roll = RemoteSource::open_disk(&url, roll_dir.clone(), &[0, 1, 2], disk_mb);
+        // two small real spine tensors: router bias + input layernorm
+        let spine = ["layers.1.block_sparse_moe.gate.e_score_correction_bias", "layers.1.input_layernorm.weight"];
+        // real expert w1 blobs (~5.6 MB packed each): 3 fetches overflow an
+        // 8 MB budget twice, oldest first
+        let experts = [
+            "layers.1.block_sparse_moe.experts.0.w1",
+            "layers.1.block_sparse_moe.experts.1.w1",
+            "layers.1.block_sparse_moe.experts.2.w1",
+        ];
+        for name in spine {
+            roll.tensor_bytes(name);
+        }
+        for name in experts {
+            roll.tensor_bytes(name); // each fetch persists, then rollover runs
+        }
+        let cached = |n: &str| roll_dir.join(sanitize(n)).is_file();
+        assert!(!cached(experts[0]), "{}: oldest expert was not evicted", experts[0]);
+        assert!(!cached(experts[1]), "{}: second-oldest expert was not evicted", experts[1]);
+        assert!(cached(experts[2]), "{}: newest expert is missing", experts[2]);
+        for name in spine {
+            assert!(cached(name), "spine tensor {} was evicted (must never happen)", name);
+        }
+        println!("  3 expert w1 fetched under {} MB: two oldest evicted, spine intact: OK", disk_mb);
+        // an evicted expert is re-fetched over HTTP on its next miss
+        let net0 = crate::http::fetched_bytes();
+        let b = roll.tensor_bytes(experts[0]);
+        let net = crate::http::fetched_bytes() - net0;
+        assert!(net > 0, "{}: evicted expert re-fetch used no network", experts[0]);
+        assert!(cached(experts[0]), "{}: re-fetched expert was not re-cached", experts[0]);
+        println!("  re-fetch of evicted {}: {} bytes, network {}: OK", experts[0], b.len(), mb(net));
+        // the manifest tracks every cached tensor and is valid JSON
+        let mbytes = std::fs::read(roll_dir.join("manifest.json")).expect("manifest.json missing after rollover");
+        assert!(crate::json::parse(&mbytes).get("tensors").is_some(), "manifest.json has no tensors object");
+        println!("  manifest.json present and valid: OK");
+        // spine alone over budget: the 25 MB MoE router (spine) exceeds the
+        // budget by itself; with nothing evictable the spine is kept anyway
+        let big_dir = cache_dir.join("roll-spine");
+        let _ = std::fs::remove_dir_all(&big_dir);
+        let big = RemoteSource::open_disk(&url, big_dir.clone(), &[0, 1, 2], disk_mb);
+        big.tensor_bytes("layers.1.block_sparse_moe.gate.weight"); // 25 MB spine > 8 MB budget
+        big.tensor_bytes(experts[0]); // rollover: the expert is the only evictable tensor
+        assert!(big_dir.join(sanitize("layers.1.block_sparse_moe.gate.weight")).is_file(), "spine router was evicted over budget");
+        assert!(!big_dir.join(sanitize(experts[0])).is_file(), "{}: expert should have been evicted", experts[0]);
+        println!("  spine alone over budget (25 MB router > {} MB): spine kept, expert evicted instead: OK", disk_mb);
+    }
     println!("streamtest: all checks passed");
     println!("{}", report_line());
+}
+
+// ── cache command: disk cache inspection and cleanup ──
+
+/// unix seconds -> "YYYY-MM-DD HH:MM:SS UTC" (civil-from-days, no tables).
+fn fmt_unix(t: u64) -> String {
+    if t == 0 {
+        return "-".to_string();
+    }
+    let days = (t / 86400) as i64;
+    let secs = t % 86400;
+    // Howard Hinnant's civil_from_days
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
+fn dir_name(p: &std::path::Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `microkimi cache --info` / `microkimi cache --clean [--repo X]`
+///
+/// --info: per-repo disk usage under ~/.cache/microkimi (bytes, tensor count,
+/// oldest/newest recorded access) plus a total. Access times come from each
+/// repo's manifest.json, rebuilt from the files on disk when missing/corrupt.
+/// --clean: deletes the cached tensors of every repo (or of --repo X only,
+/// matched by its sanitized directory name or the original URL) and prints
+/// the freed bytes. Never asks for confirmation.
+pub fn cache_cmd(args: &[String]) {
+    let info = args.iter().any(|a| a == "--info");
+    let clean = args.iter().any(|a| a == "--clean");
+    if info == clean {
+        eprintln!("usage: microkimi cache --info");
+        eprintln!("       microkimi cache --clean [--repo X]");
+        std::process::exit(1);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let root = std::path::PathBuf::from(format!("{}/.cache/microkimi", home));
+    let mut repos: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    repos.sort();
+    if let Some(r) = args.iter().position(|a| a == "--repo").and_then(|i| args.get(i + 1)) {
+        // accept the sanitized directory name or the original repo URL
+        let bare = r.trim_start_matches("https://").trim_start_matches("http://");
+        let want = sanitize(bare);
+        repos.retain(|p| {
+            let n = dir_name(p);
+            n == *r || n == want
+        });
+        if repos.is_empty() {
+            eprintln!("error: no cached repo matches '{}'", r);
+            std::process::exit(1);
+        }
+    }
+    if repos.is_empty() {
+        println!("cache: no repos under {}", root.display());
+        return;
+    }
+    if info {
+        let (mut tot_b, mut tot_n) = (0u64, 0usize);
+        for d in &repos {
+            let m = Manifest::load(d);
+            let bytes: u64 = m.map.values().map(|e| e.0).sum();
+            let oldest = m.map.values().map(|e| e.1).filter(|&t| t > 0).min();
+            let newest = m.map.values().map(|e| e.1).filter(|&t| t > 0).max();
+            println!("{}", dir_name(d));
+            println!("  tensors: {}", m.map.len());
+            println!("  bytes:   {} ({} B)", mb(bytes), bytes);
+            println!("  oldest access: {}", oldest.map(fmt_unix).unwrap_or_else(|| "-".to_string()));
+            println!("  newest access: {}", newest.map(fmt_unix).unwrap_or_else(|| "-".to_string()));
+            tot_b += bytes;
+            tot_n += m.map.len();
+        }
+        println!("total: {} in {} tensors across {} repo(s)", mb(tot_b), tot_n, repos.len());
+    } else {
+        let mut tot = 0u64;
+        for d in &repos {
+            let (mut freed, mut n) = (0u64, 0usize);
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if !p.is_file() {
+                        continue;
+                    }
+                    freed += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    n += 1;
+                    std::fs::remove_file(&p).ok();
+                }
+            }
+            println!("{}: freed {} ({} files)", dir_name(d), mb(freed), n);
+            tot += freed;
+        }
+        println!("cache: freed {} total", mb(tot));
+    }
 }
