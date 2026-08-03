@@ -24,6 +24,11 @@ GPU (NVIDIA, torch CUDA backend):
   exact fix is the chunked WY representation of the delta rule, intentionally
   NOT implemented here because it changes the float summation order (the
   engine is validated 1:1 against the per-token recurrence).
+  On cuda, two math-preserving fast paths are active (env-tunable, see
+  model_nano.py / vendor/fla/ops/kda/__init__.py): chunked MoE with cached
+  expert stacks (NANO_MOE_CHUNK, NANO_MOE_FAST_DEVICES) and time-segment
+  gradient checkpointing of the KDA recurrence (NANO_KDA_SEG,
+  NANO_KDA_SEG_DEVICES). The cpu/mps paths are unchanged.
 """
 import argparse
 import ctypes

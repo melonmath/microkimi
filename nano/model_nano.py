@@ -61,6 +61,34 @@ from vendor.moonshot.modeling_kimi_linear import (
 
 # MOE_BMM: True = vectorized grouped-GEMM (validated 1:1 against the loop), False = loop
 MOE_BMM = os.environ.get("NANO_MOE_BMM", "1") == "1"
+# CUDA fast path for the MoE: experts are processed in bounded chunks of
+# NANO_MOE_CHUNK experts (memory-bounded, each chunk wrapped in gradient
+# checkpointing) over cached stacked weights (one copy per step instead of one
+# torch.stack per call). SAME mathematics as moe_train_bmm (validated 1:1);
+# only enabled on the device types listed in NANO_MOE_FAST_DEVICES.
+MOE_FAST_DEVICES = tuple(
+    d for d in os.environ.get("NANO_MOE_FAST_DEVICES", "cuda").split(",") if d
+)
+MOE_CHUNK = int(os.environ.get("NANO_MOE_CHUNK", "128"))
+
+
+class _CachedStack(torch.autograd.Function):
+    """Identity on a pre-stacked weight cache with the gradient routing of
+    torch.stack(params): backward hands each source parameter its slice of
+    the incoming gradient. The cache is refreshed in place under no_grad
+    inside forward, so the stacked copy never appears in the autograd graph
+    (no per-call allocation, no StackBackward scatter)."""
+
+    @staticmethod
+    def forward(ctx, cache, *params):
+        with torch.no_grad():
+            torch.stack(params, out=cache)
+        ctx.n = len(params)
+        return cache
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return (None,) + tuple(grad_out[i] for i in range(ctx.n))
 
 
 class TrainableSparseMoe(KimiSparseMoeBlock):
@@ -84,7 +112,10 @@ class TrainableSparseMoe(KimiSparseMoeBlock):
         if self.use_latent_moe:
             hidden = self.routed_expert_down_proj(hidden)
         if MOE_BMM:
-            y = self.moe_train_bmm(hidden, topk_idx, topk_weight)
+            if hidden.device.type in MOE_FAST_DEVICES:
+                y = self.moe_train_bmm_fast(hidden, topk_idx, topk_weight)
+            else:
+                y = self.moe_train_bmm(hidden, topk_idx, topk_weight)
         else:
             y = self.moe_train(hidden, topk_idx, topk_weight)
         if self.use_latent_moe:
@@ -160,6 +191,95 @@ class TrainableSparseMoe(KimiSparseMoeBlock):
             act = (4.0 * torch.tanh(g / 4.0) * torch.sigmoid(g)) * (25.0 * torch.tanh(u / 25.0))
             y = torch.bmm(act, w2.transpose(1, 2))  # [E, cap, H]
             out_sorted[mask] = y[eids_r, slot_r]
+        unsorted = torch.empty_like(out_sorted)
+        unsorted[order] = out_sorted
+        return (unsorted * flat_w).view(n, k, -1).sum(1)
+
+    def _cached_expert_stacks(self):
+        """Stacked expert weights [E, I, H], [E, I, H], [E, H, I], cached on the
+        module and refreshed in place on every call (see _CachedStack)."""
+        e0 = self.experts[0]
+        ref = e0.w1.weight
+        cache = getattr(self, "_wstack_cache", None)
+        if cache is None or cache[0].device != ref.device or cache[0].dtype != ref.dtype:
+            cache = (
+                torch.empty(len(self.experts), *ref.shape, device=ref.device, dtype=ref.dtype),
+                torch.empty(len(self.experts), *e0.w3.weight.shape, device=ref.device, dtype=ref.dtype),
+                torch.empty(len(self.experts), *e0.w2.weight.shape, device=ref.device, dtype=ref.dtype),
+            )
+            self._wstack_cache = cache
+        w1c, w3c, w2c = cache
+        w1 = _CachedStack.apply(w1c, *[e.w1.weight for e in self.experts])
+        w3 = _CachedStack.apply(w3c, *[e.w3.weight for e in self.experts])
+        w2 = _CachedStack.apply(w2c, *[e.w2.weight for e in self.experts])
+        return w1, w3, w2
+
+    def _expert_chunk(self, toks, eids_l, slot_l, w1g, w3g, w2g, cap, gsz, cap_max):
+        """SiTU MLP for one chunk of gsz experts over the tokens routed to them
+        (toks [m, h], eids_l/slot_l local expert id / per-expert slot).
+        Identical math to the per-round body of moe_train_bmm; the capacity is
+        bounded by cap and overflow is handled in rounds (identical result)."""
+        h_dim = toks.shape[-1]
+        out = torch.empty_like(toks)
+        n_rounds = (cap_max + cap - 1) // cap
+        for r in range(n_rounds):
+            mask = (slot_l >= r * cap) & (slot_l < (r + 1) * cap)
+            eids_r = eids_l[mask]
+            slot_r = slot_l[mask] - r * cap
+            dense = toks.new_zeros(gsz, cap, h_dim)
+            dense[eids_r, slot_r] = toks[mask]
+            g = torch.bmm(dense, w1g.transpose(1, 2))  # [gsz, cap, I]
+            u = torch.bmm(dense, w3g.transpose(1, 2))
+            # SiTU identical to SituAndMul(4, 25): a=4·tanh(g/4)·sigmoid(g) ; u=25·tanh(u/25)
+            act = (4.0 * torch.tanh(g / 4.0) * torch.sigmoid(g)) * (25.0 * torch.tanh(u / 25.0))
+            y = torch.bmm(act, w2g.transpose(1, 2))  # [gsz, cap, H]
+            out[mask] = y[eids_r, slot_r]
+        return out
+
+    def moe_train_bmm_fast(self, x, topk_ids, topk_weight):
+        """CUDA fast path: SAME mathematics as moe_train_bmm (validated 1:1),
+        but memory-bounded: experts are processed in chunks of MOE_CHUNK
+        instead of all 896 at once, each chunk wrapped in gradient
+        checkpointing (the dense [G, cap, h] activations and their SiTU
+        intermediates are recomputed chunk-by-chunk during backward instead
+        of being retained for all 896 experts), and the expert weights are
+        stacked once per step into a cache instead of 3 torch.stack per call.
+        This removes the memory cliff (dense [896, cap_budget, 512] + SiTU
+        saves) that OOMed batch 32 on a 23 GB card."""
+        n, k = topk_ids.shape
+        e_max = len(self.experts)
+        h_dim = x.shape[-1]
+        flat_ids = topk_ids.reshape(-1)
+        flat_w = topk_weight.reshape(-1, 1)
+        rep = x.unsqueeze(1).expand(n, k, h_dim).reshape(n * k, h_dim)
+        order = flat_ids.argsort()
+        sorted_tokens = rep[order]
+        counts = torch.bincount(flat_ids, minlength=e_max)
+        starts = counts.cumsum(0) - counts
+        sorted_eids = flat_ids[order]
+        slot = torch.arange(n * k, device=x.device) - starts[sorted_eids]
+        counts_np = counts.cpu().numpy()  # one host sync per call (chunk bounds)
+        # bounded capacity budget, same formula as moe_train_bmm
+        cap_budget = max(64, (3 * n * k + e_max - 1) // e_max)
+        w1, w3, w2 = self._cached_expert_stacks()
+        out_sorted = torch.empty_like(sorted_tokens)
+        for e0 in range(0, e_max, MOE_CHUNK):
+            e1 = min(e0 + MOE_CHUNK, e_max)
+            m = int(counts_np[e0:e1].sum())
+            if m == 0:
+                continue
+            a = int(counts_np[:e0].sum())  # tokens of a chunk are contiguous (sorted)
+            cap_max = int(counts_np[e0:e1].max())
+            cap = min(cap_max, cap_budget)
+            out_sorted[a: a + m] = torch.utils.checkpoint.checkpoint(
+                self._expert_chunk,
+                sorted_tokens[a: a + m],
+                sorted_eids[a: a + m] - e0,
+                slot[a: a + m],
+                w1[e0:e1], w3[e0:e1], w2[e0:e1],
+                cap, e1 - e0, cap_max,
+                use_reentrant=False,
+            )
         unsorted = torch.empty_like(out_sorted)
         unsorted[order] = out_sorted
         return (unsorted * flat_w).view(n, k, -1).sum(1)

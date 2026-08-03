@@ -26,6 +26,36 @@ def normalize_recur_mode(value):
 
 RECUR = normalize_recur_mode(os.environ.get("K3_KDA_RECUR", "device"))
 
+# NANO_KDA_SEG: time-segment length for gradient-checkpointing the training
+# recurrence (0 = off). The recurrence itself is UNCHANGED - the exact same
+# per-token loop runs, only wrapped in torch.utils.checkpoint every SEG tokens
+# so autograd retains O(SEG) per-token states instead of O(T) (recompute is
+# deterministic, so results are bit-identical). Enabled only on the device
+# types listed in NANO_KDA_SEG_DEVICES (default "cuda": the CPU/MPS paths are
+# byte-for-byte the old code).
+KDA_SEG = int(os.environ.get("NANO_KDA_SEG", "64"))
+KDA_SEG_DEVICES = tuple(
+    d for d in os.environ.get("NANO_KDA_SEG_DEVICES", "cuda").split(",") if d
+)
+
+
+def _kda_recur(q, k, v, g, beta, S):
+    """Per-token delta-rule recurrence over a (slice of) time steps.
+    q,k,g: [B,t,H,K]; v: [B,t,H,V]; beta: [B,t,H]; S: [B,H,K,V] -> (o, S)."""
+    B, t, H, K = q.shape
+    V = v.shape[-1]
+    o = torch.empty(B, t, H, V, dtype=torch.float32, device=q.device)
+    for i in range(t):
+        q_t, k_t, v_t, g_t, b_t = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
+        S = S * g_t.exp().unsqueeze(-1)                                   # decay along K
+        delta = v_t - (k_t.unsqueeze(-1) * S).sum(-2)                     # [B,H,V]
+        # NOTE: einsum replaced by broadcast+sum — identical math, but these
+        # two forms only need mul/sum, which are universally supported on the
+        # MPS backend (einsum is the riskiest op there).
+        S = S + (b_t.unsqueeze(-1) * k_t).unsqueeze(-1) * delta.unsqueeze(-2)
+        o[:, i] = (q_t.unsqueeze(-1) * S).sum(-2)
+    return o, S
+
 
 def _kda_gate(g, A_log, dt_bias, lower_bound):
     # g: [B, T, H, K] raw; dt_bias: [H*K]; A_log: [H] or [K]
@@ -71,16 +101,23 @@ def _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
     if initial_state is not None:
         S = S + initial_state.to(torch.float32)
     q = q * scale
-    o = torch.empty(B, T, H, V, dtype=torch.float32, device=q.device)
-    for t in range(T):
-        q_t, k_t, v_t, g_t, b_t = q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t]
-        S = S * g_t.exp().unsqueeze(-1)                                   # decay along K
-        delta = v_t - (k_t.unsqueeze(-1) * S).sum(-2)                     # [B,H,V]
-        # NOTE: einsum replaced by broadcast+sum — identical math, but these
-        # two forms only need mul/sum, which are universally supported on the
-        # MPS backend (einsum is the riskiest op there).
-        S = S + (b_t.unsqueeze(-1) * k_t).unsqueeze(-1) * delta.unsqueeze(-2)
-        o[:, t] = (q_t.unsqueeze(-1) * S).sum(-2)
+    if KDA_SEG > 0 and T > KDA_SEG and q.device.type in KDA_SEG_DEVICES:
+        # training on GPU: checkpoint the recurrence every KDA_SEG tokens.
+        # Identical math (same loop, deterministic recompute); autograd only
+        # retains the segment-boundary states plus one segment's internals
+        # instead of ~4 state-sized tensors per token per layer.
+        import torch.utils.checkpoint as _ckpt
+        o = torch.empty(B, T, H, V, dtype=torch.float32, device=q.device)
+        for t0 in range(0, T, KDA_SEG):
+            t1 = min(t0 + KDA_SEG, T)
+            o_seg, S = _ckpt.checkpoint(
+                _kda_recur,
+                q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g[:, t0:t1], beta[:, t0:t1], S,
+                use_reentrant=False,
+            )
+            o[:, t0:t1] = o_seg
+    else:
+        o, S = _kda_recur(q, k, v, g, beta, S)
     return o, S
 
 
