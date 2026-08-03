@@ -10,6 +10,7 @@ mod deepseek;
 mod dequant;
 mod dstok;
 mod config;
+mod eval;
 mod http;
 mod json;
 #[cfg(target_os = "macos")]
@@ -89,6 +90,8 @@ fn main() {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
             prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"), stream_ram_flag(&args));
         }
+        // microkimi absorb file.txt --out pack.mkmem [--model X.bin] [--vocab V.json] [--chat]
+        "absorb" => absorb_cmd(&args),
         // microkimi mkmem-merge A.mkmem B.mkmem [C.mkmem ...] --out AB.mkmem [--shuffle N]
         // (experiment) KDA state additivity: s = element-wise sum over inputs,
         // conv/MLA/logits from the first input. --shuffle N shuffles the s of
@@ -122,6 +125,8 @@ fn main() {
         "mkmem-div" => mkmem_div_cmd(&args),
         // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]
         "streamtest" => stream::streamtest(&args),
+        // microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
+        "eval" => eval::run(&args),
         // microkimi cache --info | microkimi cache --clean [--repo X]
         "cache" => stream::cache_cmd(&args),
         // debug command (debug helper): prints the tokenization of a text
@@ -176,6 +181,8 @@ fn main() {
             println!("                        0 = off, default; output-preserving, only changes fetch timing)");
             println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]");
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
+            println!("  microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]");
+            println!("                                         deterministic QA probes (40 x 2 formulations) + perplexity scorecard");
             println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
             println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
