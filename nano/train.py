@@ -55,8 +55,37 @@ def rss_gb():
     return -1.0
 
 
+def _tokens_dtype(path):
+    """Picks the memmap dtype for a tokens.bin corpus.
+
+    Default is uint16 (nano vocab 8200). A sibling meta file switches to
+    uint32 when it declares a u32 dtype or a vocab larger than 65535
+    (real K3 vocab is 163840). Meta is looked up as <data>.meta.json first,
+    then as <stem>.meta.json (the convention used by prepare.py). Without a
+    meta file the behavior is exactly the legacy one: uint16.
+    """
+    metas = [path + ".meta.json"]
+    stem, ext = os.path.splitext(path)
+    if ext:
+        metas.append(stem + ".meta.json")
+    for meta in metas:
+        if not os.path.exists(meta):
+            continue
+        try:
+            with open(meta, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        dtype = str(info.get("dtype", "")).lower()
+        vocab = info.get("vocab", info.get("vocab_size", 0)) or 0
+        if dtype.replace("le", "") in ("uint32", "u32") or vocab > 65535:
+            return np.uint32
+        return np.uint16  # explicit meta wins; keep the declared legacy dtype
+    return np.uint16
+
+
 def load_tokens(path):
-    return np.memmap(path, dtype=np.uint16, mode="r")
+    return np.memmap(path, dtype=_tokens_dtype(path), mode="r")
 
 
 def dev_mem_str(dev):
