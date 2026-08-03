@@ -63,6 +63,54 @@ fn mb(n: u64) -> String {
     format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
 }
 
+// ── expert request trace (MICROKIMI_TRACE=/path/trace.bin) ──
+//
+// The router picks do not depend on the cache contents, so every demand
+// request ExpertCache::get serves can be recorded as an ordered (layer,
+// expert) stream and replayed OFFLINE under any cache policy and capacity
+// (see tools_replay.rs, `microkimi cachereplay`): one traced run yields the
+// whole hit-rate vs capacity curve without rerunning the model.
+//
+// Trace format: raw little-endian record stream, no header. One record per
+// demand request, 8 bytes: u32 layer LE ++ u32 expert LE. Records are in
+// call order (within one MoE layer the 16 parallel pool jobs serialize on
+// the trace mutex, so the intra-layer order is the lock acquisition order;
+// layers never interleave, pool barrier). Recording is demand-only:
+// prefetches do not record. Unbuffered writes (one 8-byte write per record)
+// so a process exit() cannot lose tail records; zero overhead when the env
+// var is absent (one OnceLock read + None check per request).
+static TRACE_SINK: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+
+/// The trace sink, initialized once from MICROKIMI_TRACE. Logs one startup
+/// line when active.
+fn trace_sink() -> &'static Option<Mutex<std::fs::File>> {
+    TRACE_SINK.get_or_init(|| match std::env::var("MICROKIMI_TRACE") {
+        Ok(p) if !p.is_empty() => match std::fs::File::create(&p) {
+            Ok(f) => {
+                println!("stream: tracing expert requests to {} (MICROKIMI_TRACE, u32 layer LE ++ u32 expert LE)", p);
+                Some(Mutex::new(f))
+            }
+            Err(e) => {
+                eprintln!("warning: cannot open trace file {}: {}", p, e);
+                None
+            }
+        },
+        _ => None,
+    })
+}
+
+/// Appends one (layer, expert) record to the trace (no-op when tracing is
+/// off).
+fn trace_record(layer: u32, expert: u32) {
+    if let Some(m) = trace_sink() {
+        use std::io::Write;
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&layer.to_le_bytes());
+        b[4..].copy_from_slice(&expert.to_le_bytes());
+        m.lock().unwrap().write_all(&b).ok();
+    }
+}
+
 /// One-line fetch report printed at exit when --stream is active.
 pub fn report_line() -> String {
     let mut s = format!(
@@ -434,7 +482,8 @@ fn decay(epoch: u64, stamp: u64) -> f32 {
 /// parallel pool batch and layers run sequentially, so the gets of one layer
 /// never interleave with the next layer's (pool barrier). A get whose layer
 /// differs from the open batch closes it.
-struct Predictor {
+/// pub(crate): also driven offline by tools_replay (cachereplay), as-is.
+pub(crate) struct Predictor {
     cur_layer: u32,            // layer of the open batch (u32::MAX = none yet)
     cur_set: Vec<u32>,         // distinct experts of the open batch
     prev_set: Vec<u32>,        // last closed batch (the previous MoE layer)
@@ -450,10 +499,10 @@ struct Predictor {
 }
 
 /// One predicted expert to fetch in the background: (layer, expert, offsets).
-type PrefetchJob = (u32, u32, [u64; 3]);
+pub(crate) type PrefetchJob = (u32, u32, [u64; 3]);
 
 impl Predictor {
-    fn new() -> Predictor {
+    pub(crate) fn new() -> Predictor {
         Predictor {
             cur_layer: u32::MAX,
             cur_set: Vec::new(),
@@ -480,7 +529,7 @@ impl Predictor {
     /// MoE layer when the open batch just reached top-k (the full router set
     /// of a decode step): the current layer's experts are all in flight, so
     /// the prefetch overlaps the current layer's compute.
-    fn observe(&mut self, layer: u32, expert: u32, offs: [u64; 3], blob: usize, top_k: usize, n: usize) -> Vec<PrefetchJob> {
+    pub(crate) fn observe(&mut self, layer: u32, expert: u32, offs: [u64; 3], blob: usize, top_k: usize, n: usize) -> Vec<PrefetchJob> {
         // offset book-keeping (for prefetching experts never seen before)
         self.blob = blob;
         self.offs.insert((layer, expert), offs);
@@ -799,6 +848,9 @@ impl ExpertCache {
         } else {
             println!("stream: offset-sorted expert reads off (MICROKIMI_NO_OFFSORT=1)");
         }
+        // initialize the trace sink now so its startup line prints with the
+        // other stream lines (no-op when MICROKIMI_TRACE is unset)
+        trace_sink();
         ExpertCache {
             inner: Arc::new(CacheInner {
                 lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
@@ -824,6 +876,8 @@ impl ExpertCache {
     /// w1 ++ w2 ++ w3, `blob` bytes each. `offs` = absolute file offsets of
     /// the three blobs (local source; ignored by the remote one).
     pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Arc<Vec<u8>> {
+        // record the demand request (MICROKIMI_TRACE; no-op when unset)
+        trace_record(layer, expert);
         // feed the Markov predictor; on a completed top-k batch this may
         // return prefetch jobs for the next MoE layer, run on a detached
         // thread so they overlap the current layer's compute

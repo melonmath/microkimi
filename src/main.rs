@@ -27,6 +27,7 @@ mod slice;
 mod slice_st;
 mod stream;
 mod tokenizer;
+mod tools_replay;
 mod weights;
 
 use std::time::Instant;
@@ -129,6 +130,8 @@ fn main() {
         "eval" => eval::run(&args),
         // microkimi cache --info | microkimi cache --clean [--repo X]
         "cache" => stream::cache_cmd(&args),
+        // microkimi cachereplay trace.bin [--top-k K] [--predict N]
+        "cachereplay" => tools_replay::run(&args),
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
             let tok = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -179,12 +182,16 @@ fn main() {
             println!("                        expert-only LRU rollover, spine never evicted; env MICROKIMI_STREAM_DISK)");
             println!("                    --stream-predict N (Markov expert prefetch: N predicted experts/layer,");
             println!("                        0 = off, default; output-preserving, only changes fetch timing)");
+            println!("                    env MICROKIMI_TRACE=trace.bin records the expert request stream (see cachereplay)");
             println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]");
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
             println!("  microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]");
             println!("                                         deterministic QA probes (40 x 2 formulations) + perplexity scorecard");
             println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
+            println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");
+            println!("                                         replay a MICROKIMI_TRACE expert-request trace offline:");
+            println!("                                         hit-rate vs capacity under LRU, Markov prefetch, Belady");
             println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
