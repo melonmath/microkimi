@@ -137,8 +137,169 @@ impl BinWriter {
 
 // ── reading (inference) ──
 
+// ── file backing: owned Vec or read-only mmap (RAM overcommit) ──
+//
+// Loading a 20-32 GB model with std::fs::read commits the whole file to
+// ANONYMOUS memory, which the kernel cannot reclaim under pressure: a model
+// larger than RAM OOMs (observed: a 21 GB run on a 15 GB VM). A PROT_READ /
+// MAP_PRIVATE mmap keeps the bytes file-backed instead: pages fault in on
+// first touch and are reclaimable at any time (re-faulted on the next token
+// pass), so the kernel does the demand-paging and the resident set stays
+// bounded by what the memory pressure allows. Every engine access is a
+// read-only &[u8]/&[f32] slice into BinFile.data, so the backing switch is
+// invisible upstream (Deref<Target = [u8]>). mmap is the default at ANY
+// file size: one uniform code path, no up-front copy, instant load, and the
+// page cache sharing benefits small models too; the Vec path remains as the
+// MICROKIMI_NO_MMAP=1 fallback (and mmap failure fallback).
+
+/// Raw read-only file mapping. `Send` + `Sync` are sound: the mapping is
+/// PROT_READ, so no mutation is possible through it, all access is shared
+/// reads of bytes that never change, and the only deallocation is Drop
+/// (munmap), which runs when no reference into the mapping can exist.
+pub struct Mmap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for Mmap {}
+unsafe impl Sync for Mmap {}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            mman::munmap(self.ptr as *mut std::ffi::c_void, self.len);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = (self.ptr, self.len);
+    }
+}
+
+/// What backs BinFile.data. Derefs to [u8]; nothing upstream changes.
+pub enum Backing {
+    Vec(Vec<u8>),
+    Mmap(Mmap),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::Vec(v) => v.as_slice(),
+            // sound: `ptr..ptr+len` is a live PROT_READ mapping for the whole
+            // lifetime of `self` (munmap only in Drop), u8 has no validity
+            // constraints, and the bytes are never mutated
+            Backing::Mmap(m) => unsafe { std::slice::from_raw_parts(m.ptr, m.len) },
+        }
+    }
+}
+
+// Direct libc FFI (no crate). Constant values verified against the system
+// headers: Linux glibc asm-generic/mman-common.h (PROT_READ 0x1,
+// MADV_RANDOM 1) and bits/mman-linux.h (MAP_PRIVATE 0x02); Apple XNU
+// bsd/sys/mman.h (PROT_READ 0x01, MAP_PRIVATE 0x0002, MADV_RANDOM 1 =
+// POSIX_MADV_RANDOM). Identical values on Linux and macOS. off_t is 64-bit
+// on both x86_64/aarch64 Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod mman {
+    use std::ffi::c_void;
+    pub const PROT_READ: i32 = 0x1;
+    pub const MAP_PRIVATE: i32 = 0x2;
+    pub const MADV_RANDOM: i32 = 1;
+    unsafe extern "C" {
+        pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    }
+}
+
+/// True when mmap is disabled by MICROKIMI_NO_MMAP=1 (A/B toggle, also
+/// disables the madvise hint: there is no mapping to advise).
+fn no_mmap() -> bool {
+    std::env::var("MICROKIMI_NO_MMAP").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Whole-file read-only mapping with a MADV_RANDOM hint (per-token expert
+/// access is sparse over the file; speculative readahead would only pollute
+/// the page cache - the madvise is best-effort). None when mmap is disabled,
+/// unsupported, the file is empty, or the call fails (caller falls back to
+/// reading into a Vec). Alignment: the mapping base is page-aligned and the
+/// format's tensor offsets are 64-aligned, so f32 slices keep at least the
+/// alignment the Vec path had.
+fn mmap_file(f: &std::fs::File, len: u64) -> Option<Mmap> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        if no_mmap() || len == 0 {
+            return None;
+        }
+        let p = unsafe { mman::mmap(std::ptr::null_mut(), len as usize, mman::PROT_READ, mman::MAP_PRIVATE, f.as_raw_fd(), 0) };
+        if p.is_null() || p as isize == -1 {
+            return None; // MAP_FAILED: Vec fallback
+        }
+        unsafe { mman::madvise(p, len as usize, mman::MADV_RANDOM) };
+        return Some(Mmap { ptr: p as *mut u8, len: len as usize });
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (f, len);
+        None
+    }
+}
+
+/// Available RAM in bytes, from /proc/meminfo MemAvailable (Linux). None on
+/// other OSes (no portable no-crate source; the memory line just omits it).
+fn mem_available() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb << 10);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn gb(n: u64) -> String {
+    format!("{:.1} GB", n as f64 / (1u64 << 30) as f64)
+}
+
+/// One upfront memory line at model load: model (or spine) size vs available
+/// RAM and the chosen backing. Never a hard refusal: when even the bytes
+/// that must be resident exceed the available RAM, an explicit warning is
+/// printed and the load proceeds.
+fn mem_report(model: u64, resident: u64, mmap: bool) {
+    let avail = mem_available();
+    let avail_s = avail.map(gb).unwrap_or_else(|| "? GB".to_string());
+    let kind = if mmap { "mmap demand-paging" } else { "in-RAM load" };
+    if model == resident {
+        println!("memory: model {}, RAM available {} - {}", gb(model), avail_s, kind);
+    } else {
+        println!("memory: spine {} of model {}, RAM available {} - {}", gb(resident), gb(model), avail_s, kind);
+    }
+    if let Some(a) = avail {
+        if !mmap && model > a {
+            println!("memory: WARNING model {} > RAM available {} with mmap off (MICROKIMI_NO_MMAP=1) - likely OOM", gb(model), gb(a));
+        } else if mmap && resident > a {
+            println!(
+                "memory: WARNING resident part {} > RAM available {} - heavy disk thrashing expected, consider a smaller model",
+                gb(resident),
+                gb(a)
+            );
+        }
+    }
+}
+
 pub struct BinFile {
-    pub data: Vec<u8>,
+    pub data: Backing,
     pub entries: HashMap<String, Entry>,
     pub config: crate::config::Config,
 }
@@ -220,13 +381,32 @@ fn read_directory(path: &str) -> (std::fs::File, crate::config::Config, HashMap<
 impl BinFile {
     pub fn open(path: &str) -> Self {
         let (f, config, entries) = read_directory(path);
+        let file_len = f.metadata().unwrap().len();
+        if let Some(m) = mmap_file(&f, file_len) {
+            mem_report(file_len, file_len, true);
+            return BinFile { data: Backing::Mmap(m), entries, config };
+        }
         drop(f);
-        let data = std::fs::read(path).unwrap();
-        BinFile { data, entries, config }
+        let data = std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "cannot load {} into RAM: {} (the whole file must fit in memory on this path; mmap demand-paging, the default, has no such requirement - unset MICROKIMI_NO_MMAP)",
+                path, e
+            )
+        });
+        mem_report(file_len, file_len, false);
+        BinFile { data: Backing::Vec(data), entries, config }
     }
 
     /// Streaming load (--stream): the MXFP4 routed-expert blobs are NOT read
-    /// into RAM. `data` holds only the spine bytes (embeddings, attention,
+    /// into RAM. With mmap (the default), the whole file is mapped read-only
+    /// and NO compaction happens: spine tensors are sliced on demand through
+    /// the mapping (their pages fault in), the expert regions are simply
+    /// never touched through it (the stream engine preads them through its
+    /// own, possibly O_DIRECT/F_NOCACHE, fd - the two access paths are
+    /// independent read-only views of the same file and coexist freely), so
+    /// they never become resident. With mmap off (MICROKIMI_NO_MMAP=1 or a
+    /// failed mapping), the historical path loads the spine bytes compacted
+    /// into a Vec: `data` holds only the spine (embeddings, attention,
     /// norms, router, dense/shared MLP, lm_head) with the offsets of those
     /// entries remapped to the compacted layout; expert entries keep their
     /// absolute file offsets so the stream engine can pread them on demand
@@ -238,6 +418,13 @@ impl BinFile {
         use std::os::unix::fs::FileExt;
         let (f, config, mut entries) = read_directory(path);
         let file_len = f.metadata().unwrap().len();
+        let expert_bytes: u64 = entries.iter().filter(|(n, _)| is_expert_tensor(n)).map(|(_, e)| e.size).sum();
+        let spine_bytes = file_len - expert_bytes;
+        if let Some(m) = mmap_file(&f, file_len) {
+            mem_report(file_len, spine_bytes, true);
+            return BinFile { data: Backing::Mmap(m), entries, config };
+        }
+        mem_report(file_len, spine_bytes, false);
         // expert byte ranges held back from RAM (end padded to 64, see above)
         let mut spans: Vec<(u64, u64)> = entries
             .iter()
@@ -290,7 +477,7 @@ impl BinFile {
                 e.offset -= skipped_before(e.offset);
             }
         }
-        BinFile { data, entries, config }
+        BinFile { data: Backing::Vec(data), entries, config }
     }
 
     fn blob(&self, name: &str) -> &[u8] {

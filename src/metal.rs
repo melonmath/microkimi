@@ -387,8 +387,9 @@ pub fn metaltest() {
 /// STEP 3 — on-device weight cache: `cache` holds one Metal buffer per weight
 /// matrix, uploaded on first use and reused afterwards. Key = (data pointer,
 /// rows, cols). This is valid because every weight slice seen by model::matvec
-/// points into `BinFile.data` (a single `Vec<u8>` allocated once at load time
-/// and NEVER reallocated during the session), so a (pointer, dims) pair
+/// points into `BinFile.data` (a single backing - `Vec<u8>` or read-only mmap
+/// - allocated/mapped once at load time and NEVER reallocated or remapped
+/// during the session), so a (pointer, dims) pair
 /// uniquely and stably identifies a weight matrix; keeping dims in the key
 /// also guards against two views sharing a base pointer with different shapes.
 /// Cache buffers are retained and live until process exit (intentional;
