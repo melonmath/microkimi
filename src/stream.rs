@@ -608,9 +608,80 @@ fn env_off(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1").unwrap_or(false)
 }
 
+// ── O_DIRECT (Linux): expert reads that bypass the page cache ──
+//
+// The streamed expert blobs are read once per cache miss and never re-read
+// through the same pages (the RAM LRU above is the cache), so the page
+// cache only pollutes. O_DIRECT requires a 4 KiB aligned buffer, offset and
+// length: read_direct widens every window to the enclosing 4 KiB boundaries
+// and copies the payload out, serving exactly the bytes a plain pread would.
+
+/// Linux O_DIRECT open flag (hardcoded, no libc crate). The value is
+/// arch-dependent in the kernel UAPI: aarch64/arm/m68k use 0o200000, the
+/// asm-generic arches (x86_64, riscv64, ...) use 0o40000. Where the
+/// constant does not match, the open simply fails and the buffered pread
+/// fallback serves the reads.
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm", target_arch = "m68k")))]
+const O_DIRECT: i32 = 0o200000;
+#[cfg(all(target_os = "linux", not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "m68k"))))]
+const O_DIRECT: i32 = 0o40000;
+
+/// Opens `path` with O_DIRECT. None when MICROKIMI_NO_ODIRECT=1, off Linux,
+/// or when the filesystem rejects the flag: the caller falls back to plain
+/// buffered pread.
+fn open_direct(path: &str) -> Option<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if env_off("MICROKIMI_NO_ODIRECT") {
+            return None;
+        }
+        return std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).ok();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// O_DIRECT read of `out.len()` payload bytes at file offset `off`: the read
+/// window is widened to the enclosing 4 KiB boundaries and served through a
+/// manually aligned buffer (std::alloc, Layout align 4096), then the payload
+/// is copied out. The bytes landing in `out` are exactly those a plain
+/// pread(off, out.len()) would return.
+fn read_direct(f: &std::fs::File, off: u64, out: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    const ALIGN: u64 = 4096;
+    let start = off & !(ALIGN - 1);
+    let end = (off + out.len() as u64).next_multiple_of(ALIGN);
+    let n = (end - start) as usize;
+    let layout = std::alloc::Layout::from_size_align(n, ALIGN as usize).unwrap();
+    let p = unsafe { std::alloc::alloc(layout) };
+    if p.is_null() {
+        return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "aligned O_DIRECT buffer"));
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
+    let r = f.read_exact_at(buf, start);
+    if r.is_ok() {
+        let skip = (off - start) as usize;
+        out.copy_from_slice(&buf[skip..skip + out.len()]);
+    }
+    unsafe { std::alloc::dealloc(p, layout) };
+    r
+}
+
+/// Local .bin source: expert blobs pread from the model file itself, through
+/// the O_DIRECT handle when available (Linux page-cache bypass), the plain
+/// buffered handle otherwise.
+struct LocalSrc {
+    file: std::fs::File,
+    direct: Option<std::fs::File>,
+}
+
 enum Src {
     /// Local .bin: expert blobs pread from the model file itself.
-    Local(std::fs::File),
+    Local(LocalSrc),
     /// Remote safetensors: per-tensor persistent cache (+ HTTP on cold miss).
     Remote(RemoteSource),
 }
@@ -628,15 +699,25 @@ impl CacheInner {
     /// Raw bytes of one expert from the disk/HTTP tier (no RAM LRU lookup).
     fn fetch(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Vec<u8> {
         match &self.src {
-            Src::Local(file) => {
+            Src::Local(l) => {
                 use std::os::unix::fs::FileExt;
                 let mut out = vec![0u8; 3 * blob];
-                if offs[1] == offs[0] + blob as u64 && offs[2] == offs[1] + blob as u64 {
-                    // the .bin writers emit w1, w2, w3 back to back: one pread
-                    file.read_exact_at(&mut out, offs[0]).unwrap();
-                } else {
-                    for i in 0..3 {
-                        file.read_exact_at(&mut out[i * blob..(i + 1) * blob], offs[i]).unwrap();
+                // the .bin writers emit w1, w2, w3 back to back: one read
+                let contiguous = offs[1] == offs[0] + blob as u64 && offs[2] == offs[1] + blob as u64;
+                // O_DIRECT first (page-cache bypass), plain pread as fallback.
+                // Either path serves the same file bytes.
+                let served = match &l.direct {
+                    Some(df) if contiguous => read_direct(df, offs[0], &mut out).is_ok(),
+                    Some(df) => (0..3).all(|i| read_direct(df, offs[i], &mut out[i * blob..(i + 1) * blob]).is_ok()),
+                    None => false,
+                };
+                if !served {
+                    if contiguous {
+                        l.file.read_exact_at(&mut out, offs[0]).unwrap();
+                    } else {
+                        for i in 0..3 {
+                            l.file.read_exact_at(&mut out[i * blob..(i + 1) * blob], offs[i]).unwrap();
+                        }
                     }
                 }
                 DISK_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
@@ -675,7 +756,17 @@ impl ExpertCache {
     /// Local streaming source: `path` is the .bin the spine was loaded from.
     pub fn local(path: &str, ram_mb: usize) -> ExpertCache {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
-        // one-time startup line: state of the runtime A/B toggle
+        let direct = open_direct(path);
+        // one-time startup lines: state of the runtime A/B toggles
+        if direct.is_some() {
+            println!("stream: O_DIRECT on (MICROKIMI_NO_ODIRECT=1 to disable)");
+        } else if cfg!(target_os = "linux") && env_off("MICROKIMI_NO_ODIRECT") {
+            println!("stream: O_DIRECT off (MICROKIMI_NO_ODIRECT=1)");
+        } else if cfg!(target_os = "linux") {
+            println!("stream: O_DIRECT unavailable (open failed, buffered pread fallback)");
+        } else {
+            println!("stream: O_DIRECT n/a (Linux only, buffered pread)");
+        }
         if offset_sort() {
             println!("stream: offset-sorted expert reads on (MICROKIMI_NO_OFFSORT=1 to disable)");
         } else {
@@ -684,7 +775,7 @@ impl ExpertCache {
         ExpertCache {
             inner: Arc::new(CacheInner {
                 lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
-                src: Src::Local(file),
+                src: Src::Local(LocalSrc { file, direct }),
                 pred: Mutex::new(Predictor::new()),
             }),
         }
