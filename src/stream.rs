@@ -595,6 +595,19 @@ impl Predictor {
 
 // ── expert cache: RAM LRU over a byte source ──
 
+// ── runtime A/B toggles (env vars, read once per process) ──
+
+/// MICROKIMI_NO_OFFSORT=1 disables the offset-sorted submission of the
+/// expert reads of a layer (model.rs), restoring the router-id order.
+pub fn offset_sort() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| env_off("MICROKIMI_NO_OFFSORT"))
+}
+
+fn env_off(name: &str) -> bool {
+    std::env::var(name).map(|v| v == "1").unwrap_or(false)
+}
+
 enum Src {
     /// Local .bin: expert blobs pread from the model file itself.
     Local(std::fs::File),
@@ -662,6 +675,12 @@ impl ExpertCache {
     /// Local streaming source: `path` is the .bin the spine was loaded from.
     pub fn local(path: &str, ram_mb: usize) -> ExpertCache {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
+        // one-time startup line: state of the runtime A/B toggle
+        if offset_sort() {
+            println!("stream: offset-sorted expert reads on (MICROKIMI_NO_OFFSORT=1 to disable)");
+        } else {
+            println!("stream: offset-sorted expert reads off (MICROKIMI_NO_OFFSORT=1)");
+        }
         ExpertCache {
             inner: Arc::new(CacheInner {
                 lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),

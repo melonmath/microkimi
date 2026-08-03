@@ -1209,8 +1209,16 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
             let hp = crate::pool::SPtr(h.as_ptr());
             let op = crate::pool::MPtr(outs.as_mut_ptr());
             let layer32 = layer as u32;
+            // Submit the reads sorted by file offset: the top-k experts are
+            // not stored in id order, so offset order turns scattered seeks
+            // into a near-sequential sweep. Each job writes its own output
+            // slot, so the submission order cannot change the result.
+            let mut order: Vec<usize> = (0..weights.len()).collect();
+            if crate::stream::offset_sort() {
+                order.sort_by_key(|&ei| w.experts[sel[ei].0 as usize][0]);
+            }
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
-            for (ei, _) in weights.iter().enumerate() {
+            for &ei in &order {
                 let e = sel[ei].0;
                 let offs = w.experts[e as usize];
                 let vq = w.experts_vq[e as usize];
@@ -1499,8 +1507,15 @@ fn moe_prefill(
             let hp = crate::pool::SPtr(h.as_ptr());
             let op = crate::pool::MPtr(outs.as_mut_ptr());
             let layer32 = layer as u32;
-            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
-            for (e, pairs) in by_expert {
+            // same offset-sorted submission as moe_forward (each job scatters
+            // to its own (position, slot) outputs: order cannot leak into the
+            // result)
+            let mut order: Vec<(u32, Vec<(usize, usize)>)> = by_expert.into_iter().collect();
+            if crate::stream::offset_sort() {
+                order.sort_by_key(|(e, _)| w.experts[*e as usize][0]);
+            }
+            let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(order.len());
+            for (e, pairs) in order {
                 let offs = w.experts[e as usize];
                 let vq = w.experts_vq[e as usize];
                 let eblob = if vq { expert_vq_blob } else { expert_blob };
