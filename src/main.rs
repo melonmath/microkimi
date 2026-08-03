@@ -172,6 +172,7 @@ fn main() {
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
             println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
+            println!("  microkimi absorb file.txt --out pack.mkmem  ingest a document file, snapshot the state (.mkmem)");
             println!("  run/chat options: --model X.bin --vocab vocab_nano.json (auto if next to the .bin)");
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
@@ -651,6 +652,39 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
     let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
     println!("prefill: {} tokens ingested in {:.1?} - state saved to {} ({:.1} KB)", ids.len(), tp.elapsed(), save, size as f64 / 1024.0);
     stream_report_maybe(stream_mb);
+}
+
+/// `microkimi absorb file.txt --out pack.mkmem`: reads a document from disk
+/// and ingests it exactly like `prefill` (raw completion encoding by default,
+/// chat template with --chat), then snapshots the resulting KDA/MLA state as
+/// a portable .mkmem pack. Resume it later with `run --memory pack.mkmem`.
+fn absorb_cmd(args: &[String]) {
+    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--stream-ram"]);
+    let positional: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .skip(2)
+        .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+        .map(|(_, a)| a)
+        .collect();
+    let Some(file) = positional.first() else {
+        eprintln!("error: absorb requires a text file (microkimi absorb file.txt --out pack.mkmem)");
+        std::process::exit(1);
+    };
+    let Some(out) = value_flag(args, "--out") else {
+        eprintln!("error: absorb requires --out pack.mkmem");
+        std::process::exit(1);
+    };
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", file, e);
+            std::process::exit(1);
+        }
+    };
+    model::set_gpu(args.iter().any(|a| a == "--gpu"));
+    println!("absorb: {} ({} bytes)", file, text.len());
+    prefill_cmd(&text, &out, &model_flag(args), vocab_flag(args), args.iter().any(|a| a == "--chat"), stream_ram_flag(args));
 }
 
 fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>) {
