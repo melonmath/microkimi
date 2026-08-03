@@ -138,6 +138,9 @@ def main():
                     help="exclude UNK (8198) targets from the loss (ignore_index). For chat SFT on "
                          "the nano vocab: structural XTML tags and out-of-vocab words map to UNK, "
                          "so without this the model learns to EMIT [UNK] and greedy decoding collapses")
+    ap.add_argument("--amp", action="store_true",
+                    help="bf16 autocast for the forward pass (faster on GPU, small numeric drift - "
+                         "opt-in, loss is still computed in fp32)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -154,6 +157,8 @@ def main():
         if dev == "cpu":
             print("device=auto: no GPU available -> cpu", flush=True)
     print(f"device: {dev}", flush=True)
+    if args.amp and dev != "cuda":
+        print("--amp requested but device is not cuda: amp is a no-op (bf16 autocast is cuda-only here)", flush=True)
     cfg = {"n_layers": args.layers} if args.layers else None
     model = NanoModel(cfg, grad_ckpt=True).float().to(dev)
     model.eval()  # required by the MoE gate assert; no dropout/BN in the arch
@@ -219,7 +224,11 @@ def main():
         x, y = make_batch(tokens, rng, args.batch, args.seq)
         x = x.to(dev)
         y = y.to(dev)
-        logits = model(x)
+        if args.amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                logits = model(x)
+        else:
+            logits = model(x)
         loss = torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
             ignore_index=8198 if args.ignore_unk else -100,
