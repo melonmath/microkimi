@@ -103,6 +103,40 @@ fn gb(n: u64) -> String {
     format!("{:.2} GB", n as f64 / 1e9)
 }
 
+/// Local-mirror read for a remote safetensors shard. The mirror directory is
+/// $MICROKIMI_MIRROR, defaulting to /mnt/k3 when that exists. A file is only
+/// used when it is complete for the requested range (shards may still be
+/// downloading): short file -> None -> caller falls back to HTTP.
+fn mirror_range(url: &str, start: u64, len: u64) -> Option<Vec<u8>> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        if let Ok(d) = std::env::var("MICROKIMI_MIRROR") {
+            return Some(d);
+        }
+        if std::path::Path::new("/mnt/k3").is_dir() {
+            Some("/mnt/k3".to_string())
+        } else {
+            None
+        }
+    });
+    let dir = dir.as_ref()?;
+    let fname = url.rsplit('/').next()?;
+    let path = format!("{}/{}", dir, fname);
+    let f = std::fs::File::open(&path).ok()?;
+    if f.metadata().ok()?.len() < start + len {
+        return None; // partial download: serve from HTTP instead
+    }
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        eprintln!("  mirror: serving shard reads from {} (HTTP fallback for missing/partial)", dir);
+    });
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact_at(&mut buf, start).ok()?;
+    Some(buf)
+}
+
 impl StDir {
     pub fn open(path: &str, cache_hint: &str) -> StDir {
         let remote = path.starts_with("http://") || path.starts_with("https://");
@@ -860,8 +894,14 @@ impl StDir {
                 f.read_exact_at(&mut buf, t.start + off).unwrap();
                 buf
             }
-            ShardLoc::Remote(url) => crate::http::fetch_range(url, Some((t.start + off, t.start + off + len - 1)))
-                .unwrap_or_else(|| panic!("range fetch failed on {}", url)),
+            ShardLoc::Remote(url) => {
+                let start = t.start + off;
+                if let Some(buf) = mirror_range(url, start, len) {
+                    return buf;
+                }
+                crate::http::fetch_range(url, Some((start, start + len - 1)))
+                    .unwrap_or_else(|| panic!("range fetch failed on {}", url))
+            }
         }
     }
 
@@ -872,7 +912,6 @@ impl StDir {
             dt => panic!("unhandled dtype {}", dt),
         }
     }
-
     fn cache_file(&self, name: &str) -> std::path::PathBuf {
         let safe: String = name.chars().map(|c| if c == '.' || c == '/' { '_' } else { c }).collect();
         self.cache_dir.as_ref().unwrap().join(format!("{}.f32", safe))
