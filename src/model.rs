@@ -409,7 +409,9 @@ struct MoeW {
     shared_gate: T,
     shared_up: T,
     shared_down: T,
-    experts: Vec<[u64; 3]>, // offsets of the mxfp4 blobs [w1, w2, w3] per expert
+    experts: Vec<[u64; 3]>, // offsets of the mxfp4/vq1 blobs [w1, w2, w3] per expert
+    experts_vq: Vec<bool>,  // true = cold expert stored as VQ1 (DTYPE_VQ1 indices)
+    vq_cb: Vec<f32>,        // global VQ codebook [256*16] (empty when no VQ1 tensors)
 }
 
 struct DenseW {
@@ -443,8 +445,8 @@ pub(crate) struct KdaCache {
 }
 
 pub(crate) struct MlaCache {
-    pub k: Vec<f32>, // pos × (4×192)
-    pub v: Vec<f32>, // pos × (4×128)
+    pub k: Vec<f32>, // pos × H×(nope+rope)
+    pub v: Vec<f32>, // pos × H×v
 }
 
 pub(crate) enum Cache {
@@ -469,22 +471,26 @@ pub struct Prof {
 impl Prof {
     #[allow(dead_code)]
     pub fn print(&self) {
-        self.print_cfg(512, 163_840, 896);
+        self.print_cfg(&Config::microkimi());
     }
 
-    pub fn print_cfg(&self, d: usize, vocab: usize, n_experts: usize) {
+    pub fn print_cfg(&self, cfg: &Config) {
         let tot = self.t_norm_res + self.t_kda_proj + self.t_kda_conv + self.t_kda_recur + self.t_mla + self.t_router + self.t_experts + self.t_lm_head;
         if tot == 0.0 {
             return;
         }
-        let lm_label = format!("lm_head ({} x {})", d, vocab);
-        let router_label = format!("MoE router ({})", n_experts);
+        let lm_label = format!("lm_head ({} x {})", cfg.d, cfg.vocab);
+        let router_label = format!("MoE router ({})", cfg.n_experts);
+        let mla_label = format!(
+            "MLA attention (H={}, {}/head, d={})",
+            cfg.mla_heads, cfg.mla_v, cfg.d
+        );
         let rows = [
             ("RMSNorm + AttnRes".to_string(), self.t_norm_res),
             ("KDA projections (qkv/f/g/o)".to_string(), self.t_kda_proj),
             ("causal KDA conv1d".to_string(), self.t_kda_conv),
             ("KDA recurrence (state S)".to_string(), self.t_kda_recur),
-            ("MLA attention".to_string(), self.t_mla),
+            (mla_label, self.t_mla),
             (router_label, self.t_router),
             ("MoE experts + shared + dense".to_string(), self.t_experts),
             (lm_label, self.t_lm_head),
@@ -598,16 +604,29 @@ impl Model {
             };
             let ffn = if cfg.is_moe(l) {
                 let pfx = format!("{}block_sparse_moe.experts.", p);
+                let mut experts_vq = Vec::with_capacity(cfg.n_experts);
                 let experts: Vec<[u64; 3]> = (0..cfg.n_experts)
                     .map(|e| {
                         ["w1", "w2", "w3"].map(|wn| {
-                            bin.entries
+                            let entry = bin
+                                .entries
                                 .get(&format!("{}{}.{}", pfx, e, wn))
-                                .unwrap_or_else(|| panic!("missing expert: {}{}.{}", pfx, e, wn))
-                                .offset
+                                .unwrap_or_else(|| panic!("missing expert: {}{}.{}", pfx, e, wn));
+                            if wn == "w1" {
+                                experts_vq.push(entry.dtype == crate::weights::DTYPE_VQ1);
+                            }
+                            entry.offset
                         })
                     })
                     .collect();
+                // one global codebook shared by every VQ1 tensor (16 KB, L1-resident)
+                let vq_cb = if experts_vq.iter().any(|&v| v) {
+                    let cb = bin.f32_vec("vq_codebook");
+                    assert_eq!(cb.len(), crate::quant::VQ_K * crate::quant::VQ_DIM, "vq_codebook: bad dims");
+                    cb
+                } else {
+                    Vec::new()
+                };
                 FfnW::Moe(MoeW {
                     gate_w: get(&format!("{}block_sparse_moe.gate.weight", p)),
                     gate_b: get(&format!("{}block_sparse_moe.gate.e_score_correction_bias", p)),
@@ -618,6 +637,8 @@ impl Model {
                     shared_up: get(&format!("{}block_sparse_moe.shared_experts.up_proj.weight", p)),
                     shared_down: get(&format!("{}block_sparse_moe.shared_experts.down_proj.weight", p)),
                     experts,
+                    experts_vq,
+                    vq_cb,
                 })
             } else {
                 FfnW::Dense(DenseW {
@@ -634,7 +655,7 @@ impl Model {
     /// Number of tokens already represented in the caches (from the first MLA
     /// layer; 0 for a KDA-only model). Only seeds the debug position counter:
     /// K3 has no positional encoding, so the math does not depend on it.
-    fn cached_tokens(&self) -> usize {
+    pub fn cached_tokens(&self) -> usize {
         for c in &self.caches {
             if let Cache::Mla(m) = c {
                 return m.k.len() / (self.cfg.mla_heads * self.cfg.mla_qh());
@@ -901,24 +922,24 @@ fn mla_forward(
     prof: &mut Prof,
 ) -> Vec<f32> {
     let tm = Instant::now();
-    // q = q_b(rmsnorm(q_a(x))) [768]
+    // q = q_b(rmsnorm(q_a(x))) [H*(nope+rope)]
     let mut qa = vec![0f32; cfg.mla_qa];
     matvec(Model::t(data, &w.q_a), cfg.mla_qa, cfg.d, x, &mut qa);
     let mut qa_n = vec![0f32; cfg.mla_qa];
     rmsnorm(cfg, &qa, Model::t(data, &w.q_a_ln), &mut qa_n);
     let mut q = vec![0f32; cfg.mla_qb()];
     matvec(Model::t(data, &w.q_b), cfg.mla_qb(), cfg.mla_qa, &qa_n, &mut q);
-    // c = kv_a(x) [128] ; k_pass [64] ; k_rot [64] (shared across heads)
-    let mut c = vec![0f32; cfg.mla_qa];
-    matvec(Model::t(data, &w.kv_a), cfg.mla_qa, cfg.d, x, &mut c);
+    // c = kv_a(x) [kva+rope] ; k_pass [kva] ; k_rot [rope] (shared across heads)
+    let mut c = vec![0f32; cfg.mla_c_dim()];
+    matvec(Model::t(data, &w.kv_a), cfg.mla_c_dim(), cfg.d, x, &mut c);
     let k_rot: Vec<f32> = c[cfg.mla_kva..cfg.mla_kva + cfg.mla_rope].to_vec();
     let mut kp_n = vec![0f32; cfg.mla_kva];
     rmsnorm(cfg, &c[..cfg.mla_kva], Model::t(data, &w.kv_a_ln), &mut kp_n);
     let mut kb = vec![0f32; cfg.mla_kvb()];
     matvec(Model::t(data, &w.kv_b), cfg.mla_kvb(), cfg.mla_kva, &kp_n, &mut kb);
-    // K[h] = kb[h][..128] ++ k_rot ; V[h] = kb[h][128..256]
+    // K[h] = kb[h][..nope] ++ k_rot ; V[h] = kb[h][nope..nope+v]
     let mut k_new = vec![0f32; cfg.mla_heads * cfg.mla_qh()];
-    let mut v_new = vec![0f32; cfg.mla_heads * cfg.mla_v];
+    let mut v_new = vec![0f32; cfg.mla_hv()];
     for h in 0..cfg.mla_heads {
         k_new[h * cfg.mla_qh()..h * cfg.mla_qh() + cfg.mla_nope]
             .copy_from_slice(&kb[h * (cfg.mla_nope + cfg.mla_v)..h * (cfg.mla_nope + cfg.mla_v) + cfg.mla_nope]);
@@ -930,7 +951,7 @@ fn mla_forward(
     cache.k.extend_from_slice(&k_new);
     cache.v.extend_from_slice(&v_new);
     let pos = cache.k.len() / (cfg.mla_heads * cfg.mla_qh()) - 1;
-    // causal attention, scale 192^-0.5
+    // causal attention, scale (nope+rope)^-0.5
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
     let mut attn = vec![0f32; cfg.mla_heads * cfg.mla_v];
     for h in 0..cfg.mla_heads {
@@ -958,14 +979,16 @@ fn mla_forward(
             }
         }
     }
-    // output gate + o_proj
-    let mut g = vec![0f32; cfg.d];
-    matvec(Model::t(data, &w.g_proj), cfg.d, cfg.d, x, &mut g);
-    for i in 0..cfg.d {
+    // output gate + o_proj (g_proj is [H*v, d]: H*v == d only in the micro
+    // config; real K3 is [12288, 7168])
+    let hv = cfg.mla_hv();
+    let mut g = vec![0f32; hv];
+    matvec(Model::t(data, &w.g_proj), hv, cfg.d, x, &mut g);
+    for i in 0..hv {
         attn[i] *= sigmoid(g[i]);
     }
     let mut out = vec![0f32; cfg.d];
-    matvec(Model::t(data, &w.o_proj), cfg.d, cfg.mla_heads * cfg.mla_v, &attn, &mut out);
+    matvec(Model::t(data, &w.o_proj), cfg.d, hv, &attn, &mut out);
     prof.t_mla += tm.elapsed().as_secs_f64();
     out
 }
@@ -987,7 +1010,7 @@ fn mla_prefill(
     prof: &mut Prof,
 ) -> Vec<f32> {
     let tm = Instant::now();
-    let (qa_dim, qb, kvb) = (cfg.mla_qa, cfg.mla_qb(), cfg.mla_kvb());
+    let (qa_dim, qb, kvb, c_dim) = (cfg.mla_qa, cfg.mla_qb(), cfg.mla_kvb(), cfg.mla_c_dim());
     // q = q_b(rmsnorm(q_a(x))) for all positions
     let mut qa = vec![0f32; n * qa_dim];
     gemm_batch(Model::t(data, &w.q_a), qa_dim, cfg.d, x, n, &mut qa);
@@ -997,12 +1020,12 @@ fn mla_prefill(
     }
     let mut q = vec![0f32; n * qb];
     gemm_batch(Model::t(data, &w.q_b), qb, qa_dim, &qa_n, n, &mut q);
-    // c = kv_a(x) ; k_rot = c[kva..kva+rope] ; kp_n = rmsnorm(c[..kva])
-    let mut c = vec![0f32; n * qa_dim];
-    gemm_batch(Model::t(data, &w.kv_a), qa_dim, cfg.d, x, n, &mut c);
+    // c = kv_a(x) [kva+rope] ; k_rot = c[kva..kva+rope] ; kp_n = rmsnorm(c[..kva])
+    let mut c = vec![0f32; n * c_dim];
+    gemm_batch(Model::t(data, &w.kv_a), c_dim, cfg.d, x, n, &mut c);
     let mut kp_n = vec![0f32; n * cfg.mla_kva];
     for t in 0..n {
-        rmsnorm(cfg, &c[t * qa_dim..t * qa_dim + cfg.mla_kva], Model::t(data, &w.kv_a_ln), &mut kp_n[t * cfg.mla_kva..(t + 1) * cfg.mla_kva]);
+        rmsnorm(cfg, &c[t * c_dim..t * c_dim + cfg.mla_kva], Model::t(data, &w.kv_a_ln), &mut kp_n[t * cfg.mla_kva..(t + 1) * cfg.mla_kva]);
     }
     let mut kb = vec![0f32; n * kvb];
     gemm_batch(Model::t(data, &w.kv_b), kvb, cfg.mla_kva, &kp_n, n, &mut kb);
@@ -1010,7 +1033,7 @@ fn mla_prefill(
     // position and append in order: same cache state as the sequential path
     let p0 = cache.k.len() / (cfg.mla_heads * cfg.mla_qh());
     for t in 0..n {
-        let k_rot = &c[t * qa_dim + cfg.mla_kva..t * qa_dim + cfg.mla_kva + cfg.mla_rope];
+        let k_rot = &c[t * c_dim + cfg.mla_kva..t * c_dim + cfg.mla_kva + cfg.mla_rope];
         let kbt = &kb[t * kvb..(t + 1) * kvb];
         let mut k_new = vec![0f32; cfg.mla_heads * cfg.mla_qh()];
         let mut v_new = vec![0f32; cfg.mla_heads * cfg.mla_v];
@@ -1057,14 +1080,16 @@ fn mla_prefill(
             }
         }
     }
-    // output gate + o_proj
-    let mut g = vec![0f32; n * cfg.d];
-    gemm_batch(Model::t(data, &w.g_proj), cfg.d, cfg.d, x, n, &mut g);
-    for i in 0..n * cfg.d {
+    // output gate + o_proj (g_proj is [H*v, d]: H*v == d only in the micro
+    // config; real K3 is [12288, 7168])
+    let hv = cfg.mla_hv();
+    let mut g = vec![0f32; n * hv];
+    gemm_batch(Model::t(data, &w.g_proj), hv, cfg.d, x, n, &mut g);
+    for i in 0..n * hv {
         attn[i] *= sigmoid(g[i]);
     }
     let mut out = vec![0f32; n * cfg.d];
-    gemm_batch(Model::t(data, &w.o_proj), cfg.d, cfg.mla_heads * cfg.mla_v, &attn, n, &mut out);
+    gemm_batch(Model::t(data, &w.o_proj), cfg.d, hv, &attn, n, &mut out);
     prof.t_mla += tm.elapsed().as_secs_f64();
     out
 }
@@ -1125,7 +1150,10 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
     let tm = Instant::now();
     let expert_packed = cfg.routed_hidden * cfg.moe_inter / 2;
     let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
+    let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM;
     let (erh, emi) = (cfg.routed_hidden, cfg.moe_inter); // copies for the 'static closures
+    let cbp = crate::pool::SPtr(w.vq_cb.as_ptr());
+    let cblen = w.vq_cb.len();
     let mut outs = vec![0f32; cfg.top_k * cfg.routed_hidden];
     match stream {
         // historical full-load path: expert blobs read straight from the file image
@@ -1137,22 +1165,36 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
             for (ei, _) in weights.iter().enumerate() {
                 let offs = w.experts[sel[ei].0 as usize];
+                let vq = w.experts_vq[sel[ei].0 as usize];
+                let eblob = if vq { expert_vq_blob } else { expert_blob };
                 jobs.push(Box::new(move || {
-                    let (dp, hp, op) = (dp, hp, op);
+                    let (dp, hp, op, cbp) = (dp, hp, op, cbp);
                     unsafe {
                         let data = std::slice::from_raw_parts(dp.0, dlen);
                         let h = std::slice::from_raw_parts(hp.0, erh);
-                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
+                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + eblob];
                         let mut a = vec![0f32; emi];
                         let mut u = vec![0f32; emi];
-                        crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
-                        crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        if vq {
+                            // cold expert: gather from the L1-resident codebook
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq(cb, blob(0), emi, erh, h, &mut a);
+                            crate::quant::matvec_vq(cb, blob(2), emi, erh, h, &mut u);
+                        } else {
+                            crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
+                            crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        }
                         let mut act = vec![0f32; emi];
                         for j in 0..emi {
                             act[j] = situ(a[j], u[j]);
                         }
                         let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
-                        crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq(cb, blob(1), erh, emi, &act, o);
+                        } else {
+                            crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
+                        }
                     }
                 }));
             }
@@ -1171,23 +1213,36 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
             for (ei, _) in weights.iter().enumerate() {
                 let e = sel[ei].0;
                 let offs = w.experts[e as usize];
+                let vq = w.experts_vq[e as usize];
+                let eblob = if vq { expert_vq_blob } else { expert_blob };
                 jobs.push(Box::new(move || {
-                    let (hp, op) = (hp, op);
+                    let (hp, op, cbp) = (hp, op, cbp);
                     unsafe {
                         let cache = &*(cp as *const crate::stream::ExpertCache);
-                        let bytes = cache.get(layer32, e, offs, expert_blob);
+                        let bytes = cache.get(layer32, e, offs, eblob);
                         let h = std::slice::from_raw_parts(hp.0, erh);
-                        let blob = |i: usize| &bytes[i * expert_blob..(i + 1) * expert_blob];
+                        let blob = |i: usize| &bytes[i * eblob..(i + 1) * eblob];
                         let mut a = vec![0f32; emi];
                         let mut u = vec![0f32; emi];
-                        crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
-                        crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq(cb, blob(0), emi, erh, h, &mut a);
+                            crate::quant::matvec_vq(cb, blob(2), emi, erh, h, &mut u);
+                        } else {
+                            crate::mxfp4::matvec_packed(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, h, &mut a, 1);
+                            crate::mxfp4::matvec_packed(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, h, &mut u, 1);
+                        }
                         let mut act = vec![0f32; emi];
                         for j in 0..emi {
                             act[j] = situ(a[j], u[j]);
                         }
                         let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
-                        crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq(cb, blob(1), erh, emi, &act, o);
+                        } else {
+                            crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
+                        }
                     }
                 }));
             }
@@ -1366,7 +1421,10 @@ fn moe_prefill(
     let tm = Instant::now();
     let expert_packed = cfg.routed_hidden * cfg.moe_inter / 2;
     let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
+    let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM;
     let (erh, emi, topk) = (cfg.routed_hidden, cfg.moe_inter, cfg.top_k); // copies for the 'static closures
+    let cbp = crate::pool::SPtr(w.vq_cb.as_ptr());
+    let cblen = w.vq_cb.len();
     let mut by_expert: std::collections::HashMap<u32, Vec<(usize, usize)>> = std::collections::HashMap::new();
     for (t, sel) in sels.iter().enumerate() {
         for (slot, &(e, _)) in sel.iter().enumerate() {
@@ -1384,11 +1442,13 @@ fn moe_prefill(
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
             for (e, pairs) in by_expert {
                 let offs = w.experts[e as usize];
+                let vq = w.experts_vq[e as usize];
+                let eblob = if vq { expert_vq_blob } else { expert_blob };
                 jobs.push(Box::new(move || {
-                    let (dp, hp, op) = (dp, hp, op);
+                    let (dp, hp, op, cbp) = (dp, hp, op, cbp);
                     unsafe {
                         let data = std::slice::from_raw_parts(dp.0, dlen);
-                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + expert_blob];
+                        let blob = |i: usize| &data[offs[i] as usize..offs[i] as usize + eblob];
                         let m = pairs.len();
                         let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
                         // gather the inputs of this expert's pairs, transposed [erh][m8]
@@ -1401,8 +1461,14 @@ fn moe_prefill(
                         }
                         let mut a = vec![0f32; m8 * emi];
                         let mut u = vec![0f32; m8 * emi];
-                        matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
-                        matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq_nt(cb, blob(0), emi, erh, &ht, m8, &mut a);
+                            crate::quant::matvec_vq_nt(cb, blob(2), emi, erh, &ht, m8, &mut u);
+                        } else {
+                            matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
+                            matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        }
                         // SiTU, transposed [emi][m8]
                         let mut act_t = vec![0f32; m8 * emi];
                         for i in 0..m {
@@ -1411,7 +1477,12 @@ fn moe_prefill(
                             }
                         }
                         let mut o = vec![0f32; m8 * erh];
-                        matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq_nt(cb, blob(1), erh, emi, &act_t, m8, &mut o);
+                        } else {
+                            matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        }
                         for (i, (t, slot)) in pairs.iter().enumerate() {
                             let dst = std::slice::from_raw_parts_mut(op.0.add((t * topk + slot) * erh), erh);
                             dst.copy_from_slice(&o[i * erh..(i + 1) * erh]);
@@ -1431,12 +1502,14 @@ fn moe_prefill(
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(by_expert.len());
             for (e, pairs) in by_expert {
                 let offs = w.experts[e as usize];
+                let vq = w.experts_vq[e as usize];
+                let eblob = if vq { expert_vq_blob } else { expert_blob };
                 jobs.push(Box::new(move || {
-                    let (hp, op) = (hp, op);
+                    let (hp, op, cbp) = (hp, op, cbp);
                     unsafe {
                         let cache = &*(cp as *const crate::stream::ExpertCache);
-                        let bytes = cache.get(layer32, e, offs, expert_blob);
-                        let blob = |i: usize| &bytes[i * expert_blob..(i + 1) * expert_blob];
+                        let bytes = cache.get(layer32, e, offs, eblob);
+                        let blob = |i: usize| &bytes[i * eblob..(i + 1) * eblob];
                         let m = pairs.len();
                         let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
                         // gather the inputs of this expert's pairs, transposed [erh][m8]
@@ -1449,8 +1522,14 @@ fn moe_prefill(
                         }
                         let mut a = vec![0f32; m8 * emi];
                         let mut u = vec![0f32; m8 * emi];
-                        matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
-                        matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq_nt(cb, blob(0), emi, erh, &ht, m8, &mut a);
+                            crate::quant::matvec_vq_nt(cb, blob(2), emi, erh, &ht, m8, &mut u);
+                        } else {
+                            matvec_packed_nt(&blob(0)[..expert_packed], &blob(0)[expert_packed..], emi, erh, &ht, m8, &mut a);
+                            matvec_packed_nt(&blob(2)[..expert_packed], &blob(2)[expert_packed..], emi, erh, &ht, m8, &mut u);
+                        }
                         // SiTU, transposed [emi][m8]
                         let mut act_t = vec![0f32; m8 * emi];
                         for i in 0..m {
@@ -1459,7 +1538,12 @@ fn moe_prefill(
                             }
                         }
                         let mut o = vec![0f32; m8 * erh];
-                        matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        if vq {
+                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
+                            crate::quant::matvec_vq_nt(cb, blob(1), erh, emi, &act_t, m8, &mut o);
+                        } else {
+                            matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);
+                        }
                         for (i, (t, slot)) in pairs.iter().enumerate() {
                             let dst = std::slice::from_raw_parts_mut(op.0.add((t * topk + slot) * erh), erh);
                             dst.copy_from_slice(&o[i * erh..(i + 1) * erh]);
@@ -1972,7 +2056,7 @@ fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mo
         init_logits,
         sampler,
     );
-    model.prof.print_cfg(model.cfg.d, model.cfg.vocab, model.cfg.n_experts);
+    model.prof.print_cfg(&model.cfg);
     answer
 }
 

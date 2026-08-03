@@ -19,6 +19,7 @@ mod model;
 mod mxfp4;
 mod parity;
 mod pool;
+mod quant;
 mod safetensors;
 mod selftest;
 mod slice;
@@ -88,6 +89,37 @@ fn main() {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
             prefill_cmd(&text, &save, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--chat"), stream_ram_flag(&args));
         }
+        // microkimi mkmem-merge A.mkmem B.mkmem [C.mkmem ...] --out AB.mkmem [--shuffle N]
+        // (experiment) KDA state additivity: s = element-wise sum over inputs,
+        // conv/MLA/logits from the first input. --shuffle N shuffles the s of
+        // the Nth input (1-based) before summing: shuffled-garbage control.
+        "mkmem-merge" => {
+            let skip = flag_value_positions(&args, &["--out", "--shuffle"]);
+            let paths: Vec<String> = args
+                .iter()
+                .enumerate()
+                .skip(2)
+                .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+                .map(|(_, a)| a.clone())
+                .collect();
+            let Some(out) = value_flag(&args, "--out") else {
+                eprintln!("error: mkmem-merge requires --out AB.mkmem");
+                std::process::exit(1);
+            };
+            let shuffle_idx = value_flag(&args, "--shuffle").and_then(|s| s.parse().ok());
+            let avg = args.iter().any(|a| a == "--avg");
+            match mkmem::merge(&paths, &out, shuffle_idx, avg) {
+                Ok(()) => println!("merged {} states -> {} (KDA s summed, conv/MLA/logits from {})", paths.len(), out, paths[0]),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // microkimi mkmem-div REF.mkmem X.mkmem [Y.mkmem ...] --prompt "text" [--max-new N]
+        // (hidden debug tool) greedy-generates N tokens from the prompt on top
+        // of each state and reports the top-1 agreement of X, Y, ... vs REF.
+        "mkmem-div" => mkmem_div_cmd(&args),
         // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]
         "streamtest" => stream::streamtest(&args),
         // microkimi cache --info | microkimi cache --clean [--repo X]
@@ -124,6 +156,8 @@ fn main() {
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
             println!("                                         structural pruning (channels / experts / layers)");
+            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
+            println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
             println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
             println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
             println!("      and, for expert ranking, only the weight_scale bytes are fetched)");
@@ -138,6 +172,8 @@ fn main() {
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
             println!("                    --stream-disk N (remote disk cache budget in MB, default 0 = unlimited;");
             println!("                        expert-only LRU rollover, spine never evicted; env MICROKIMI_STREAM_DISK)");
+            println!("                    --stream-predict N (Markov expert prefetch: N predicted experts/layer,");
+            println!("                        0 = off, default; output-preserving, only changes fetch timing)");
             println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]");
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
             println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
@@ -280,8 +316,88 @@ fn gpu_prof_maybe_print() {
 #[cfg(not(target_os = "macos"))]
 fn gpu_prof_maybe_print() {}
 
-fn model_flag(args: &[String]) -> Option<String> {
-    args.iter()
+/// Positions of the values taken by --flag style options, so positional
+/// extraction can skip them (e.g. the X in `--out X`).
+fn flag_value_positions(args: &[String], names: &[&str]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if names.contains(&a.as_str()) && i + 1 < args.len() {
+            out.push(i + 1);
+        }
+    }
+    out
+}
+
+/// Hidden debug tool behind `mkmem-div`: loads each .mkmem in turn, prefills
+/// the same raw prompt on top of it, greedily decodes N tokens and prints the
+/// token ids; then reports the per-position top-1 agreement of every state
+/// against the first one (the reference). Quantifies how much a merged state
+/// diverges from each of its parents.
+fn mkmem_div_cmd(args: &[String]) {
+    let skip = flag_value_positions(args, &["--prompt", "--max-new", "--model", "--vocab"]);
+    let paths: Vec<String> = args
+        .iter()
+        .enumerate()
+        .skip(2)
+        .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+        .map(|(_, a)| a.clone())
+        .collect();
+    if paths.len() < 2 {
+        eprintln!("error: mkmem-div needs at least 2 .mkmem files (reference first)");
+        std::process::exit(1);
+    }
+    let prompt = value_flag(args, "--prompt").unwrap_or_else(|| "Once upon a time".to_string());
+    let max_new: usize = value_flag(args, "--max-new").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let mp = model_flag(args).unwrap_or_else(bin_path);
+    if crate::weights::read_config(&mp).ds.is_some() {
+        eprintln!("error: mkmem-div is only supported for K3 models (not DeepSeek-V4)");
+        std::process::exit(1);
+    }
+    let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::weights::read_config(&mp).vocab);
+    let mut model = model::Model::load(&mp);
+    check_tok_compat(&tok, &model);
+    let mut seqs: Vec<Vec<u32>> = Vec::new();
+    for p in &paths {
+        model.reset_cache();
+        let init = match crate::mkmem::load(&mut model, p) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let mut ids = tok.encode_raw(&prompt);
+        strip_bos(&mut ids, &tok);
+        let mut pos = model.cached_tokens();
+        let mut logits = init;
+        if !ids.is_empty() {
+            logits = model.prefill(&ids, pos);
+            pos += ids.len();
+        }
+        let mut seq = Vec::new();
+        for _ in 0..max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            seq.push(next);
+            logits = model.forward(next, pos);
+            pos += 1;
+        }
+        println!("{}: {:?}", p, seq);
+        println!("  text: {}", tok.decode(&seq));
+        seqs.push(seq);
+    }
+    let reference = &seqs[0];
+    for (i, s) in seqs.iter().enumerate().skip(1) {
+        let agree = reference.iter().zip(s.iter()).filter(|(a, b)| a == b).count();
+        println!("agreement vs {}: {}/{} top-1 ({:.0}%)", paths[i], agree, reference.len(), agree as f64 / reference.len() as f64 * 100.0);
+    }
+}
+
+fn model_flag(args: &[String]) -> Option<String> {    args.iter()
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
         .cloned()
@@ -319,6 +435,17 @@ fn stream_ram_flag(args: &[String]) -> Option<usize> {
 fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
     match stream_mb {
         Some(mb) => {
+            // --stream-predict N: Markov expert prefetch (0 = off, default).
+            // Parsed here from the process args so every streaming entry
+            // point (run / chat / prefill) picks it up. top_k comes from the
+            // model config (the expert batch size of one MoE layer).
+            let pargs: Vec<String> = std::env::args().collect();
+            let n: usize = value_flag(&pargs, "--stream-predict").and_then(|s| s.parse().ok()).unwrap_or(0);
+            if n > 0 {
+                let top_k = crate::weights::read_config(mp).top_k;
+                crate::stream::set_predict(n, top_k);
+                println!("stream: predictive prefetch enabled ({} experts/layer, top-k {})", n, top_k);
+            }
             println!("stream: expert streaming enabled (RAM LRU budget {} MB)", mb);
             model::Model::load_streaming(mp, mb)
         }

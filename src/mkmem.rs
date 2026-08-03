@@ -93,6 +93,148 @@ pub fn load(model: &mut Model, path: &str) -> Result<Vec<f32>, String> {
     r.vec_f32()
 }
 
+// ── merge (experimental): KDA state additivity ──
+//
+// `microkimi mkmem-merge A.mkmem B.mkmem [C.mkmem ...] --out AB.mkmem` writes
+// a standard .mkmem that loads with the normal path. Design choice: the KDA
+// recurrent state s is the only part that is a true accumulator (the
+// recurrence S += (beta k) x delta makes it a sum-like memory), so the merge
+// SUMS the s vectors of all inputs element-wise. The short conv windows are
+// not accumulators and per-position MLA latents cannot be summed (they are a
+// sequence, not a state), so conv_q/conv_k/conv_v, the MLA k/v caches and the
+// stored logits are all taken from the FIRST file unchanged.
+
+/// A parsed .mkmem file (header kept verbatim so a merge output is
+/// byte-identical in layout to what `save` writes).
+struct MemFile {
+    header: Vec<u8>, // magic + fingerprint + layer kinds
+    layers: Vec<LayerMem>,
+    logits: Vec<f32>,
+}
+
+enum LayerMem {
+    Kda { conv_q: Vec<f32>, conv_k: Vec<f32>, conv_v: Vec<f32>, s: Vec<f32> },
+    Mla { k: Vec<f32>, v: Vec<f32> },
+}
+
+fn parse(path: &str) -> Result<MemFile, String> {
+    let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let mut r = Reader { b: &b, p: 0 };
+    if r.take(8)? != MAGIC {
+        return Err(format!("{}: not a .mkmem file (bad magic)", path));
+    }
+    // header = magic + 5 x u32 fingerprint + n_layers x u8 kinds
+    let fp: Vec<u32> = (0..5).map(|_| r.u32()).collect::<Result<_, _>>()?;
+    let n_layers = fp[0] as usize;
+    let kinds = r.take(n_layers)?.to_vec();
+    let mut header = Vec::new();
+    header.extend_from_slice(MAGIC);
+    for v in &fp {
+        header.extend_from_slice(&v.to_le_bytes());
+    }
+    header.extend_from_slice(&kinds);
+    let mut layers = Vec::new();
+    for (l, &kind) in kinds.iter().enumerate() {
+        let tag = r.u8()?;
+        match (kind, tag) {
+            (0, 0) => layers.push(LayerMem::Kda {
+                conv_q: r.vec_f32()?,
+                conv_k: r.vec_f32()?,
+                conv_v: r.vec_f32()?,
+                s: r.vec_f32()?,
+            }),
+            (1, 1) => layers.push(LayerMem::Mla { k: r.vec_f32()?, v: r.vec_f32()? }),
+            _ => return Err(format!("{}: corrupt .mkmem (layer {} kind/tag mismatch)", path, l)),
+        }
+    }
+    let logits = r.vec_f32()?;
+    Ok(MemFile { header, layers, logits })
+}
+
+fn write_mem(m: &MemFile, path: &str) -> std::io::Result<()> {
+    let mut out = m.header.clone();
+    for l in &m.layers {
+        match l {
+            LayerMem::Kda { conv_q, conv_k, conv_v, s } => {
+                out.push(0);
+                put_vec(&mut out, conv_q);
+                put_vec(&mut out, conv_k);
+                put_vec(&mut out, conv_v);
+                put_vec(&mut out, s);
+            }
+            LayerMem::Mla { k, v } => {
+                out.push(1);
+                put_vec(&mut out, k);
+                put_vec(&mut out, v);
+            }
+        }
+    }
+    put_vec(&mut out, &m.logits);
+    std::fs::write(path, out)
+}
+
+/// Deterministic Fisher-Yates shuffle (xorshift64), used to build the
+/// shuffled-garbage control: same values, same energy, destroyed structure.
+fn shuffle(v: &mut [f32], seed: u64) {
+    let mut x = seed | 1;
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let j = (x % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+}
+
+/// Merges N .mkmem files into one: KDA s = element-wise sum over all inputs,
+/// everything else from the first input. `shuffle_idx` (1-based) marks an
+/// input whose s vectors are shuffled before summing (garbage control).
+/// With `avg`, the summed s is divided by N afterwards: a plain sum doubles
+/// the state energy, which is itself off-distribution for the recurrence.
+pub fn merge(paths: &[String], out: &str, shuffle_idx: Option<usize>, avg: bool) -> Result<(), String> {
+    if paths.len() < 2 {
+        return Err("mkmem-merge needs at least 2 input files".to_string());
+    }
+    let mut mems: Vec<MemFile> = Vec::new();
+    for p in paths {
+        mems.push(parse(p)?);
+    }
+    for (i, m) in mems.iter().enumerate().skip(1) {
+        if m.header != mems[0].header {
+            return Err(format!("{}: fingerprint differs from {} - cannot merge states of different models", paths[i], paths[0]));
+        }
+    }
+    let mut base = mems.remove(0);
+    for (i, m) in mems.into_iter().enumerate() {
+        let idx = i + 2; // 1-based position in the original argument list
+        for (bl, ml) in base.layers.iter_mut().zip(m.layers.into_iter()) {
+            if let (LayerMem::Kda { s: bs, .. }, LayerMem::Kda { s: mut ms, .. }) = (bl, ml) {
+                if bs.len() != ms.len() {
+                    return Err(format!("{}: KDA state length mismatch", paths[idx - 1]));
+                }
+                if shuffle_idx == Some(idx) {
+                    shuffle(&mut ms, 0x9E37_79B9_7F4A_7C15u64.wrapping_add(idx as u64));
+                }
+                for (a, b) in bs.iter_mut().zip(ms.iter()) {
+                    *a += b;
+                }
+            }
+        }
+    }
+    if avg {
+        let n = paths.len() as f32;
+        for l in base.layers.iter_mut() {
+            if let LayerMem::Kda { s, .. } = l {
+                for x in s.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+    }
+    write_mem(&base, out).map_err(|e| format!("cannot write {}: {}", out, e))?;
+    Ok(())
+}
+
 fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
     for x in v {

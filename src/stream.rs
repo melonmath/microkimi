@@ -20,7 +20,7 @@
 // matvec sequence runs on them.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // global fetch report counters (one model per process)
@@ -28,34 +28,85 @@ static RAM_HITS: AtomicU64 = AtomicU64::new(0);
 static RAM_MISSES: AtomicU64 = AtomicU64::new(0);
 static DISK_BYTES: AtomicU64 = AtomicU64::new(0); // bytes served by the disk tier
 
+// ── predictive prefetch (--stream-predict N) ──
+//
+// Expert selection is temporally correlated: within a conversation the experts
+// the router picks at MoE layer L correlate with the picks at the next MoE
+// layer. The cache observes every actual pick (model.rs pulls the 16 selected
+// experts through ExpertCache::get), so a Markov predictor can be trained
+// online: per-layer marginal expert frequencies plus per-(layer, prev_expert)
+// transition counts into the next layer, exponentially decayed (halflife
+// DECAY_HALFLIFE token passes) so the model adapts to topic drift. When a
+// layer's top-k set is complete, the predicted top-N experts of the NEXT MoE
+// layer are fetched on a detached thread while the current layer computes.
+// Prediction only changes WHEN bytes land in the RAM LRU, never WHICH experts
+// are computed: a mispredicted prefetch is a wasted fetch, an unpredicted pick
+// is fetched on demand as usual. The served bytes are always the same file
+// bytes, so the output stays bit-identical.
+static PREDICT_N: AtomicUsize = AtomicUsize::new(0); // predicted experts per layer, 0 = off
+static TOP_K: AtomicUsize = AtomicUsize::new(16); // router top-k (batch size of one MoE layer)
+static PREF_ISSUED: AtomicU64 = AtomicU64::new(0); // prefetches that fetched bytes
+static PREF_CACHED: AtomicU64 = AtomicU64::new(0); // predicted experts already in RAM
+static PREF_USED: AtomicU64 = AtomicU64::new(0); // prefetched entries later consumed on demand
+static PRED_HIT: AtomicU64 = AtomicU64::new(0); // predicted experts the router actually picked
+static PRED_TOT: AtomicU64 = AtomicU64::new(0); // total predicted experts
+
+/// `--stream-predict N`: enable the Markov expert prefetcher with N predicted
+/// experts per MoE layer (0 = off, the default). `top_k` is the router's
+/// top-k from the model config (the expert batch size of one MoE layer).
+pub fn set_predict(n: usize, top_k: usize) {
+    PREDICT_N.store(n, Ordering::Relaxed);
+    TOP_K.store(top_k.max(1), Ordering::Relaxed);
+}
+
 fn mb(n: u64) -> String {
     format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
 }
 
 /// One-line fetch report printed at exit when --stream is active.
 pub fn report_line() -> String {
-    format!(
+    let mut s = format!(
         "stream: {} expert RAM hits, {} misses, {} read from the disk tier, {} fetched over HTTP ({} requests)",
         RAM_HITS.load(Ordering::Relaxed),
         RAM_MISSES.load(Ordering::Relaxed),
         mb(DISK_BYTES.load(Ordering::Relaxed)),
         mb(crate::http::fetched_bytes()),
         crate::http::fetched_requests(),
-    )
+    );
+    if PREDICT_N.load(Ordering::Relaxed) > 0 {
+        let issued = PREF_ISSUED.load(Ordering::Relaxed);
+        let used = PREF_USED.load(Ordering::Relaxed);
+        let wasted = if issued > 0 { 100.0 * (issued - used) as f64 / issued as f64 } else { 0.0 };
+        let (hit, tot) = (PRED_HIT.load(Ordering::Relaxed), PRED_TOT.load(Ordering::Relaxed));
+        let acc = if tot > 0 { 100.0 * hit as f64 / tot as f64 } else { 0.0 };
+        s.push_str(&format!(
+            "\nstream-predict: {} prefetched ({} already cached), {} consumed on demand ({:.0}% of fetched wasted), prediction accuracy {}/{} ({:.0}%)",
+            issued,
+            PREF_CACHED.load(Ordering::Relaxed),
+            used,
+            wasted,
+            hit,
+            tot,
+            acc,
+        ));
+    }
+    s
 }
 
 // ── RAM LRU ──
 
 struct Lru {
-    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64)>, // (layer, expert) -> (w1++w2++w3, tick)
-    queue: VecDeque<((u32, u32), u64)>,            // access order, stale gens skipped
+    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch)
+    queue: VecDeque<((u32, u32), u64)>,                   // access order, stale gens skipped
     cur: usize,
     tick: u64,
     budget: usize,
 }
 
 impl Lru {
-    fn get(&mut self, k: (u32, u32)) -> Option<Arc<Vec<u8>>> {
+    /// On a hit, also reports (and clears) the from_prefetch mark, so a
+    /// prefetched entry consumed on demand is counted exactly once.
+    fn get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, bool)> {
         if !self.map.contains_key(&k) {
             return None;
         }
@@ -63,17 +114,18 @@ impl Lru {
         let e = self.map.get_mut(&k).unwrap();
         e.1 = self.tick;
         let v = e.0.clone();
+        let pref = std::mem::take(&mut e.2);
         self.queue.push_back((k, self.tick));
-        Some(v)
+        Some((v, pref))
     }
 
-    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>) {
+    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: bool) {
         let sz = v.len();
         if sz > self.budget {
             return; // a single expert exceeds the budget: serve without caching
         }
         self.tick += 1;
-        if let Some(old) = self.map.insert(k, (v, self.tick)) {
+        if let Some(old) = self.map.insert(k, (v, self.tick, pref)) {
             self.cur -= old.0.len();
         }
         self.cur += sz;
@@ -94,7 +146,7 @@ impl Lru {
         }
         // amortized queue compaction (every access pushes one entry)
         if self.queue.len() > 4 * self.map.len().max(16) {
-            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g))| (k, g)).collect();
+            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _))| (k, g)).collect();
             live.sort_by_key(|&(_, g)| g);
             self.queue = live.into();
         }
@@ -356,6 +408,191 @@ impl Drop for RemoteSource {
     }
 }
 
+// ── Markov predictor: online transition statistics over router picks ──
+
+/// Halflife of the statistics decay, in token passes (one pass = one sweep
+/// over the MoE layers). Counts older than this weigh half as much, so the
+/// predictor follows topic drift within a conversation.
+const DECAY_HALFLIFE: f32 = 256.0;
+/// Per-(layer, prev_expert) transition rows are capped: when a row grows past
+/// ROW_CAP entries it is pruned back to ROW_KEEP by effective count. Predicted
+/// experts come from the head of the distribution anyway.
+const ROW_CAP: usize = 128;
+const ROW_KEEP: usize = 64;
+/// Weight of the per-layer marginal frequency relative to the transition
+/// counts: a backoff for experts with no observed transition history.
+const MARGINAL_W: f32 = 0.25;
+
+/// Decay factor for a count stamped `stamp` read at `epoch` (lazy decay: each
+/// entry carries the epoch of its last update, no global rescale pass).
+fn decay(epoch: u64, stamp: u64) -> f32 {
+    (-(epoch.saturating_sub(stamp) as f32) / DECAY_HALFLIFE).exp2()
+}
+
+/// Online Markov model of the router's expert picks, fed by ExpertCache::get.
+/// Batching: model.rs fetches the top-k experts of one MoE layer as one
+/// parallel pool batch and layers run sequentially, so the gets of one layer
+/// never interleave with the next layer's (pool barrier). A get whose layer
+/// differs from the open batch closes it.
+struct Predictor {
+    cur_layer: u32,            // layer of the open batch (u32::MAX = none yet)
+    cur_set: Vec<u32>,         // distinct experts of the open batch
+    prev_set: Vec<u32>,        // last closed batch (the previous MoE layer)
+    epoch: u64,                // token pass counter (incremented on layer wrap)
+    last_fired: (u64, u32),    // (epoch, layer) of the last prefetch trigger
+    next_layer: HashMap<u32, u32>, // observed MoE layer sequence: layer -> next MoE layer
+    marginal: HashMap<u32, HashMap<u32, (f32, u64)>>, // layer -> expert -> (count, stamp)
+    trans: HashMap<(u32, u32), HashMap<u32, (f32, u64)>>, // (layer, prev_expert) -> expert -> (count, stamp)
+    pred_made: HashMap<u32, Vec<u32>>, // layer -> experts predicted for it (accuracy accounting)
+    blob: usize,               // bytes per MXFP4 blob (constant per model)
+    offs: HashMap<(u32, u32), [u64; 3]>, // observed file offsets per (layer, expert)
+    base: HashMap<u32, (u64, bool)>,     // layer -> (offs[0] - expert * 3 * blob, affine-ok)
+}
+
+/// One predicted expert to fetch in the background: (layer, expert, offsets).
+type PrefetchJob = (u32, u32, [u64; 3]);
+
+impl Predictor {
+    fn new() -> Predictor {
+        Predictor {
+            cur_layer: u32::MAX,
+            cur_set: Vec::new(),
+            prev_set: Vec::new(),
+            epoch: 0,
+            last_fired: (u64::MAX, u32::MAX),
+            next_layer: HashMap::new(),
+            marginal: HashMap::new(),
+            trans: HashMap::new(),
+            pred_made: HashMap::new(),
+            blob: 0,
+            offs: HashMap::new(),
+            base: HashMap::new(),
+        }
+    }
+
+    /// Adds `incr` to a lazily-decayed (count, stamp) entry.
+    fn bump(e: &mut (f32, u64), epoch: u64, incr: f32) {
+        e.0 = e.0 * decay(epoch, e.1) + incr;
+        e.1 = epoch;
+    }
+
+    /// Records one observed router pick. Returns prefetch jobs for the next
+    /// MoE layer when the open batch just reached top-k (the full router set
+    /// of a decode step): the current layer's experts are all in flight, so
+    /// the prefetch overlaps the current layer's compute.
+    fn observe(&mut self, layer: u32, expert: u32, offs: [u64; 3], blob: usize, top_k: usize, n: usize) -> Vec<PrefetchJob> {
+        // offset book-keeping (for prefetching experts never seen before)
+        self.blob = blob;
+        self.offs.insert((layer, expert), offs);
+        let stride_ok = offs[1] == offs[0] + blob as u64 && offs[2] == offs[1] + blob as u64;
+        let b = offs[0].wrapping_sub(expert as u64 * 3 * blob as u64);
+        match self.base.get_mut(&layer) {
+            None => {
+                self.base.insert(layer, (b, stride_ok));
+            }
+            Some(e) => {
+                if !stride_ok || e.0 != b {
+                    e.1 = false; // layout is not a plain expert-major run: recorded offsets only
+                }
+            }
+        }
+        // batching
+        if layer != self.cur_layer {
+            self.close_batch();
+            if self.cur_layer != u32::MAX {
+                self.next_layer.insert(self.cur_layer, layer);
+                if layer < self.cur_layer {
+                    self.epoch += 1; // layers increase within a token pass: a wrap is a new token
+                }
+            }
+            self.prev_set = std::mem::take(&mut self.cur_set);
+            self.cur_layer = layer;
+        }
+        if !self.cur_set.contains(&expert) {
+            self.cur_set.push(expert);
+        }
+        // trigger: the batch just reached the router's top-k (complete set)
+        if n == 0 || self.cur_set.len() != top_k || self.last_fired == (self.epoch, self.cur_layer) {
+            return Vec::new();
+        }
+        self.last_fired = (self.epoch, self.cur_layer);
+        // accuracy of the prediction made for THIS layer earlier in the pass
+        if let Some(pred) = self.pred_made.remove(&self.cur_layer) {
+            let hits = pred.iter().filter(|e| self.cur_set.contains(e)).count() as u64;
+            PRED_HIT.fetch_add(hits, Ordering::Relaxed);
+            PRED_TOT.fetch_add(pred.len() as u64, Ordering::Relaxed);
+        }
+        let Some(&nl) = self.next_layer.get(&self.cur_layer) else {
+            return Vec::new(); // first pass: the layer sequence is still being learned
+        };
+        let predicted = self.top_predicted(nl, n);
+        self.pred_made.insert(nl, predicted.clone());
+        // resolve file offsets: affine layout when verified, else observed only
+        let mut jobs = Vec::new();
+        for e in predicted {
+            if let Some(o) = self.offs.get(&(nl, e)) {
+                jobs.push((nl, e, *o));
+            } else if let Some(&(b, true)) = self.base.get(&nl) {
+                let o0 = b + e as u64 * 3 * self.blob as u64;
+                jobs.push((nl, e, [o0, o0 + self.blob as u64, o0 + 2 * self.blob as u64]));
+            }
+        }
+        jobs
+    }
+
+    /// Folds the closing batch into the statistics: marginals for its own
+    /// layer, transitions from the previous MoE layer's set into this one.
+    fn close_batch(&mut self) {
+        if self.cur_set.is_empty() || self.cur_layer == u32::MAX {
+            return;
+        }
+        let epoch = self.epoch;
+        let layer = self.cur_layer;
+        let row = self.marginal.entry(layer).or_default();
+        for &e in &self.cur_set {
+            Self::bump(row.entry(e).or_insert((0.0, epoch)), epoch, 1.0);
+        }
+        for &p in &self.prev_set {
+            let row = self.trans.entry((layer, p)).or_default();
+            for &e in &self.cur_set {
+                Self::bump(row.entry(e).or_insert((0.0, epoch)), epoch, 1.0);
+            }
+            if row.len() > ROW_CAP {
+                // keep the ROW_KEEP strongest entries by effective count
+                let mut v: Vec<(u32, f32)> = row.iter().map(|(&e, &(c, s))| (e, c * decay(epoch, s))).collect();
+                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                v.truncate(ROW_KEEP);
+                *row = v.into_iter().map(|(e, c)| (e, (c, epoch))).collect();
+            }
+        }
+    }
+
+    /// Top-n predicted experts of `layer`: transition counts from the current
+    /// layer's actual picks, plus the layer marginal as a backoff.
+    fn top_predicted(&self, layer: u32, n: usize) -> Vec<u32> {
+        let epoch = self.epoch;
+        let mut score: HashMap<u32, f32> = HashMap::new();
+        for &p in &self.cur_set {
+            if let Some(row) = self.trans.get(&(layer, p)) {
+                for (&e, &(c, s)) in row {
+                    *score.entry(e).or_insert(0.0) += c * decay(epoch, s);
+                }
+            }
+        }
+        if let Some(row) = self.marginal.get(&layer) {
+            for (&e, &(c, s)) in row {
+                *score.entry(e).or_insert(0.0) += MARGINAL_W * c * decay(epoch, s);
+            }
+        }
+        // never predict what the router is already fetching for the current
+        // layer... different layer, so no overlap possible; just rank
+        let mut v: Vec<(u32, f32)> = score.into_iter().collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        v.truncate(n);
+        v.into_iter().map(|(e, _)| e).collect()
+    }
+}
+
 // ── expert cache: RAM LRU over a byte source ──
 
 enum Src {
@@ -365,47 +602,19 @@ enum Src {
     Remote(RemoteSource),
 }
 
-/// RAM LRU of packed expert bytes keyed by (layer, expert), budgeted by
-/// --stream-ram. Thread-safe: the 16 router-selected experts of a layer are
-// fetched and computed in parallel pool jobs (model.rs).
-pub struct ExpertCache {
-    inner: Mutex<Lru>,
+/// Shared state behind an Arc so detached prefetch threads can outlive the
+/// trigger point safely (the model - and with it the cache - may be dropped
+/// while a prefetch is still reading).
+struct CacheInner {
+    lru: Mutex<Lru>,
     src: Src,
+    pred: Mutex<Predictor>,
 }
 
-impl ExpertCache {
-    /// Local streaming source: `path` is the .bin the spine was loaded from.
-    pub fn local(path: &str, ram_mb: usize) -> ExpertCache {
-        let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
-        ExpertCache {
-            inner: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
-            src: Src::Local(file),
-        }
-    }
-
-    /// Remote streaming source (per-tensor persistent cache, disk budget in MB).
-    #[allow(dead_code)] // wired end-to-end once real-dim MLA layers run (see docs)
-    pub fn remote(url: &str, ram_mb: usize, kept_layers: &[usize], disk_mb: u64) -> ExpertCache {
-        ExpertCache {
-            inner: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
-            src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
-        }
-    }
-
-    /// The 3 MXFP4 blobs of expert `expert` of `layer`, concatenated
-    /// w1 ++ w2 ++ w3, `blob` bytes each. `offs` = absolute file offsets of
-    /// the three blobs (local source; ignored by the remote one).
-    pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Arc<Vec<u8>> {
-        let k = (layer, expert);
-        {
-            let mut lru = self.inner.lock().unwrap();
-            if let Some(v) = lru.get(k) {
-                RAM_HITS.fetch_add(1, Ordering::Relaxed);
-                return v;
-            }
-        }
-        RAM_MISSES.fetch_add(1, Ordering::Relaxed);
-        let bytes = match &self.src {
+impl CacheInner {
+    /// Raw bytes of one expert from the disk/HTTP tier (no RAM LRU lookup).
+    fn fetch(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Vec<u8> {
+        match &self.src {
             Src::Local(file) => {
                 use std::os::unix::fs::FileExt;
                 let mut out = vec![0u8; 3 * blob];
@@ -421,9 +630,93 @@ impl ExpertCache {
                 out
             }
             Src::Remote(r) => r.expert_blobs(layer, expert),
-        };
+        }
+    }
+
+    /// Background prefetch of one predicted expert: already cached = just
+    /// refresh the recency (protects it from eviction), otherwise fetch and
+    /// insert with the from_prefetch mark. Never touches the router path.
+    fn prefetch_one(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) {
+        let k = (layer, expert);
+        {
+            let mut lru = self.lru.lock().unwrap();
+            if lru.get(k).is_some() {
+                PREF_CACHED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        let bytes = self.fetch(layer, expert, offs, blob);
+        self.lru.lock().unwrap().insert(k, Arc::new(bytes), true);
+        PREF_ISSUED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// RAM LRU of packed expert bytes keyed by (layer, expert), budgeted by
+/// --stream-ram. Thread-safe: the 16 router-selected experts of a layer are
+// fetched and computed in parallel pool jobs (model.rs).
+pub struct ExpertCache {
+    inner: Arc<CacheInner>,
+}
+
+impl ExpertCache {
+    /// Local streaming source: `path` is the .bin the spine was loaded from.
+    pub fn local(path: &str, ram_mb: usize) -> ExpertCache {
+        let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
+        ExpertCache {
+            inner: Arc::new(CacheInner {
+                lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
+                src: Src::Local(file),
+                pred: Mutex::new(Predictor::new()),
+            }),
+        }
+    }
+
+    /// Remote streaming source (per-tensor persistent cache, disk budget in MB).
+    #[allow(dead_code)] // wired end-to-end once real-dim MLA layers run (see docs)
+    pub fn remote(url: &str, ram_mb: usize, kept_layers: &[usize], disk_mb: u64) -> ExpertCache {
+        ExpertCache {
+            inner: Arc::new(CacheInner {
+                lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
+                src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
+                pred: Mutex::new(Predictor::new()),
+            }),
+        }
+    }
+
+    /// The 3 MXFP4 blobs of expert `expert` of `layer`, concatenated
+    /// w1 ++ w2 ++ w3, `blob` bytes each. `offs` = absolute file offsets of
+    /// the three blobs (local source; ignored by the remote one).
+    pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Arc<Vec<u8>> {
+        // feed the Markov predictor; on a completed top-k batch this may
+        // return prefetch jobs for the next MoE layer, run on a detached
+        // thread so they overlap the current layer's compute
+        let n = PREDICT_N.load(Ordering::Relaxed);
+        if n > 0 {
+            let jobs = self.inner.pred.lock().unwrap().observe(layer, expert, offs, blob, TOP_K.load(Ordering::Relaxed), n);
+            if !jobs.is_empty() {
+                let inner = Arc::clone(&self.inner);
+                std::thread::spawn(move || {
+                    for (l, e, o) in jobs {
+                        inner.prefetch_one(l, e, o, blob);
+                    }
+                });
+            }
+        }
+        let k = (layer, expert);
+        {
+            let mut lru = self.inner.lru.lock().unwrap();
+            if let Some((v, pref)) = lru.get(k) {
+                if pref {
+                    PREF_USED.fetch_add(1, Ordering::Relaxed);
+                }
+                RAM_HITS.fetch_add(1, Ordering::Relaxed);
+                return v;
+            }
+        }
+        RAM_MISSES.fetch_add(1, Ordering::Relaxed);
+        let bytes = self.inner.fetch(layer, expert, offs, blob);
         let v = Arc::new(bytes);
-        self.inner.lock().unwrap().insert(k, v.clone());
+        self.inner.lru.lock().unwrap().insert(k, v.clone(), false);
         v
     }
 }
@@ -510,14 +803,17 @@ pub fn streamtest(args: &[String]) {
     println!("-- 3) LRU eviction under a 3-entry budget");
     let entry = 1 << 20; // 1 MB synthetic entries
     let cache = ExpertCache {
-        inner: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: 3 * entry }),
-        src: Src::Remote(src),
+        inner: Arc::new(CacheInner {
+            lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: 3 * entry }),
+            src: Src::Remote(src),
+            pred: Mutex::new(Predictor::new()),
+        }),
     };
     for e in 0..4u32 {
-        cache.inner.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]));
+        cache.inner.lru.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]), false);
     }
     {
-        let lru = cache.inner.lock().unwrap();
+        let lru = cache.inner.lru.lock().unwrap();
         assert!(lru.cur <= 3 * entry, "LRU over budget: {} > {}", lru.cur, 3 * entry);
         assert!(!lru.map.contains_key(&(0, 0)), "oldest entry was not evicted");
         assert!(lru.map.contains_key(&(0, 3)), "newest entry is missing");

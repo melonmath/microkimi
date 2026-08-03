@@ -148,6 +148,18 @@ impl Config {
     pub fn mla_kvb(&self) -> usize {
         self.mla_heads * (self.mla_nope + self.mla_v)
     }
+    /// kv_a_proj_with_mqa output width: latent KV + the shared rope key.
+    /// Coincides with mla_q_lora in the micro config (64+64 == 128) but not
+    /// in real K3 (512+64 == 576 vs q_lora 1536).
+    pub fn mla_c_dim(&self) -> usize {
+        self.mla_kva + self.mla_rope
+    }
+    /// Flat attention output width H*v (g_proj rows / o_proj cols).
+    /// Coincides with d in the micro config (4*128 == 512) but not in real
+    /// K3 (96*128 == 12288 vs hidden 7168).
+    pub fn mla_hv(&self) -> usize {
+        self.mla_heads * self.mla_v
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
