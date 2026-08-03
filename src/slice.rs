@@ -510,16 +510,28 @@ fn mxfp4_scale_energy(scale_bytes: &[u8]) -> f64 {
 /// .bin path: exact dequantized Frobenius, one thread per layer (disk reads).
 /// Safetensors path: scale-energy from the weight_scale tensors only; layers
 /// are processed sequentially but each layer's experts are split across 8
-/// threads (remote scoring is curl-latency bound). Every finished layer is
-/// logged (the scoring used to be ~1h of silence on a remote slice).
-fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::collections::HashMap<usize, Vec<usize>> {
+/// threads (remote scoring is curl-latency bound).
+/// Every finished layer is logged and checkpointed immediately; layers found
+/// in the checkpoint are restored instead of re-scored (both branches).
+fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize, ckpt: &SliceCkpt) -> std::collections::HashMap<usize, Vec<usize>> {
     let cfg = src.config();
     let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
     let total = moe_layers.len();
-    let done = std::sync::atomic::AtomicUsize::new(0);
+    let mut restored: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut todo: Vec<usize> = Vec::new();
+    for &l in &moe_layers {
+        match ckpt.experts.get(&l) {
+            Some(set) => restored.push((l, set.clone())),
+            None => todo.push(l),
+        }
+    }
+    for (l, _) in &restored {
+        println!("experts: layer {} restored from checkpoint", l);
+    }
+    let done = std::sync::atomic::AtomicUsize::new(restored.len());
     if matches!(src, Source::St(_)) {
-        let mut results = Vec::new();
-        for &l in &moe_layers {
+        let mut results = restored;
+        for &l in &todo {
             let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
             let mut scores = vec![0f64; cfg.n_experts];
             let nt = 8.min(cfg.n_experts);
@@ -540,6 +552,7 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
                 }
             });
             let keep = top_n(&scores, n_keep.min(cfg.n_experts));
+            ckpt.record_experts(l, &keep);
             let lo = keep.iter().map(|&e| scores[e]).fold(f64::INFINITY, f64::min);
             let hi = keep.iter().map(|&e| scores[e]).fold(f64::NEG_INFINITY, f64::max);
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -550,7 +563,7 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
     }
     let results: Vec<(usize, Vec<usize>)> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for &l in &moe_layers {
+        for &l in &todo {
             let done = &done;
             handles.push(scope.spawn(move || {
                 let pfx = format!("layers.{}.block_sparse_moe.experts.", l);
@@ -568,6 +581,7 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
                     scores[e] = expert_norm_sq(&blobs[0], &blobs[1], &blobs[2], rc);
                 }
                 let keep = top_n(&scores, n_keep.min(cfg.n_experts));
+                ckpt.record_experts(l, &keep);
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 println!("experts: scored layer {}/{} (layer {}, kept {}/{})", n, total, l, keep.len(), cfg.n_experts);
                 (l, keep)
@@ -575,7 +589,7 @@ fn expert_keep_sets(src: &Source, kept_layers: &[usize], n_keep: usize) -> std::
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    results.into_iter().collect()
+    results.into_iter().chain(restored).collect()
 }
 
 /// Per kept MoE layer: the full per-expert Frobenius scores (.bin sources
@@ -757,6 +771,132 @@ fn value_flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+// ── crash-safe resume checkpoint (<out>.sliceckpt) ──
+//
+// The scoring phases (channel |w| sums, per-layer expert scale-energy) are
+// the long part of a remote slice (tens of thousands of range requests, ~1h
+// of silence) and used to be lost entirely on a spot-VM preemption. Every
+// finished entry is appended to the sidecar and fsynced IMMEDIATELY (it
+// survives kill -9); a rerun with the same parameters resumes from it.
+//
+// Format (text, one entry per line):
+//   config <fnv1a-64 hex>     run parameters: model | kept layers | hidden | experts
+//   channels <c0,c1,...>      hidden keep-set (ascending)
+//   experts <layer> <e0,e1,...>  keep-set of one scored MoE layer (ascending)
+//
+// A `config` mismatch (different model/layers/hidden/experts) discards the
+// sidecar with a warning and starts fresh. Covered: channel keep-set and
+// expert keep-sets (both the remote scale-energy branch and the local .bin
+// Frobenius branch of expert_keep_sets). NOT covered: the --cold-vq score
+// map (expert_score_map restarts from scratch) and the write phase itself
+// (it restarts from scratch too: it is much faster than the scoring phases
+// and resumability would complicate the append-only .bin layout). The file
+// is deleted on successful completion.
+
+struct SliceCkpt {
+    path: std::path::PathBuf,
+    file: std::sync::Mutex<std::fs::File>,
+    channels: Option<Vec<usize>>,
+    experts: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+/// FNV-1a 64 over the run-parameter string (no hash crates, std only).
+fn fnv1a(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn parse_csv(s: &str) -> Option<Vec<usize>> {
+    s.split(',').map(|t| t.parse().ok()).collect()
+}
+
+fn join_csv(v: &[usize]) -> String {
+    v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
+impl SliceCkpt {
+    /// Loads <out>.sliceckpt when present. A matching `config` line restores
+    /// the recorded entries, anything else (missing or corrupt file, parameter
+    /// mismatch) starts fresh with a warning.
+    fn open(out: &str, key: &str) -> SliceCkpt {
+        use std::io::Write;
+        let path = std::path::PathBuf::from(format!("{}.sliceckpt", out));
+        let want = format!("{:016x}", fnv1a(key));
+        let mut config_ok = false;
+        let mut channels = None;
+        let mut experts = std::collections::HashMap::new();
+        let existed = path.is_file();
+        if let Ok(bytes) = std::fs::read(&path) {
+            // a kill -9 between the write and the fsync of the LAST entry can
+            // leave a torn trailing line: only complete lines are parsed
+            let text = String::from_utf8_lossy(&bytes);
+            let body = match text.rsplit_once('\n') {
+                Some((body, _)) => body,
+                None => "",
+            };
+            for line in body.lines() {
+                let mut it = line.split_whitespace();
+                match it.next() {
+                    Some("config") => config_ok = it.next() == Some(want.as_str()),
+                    Some("channels") => channels = it.next().and_then(parse_csv),
+                    Some("experts") => {
+                        if let (Some(l), Some(set)) = (it.next().and_then(|s| s.parse().ok()), it.next().and_then(parse_csv)) {
+                            experts.insert(l, set);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if existed && !config_ok {
+            println!("sliceckpt: ignoring {} (parameters differ), starting fresh", path.display());
+            std::fs::remove_file(&path).ok();
+            channels = None;
+            experts = std::collections::HashMap::new();
+        }
+        let n = experts.len() + channels.is_some() as usize;
+        if config_ok && n > 0 {
+            println!("sliceckpt: resumed {} ({} entries)", path.display(), n);
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        if f.metadata().unwrap().len() == 0 {
+            f.write_all(format!("config {}\n", want).as_bytes()).unwrap();
+            f.sync_data().unwrap();
+        }
+        SliceCkpt { path, file: std::sync::Mutex::new(f), channels, experts }
+    }
+
+    /// Appends one entry and fsyncs it (every entry must survive kill -9).
+    /// The whole line goes out in ONE write: a kill -9 lands either before
+    /// or after it, never in the middle of a line.
+    fn record(&self, line: &str) {
+        use std::io::Write;
+        let mut f = self.file.lock().unwrap();
+        f.write_all(format!("{}\n", line).as_bytes()).unwrap();
+        f.sync_data().unwrap();
+    }
+
+    fn record_channels(&self, ch: &[usize]) {
+        self.record(&format!("channels {}", join_csv(ch)));
+    }
+
+    fn record_experts(&self, layer: usize, set: &[usize]) {
+        self.record(&format!("experts {} {}", layer, join_csv(set)));
+    }
+
+    /// Successful completion: a finished .bin needs no checkpoint.
+    fn finish(self) {
+        drop(self.file);
+        if std::fs::remove_file(&self.path).is_ok() {
+            println!("sliceckpt: {} removed (slice complete)", self.path.display());
+        }
+    }
+}
+
 pub fn run(args: &[String]) {
     let t0 = std::time::Instant::now();
     let Some(model) = value_flag(args, "--model") else {
@@ -816,9 +956,23 @@ pub fn run(args: &[String]) {
     );
     println!("layers: keeping {}/{} {:?}", kept_layers.len(), cfg.n_layers, kept_layers);
 
+    // crash-safe resume checkpoint: model + kept layers + pruning params
+    let ckpt_key = format!(
+        "model={}|layers={}|hidden={}|experts={}",
+        model,
+        join_csv(&kept_layers),
+        hidden.map(|h| h.to_string()).unwrap_or_default(),
+        experts.map(|e| e.to_string()).unwrap_or_default()
+    );
+    let ckpt = SliceCkpt::open(&out, &ckpt_key);
+
     // ── 2. channel selection (scored on the kept layers only) ──
     let channels: Option<Vec<usize>> = hidden.map(|h| {
         assert!(h > 0 && h <= d, "--hidden must be in 1..={}", d);
+        if let Some(ch) = &ckpt.channels {
+            println!("hidden: {}/{} channels restored from checkpoint", ch.len(), d);
+            return ch.clone();
+        }
         let n_scored = source
             .entries()
             .iter()
@@ -833,6 +987,7 @@ pub fn run(args: &[String]) {
         println!("hidden: keeping {}/{} channels (top-|w|), score range {:.3} .. {:.3}", h, d,
             keep.iter().map(|&i| scores[i]).fold(f64::INFINITY, f64::min),
             keep.iter().map(|&i| scores[i]).fold(f64::NEG_INFINITY, f64::max));
+        ckpt.record_channels(&keep);
         keep
     });
 
@@ -840,7 +995,7 @@ pub fn run(args: &[String]) {
     let expert_sets = experts.map(|n| {
         assert!(n > 0, "--experts must be >= 1");
         let t = std::time::Instant::now();
-        let sets = expert_keep_sets(&source, &kept_layers, n);
+        let sets = expert_keep_sets(&source, &kept_layers, n, &ckpt);
         let how = if matches!(source, Source::Bin(_)) {
             "Frobenius of dequantized w1+w2+w3"
         } else {
@@ -1112,4 +1267,5 @@ pub fn run(args: &[String]) {
         );
     }
     println!("  done in {:.0?}", t0.elapsed());
+    ckpt.finish();
 }
