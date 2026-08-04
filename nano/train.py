@@ -125,6 +125,7 @@ def save_ckpt(model, opt, step, rng, args, path):
         "rng_torch": torch.get_rng_state(),
         "cfg": model.c,
         "args": vars(args),
+        "lora": getattr(model, "lora_info", None),
     }
     tmp = path + f".tmp{os.getpid()}"
     torch.save(payload, tmp)
@@ -170,6 +171,15 @@ def main():
     ap.add_argument("--amp", action="store_true",
                     help="bf16 autocast for the forward pass (faster on GPU, small numeric drift - "
                          "opt-in, loss is still computed in fp32)")
+    ap.add_argument("--lora", type=int, default=0,
+                    help="LoRA rank on the attention projections (0 = full training, default). "
+                         "Base weights are frozen, only the adapters train (healing mode)")
+    ap.add_argument("--lora-alpha", type=float, default=None,
+                    help="LoRA alpha (default: same as the rank, i.e. scaling 1.0)")
+    ap.add_argument("--lora-targets", default="attn",
+                    help="comma list from q,k,v,o,attn (default attn: q/k/v/o projections)")
+    ap.add_argument("--lora-norms", action="store_true",
+                    help="also train the norm gains (everything else stays frozen)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -203,7 +213,29 @@ def main():
     print(f"nanokimi: {total / 1e6:.1f} M params (experts {experts / 1e6:.1f} M), "
           f"{model.c['n_layers']} layers, batch {args.batch}×{args.seq}", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # LoRA (healing): the adapter config comes from the checkpoint being
+    # resumed when it has one, else from the flags. Base weights frozen,
+    # only the adapters (+ norms with --lora-norms) receive gradients.
+    from model_nano import apply_lora
+    lora_cfg = (pre_ck or {}).get("lora")
+    if lora_cfg is None and args.lora > 0:
+        lora_cfg = {
+            "rank": args.lora,
+            "alpha": args.lora_alpha if args.lora_alpha is not None else args.lora,
+            "targets": [t.strip() for t in args.lora_targets.split(",") if t.strip()],
+            "norms": args.lora_norms,
+        }
+    if lora_cfg:
+        n_train, n_total = apply_lora(
+            model, lora_cfg["rank"], lora_cfg["alpha"], lora_cfg["targets"], lora_cfg.get("norms", False)
+        )
+        print(f"lora: rank {lora_cfg['rank']} alpha {lora_cfg['alpha']} targets {lora_cfg['targets']} "
+              f"on {len(model.lora_info['wrapped'])} linears - {n_train / 1e6:.2f} M trainable / "
+              f"{n_total / 1e6:.1f} M total ({100 * n_train / n_total:.2f}%)", flush=True)
+
+    # only the trainable params reach the optimizer (LoRA: ~1% of the model)
+    opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                            lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     tokens = load_tokens(args.data)
     print(f"corpus: {len(tokens) / 1e6:.1f} M tokens", flush=True)
     rng = np.random.default_rng(args.seed)
@@ -217,8 +249,25 @@ def main():
     if pre_ck is not None:
         print(f"resuming from {ckpt_latest} ...", flush=True)
         ck = pre_ck
-        model.load_state_dict(ck["model"])
-        if "opt" in ck:
+        sd = ck["model"]
+        if lora_cfg and not any(k.endswith(".lora_A") for k in sd):
+            # plain (non-LoRA) checkpoint loaded into a LoRA-wrapped model:
+            # route the base weights to the frozen .base of each wrapper;
+            # the adapters keep their fresh init (A kaiming, B zero)
+            sd = dict(sd)
+            for w in model.lora_info["wrapped"]:
+                key = w + ".weight"
+                if key in sd:
+                    sd[w + ".base.weight"] = sd.pop(key)
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            assert not unexpected, f"unexpected keys in checkpoint: {unexpected[:4]}"
+            assert all(k.endswith((".lora_A", ".lora_B")) for k in missing), f"missing non-LoRA keys: {missing[:4]}"
+        else:
+            model.load_state_dict(sd)
+        # optimizer resume: skipped when LoRA-healing from a PLAIN checkpoint
+        # (the full-training param groups do not map onto the adapters)
+        healing_fresh = lora_cfg is not None and ck.get("lora") is None and "opt" in ck
+        if "opt" in ck and not healing_fresh:
             opt.load_state_dict(ck["opt"])
             # optimizer states load as CPU tensors - move them onto the run device
             # (AdamW requires state and params on the same device)
@@ -232,14 +281,18 @@ def main():
             torch.set_rng_state(ck["rng_torch"])
             print(f"  -> step {step0}", flush=True)
         else:
-            # weights-only checkpoint (e.g. bin2pt conversion): nothing to
-            # resume but the weights - optimizer, step and rng stay fresh
-            print("  weights-only checkpoint: optimizer/step/rng start fresh", flush=True)
+            # weights-only checkpoint (e.g. bin2pt conversion) or LoRA
+            # healing start: optimizer, step and rng stay fresh
+            if healing_fresh:
+                print("  lora healing from a plain checkpoint: fresh optimizer/step/rng", flush=True)
+            else:
+                print("  weights-only checkpoint: optimizer/step/rng start fresh", flush=True)
         if args.fresh_opt:
             # SFT from a base model: keep only the weights; optimizer
             # (AdamW moments from pretraining), step counter and rng restart
             # from scratch so the LR schedule is fresh (full cosine over --steps).
-            opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+            opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                                    lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
             step0 = 0
             rng = np.random.default_rng(args.seed)
             torch.manual_seed(args.seed)
