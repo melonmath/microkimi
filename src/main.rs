@@ -243,6 +243,28 @@ fn dotbench_cmd() {
             out.iter().map(|&v| v as f64).sum::<f64>()
         );
     }
+    // gemm_batch (batched prefill projections): position-major GEMM
+    for (rows, cols, n) in [(512usize, 512usize, 600usize), (896, 512, 600)] {
+        let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..n * cols).map(|_| next_f32()).collect();
+        let mut out = vec![0f32; n * rows];
+        model::gemm_batch(&w, rows, cols, &x, n, &mut out); // warmup
+        let iters = 20;
+        let t = Instant::now();
+        for _ in 0..iters {
+            model::gemm_batch(&w, rows, cols, &x, n, &mut out);
+        }
+        let dt = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "gemm {}x{}x{}: {:.4} ms/call ({:.2} GFLOP/s)  [checksum {:e}]",
+            rows,
+            cols,
+            n,
+            dt * 1000.0,
+            2.0 * rows as f64 * cols as f64 * n as f64 / dt / 1e9,
+            out.iter().map(|&v| v as f64).sum::<f64>()
+        );
+    }
     // mxfp4 quantized matvec: f32-dequant path vs integer q8 path
     for (rows, cols, nt) in [(64usize, 128usize, 1usize), (3072, 3584, 1), (163840, 1024, 10)] {
         let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();

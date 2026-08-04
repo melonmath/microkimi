@@ -251,8 +251,14 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
 /// works across positions, while each position keeps the exact 8-lane
 /// accumulation order of dot() (bit-identical results).
 /// `xt` is x transposed: xt[c * n + t].
+/// dot8t scalar (reference + fallback): 8 positions at once against the
+/// same weight row. Each position keeps the exact 8-accumulator order of
+/// dot() (bit-identical); the SIMD kernels below replay the same per-lane
+/// mul-then-add and the same reduction order, so they are bit-identical to
+/// this reference BY CONSTRUCTION (see the contract above dot()).
 #[inline]
-fn dot8t(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+#[allow(dead_code)] // on aarch64 the dispatched dot8t never reaches this
+fn dot8t_scalar(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
     let mut acc = [[0f32; 8]; 8]; // acc[lane][position]
     let mut cw = wr.chunks_exact(8);
     let mut c = 0;
@@ -276,6 +282,105 @@ fn dot8t(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
         }
     }
     s
+}
+
+/// NEON dot8t: the 8 column-accumulators live in 16 float32x4 registers
+/// (positions in lanes, acc[j][0] = positions 0-3, acc[j][1] = 4-7). Each
+/// lane sees the same mul-then-add as the scalar kernel (vaddq of vmulq,
+/// never fma). The per-position reduction replays the scalar reduction
+/// order exactly, so the result is bit-identical to dot8t_scalar.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot8t_neon(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = [[vdupq_n_f32(0.0); 2]; 8];
+        let xp = xt.as_ptr();
+        let mut cw = wr.chunks_exact(8);
+        let mut c = 0usize;
+        for w8 in &mut cw {
+            for (j, &wv) in w8.iter().enumerate() {
+                let w = vdupq_n_f32(wv);
+                let p = xp.add((c + j) * n + t0);
+                acc[j][0] = vaddq_f32(acc[j][0], vmulq_f32(w, vld1q_f32(p)));
+                acc[j][1] = vaddq_f32(acc[j][1], vmulq_f32(w, vld1q_f32(p.add(4))));
+            }
+            c += 8;
+        }
+        let mut accs = [[0f32; 8]; 8];
+        for j in 0..8 {
+            vst1q_f32(accs[j].as_mut_ptr(), acc[j][0]);
+            vst1q_f32(accs[j].as_mut_ptr().add(4), acc[j][1]);
+        }
+        let mut s = [0f32; 8];
+        for p in 0..8 {
+            s[p] = (accs[0][p] + accs[1][p]) + (accs[2][p] + accs[3][p]) + (accs[4][p] + accs[5][p]) + (accs[6][p] + accs[7][p]);
+        }
+        for (i, &wv) in cw.remainder().iter().enumerate() {
+            let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 8];
+            for p in 0..8 {
+                s[p] += wv * xc[p];
+            }
+        }
+        s
+    }
+}
+
+/// AVX2 dot8t: the 8 column-accumulators live in 8 __m256 registers (the 8
+/// positions in lanes). Same mul-then-add discipline (never fmadd), same
+/// reduction replay: bit-identical to dot8t_scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot8t_avx2(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 8];
+        let xp = xt.as_ptr();
+        let mut cw = wr.chunks_exact(8);
+        let mut c = 0usize;
+        for w8 in &mut cw {
+            for (j, &wv) in w8.iter().enumerate() {
+                let w = _mm256_set1_ps(wv);
+                acc[j] = _mm256_add_ps(acc[j], _mm256_mul_ps(w, _mm256_loadu_ps(xp.add((c + j) * n + t0))));
+            }
+            c += 8;
+        }
+        let mut accs = [[0f32; 8]; 8];
+        for j in 0..8 {
+            _mm256_storeu_ps(accs[j].as_mut_ptr(), acc[j]);
+        }
+        let mut s = [0f32; 8];
+        for p in 0..8 {
+            s[p] = (accs[0][p] + accs[1][p]) + (accs[2][p] + accs[3][p]) + (accs[4][p] + accs[5][p]) + (accs[6][p] + accs[7][p]);
+        }
+        for (i, &wv) in cw.remainder().iter().enumerate() {
+            let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 8];
+            for p in 0..8 {
+                s[p] += wv * xc[p];
+            }
+        }
+        s
+    }
+}
+
+/// dot8t: 8 positions at once against the same weight row, dispatched to
+/// the widest bit-identical SIMD kernel (positions in vector lanes: the row
+/// is loaded once for all eight).
+#[inline]
+fn dot8t(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64: unconditional, zero dispatch cost
+        return unsafe { dot8t_neon(wr, xt, n, t0) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            return unsafe { dot8t_avx2(wr, xt, n, t0) };
+        }
+    }
+    #[allow(unreachable_code)]
+    dot8t_scalar(wr, xt, n, t0)
 }
 
 /// dot4t: dot8t for a tail block of 4 positions.
@@ -547,6 +652,7 @@ struct LayerW {
 // ── caches ──
 
 // pub(crate): read/rewritten by mkmem.rs (.mkmem state snapshots)
+#[derive(Clone)]
 pub(crate) struct KdaCache {
     pub conv_q: Vec<f32>, // 3 × 512 (raw pre-conv)
     pub conv_k: Vec<f32>,
@@ -554,11 +660,13 @@ pub(crate) struct KdaCache {
     pub s: Vec<f32>, // 4 × 128 × 128
 }
 
+#[derive(Clone)]
 pub(crate) struct MlaCache {
     pub k: Vec<f32>, // pos × H×(nope+rope)
     pub v: Vec<f32>, // pos × H×v
 }
 
+#[derive(Clone)]
 pub(crate) enum Cache {
     Kda(KdaCache),
     Mla(MlaCache),
@@ -1502,22 +1610,31 @@ fn dense_forward(cfg: &Config, data: &[u8], w: &DenseW, x: &[f32], prof: &mut Pr
 /// exact per-group sequence of mxfp4::matvec_packed (gsum over the 32
 /// columns of a group in order, then sum += gsum * scale): bit-identical
 /// results.
+/// Loop order is row-outer: each row's nibbles are decoded to their f32 LUT
+/// values ONCE (they were re-decoded for every 8-position tile - 75x
+/// redundant work on a 600-token prompt), then all tiles run against the
+/// decoded row. Outputs are independent per (row, tile), so the swap and
+/// the hoisted decode keep the result bit-identical.
 fn matvec_packed_nt(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xt: &[f32], m: usize, out: &mut [f32]) {
     use crate::mxfp4::{E2M1, exp2_i};
     debug_assert_eq!(cols % 32, 0);
     debug_assert_eq!(m % 8, 0);
-    for t0 in (0..m).step_by(8) {
-        for r in 0..rows {
-            let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
-            let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+    let mut wrow = vec![0f32; cols];
+    for r in 0..rows {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        for c in 0..cols {
+            let byte = prow[c / 2];
+            let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            wrow[c] = E2M1[nib as usize];
+        }
+        for t0 in (0..m).step_by(8) {
             let mut sum = [0f32; 8];
             for g in 0..cols / 32 {
                 let mut gsum = [0f32; 8];
                 for j in 0..32 {
                     let c = g * 32 + j;
-                    let byte = prow[c / 2];
-                    let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-                    let wv = E2M1[nib as usize];
+                    let wv = wrow[c];
                     let xc = &xt[c * m + t0..c * m + t0 + 8];
                     for p in 0..8 {
                         gsum[p] += wv * xc[p];
@@ -2020,8 +2137,20 @@ impl Model {
     /// sequential forward calls, and every per-position computation keeps
     /// the same accumulation order, so the result is bit-identical.
     pub fn prefill(&mut self, ids: &[u32], pos0: usize) -> Vec<f32> {
+        self.prefill_impl(ids, pos0, false).pop().unwrap()
+    }
+
+    /// Batched prefill returning the logits of EVERY position, not just the
+    /// last (consumed by the --spec verification pass). Same pass as prefill
+    /// with lm_head applied per position: each logits vector is bit-identical
+    /// to what a sequential forward of that prefix would produce.
+    pub fn prefill_all(&mut self, ids: &[u32], pos0: usize) -> Vec<Vec<f32>> {
+        self.prefill_impl(ids, pos0, true)
+    }
+
+    fn prefill_impl(&mut self, ids: &[u32], pos0: usize, all_logits: bool) -> Vec<Vec<f32>> {
         if ids.len() == 1 {
-            return self.forward(ids[0], pos0);
+            return vec![self.forward(ids[0], pos0)];
         }
         let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
         let cfg = &*cfg;
@@ -2145,6 +2274,23 @@ impl Model {
             attn_res_refs(cfg, &hidden[t * d..(t + 1) * d], &brefs, &out_res_w, &mut buf_res[t * d..(t + 1) * d]);
         }
         hidden.copy_from_slice(&buf_res);
+        if all_logits {
+            // --spec verification: rmsnorm + lm_head on EVERY position (the
+            // same matvec as the single-token forward, so per-position
+            // logits are bit-identical to a sequential run)
+            let tm = Instant::now();
+            let mut out = Vec::with_capacity(n);
+            for t in 0..n {
+                let mut xf = vec![0f32; d];
+                rmsnorm(cfg, &hidden[t * d..(t + 1) * d], Self::t(data, &norm_f), &mut xf);
+                let mut logits = vec![0f32; cfg.vocab];
+                matvec(Self::t(data, &lm_head), cfg.vocab, d, &xf, &mut logits);
+                out.push(logits);
+            }
+            prof.t_norm_res += tm.elapsed().as_secs_f64();
+            *last_logits = out.last().unwrap().clone();
+            return out;
+        }
         let mut xf = vec![0f32; d];
         rmsnorm(cfg, &hidden[(n - 1) * d..n * d], Self::t(data, &norm_f), &mut xf);
         prof.t_norm_res += tm.elapsed().as_secs_f64();
@@ -2158,13 +2304,13 @@ impl Model {
             dump_hidden_print(&hd, vec_rms(&hidden[(n - 1) * d..n * d]), &logits);
         }
         *last_logits = logits.clone();
-        logits
+        vec![logits]
     }
 }
 
 // ── greedy generation + display (rustgpt style) ──
 
-fn top_k_probs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+pub(crate) fn top_k_probs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let m = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let mut z = 0f32;
     for &l in logits {
@@ -2212,15 +2358,17 @@ impl XorShift {
 
 /// Decoding policy: temp <= 0 keeps the exact greedy argmax path; temp > 0
 /// samples from softmax(logits / temp) restricted to the top-p nucleus.
+/// spec > 0 enables n-gram speculative decoding (src/spec.rs, greedy only).
 pub struct Sampler {
     pub temp: f32,
     pub top_p: f32,
     pub rng: XorShift,
+    pub spec: usize,
 }
 
 impl Sampler {
     pub fn new(temp: f32, top_p: f32, seed: u64) -> Sampler {
-        Sampler { temp, top_p, rng: XorShift::new(seed) }
+        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0 }
     }
     /// Default no-op decoding: the historical greedy behavior.
     pub fn greedy() -> Sampler {
@@ -2549,6 +2697,45 @@ mod dot_simd_tests {
             let b: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) * 1e-10).collect();
             let (want, got) = (dot_scalar(&a, &b), dot(&a, &b));
             assert_eq!(want.to_bits(), got.to_bits(), "bit mismatch (pathological) at n={}", n);
+        }
+    }
+
+    /// gemm_batch (the batched-prefill GEMM) must be BIT-IDENTICAL to n
+    /// separate matvec calls: every (row, position) dot keeps the same
+    /// accumulation order in every kernel (dot, dot8t tiles, tail dots,
+    /// pooled row split).
+    #[test]
+    fn gemm_matches_matvec_bit_exact() {
+        use super::{dot, gemm_batch};
+        let mut rng = Rng(0x0F0F0F0F0F0F0F0F);
+        for (rows, cols, n) in [
+            (5usize, 3usize, 1usize),
+            (7, 8, 3),
+            (16, 64, 4),
+            (33, 96, 7),
+            (64, 128, 8),
+            (64, 130, 13), // awkward cols remainder
+            (128, 512, 32), // exercises the pooled row split
+        ] {
+            let w: Vec<f32> = (0..rows * cols).map(|_| rng.f32()).collect();
+            let x: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+            let mut out = vec![0f32; n * rows];
+            gemm_batch(&w, rows, cols, &x, n, &mut out);
+            for t in 0..n {
+                for r in 0..rows {
+                    let want = dot(&w[r * cols..(r + 1) * cols], &x[t * cols..(t + 1) * cols]);
+                    assert_eq!(
+                        want.to_bits(),
+                        out[t * rows + r].to_bits(),
+                        "bit mismatch at (t={}, r={}) for {}x{}x{}",
+                        t,
+                        r,
+                        rows,
+                        cols,
+                        n
+                    );
+                }
+            }
         }
     }
 }
