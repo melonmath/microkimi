@@ -440,6 +440,84 @@ def count_params(model):
     return total, experts
 
 
+# ── LoRA (healing adapters) ──
+#
+# Freeze the base weights and train only small low-rank adapters on the
+# attention projections: y = W x + (B A x) * alpha / rank, with A [r, in]
+# kaiming-initialized and B [out, r] zero-initialized, so the adapter is the
+# identity at step 0. Experts are never wrapped (they are the bulk of the
+# params and not what LoRA healing targets); the MoE router gate is a custom
+# module (not an nn.Linear) and stays untouched as well.
+
+class LoRALinear(nn.Module):
+    """Frozen nn.Linear + trainable low-rank adapter (A @ x then B @ ., scaled)."""
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+        in_f, out_f = base.in_features, base.out_features
+        self.rank, self.alpha = rank, alpha
+        self.scaling = alpha / rank
+        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+
+    def merged_weight(self):
+        """W + B A * scaling (for the merge-and-export path)."""
+        return self.base.weight.data + (self.lora_B @ self.lora_A) * self.scaling
+
+
+# target name -> projection suffixes it wraps (matched on the module's leaf name)
+_LORA_TARGET_SUFFIXES = {
+    "q": ("q_proj", "q_a_proj", "q_b_proj"),
+    "k": ("k_proj", "kv_a_proj_with_mqa", "kv_b_proj"),
+    "v": ("v_proj", "kv_a_proj_with_mqa", "kv_b_proj"),
+    "o": ("o_proj",),
+}
+_LORA_TARGET_SUFFIXES["attn"] = tuple(
+    dict.fromkeys(s for v in ("q", "k", "v", "o") for s in _LORA_TARGET_SUFFIXES[v])
+)
+
+
+def apply_lora(model, rank, alpha, targets, lora_norms=False):
+    """Wrap the targeted attention Linears of `model` in LoRALinear and freeze
+    everything else (except the norm gains when lora_norms). `targets` is a
+    list from {q, k, v, o, attn}. Records model.lora_info for the checkpoint
+    and returns (n_trainable, n_total)."""
+    suffixes = tuple(dict.fromkeys(s for t in targets for s in _LORA_TARGET_SUFFIXES.get(t, ())))
+    if not suffixes:
+        raise SystemExit(f"apply_lora: no valid targets in {targets}")
+    for p in model.parameters():
+        p.requires_grad = False
+    wrapped = []
+    for mod_name, module in model.named_modules():
+        leaf = mod_name.rsplit(".", 1)[-1]
+        if isinstance(module, nn.Linear) and leaf in suffixes:
+            parent = model.get_submodule(mod_name.rsplit(".", 1)[0])
+            setattr(parent, leaf, LoRALinear(module, rank, alpha))
+            wrapped.append(mod_name)
+    assert wrapped, "apply_lora: no Linear matched - check the targets"
+    if lora_norms:
+        for name, p in model.named_parameters():
+            if "norm" in name:
+                p.requires_grad = True
+    model.lora_info = {
+        "rank": rank,
+        "alpha": alpha,
+        "targets": list(targets),
+        "norms": bool(lora_norms),
+        "wrapped": wrapped,
+    }
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    return n_train, n_total
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
