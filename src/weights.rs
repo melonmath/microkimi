@@ -3,7 +3,10 @@
 //   u32 n_tensors
 //   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32, 3=vq1) |
 //                   u8 n_dims | u32 dims[n_dims] | u64 offset | u64 size
-//   raw data (offsets from start of file, 64-aligned)
+//   raw data (offsets from start of file; routed expert blobs 4096-aligned so
+//   mmap demand-paging and streaming preads never pull a neighbor expert's
+//   pages, everything else 64-aligned; padding is zero space readers never
+//   see - they only use the directory's offset/size)
 // mxfp4 dtype: blob = packed (R×C/2 bytes) then scales (R×C/32), dims = logical [R,C].
 // vq1 dtype: blob = R×C/16 index bytes, one u8 codebook index per vector of 16
 //   consecutive row-major values; dims = logical [R,C] with C % 16 == 0. The
@@ -69,9 +72,16 @@ impl BinWriter {
         self.names_order.push((name.to_string(), dtype, dims));
     }
 
-    /// Computes the 64-aligned offsets in write order; `prefix` = number of
-    /// bytes before the u32 tensor count (8 for MKIM0001, 8+4+config_len for
-    /// MKIM0002).
+    /// Computes the blob offsets in write order; `prefix` = number of bytes
+    /// before the u32 tensor count (8 for MKIM0001, 8+4+config_len for
+    /// MKIM0002). Alignment: routed expert blobs (the MXFP4 w1/w2/w3 the
+    /// stream engine preads one routed expert at a time) start on a 4096
+    /// page boundary, so the mmap demand-paging and those preads never touch
+    /// a neighbor expert's pages - a token faults only the pages of its
+    /// routed experts, never fragments of the unrouted ones. Everything else
+    /// keeps the historical 64-byte alignment (vectorized loads, f32 slice
+    /// alignment). The padding is plain zero space between blobs: readers
+    /// only ever use the directory's (offset, size) and never see it.
     fn layout(&self, prefix: u64) -> Vec<u64> {
         let dir_size: u64 = self
             .names_order
@@ -81,8 +91,9 @@ impl BinWriter {
         let data_start = prefix + 4 + dir_size;
         let mut offsets = Vec::with_capacity(self.names_order.len());
         let mut pos = data_start;
-        for (_, dtype, dims) in &self.names_order {
-            pos = pos.div_ceil(64) * 64;
+        for (name, dtype, dims) in &self.names_order {
+            let align = if is_expert_tensor(name) { 4096 } else { 64 };
+            pos = pos.div_ceil(align) * align;
             offsets.push(pos);
             pos += blob_size(*dtype, dims);
         }
