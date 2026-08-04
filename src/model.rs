@@ -1023,6 +1023,110 @@ fn kda_prefill(
 
 // ── MLA: full NoPE ──
 
+// ── MLA attention kernel: flash (online softmax) vs materialized scores ──
+//
+// Both mla_forward (decode) and mla_prefill compute, for one (query, head),
+// attention over the cache positions 0..=pos. The historical kernel
+// materializes the whole score row (pos+1 floats per (query, head), fresh
+// allocation each time) and makes three passes over it (max, exp+sum,
+// normalize) plus a fourth over V. The flash kernel below never materializes
+// it: scores are computed one KV tile at a time and folded into an online
+// softmax (running max m, running normalizer l, output accumulator rescaled
+// on every max update). Same math, different f32 summation order (running
+// rescales instead of a final single division) - the A/B test in selftest
+// bounds the deviation (measured ~1e-6, tol 1e-5). Causal masking needs no
+// matrix anywhere: the loop bound IS the mask (NoPE has no positional terms
+// to adjust). MICROKIMI_NO_FLASH=1 restores the materialized path.
+
+/// True when MICROKIMI_NO_FLASH=1 (A/B toggle for the flash attention kernel).
+fn no_flash() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_FLASH").map(|v| v == "1").unwrap_or(false))
+}
+
+/// KV tile size of the flash kernel: a tile's scores live in a 64-float
+/// stack buffer and its K rows span 64 x 192 f32 = 48 KB (micro dims), L1/L2
+/// friendly; 64 also keeps the running-rescale corrections rare enough that
+/// the numerics stay within ~1e-6 of the materialized path.
+const FLASH_KV: usize = 64;
+
+/// Attention output for one (query, head) over cache positions 0..=pos:
+/// materialized-score reference (the historical kernel, kept for the
+/// MICROKIMI_NO_FLASH toggle and the selftest A/B). `oh` must be zeroed.
+pub(crate) fn mla_attn_ref(cfg: &Config, k: &[f32], v: &[f32], qh: &[f32], h: usize, pos: usize, scale: f32, oh: &mut [f32]) {
+    let mut scores = vec![0f32; pos + 1];
+    for j in 0..=pos {
+        let kj = &k[(j * cfg.mla_heads + h) * cfg.mla_qh()..(j * cfg.mla_heads + h + 1) * cfg.mla_qh()];
+        scores[j] = dot(qh, kj) * scale;
+    }
+    let m = scores.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+    let mut z = 0f32;
+    for s in scores.iter_mut() {
+        *s = (*s - m).exp();
+        z += *s;
+    }
+    for s in scores.iter_mut() {
+        *s /= z;
+    }
+    for j in 0..=pos {
+        let vj = &v[(j * cfg.mla_heads + h) * cfg.mla_v..(j * cfg.mla_heads + h + 1) * cfg.mla_v];
+        let p = scores[j];
+        for d in 0..cfg.mla_v {
+            oh[d] += p * vj[d];
+        }
+    }
+}
+
+/// Flash attention for one (query, head) over cache positions 0..=pos:
+/// online softmax in KV tiles of FLASH_KV positions, no score row
+/// materialized (a 64-float stack buffer is the only working memory, vs
+/// pos+1 floats allocated per (query, head) in the reference). `oh` must be
+/// zeroed. Numerics: identical math to mla_attn_ref, different f32
+/// association (the accumulator and the normalizer are rescaled whenever the
+/// running max grows instead of normalizing once at the end); the deviation
+/// is bounded by the selftest A/B (tol 1e-5, measured ~1e-6).
+pub(crate) fn mla_attn_flash(cfg: &Config, k: &[f32], v: &[f32], qh: &[f32], h: usize, pos: usize, scale: f32, oh: &mut [f32]) {
+    let (hd, vd, nh) = (cfg.mla_qh(), cfg.mla_v, cfg.mla_heads);
+    let mut m = f32::NEG_INFINITY; // running max
+    let mut l = 0f32; // running normalizer (sum of exp(s - m) so far)
+    let mut scores = [0f32; FLASH_KV];
+    let mut t = 0usize;
+    while t <= pos {
+        let end = (t + FLASH_KV - 1).min(pos);
+        // tile scores (causal mask = the loop bound; NoPE: nothing positional)
+        let mut tm = f32::NEG_INFINITY;
+        for (i, j) in (t..=end).enumerate() {
+            let kj = &k[(j * nh + h) * hd..(j * nh + h + 1) * hd];
+            let s = dot(qh, kj) * scale;
+            scores[i] = s;
+            tm = tm.max(s);
+        }
+        let m_new = m.max(tm);
+        let corr = (m - m_new).exp(); // 1 when the max did not move, 0 on the first tile
+        let mut tile_l = 0f32;
+        for s in scores.iter_mut().take(end - t + 1) {
+            *s = (*s - m_new).exp();
+            tile_l += *s;
+        }
+        for d in 0..vd {
+            oh[d] *= corr;
+        }
+        l = l * corr + tile_l;
+        for (i, j) in (t..=end).enumerate() {
+            let vj = &v[(j * nh + h) * vd..(j * nh + h + 1) * vd];
+            let p = scores[i];
+            for d in 0..vd {
+                oh[d] += p * vj[d];
+            }
+        }
+        m = m_new;
+        t = end + 1;
+    }
+    for d in 0..vd {
+        oh[d] /= l;
+    }
+}
+
 fn mla_forward(
     cfg: &Config,
     data: &[u8],
@@ -1064,29 +1168,14 @@ fn mla_forward(
     // causal attention, scale (nope+rope)^-0.5
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
     let mut attn = vec![0f32; cfg.mla_heads * cfg.mla_v];
+    let flash = !no_flash();
     for h in 0..cfg.mla_heads {
         let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
-        let mut scores = vec![0f32; pos + 1];
-        for j in 0..=pos {
-            let kj = &cache.k[(j * cfg.mla_heads + h) * cfg.mla_qh()..(j * cfg.mla_heads + h + 1) * cfg.mla_qh()];
-            scores[j] = dot(qh, kj) * scale;
-        }
-        let m = scores.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
-        let mut z = 0f32;
-        for s in scores.iter_mut() {
-            *s = (*s - m).exp();
-            z += *s;
-        }
-        for s in scores.iter_mut() {
-            *s /= z;
-        }
         let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
-        for j in 0..=pos {
-            let vj = &cache.v[(j * cfg.mla_heads + h) * cfg.mla_v..(j * cfg.mla_heads + h + 1) * cfg.mla_v];
-            let p = scores[j];
-            for d in 0..cfg.mla_v {
-                oh[d] += p * vj[d];
-            }
+        if flash {
+            mla_attn_flash(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
+        } else {
+            mla_attn_ref(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
         }
     }
     // output gate + o_proj (g_proj is [H*v, d]: H*v == d only in the micro
@@ -1161,32 +1250,17 @@ fn mla_prefill(
     // causal attention per query position, scale qh^-0.5
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
     let mut attn = vec![0f32; n * cfg.mla_heads * cfg.mla_v];
+    let flash = !no_flash();
     for t in 0..n {
         let pos = p0 + t;
         let qt = &q[t * qb..(t + 1) * qb];
         for h in 0..cfg.mla_heads {
             let qh = &qt[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
-            let mut scores = vec![0f32; pos + 1];
-            for j in 0..=pos {
-                let kj = &cache.k[(j * cfg.mla_heads + h) * cfg.mla_qh()..(j * cfg.mla_heads + h + 1) * cfg.mla_qh()];
-                scores[j] = dot(qh, kj) * scale;
-            }
-            let m = scores.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
-            let mut z = 0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - m).exp();
-                z += *s;
-            }
-            for s in scores.iter_mut() {
-                *s /= z;
-            }
             let oh = &mut attn[(t * cfg.mla_heads + h) * cfg.mla_v..(t * cfg.mla_heads + h + 1) * cfg.mla_v];
-            for j in 0..=pos {
-                let vj = &cache.v[(j * cfg.mla_heads + h) * cfg.mla_v..(j * cfg.mla_heads + h + 1) * cfg.mla_v];
-                let p = scores[j];
-                for d in 0..cfg.mla_v {
-                    oh[d] += p * vj[d];
-                }
+            if flash {
+                mla_attn_flash(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
+            } else {
+                mla_attn_ref(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
             }
         }
     }

@@ -644,3 +644,51 @@ pub fn run_q8() {
         std::process::exit(1);
     }
 }
+
+/// Flash MLA attention A/B: mla_attn_flash (online softmax, KV tiles) vs
+/// mla_attn_ref (materialized score row) on synthetic caches at the micro
+/// MLA dims, lengths 1 / 7 / 64 / 65 / 512 (tile boundary crossings
+/// included). Tolerance 1e-5 absolute: same math, different f32 association
+/// (running rescales vs a single final normalization) - the measured
+/// deviation is printed.
+pub fn run_flash() {
+    println!("flash MLA attention vs materialized reference (tol 1e-5)");
+    let cfg = crate::config::Config::microkimi();
+    let (nh, hd, vd) = (cfg.mla_heads, cfg.mla_qh(), cfg.mla_v);
+    let pattern = |i: usize| -> f32 {
+        let h = (i as u64).wrapping_mul(2654435761).wrapping_add(0x9E3779B9);
+        ((h >> 13) % 2000) as f32 / 1000.0 - 1.0
+    };
+    let scale = (hd as f32).powf(-0.5);
+    let mut all_ok = true;
+    let mut worst_all = 0f64;
+    for len in [1usize, 7, 64, 65, 512] {
+        let k: Vec<f32> = (0..len * nh * hd).map(&pattern).collect();
+        let v: Vec<f32> = (0..len * nh * vd).map(|i| pattern(i + 99991)).collect();
+        let q: Vec<f32> = (0..nh * hd).map(|i| pattern(i + 777)).collect();
+        let pos = len - 1;
+        let mut worst = 0f64;
+        for h in 0..nh {
+            let qh = &q[h * hd..(h + 1) * hd];
+            let mut a = vec![0f32; vd];
+            let mut b = vec![0f32; vd];
+            crate::model::mla_attn_ref(&cfg, &k, &v, qh, h, pos, scale, &mut a);
+            crate::model::mla_attn_flash(&cfg, &k, &v, qh, h, pos, scale, &mut b);
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((*x as f64 - *y as f64).abs());
+            }
+        }
+        worst_all = worst_all.max(worst);
+        let ok = worst <= 1e-5;
+        all_ok &= ok;
+        println!("  len={:<4} max_abs={:.3e}  {}", len, worst, if ok { "OK" } else { "FAIL" });
+    }
+    println!("  worst over all lengths: {:.3e}", worst_all);
+    println!();
+    if all_ok {
+        println!("FLASH OK - online-softmax kernel matches the materialized path (tol 1e-5)");
+    } else {
+        println!("FLASH FAILED");
+        std::process::exit(1);
+    }
+}
