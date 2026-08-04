@@ -2494,6 +2494,17 @@ pub fn run_turn_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &
 fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, resumed: bool, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
     model.prof = Prof::default();
     let mut pos = if resumed { model.cached_tokens() } else { 0 };
+    // --spec N: n-gram speculative decoding, greedy only (rejection sampling
+    // for temp > 0 is future work; the flag is ignored there)
+    if sampler.spec > 0 {
+        if sampler.temp > 0.0 {
+            eprintln!("warning: --spec is greedy-only, ignoring it with --temp > 0");
+        } else {
+            let answer = crate::spec::run_turn_spec(ids, max_new, tok, model, pos, init_logits, debug, stop_id, sampler);
+            model.prof.print_cfg(&model.cfg);
+            return answer;
+        }
+    }
     let answer = run_turn_core_batch(
         ids,
         max_new,

@@ -26,6 +26,7 @@ mod safetensors;
 mod selftest;
 mod slice;
 mod slice_st;
+mod spec;
 mod stream;
 mod tokenizer;
 mod tools_replay;
@@ -182,6 +183,7 @@ fn main() {
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
+            println!("                    --spec N (n-gram speculative decoding, greedy only)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
@@ -568,7 +570,7 @@ fn stream_report_maybe(stream_mb: Option<usize>) {
     }
 }
 
-/// Builds the decoding policy from --temp / --top-p / --seed.
+/// Builds the decoding policy from --temp / --top-p / --seed / --spec.
 /// temp absent or 0 -> greedy (the exact historical path). With temp > 0 and
 /// no --seed, the RNG is seeded from the wall clock (non reproducible).
 fn sampler_flag(args: &[String]) -> model::Sampler {
@@ -580,7 +582,9 @@ fn sampler_flag(args: &[String]) -> model::Sampler {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
     });
-    model::Sampler::new(temp, top_p, seed)
+    let mut s = model::Sampler::new(temp, top_p, seed);
+    s.spec = value_flag(args, "--spec").and_then(|v| v.parse().ok()).unwrap_or(0);
+    s
 }
 
 /// Drops the leading BOS of a freshly encoded prompt when resuming from a
@@ -657,6 +661,9 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         if stream_mb.is_some() {
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
+        }
+        if sampler.spec > 0 {
+            eprintln!("warning: --spec is only supported for K3 models, ignoring it (DeepSeek-V4)");
         }
         let tok = load_ds_any_tokenizer(&mp, vocab, mp_cfg.vocab);
         let mut model = deepseek::DsModel::load(&mp);

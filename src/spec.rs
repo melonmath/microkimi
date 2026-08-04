@@ -1,0 +1,245 @@
+// spec.rs - n-gram speculative decoding (--spec N), greedy only.
+//
+// Proposal (prompt lookup, no draft model): after each committed token, find
+// the longest suffix n-gram (2..=8 tokens) of the full context that also
+// occurs EARLIER in the context, and propose the N tokens that followed the
+// most recent earlier occurrence.
+//
+// Verification: the pending token (emitted last round, not yet ingested) +
+// the N proposals are ingested in ONE batched pass (Model::prefill_all,
+// per-position logits, bit-identical to sequential forwards). A proposal is
+// accepted while it matches the greedy argmax of the previous position; the
+// longest valid prefix is committed plus one bonus token selected at the
+// divergence position (vanilla speculative decoding with an n-gram "draft").
+//
+// Rollback: the optimistic batch ingests tokens that may be rejected. The
+// MLA caches are append-only per position but the KDA state is recurrent
+// (NOT truncatable: the recurrence S += (beta k) x delta cannot un-ingest),
+// so the whole layer-cache set is cloned BEFORE the batch (a few MB of
+// memcpy, cheap next to a forward pass) and restored on a partial accept;
+// the accepted prefix is then re-ingested with one batched prefill, which
+// rebuilds the exact same state (prefill is bit-identical to n sequential
+// forwards). Full accept: no restore at all.
+//
+// Greedy output is BIT-IDENTICAL to the non-speculative loop: every emitted
+// token is the argmax (top_k_probs, same tie-breaking) of the same
+// per-position logits the sequential loop would see. Sampling (temp > 0)
+// declines the flag at dispatch (exact rejection sampling is future work).
+
+use crate::model::{Model, Sampler};
+use crate::tokenizer::AnyTokenizer;
+use std::time::Instant;
+
+/// Greedy selection, same function and tie-breaking as the
+/// run_turn_core_batch greedy path (required for bit-identity).
+fn select(logits: &[f32]) -> u32 {
+    crate::model::top_k_probs(logits, 5)[0].0 as u32
+}
+
+/// Longest suffix n-gram (2..=8) of ctx that also occurs earlier in ctx;
+/// returns up to `n` tokens following the MOST RECENT earlier occurrence.
+/// Plain nested scan: contexts are modest (one prompt + one answer).
+fn propose(ctx: &[u32], n: usize) -> Vec<u32> {
+    for l in (2..=8usize).rev() {
+        if ctx.len() <= l {
+            continue;
+        }
+        let suffix = &ctx[ctx.len() - l..];
+        for i in (0..ctx.len() - l).rev() {
+            if &ctx[i..i + l] == suffix {
+                let from = i + l;
+                let to = (from + n).min(ctx.len());
+                return ctx[from..to].to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Speculative generation loop (see the header comment). Mirrors
+/// run_turn_core_batch's contract: prefill, generate up to max_new tokens,
+/// stop on stop_id (not emitted), print the answer + tok/s line.
+pub fn run_turn_spec(
+    ids: &[u32],
+    max_new: usize,
+    tok: &AnyTokenizer,
+    model: &mut Model,
+    pos0: usize,
+    init_logits: Option<Vec<f32>>,
+    debug: bool,
+    stop_id: u32,
+    sampler: &mut Sampler,
+) -> String {
+    let k = sampler.spec;
+    let t0 = Instant::now();
+    let mut pos = pos0;
+    let mut logits = init_logits.unwrap_or_default();
+    if !ids.is_empty() {
+        logits = model.prefill(ids, pos);
+        pos += ids.len();
+    }
+    if logits.is_empty() {
+        eprintln!("error: nothing to continue from (empty prompt and no logits stored in the .mkmem snapshot)");
+        std::process::exit(1);
+    }
+    let t_prefill = t0.elapsed();
+    let t_gen = Instant::now();
+
+    let mut ctx: Vec<u32> = ids.to_vec(); // committed context (text-wise)
+    let mut generated: Vec<u32> = Vec::new();
+    let mut pending = false; // generated.last() is emitted but not ingested
+    let mut passes = 0usize; // batched verification passes
+    let mut pass_tokens = 0usize; // tokens ingested through those passes
+    let mut singles = 0usize; // plain greedy steps (no proposal available)
+    let mut stop_hit = false;
+    // adaptive gate: a pass that commits nothing beyond the pending token is
+    // pure overhead (snapshot + batch + rollback for zero gain). After
+    // STRIKES consecutive fruitless passes, fall back to COOL plain greedy
+    // steps, then retry (repetition often appears only later in the answer).
+    const STRIKES: usize = 1;
+    const COOL: usize = 48;
+    let mut strikes = 0usize;
+    let mut cool = 0usize;
+
+    while generated.len() < max_new && !stop_hit {
+        let prop = if cool > 0 { Vec::new() } else { propose(&ctx, k) };
+        if prop.is_empty() {
+            // no earlier n-gram to continue from (or cooldown): plain step.
+            // With a pending token, just ingest it (it was selected by
+            // `logits` last round); otherwise select + ingest + emit.
+            if pending {
+                logits = model.prefill(&[*generated.last().unwrap()], pos);
+                pos += 1;
+                pending = false;
+            } else {
+                let sel = select(&logits);
+                if sel == stop_id {
+                    break;
+                }
+                logits = model.prefill(&[sel], pos);
+                pos += 1;
+                ctx.push(sel);
+                generated.push(sel);
+            }
+            cool = cool.saturating_sub(1);
+            singles += 1;
+            continue;
+        }
+        // optimistic batch: pending token (if any) + the proposals
+        let snap = model.caches.clone();
+        let mut batch: Vec<u32> = Vec::with_capacity(k + 1);
+        if pending {
+            batch.push(*generated.last().unwrap());
+        }
+        batch.extend_from_slice(&prop);
+        let g = model.prefill_all(&batch, pos);
+        passes += 1;
+        // verification: accept while the argmax matches the proposal
+        let mut committed = 0usize;
+        let mut next_sel: Option<u32> = None;
+        for i in 0..batch.len() {
+            let prev = if i == 0 { &logits } else { &g[i - 1] };
+            let sel = select(prev);
+            if sel == stop_id {
+                stop_hit = true;
+                break;
+            }
+            if sel != batch[i] {
+                next_sel = Some(sel);
+                break;
+            }
+            committed = i + 1;
+        }
+        if !stop_hit && next_sel.is_none() {
+            let sel = select(g.last().unwrap());
+            if sel == stop_id {
+                stop_hit = true;
+            } else {
+                next_sel = Some(sel);
+            }
+        }
+        if debug {
+            println!(
+                "  spec pass {}: proposed {:?}, accepted {}, next {}",
+                passes,
+                prop.iter().map(|&t| tok.decode_id(t)).collect::<Vec<_>>(),
+                committed - pending as usize,
+                next_sel.map(|t| tok.decode_id(t)).unwrap_or_else(|| "<stop>".to_string())
+            );
+        }
+        // rollback: restore the pre-batch caches, re-ingest the accepted
+        // prefix in one batched prefill (bit-identical state)
+        if committed < batch.len() {
+            model.caches = snap;
+            if committed > 0 {
+                model.prefill(&batch[..committed], pos);
+            }
+        }
+        pos += committed;
+        pass_tokens += committed;
+        // a pass is fruitful only if it accepted at least one PROPOSED token
+        // (beyond the pending one it would have ingested anyway)
+        if committed == pending as usize {
+            strikes += 1;
+            if strikes >= STRIKES {
+                cool = COOL;
+                strikes = 0;
+            }
+        } else {
+            strikes = 0;
+        }
+        ctx.extend_from_slice(&batch[..committed]);
+        if committed > 0 {
+            logits = g[committed - 1].clone();
+        }
+        // emission: accepted proposals are new, plus the divergence token
+        let skip = pending as usize; // batch[0] was already emitted last round
+        let n_acc = committed - skip;
+        let mut newtoks: Vec<u32> = batch[skip..committed].to_vec();
+        if let Some(s) = next_sel {
+            newtoks.push(s);
+        }
+        let room = max_new - generated.len();
+        let clamped = newtoks.len() > room;
+        newtoks.truncate(room);
+        ctx.extend_from_slice(&newtoks[n_acc.min(newtoks.len())..]); // the pending tail
+        generated.extend_from_slice(&newtoks);
+        pending = !clamped && !stop_hit && next_sel.is_some();
+        if clamped {
+            break;
+        }
+    }
+
+    let gen_dt = t_gen.elapsed().as_secs_f64();
+    let answer = tok.decode(&generated);
+    if debug {
+        println!();
+        println!("{}", "=".repeat(64));
+        println!("SUMMARY");
+        println!("{}", "=".repeat(64));
+        println!("answer: {}", answer);
+    } else {
+        println!("Bot > {}", answer);
+    }
+    if !generated.is_empty() {
+        let moy = gen_dt / generated.len() as f64;
+        if debug {
+            println!(
+                "prefill: {:.2} s  |  generation: {:.0} ms/token average ({:.1} tok/s)",
+                t_prefill.as_secs_f64(),
+                moy * 1000.0,
+                1.0 / moy
+            );
+        } else {
+            println!("  ({:.0} ms/token, {:.1} tok/s)", moy * 1000.0, 1.0 / moy);
+        }
+    }
+    println!(
+        "  spec: {} tokens in {} batched passes ({:.2} tokens/pass) + {} single steps",
+        pass_tokens,
+        passes,
+        pass_tokens as f64 / passes.max(1) as f64,
+        singles
+    );
+    answer
+}
