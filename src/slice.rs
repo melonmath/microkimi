@@ -693,16 +693,19 @@ fn vq_reservoir(
     let mut wres: Option<Vec<f32>> = im.map(|_| Vec::with_capacity(cap * VQ_DIM));
     let mut seen = 0u64; // vectors offered so far
     // A tensor without usable imatrix stats falls back to flat weights (1.0),
-    // so `wres` always stays aligned with `res`.
-    let feed = |w: &[f32], cw: Option<&[f32]>, res: &mut Vec<f32>, wres: &mut Option<Vec<f32>>, rng: &mut Rng, seen: &mut u64| {
+    // so `wres` always stays aligned with `res`. `cw` holds one weight per
+    // matrix COLUMN: vector `vi` of a row of `vpr` vectors covers columns
+    // (vi % vpr) * VQ_DIM .. + VQ_DIM.
+    let feed = |w: &[f32], cw: Option<&[f32]>, vpr: usize, res: &mut Vec<f32>, wres: &mut Option<Vec<f32>>, rng: &mut Rng, seen: &mut u64| {
         for (vi, v) in w.chunks_exact(VQ_DIM).enumerate() {
+            let c0 = (vi % vpr) * VQ_DIM;
             let t = *seen;
             *seen += 1;
             if (t as usize) < cap {
                 res.extend_from_slice(v);
                 if let Some(wr) = wres.as_mut() {
                     match cw {
-                        Some(cw) => wr.extend_from_slice(&cw[vi * VQ_DIM..(vi + 1) * VQ_DIM]),
+                        Some(cw) => wr.extend_from_slice(&cw[c0..c0 + VQ_DIM]),
                         None => wr.extend_from_slice(&[1.0; VQ_DIM]),
                     }
                 }
@@ -712,7 +715,7 @@ fn vq_reservoir(
                     res[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(v);
                     if let Some(wr) = wres.as_mut() {
                         match cw {
-                            Some(cw) => wr[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(&cw[vi * VQ_DIM..(vi + 1) * VQ_DIM]),
+                            Some(cw) => wr[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(&cw[c0..c0 + VQ_DIM]),
                             None => wr[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(&[1.0; VQ_DIM]),
                         }
                     }
@@ -731,7 +734,7 @@ fn vq_reservoir(
                 let (r, c) = (entry.dims[0] as usize, entry.dims[1] as usize);
                 let w = crate::mxfp4::dequant_any(entry.dtype, &blob, r, c);
                 let cw = im.and_then(|im| im.col_weights(l, wn));
-                feed(&w, cw.as_deref(), &mut res, &mut wres, &mut rng, &mut seen);
+                feed(&w, cw.as_deref(), c / VQ_DIM, &mut res, &mut wres, &mut rng, &mut seen);
             }
         }
     }
@@ -740,28 +743,41 @@ fn vq_reservoir(
 }
 
 /// Dequantizes one source expert tensor (either mxfp4 flavor) and VQ-quantizes
-/// it with the shared codebook. With `quant_weights` the nearest-centroid
-/// assignment is the activation-weighted one (slice --imatrix). Returns
-/// (index bytes, relative Frobenius error, activation-weighted relative
-/// error when `score_weights` is given).
+/// it with the shared codebook. With `quant_col_w` the nearest-centroid
+/// assignment is the activation-weighted one (slice --imatrix); both weight
+/// arguments hold ONE WEIGHT PER MATRIX COLUMN (expanded per element here).
+/// Returns (index bytes, relative Frobenius error, activation-weighted
+/// relative error when `score_col_w` is given).
 fn vq_quantize_tensor(
     src: &Source,
     e: &DirEntry,
     codebook: &[f32],
-    quant_weights: Option<&[f32]>,
-    score_weights: Option<&[f32]>,
+    quant_col_w: Option<&[f32]>,
+    score_col_w: Option<&[f32]>,
 ) -> (Vec<u8>, f64, Option<f64>) {
     assert!(matches!(e.dtype, DTYPE_MXFP4 | DTYPE_MXFP4SQ), "{} is not an mxfp4 flavor", e.name);
     let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
     assert_eq!(c % crate::quant::VQ_DIM, 0, "{}: cols {} not a multiple of {}", e.name, c, crate::quant::VQ_DIM);
     let blob = src.raw_blob(e);
     let w = crate::mxfp4::dequant_any(e.dtype, &blob, r, c);
-    let idx = match quant_weights {
+    // per-column importance -> per-element weights (same row of c weights
+    // repeated r times; expert matrices are small enough to materialize it)
+    let expand = |cw: &[f32]| -> Vec<f32> {
+        assert_eq!(cw.len(), c, "{}: imatrix column count {} != tensor cols {}", e.name, cw.len(), c);
+        let mut v = Vec::with_capacity(r * c);
+        for _ in 0..r {
+            v.extend_from_slice(cw);
+        }
+        v
+    };
+    let quant_w = quant_col_w.map(expand);
+    let score_w = score_col_w.map(expand);
+    let idx = match &quant_w {
         Some(wv) => crate::quant::quantize_weighted(&w, wv, codebook),
         None => crate::quant::quantize(&w, codebook),
     };
     let err = crate::quant::rel_error(&w, &idx, codebook);
-    let werr = score_weights.map(|wv| crate::quant::rel_error_weighted(&w, wv, &idx, codebook));
+    let werr = score_w.map(|wv| crate::quant::rel_error_weighted(&w, &wv, &idx, codebook));
     (idx, err, werr)
 }
 

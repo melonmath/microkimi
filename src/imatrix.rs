@@ -190,6 +190,19 @@ pub fn calibrate_cmd(args: &[String]) {
     crate::check_tok_compat(&tok, &model);
     let cfg_n_layers = model.cfg.n_layers;
     let moe_layers: Vec<u32> = (0..cfg_n_layers).filter(|&l| model.cfg.is_moe(l)).map(|l| l as u32).collect();
+    // The BPE encoder is slow on large inputs, so cap the text BEFORE
+    // encoding when --max-tokens is given (6 bytes/token is a safe
+    // overestimate for English; ids are truncated to the exact count below).
+    let text = match crate::value_flag(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if text.len() > n * 6 => {
+            let mut cap = n * 6;
+            while !text.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            text[..cap].to_string()
+        }
+        _ => text,
+    };
     let mut ids = tok.encode_raw(&text);
     if let Some(n) = crate::value_flag(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()) {
         ids.truncate(n);
@@ -206,11 +219,22 @@ pub fn calibrate_cmd(args: &[String]) {
     start(&model.cfg, moe_layers);
     model.reset_cache();
     let tp = std::time::Instant::now();
-    for (pos, &id) in ids.iter().enumerate() {
+    // --chunk N (default 512): restart the context every N tokens. Decode
+    // attention costs O(position) per token, so one long contiguous context
+    // makes calibration quadratic; the activation statistics do not need a
+    // contiguous context (same chunking convention as llama.cpp imatrix).
+    let chunk: usize = crate::value_flag(args, "--chunk").and_then(|s| s.parse().ok()).unwrap_or(512);
+    let mut pos = 0usize;
+    for (done, &id) in ids.iter().enumerate() {
+        if pos == chunk {
+            model.reset_cache();
+            pos = 0;
+        }
         model.forward(id, pos);
+        pos += 1;
         tick();
-        if (pos + 1) % 2000 == 0 {
-            println!("  {} tokens ({:.1?})", pos + 1, tp.elapsed());
+        if (done + 1) % 2000 == 0 {
+            println!("  {} tokens ({:.1?})", done + 1, tp.elapsed());
         }
     }
     if let Err(e) = stop_and_save(&out) {
