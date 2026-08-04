@@ -2411,16 +2411,19 @@ impl XorShift {
 /// Decoding policy: temp <= 0 keeps the exact greedy argmax path; temp > 0
 /// samples from softmax(logits / temp) restricted to the top-p nucleus.
 /// spec > 0 enables n-gram speculative decoding (src/spec.rs, greedy only).
+/// dry > 0 subtracts a DRY-style anti-repetition penalty from the logits
+/// (apply_dry; 0 = off, the historical bit-exact path).
 pub struct Sampler {
     pub temp: f32,
     pub top_p: f32,
     pub rng: XorShift,
     pub spec: usize,
+    pub dry: f32,
 }
 
 impl Sampler {
     pub fn new(temp: f32, top_p: f32, seed: u64) -> Sampler {
-        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0 }
+        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0, dry: 0.0 }
     }
     /// Default no-op decoding: the historical greedy behavior.
     pub fn greedy() -> Sampler {
@@ -2480,6 +2483,38 @@ fn py_repr(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// DRY-style anti-repetition penalty (--dry P): a token that would EXTEND an
+/// n-gram (length >= 3) already present earlier in the GENERATION gets
+/// P x DECAY^distance subtracted from its logit, where distance is the
+/// number of tokens between the end of the earlier occurrence and the
+/// current tail (DECAY = 0.9: a repetition starting far back hurts less).
+/// Only the last 64 generated tokens are scanned, and the prompt is never
+/// scanned: what matters is the text the model itself produced. Plain
+/// quadratic scan over the 64-token window, negligible next to a forward.
+/// Shared by the run_turn_core_batch loop and the --spec verification.
+pub(crate) fn apply_dry(logits: &mut [f32], generated: &[u32], pen: f32) {
+    const WIN: usize = 64;
+    const DECAY: f32 = 0.9;
+    let w = &generated[generated.len().saturating_sub(WIN)..];
+    if w.len() < 3 {
+        return;
+    }
+    for n in 3..=8usize.min(w.len()) {
+        let m = n - 1; // matched suffix length (the n-gram completes with the next token)
+        let suffix = &w[w.len() - m..];
+        for i in 0..w.len() - m {
+            // the final occurrence (the suffix itself, at i == w.len() - m) is excluded
+            if w[i..i + m] == *suffix {
+                let culprit = w[i + m] as usize; // token that followed the earlier occurrence
+                let dist = (w.len() - m - i) as f32;
+                if culprit < logits.len() {
+                    logits[culprit] -= pen * DECAY.powf(dist);
+                }
+            }
+        }
+    }
 }
 
 pub fn run_turn(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, sampler: &mut Sampler) -> String {
@@ -2628,11 +2663,22 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
         });
     }
     for i in 0..max_new {
-        let top = top_k_probs(&logits, 5);
+        // --dry P: anti-repetition penalty on the tokens that would extend
+        // an already-seen n-gram of the generation. Off by default: the
+        // selection below is bit-identical when P == 0.
+        let mut dry_logits;
+        let sel_logits: &Vec<f32> = if sampler.dry > 0.0 {
+            dry_logits = logits.clone();
+            apply_dry(&mut dry_logits, &generated, sampler.dry);
+            &dry_logits
+        } else {
+            &logits
+        };
+        let top = top_k_probs(sel_logits, 5);
         // temp <= 0: exact historical greedy path (argmax of the top-5);
         // temp > 0: top-p nucleus sampling over softmax(logits / temp).
         let (next_id, sampled_p) = if sampler.temp > 0.0 {
-            sample_top_p(&logits, sampler.temp, sampler.top_p, &mut sampler.rng)
+            sample_top_p(sel_logits, sampler.temp, sampler.top_p, &mut sampler.rng)
         } else {
             (top[0].0 as u32, top[0].1)
         };

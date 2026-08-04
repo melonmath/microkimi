@@ -31,8 +31,15 @@ use crate::tokenizer::AnyTokenizer;
 use std::time::Instant;
 
 /// Greedy selection, same function and tie-breaking as the
-/// run_turn_core_batch greedy path (required for bit-identity).
-fn select(logits: &[f32]) -> u32 {
+/// run_turn_core_batch greedy path (required for bit-identity). With
+/// --dry, the same penalty is applied over the same emitted-token context
+/// the plain loop would see at this position.
+fn select(logits: &[f32], sampler: &Sampler, gen_ctx: &[u32]) -> u32 {
+    if sampler.dry > 0.0 {
+        let mut adj = logits.to_vec();
+        crate::model::apply_dry(&mut adj, gen_ctx, sampler.dry);
+        return crate::model::top_k_probs(&adj, 5)[0].0 as u32;
+    }
     crate::model::top_k_probs(logits, 5)[0].0 as u32
 }
 
@@ -112,7 +119,7 @@ pub fn run_turn_spec(
                 pos += 1;
                 pending = false;
             } else {
-                let sel = select(&logits);
+                let sel = select(&logits, sampler, &generated);
                 if sel == stop_id {
                     break;
                 }
@@ -127,6 +134,7 @@ pub fn run_turn_spec(
         }
         // optimistic batch: pending token (if any) + the proposals
         let snap = model.caches.clone();
+        let skip = pending as usize; // batch[0] was already emitted last round
         let mut batch: Vec<u32> = Vec::with_capacity(k + 1);
         if pending {
             batch.push(*generated.last().unwrap());
@@ -137,9 +145,18 @@ pub fn run_turn_spec(
         // verification: accept while the argmax matches the proposal
         let mut committed = 0usize;
         let mut next_sel: Option<u32> = None;
+        let mut vctx: Vec<u32> = Vec::new(); // --dry context, reused per position
         for i in 0..batch.len() {
             let prev = if i == 0 { &logits } else { &g[i - 1] };
-            let sel = select(prev);
+            let sel = if sampler.dry > 0.0 {
+                // tokens emitted before batch[i]: generated + batch[skip..i]
+                vctx.clear();
+                vctx.extend_from_slice(&generated);
+                vctx.extend_from_slice(&batch[skip..i]);
+                select(prev, sampler, &vctx)
+            } else {
+                select(prev, sampler, &[])
+            };
             if sel == stop_id {
                 stop_hit = true;
                 break;
@@ -151,7 +168,14 @@ pub fn run_turn_spec(
             committed = i + 1;
         }
         if !stop_hit && next_sel.is_none() {
-            let sel = select(g.last().unwrap());
+            let sel = if sampler.dry > 0.0 {
+                vctx.clear();
+                vctx.extend_from_slice(&generated);
+                vctx.extend_from_slice(&batch[skip..]);
+                select(g.last().unwrap(), sampler, &vctx)
+            } else {
+                select(g.last().unwrap(), sampler, &[])
+            };
             if sel == stop_id {
                 stop_hit = true;
             } else {
@@ -193,7 +217,6 @@ pub fn run_turn_spec(
             logits = g[committed - 1].clone();
         }
         // emission: accepted proposals are new, plus the divergence token
-        let skip = pending as usize; // batch[0] was already emitted last round
         let n_acc = committed - skip;
         let mut newtoks: Vec<u32> = batch[skip..committed].to_vec();
         if let Some(s) = next_sel {

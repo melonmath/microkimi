@@ -192,6 +192,7 @@ fn main() {
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
+            println!("                    --dry P (DRY anti-repetition penalty, 0 = off)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
@@ -595,6 +596,7 @@ fn sampler_flag(args: &[String]) -> model::Sampler {
     });
     let mut s = model::Sampler::new(temp, top_p, seed);
     s.spec = value_flag(args, "--spec").and_then(|v| v.parse().ok()).unwrap_or(0);
+    s.dry = value_flag(args, "--dry").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     s
 }
 
