@@ -20,6 +20,7 @@ mod model;
 mod mxfp4;
 mod parity;
 mod pool;
+mod q8;
 mod quant;
 mod safetensors;
 mod selftest;
@@ -52,7 +53,7 @@ fn main() {
         "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => slice::run(&args),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); },
         "metaltest" => metaltest_cmd(),
         "metaltest-packed" => metaltest_packed_cmd(),
         "gputest" => gputest_cmd(),
@@ -241,6 +242,28 @@ fn dotbench_cmd() {
             2.0 * rows as f64 * cols as f64 / dt / 1e9,
             out.iter().map(|&v| v as f64).sum::<f64>()
         );
+    }
+    // mxfp4 quantized matvec: f32-dequant path vs integer q8 path
+    for (rows, cols, nt) in [(64usize, 128usize, 1usize), (3072, 3584, 1), (163840, 1024, 10)] {
+        let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();
+        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        drop(w);
+        let x: Vec<f32> = (0..cols).map(|_| next_f32()).collect();
+        let mut out = vec![0f32; rows];
+        let mut line = format!("mxfp4 matvec {}x{} (nt={}):", rows, cols, nt);
+        for (label, force) in [("f32", 0), ("q8", 1)] {
+            crate::q8::force_q8(force);
+            crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt); // warmup
+            let iters = 100;
+            let t = Instant::now();
+            for _ in 0..iters {
+                crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt);
+            }
+            let dt = t.elapsed().as_secs_f64() / iters as f64;
+            line.push_str(&format!("  {} {:.4} ms/call ({:.2} GFLOP/s)", label, dt * 1000.0, 2.0 * rows as f64 * cols as f64 / dt / 1e9));
+        }
+        crate::q8::force_q8(-1);
+        println!("{}  [checksum {:e}]", line, out.iter().map(|&v| v as f64).sum::<f64>());
     }
 }
 

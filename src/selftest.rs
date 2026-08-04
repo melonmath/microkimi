@@ -532,6 +532,9 @@ pub fn run_ds4() {
 /// subnormal path sb == 0). Tolerance 1e-3 relative, the same bound the
 /// on-Mac metaltest-packed / dstest checks use.
 pub fn run_packed_emul() {
+    // the q8 path (default) is an approximation mode; this section compares
+    // the shader emulation against the EXACT f32 CPU path, so force it off
+    crate::q8::force_q8(0);
     println!("packed fp4 GPU-kernel emulation vs CPU reference (tol 1e-3 rel)");
     // deterministic pattern (integer hash -> [-1, 1]) - same as metal.rs
     let pattern = |i: usize| -> f32 {
@@ -582,10 +585,62 @@ pub fn run_packed_emul() {
     }
     println!("  worst over {} cases: max_abs={:.3e} rel={:.3e}", cases.len(), worst_abs, worst_rel);
     println!();
+    crate::q8::force_q8(-1);
     if all_ok {
         println!("PACKED-EMUL OK - the Metal kernel's operation order stays within 1e-3 of the CPU path");
     } else {
         println!("PACKED-EMUL FAILED");
+        std::process::exit(1);
+    }
+}
+
+/// Q8-EMUL: the integer q8 mxfp4 matvec (default path) vs the exact f32
+/// reference. The q8 path is int32-exact per block, not bit-identical (the
+/// x quantization is the dominant term): the per-row error must stay well
+/// under 1e-3 relative to the row output scale.
+pub fn run_q8() {
+    println!("q8 integer mxfp4 matvec vs f32 reference (tol 1e-3 rel)");
+    // deterministic pattern (integer hash -> [-1, 1]) - same as metal.rs
+    let pattern = |i: usize| -> f32 {
+        let h = (i as u64).wrapping_mul(2654435761).wrapping_add(0x9E3779B9);
+        ((h >> 13) % 2000) as f32 / 1000.0 - 1.0
+    };
+    let mut all_ok = true;
+    let mut worst_rel = 0f64;
+    for (rows, cols, nt) in [
+        (128usize, 512usize, 1usize),
+        (512, 128, 1),
+        (64, 128, 1),
+        (3, 64, 1),
+        (1, 32, 1),
+        (256, 1024, 1),
+        (2048, 4096, 1),
+        (333, 1024, 4), // threaded skeleton too
+    ] {
+        let w: Vec<f32> = (0..rows * cols).map(&pattern).collect();
+        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
+        crate::q8::force_q8(0);
+        let mut y_ref = vec![0f32; rows];
+        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, nt);
+        crate::q8::force_q8(-1);
+        let xq = crate::q8::quantize_q8(&x);
+        let mut y_q8 = vec![0f32; rows];
+        crate::mxfp4::matvec_packed_q8(&p, &s, rows, cols, &xq, &mut y_q8, nt);
+        let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12) as f64;
+        let max_abs = y_q8.iter().zip(&y_ref).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
+        let rel = max_abs / scale;
+        worst_rel = worst_rel.max(rel);
+        let ok = rel <= 1e-3;
+        all_ok &= ok;
+        println!("  [{:>4}x{:<4} nt={}] max_abs={:.3e} rel={:.3e}  {}", rows, cols, nt, max_abs, rel, if ok { "OK" } else { "FAIL" });
+    }
+    println!("  worst rel over all shapes: {:.3e}", worst_rel);
+    println!();
+    if all_ok {
+        println!("Q8-EMUL OK - the integer q8 path stays within 1e-3 of the exact f32 path");
+    } else {
+        println!("Q8-EMUL FAILED");
         std::process::exit(1);
     }
 }
