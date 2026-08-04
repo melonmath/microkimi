@@ -521,3 +521,71 @@ pub fn run_ds4() {
         std::process::exit(1);
     }
 }
+
+/// Packed-GPU fp4 numeric bound, host-side (no Metal device needed):
+/// compares the CPU reference (mxfp4::matvec_packed) against a Rust
+/// emulation of the Metal matvec_fp4 kernel's exact operation order
+/// (mxfp4::matvec_packed_shader_emul: per-element lut*s*x scaling, 256
+/// strided lanes per row, binary-tree reductions standing in for the
+/// implementation-defined simd_sum). Runs on synthetic quantized blobs at
+/// micro, edge and real V4 dims, plus an all-zero block (hits the ue8m0
+/// subnormal path sb == 0). Tolerance 1e-3 relative, the same bound the
+/// on-Mac metaltest-packed / dstest checks use.
+pub fn run_packed_emul() {
+    println!("packed fp4 GPU-kernel emulation vs CPU reference (tol 1e-3 rel)");
+    // deterministic pattern (integer hash -> [-1, 1]) - same as metal.rs
+    let pattern = |i: usize| -> f32 {
+        let h = (i as u64).wrapping_mul(2654435761).wrapping_add(0x9E3779B9);
+        ((h >> 13) % 2000) as f32 / 1000.0 - 1.0
+    };
+    let mut all_ok = true;
+    let mut worst_abs = 0f64;
+    let mut worst_rel = 0f64;
+    let mut cases: Vec<(Vec<f32>, usize, usize, String)> = Vec::new();
+    for (rows, cols) in [
+        (128usize, 512usize),
+        (512, 128),
+        (64, 128),
+        (3, 64),
+        (1, 32),
+        (256, 1024),
+        (2048, 4096),
+        (4096, 2048),
+    ] {
+        let w: Vec<f32> = (0..rows * cols).map(&pattern).collect();
+        cases.push((w, rows, cols, format!("synthetic [{}x{}]", rows, cols)));
+    }
+    // an all-zero block forces scale byte 0 (ue8m0 subnormal 2^-127 path)
+    {
+        let (rows, cols) = (64usize, 128usize);
+        let mut w: Vec<f32> = (0..rows * cols).map(&pattern).collect();
+        for v in w[2 * cols..4 * cols].iter_mut() {
+            *v = 0.0;
+        }
+        cases.push((w, rows, cols, "zero block (scale byte 0)".to_string()));
+    }
+    for (w, rows, cols, label) in &cases {
+        let (p, s) = crate::mxfp4::quantize(w, *rows, *cols);
+        let x: Vec<f32> = (0..*cols).map(|i| pattern(i + 4242)).collect();
+        let mut y_ref = vec![0f32; *rows];
+        crate::mxfp4::matvec_packed(&p, &s, *rows, *cols, &x, &mut y_ref, 1);
+        let mut y_emul = vec![0f32; *rows];
+        crate::mxfp4::matvec_packed_shader_emul(&p, &s, *rows, *cols, &x, &mut y_emul, 256);
+        let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12) as f64;
+        let max_abs = y_emul.iter().zip(&y_ref).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
+        let rel = max_abs / scale;
+        worst_abs = worst_abs.max(max_abs);
+        worst_rel = worst_rel.max(rel);
+        let ok = rel <= 1e-3;
+        all_ok &= ok;
+        println!("  {:<28} max_abs={:.3e} rel={:.3e}  {}", label, max_abs, rel, if ok { "OK" } else { "FAIL" });
+    }
+    println!("  worst over {} cases: max_abs={:.3e} rel={:.3e}", cases.len(), worst_abs, worst_rel);
+    println!();
+    if all_ok {
+        println!("PACKED-EMUL OK - the Metal kernel's operation order stays within 1e-3 of the CPU path");
+    } else {
+        println!("PACKED-EMUL FAILED");
+        std::process::exit(1);
+    }
+}

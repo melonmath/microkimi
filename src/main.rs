@@ -52,8 +52,9 @@ fn main() {
         "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => slice::run(&args),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); },
         "metaltest" => metaltest_cmd(),
+        "metaltest-packed" => metaltest_packed_cmd(),
         "gputest" => gputest_cmd(),
         "dstest" => dstest_cmd(),
         "gpubench" => gpubench_cmd(&args),
@@ -197,7 +198,7 @@ fn main() {
             println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");
             println!("                                         replay a MICROKIMI_TRACE expert-request trace offline:");
             println!("                                         hit-rate vs capacity under LRU, Markov prefetch, Belady");
-            println!("  microkimi metaltest | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
+            println!("  microkimi metaltest | metaltest-packed | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
     let _ = t0;
@@ -251,6 +252,16 @@ fn metaltest_cmd() {
 #[cfg(not(target_os = "macos"))]
 fn metaltest_cmd() {
     println!("metaltest is only available on macOS (Metal GPU support step 1)");
+}
+
+#[cfg(target_os = "macos")]
+fn metaltest_packed_cmd() {
+    metal::metaltest_packed();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn metaltest_packed_cmd() {
+    println!("metaltest-packed is only available on macOS (packed mxfp4 Metal kernel)");
 }
 
 #[cfg(target_os = "macos")]

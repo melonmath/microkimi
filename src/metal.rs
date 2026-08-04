@@ -1239,3 +1239,103 @@ pub fn dstest() {
         println!("DSTEST FAIL");
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// metaltest-packed: packed mxfp4 GPU kernel vs CPU on REAL K3 expert blobs
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Compares the fused packed fp4 kernel (matvec_fp4, weights uploaded as
+/// PACKED BYTES - no fp32 staging) against the CPU mxfp4::matvec_packed on:
+/// 1. real routed-expert blobs of the local K3 model (nanokimi /
+///    microkimi-debug: layers.N.block_sparse_moe.experts.E.w{1,2,3}),
+/// 2. synthetic shapes at micro and real V4 dims (2048x4096),
+/// 3. the ue8m0 subnormal path (an all-zero block -> scale byte 0).
+/// dstest covers the DeepSeek models; this one covers the K3 expert layout.
+/// Tolerance 1e-3 relative - the kernel scales per element (lut*s*x) where
+/// the CPU scales per group of 32, an f32 reassociation, plus the
+/// implementation-defined simd_sum reduction order (bounded host-side by
+/// selftest's PACKED-EMUL section).
+pub fn metaltest_packed() {
+    if !gpu_available() {
+        println!("metaltest-packed FAIL — no usable Metal context (see message above)");
+        return;
+    }
+    let Some(c) = ctx() else { return };
+    if c.pipeline_fp4.is_null() {
+        println!("metaltest-packed FAIL — fp4 pipeline unavailable (see message above)");
+        return;
+    }
+    println!("metaltest-packed — packed mxfp4 Metal kernel vs CPU (K3 experts, tol 1e-3)");
+    let mut all_ok = true;
+
+    let check = |label: String, packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> bool {
+        let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
+        let mut y_cpu = vec![0f32; rows];
+        crate::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
+        let mut y_gpu = vec![0f32; rows];
+        gpu_matvec_fp4(packed, scales, rows, cols, &x, &mut y_gpu);
+        let scale = y_cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        let max_abs = y_gpu.iter().zip(&y_cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let rel = max_abs / scale;
+        let ok = rel <= 1e-3;
+        println!(
+            "  {:<52} [{}x{}] max_abs={:.3e} rel={:.3e}  {}",
+            label, rows, cols, max_abs, rel, if ok { "OK" } else { "FAIL" }
+        );
+        ok
+    };
+
+    // 1) real K3 routed-expert blobs from the default model (SKIPPED per
+    // tensor if absent: microkimi-debug and nanokimi share the naming, dims
+    // differ). keep_alive pins every blob: the fp4 cache keys on (ptr, dims).
+    let path = crate::bin_path();
+    println!("  model: {}", path);
+    let bin = crate::weights::BinFile::open(&path);
+    let names = [
+        "layers.1.block_sparse_moe.experts.0.w1",
+        "layers.1.block_sparse_moe.experts.0.w2",
+        "layers.1.block_sparse_moe.experts.0.w3",
+        "layers.2.block_sparse_moe.experts.17.w1",
+        "layers.5.block_sparse_moe.experts.511.w2",
+        "layers.7.block_sparse_moe.experts.895.w3",
+    ];
+    let mut keep_alive: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for name in names {
+        let Some(e) = bin.entries.get(name) else {
+            println!("  {:<52} SKIP (not in this model)", name);
+            continue;
+        };
+        let (rows, cols) = (e.dims[0] as usize, e.dims[1] as usize);
+        let (p, s, _, _) = bin.mxfp4_parts(name);
+        keep_alive.push((p.to_vec(), s.to_vec()));
+        let (p, s) = &keep_alive[keep_alive.len() - 1];
+        all_ok &= check(name.to_string(), p, s, rows, cols);
+    }
+
+    // 2) synthetic: micro dims, edge shapes, real V4 expert dims
+    for (rows, cols) in [(128usize, 512usize), (3, 64), (1, 32), (2048, 4096), (4096, 2048)] {
+        let w: Vec<f32> = (0..rows * cols).map(pattern).collect();
+        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        let (p, s) = &keep_alive[keep_alive.len() - 1];
+        all_ok &= check(format!("synthetic [{rows}x{cols}]"), p, s, rows, cols);
+    }
+
+    // 3) ue8m0 subnormal path: an all-zero block -> scale byte 0 -> 2^-127
+    {
+        let (rows, cols) = (64usize, 128usize);
+        let mut w: Vec<f32> = (0..rows * cols).map(pattern).collect();
+        for v in w[2 * cols..4 * cols].iter_mut() {
+            *v = 0.0;
+        }
+        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        let (p, s) = &keep_alive[keep_alive.len() - 1];
+        assert!(s[2 * cols / 32] == 0, "zero block must produce scale byte 0");
+        all_ok &= check("zero block (scale byte 0)".to_string(), p, s, rows, cols);
+    }
+
+    if all_ok {
+        println!("METALTEST-PACKED OK — packed GPU kernel matches the CPU path on K3 experts (tol 1e-3)");
+    } else {
+        println!("METALTEST-PACKED FAIL");
+    }
+}

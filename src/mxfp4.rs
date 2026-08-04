@@ -76,12 +76,82 @@ pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
     (packed, scales)
 }
 
+/// MICROKIMI_NO_PACKED_GPU=1: keep the packed mxfp4 matvecs on the CPU even
+/// with --gpu (A/B toggle for the fused Metal fp4 kernel path).
+#[cfg(target_os = "macos")]
+fn no_packed_gpu() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_PACKED_GPU").map(|v| v == "1").unwrap_or(false))
+}
+
+/// 2^(sb-127) from a ue8m0 scale byte, as an exact bit pattern - the SAME
+/// formula the Metal matvec_fp4 kernel uses (and equivalent to exp2_i):
+/// sb >= 1 -> exponent field = sb (normal float), sb == 0 -> 0x00400000
+/// (2^-127, subnormal), matching exp2_i(-127)'s 2f32.powi fallback.
+#[inline]
+pub fn scale_from_byte(sb: u8) -> f32 {
+    if sb == 0 {
+        f32::from_bits(0x0040_0000)
+    } else {
+        f32::from_bits((sb as u32) << 23)
+    }
+}
+
+/// Host-side emulation of the Metal matvec_fp4 kernel (metal.rs, macOS-only):
+/// per-element scaling `lut * s * x[c]` (NOT the CPU's per-group
+/// (Σ lut·x)·s) and the kernel's accumulation order - `lanes` strided
+/// accumulators per row (lane i takes columns i, i+lanes, ...), then a
+/// binary-tree reduction within each 32-lane simdgroup and across the
+/// simdgroups, standing in for simd_sum (Metal's simdgroup reduction order
+/// is implementation-defined; a butterfly tree is representative of its
+/// reassociation noise). selftest uses this to bound the GPU-vs-CPU numeric
+/// gap on hosts without a Metal device.
+pub fn matvec_packed_shader_emul(packed: &[u8], scales: &[u8], rows: usize, cols: usize, x: &[f32], out: &mut [f32], lanes: usize) {
+    assert_eq!(cols % 32, 0);
+    assert_eq!(packed.len(), rows * cols / 2);
+    assert_eq!(scales.len(), rows * cols / 32);
+    assert_eq!(x.len(), cols);
+    assert_eq!(out.len(), rows);
+    assert!(lanes % 32 == 0 && lanes > 0);
+    fn tree_sum(v: &mut [f32]) -> f32 {
+        let mut n = v.len();
+        while n > 1 {
+            for i in 0..n / 2 {
+                v[i] += v[n / 2 + i];
+            }
+            n /= 2;
+        }
+        v[0]
+    }
+    for (r, o) in out.iter_mut().enumerate() {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        let mut part = vec![0f32; lanes];
+        for (lane, p) in part.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            let mut c = lane;
+            while c < cols {
+                let byte = prow[c / 2];
+                let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                acc += E2M1[nib as usize] * scale_from_byte(srow[c / 32]) * x[c];
+                c += lanes;
+            }
+            *p = acc;
+        }
+        // simdgroup trees, then a tree across the simdgroup partials
+        let mut sg: Vec<f32> = part.chunks_mut(32).map(|c| tree_sum(c)).collect();
+        *o = tree_sum(&mut sg);
+    }
+}
+
 /// Matvec with on-the-fly dequantization (weights stay packed in RAM):
 /// out[r] = Σ_c W[r,c] · x[c]. Per group of 32: Σ(lut·x) × scale - same
 /// mathematical result, one floating-point multiplication per group. Multithreaded over rows.
 ///
 /// --gpu (macOS): at rows*cols ≥ GPU_MIN_ELEMS the fused Metal fp4 kernel
-/// takes over (metal::gpu_matvec_fp4, weights cached on device). Below the
+/// takes over (metal::gpu_matvec_fp4, weights cached on device).
+/// MICROKIMI_NO_PACKED_GPU=1 keeps the packed matvecs on the CPU even with
+/// --gpu (A/B toggle for the fused kernel). Below the
 /// threshold the CPU path wins — a Metal dispatch costs ~0.25 ms, far more
 /// than these small matvecs. Micro models keep every expert on the CPU
 /// (128×512 = 65 K params ≪ 2 M); the GPU path only kicks in at real V4
@@ -100,7 +170,7 @@ pub fn matvec_packed(
 ) {
     #[cfg(target_os = "macos")]
     {
-        if crate::model::gpu_on() && rows * cols >= crate::model::GPU_MIN_ELEMS && crate::metal::gpu_available() {
+        if crate::model::gpu_on() && !no_packed_gpu() && rows * cols >= crate::model::GPU_MIN_ELEMS && crate::metal::gpu_available() {
             crate::metal::gpu_matvec_fp4(packed, scales, rows, cols, x, out);
             return;
         }
