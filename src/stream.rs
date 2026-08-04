@@ -59,6 +59,27 @@ pub fn set_predict(n: usize, top_k: usize) {
     TOP_K.store(top_k.max(1), Ordering::Relaxed);
 }
 
+/// Number of experts the prefetcher targets per MoE layer (--stream-predict
+/// N, 0 = off).
+pub fn predict_n() -> usize {
+    PREDICT_N.load(Ordering::Relaxed)
+}
+
+// ── router-lookahead prefetch (streaming v2) ──
+//
+// Next-layer expert prediction via the ROUTER ITSELF instead of history:
+// model.rs runs the next MoE layer's gate GEMV on the current MoE input
+// (the closest available state to what that router will see) and pushes the
+// predicted ids to ExpertCache::prefetch. External measurements put this at
+// ~72% recall vs ~41% for the Markov/history approach. ON by default when
+// --stream-predict > 0 (it REPLACES the Markov predictor: both would
+// compete for the same prefetch bandwidth); MICROKIMI_LOOKAHEAD=0 reverts
+// to the Markov predictor.
+pub fn lookahead_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_LOOKAHEAD").map(|v| v != "0").unwrap_or(true))
+}
+
 fn mb(n: u64) -> String {
     format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
 }
@@ -125,18 +146,21 @@ pub fn report_line() -> String {
         let issued = PREF_ISSUED.load(Ordering::Relaxed);
         let used = PREF_USED.load(Ordering::Relaxed);
         let wasted = if issued > 0 { 100.0 * (issued - used) as f64 / issued as f64 } else { 0.0 };
-        let (hit, tot) = (PRED_HIT.load(Ordering::Relaxed), PRED_TOT.load(Ordering::Relaxed));
-        let acc = if tot > 0 { 100.0 * hit as f64 / tot as f64 } else { 0.0 };
+        let recall = if issued > 0 { 100.0 * used as f64 / issued as f64 } else { 0.0 };
         s.push_str(&format!(
-            "\nstream-predict: {} prefetched ({} already cached), {} consumed on demand ({:.0}% of fetched wasted), prediction accuracy {}/{} ({:.0}%)",
+            "\nstream-predict: {} prefetched ({} already cached), {} consumed on demand ({:.0}% recall, {:.0}% of fetched wasted)",
             issued,
             PREF_CACHED.load(Ordering::Relaxed),
             used,
+            recall,
             wasted,
-            hit,
-            tot,
-            acc,
         ));
+        // Markov-only line (the lookahead path does not train the predictor)
+        let (hit, tot) = (PRED_HIT.load(Ordering::Relaxed), PRED_TOT.load(Ordering::Relaxed));
+        if tot > 0 {
+            let acc = 100.0 * hit as f64 / tot as f64;
+            s.push_str(&format!(", markov prediction accuracy {}/{} ({:.0}%)", hit, tot, acc));
+        }
     }
     s
 }
@@ -882,7 +906,9 @@ impl ExpertCache {
         // return prefetch jobs for the next MoE layer, run on a detached
         // thread so they overlap the current layer's compute
         let n = PREDICT_N.load(Ordering::Relaxed);
-        if n > 0 {
+        if n > 0 && !lookahead_on() {
+            // Markov predictor path (MICROKIMI_LOOKAHEAD=0); when the
+            // router-lookahead is on it replaces this entirely
             let jobs = self.inner.pred.lock().unwrap().observe(layer, expert, offs, blob, TOP_K.load(Ordering::Relaxed), n);
             if !jobs.is_empty() {
                 let inner = Arc::clone(&self.inner);
@@ -909,6 +935,25 @@ impl ExpertCache {
         let v = Arc::new(bytes);
         self.inner.lru.lock().unwrap().insert(k, v.clone(), false);
         v
+    }
+
+    /// Router-lookahead prefetch (streaming v2): background-fetch the
+    /// (layer, expert, offsets, blob) jobs predicted by the NEXT MoE layer's
+    /// router (model.rs runs the gate GEMV on the current MoE input). One
+    /// detached thread per batch, same semantics as the Markov prefetch
+    /// (prefetch_one: cached = recency refresh, missing = fetch + insert
+    /// with the from_prefetch mark; the PREF_* counters apply). Never
+    /// touches the router path: the output is unaffected.
+    pub fn prefetch(&self, jobs: Vec<(u32, u32, [u64; 3], usize)>) {
+        if jobs.is_empty() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        std::thread::spawn(move || {
+            for (l, e, o, blob) in jobs {
+                inner.prefetch_one(l, e, o, blob);
+            }
+        });
     }
 }
 

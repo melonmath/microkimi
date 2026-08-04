@@ -1388,6 +1388,37 @@ fn mla_prefill(
 
 // ── MoE ──
 
+/// Router-lookahead prefetch (--stream-predict N; MICROKIMI_LOOKAHEAD=0
+/// reverts to the Markov predictor): runs the NEXT MoE layer's router (one
+/// small GEMV, n_experts x d) on the CURRENT MoE input x - the closest state
+/// available to what that router will actually see (its true input is the
+/// post-attention layernorm of the next layer, not yet computed) - and
+/// background-prefetches its top-N predicted experts through the stream
+/// cache while the current layer's experts compute. The selection replicates
+/// the noaux_tc rule (sigmoid + correction bias, ranked by key) without
+/// touching moe_forward's own selection; only WHEN bytes are fetched
+/// changes, never WHICH experts run: the output is bit-identical.
+fn moe_lookahead(cfg: &Config, data: &[u8], w: &MoeW, layer2: usize, x: &[f32], n: usize, cache: &crate::stream::ExpertCache) {
+    let gate_w = Model::t(data, &w.gate_w);
+    let gate_b = Model::t(data, &w.gate_b);
+    let mut logits = vec![0f32; cfg.n_experts];
+    matvec(gate_w, cfg.n_experts, cfg.d, x, &mut logits);
+    let mut ids: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, sigmoid(l) + gate_b[i])).collect();
+    ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let expert_packed = cfg.routed_hidden * cfg.moe_inter / 2;
+    let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
+    let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM;
+    let jobs: Vec<(u32, u32, [u64; 3], usize)> = ids
+        .iter()
+        .take(n)
+        .map(|&(e, _)| {
+            let eblob = if w.experts_vq[e as usize] { expert_vq_blob } else { expert_blob };
+            (layer2 as u32, e, w.experts[e as usize], eblob)
+        })
+        .collect();
+    cache.prefetch(jobs);
+}
+
 fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, layer: usize, pos: usize, stream: Option<&crate::stream::ExpertCache>) -> Vec<f32> {
     // noaux_tc router: sigmoid, +bias for selection, weights without bias
     let tm = Instant::now();
@@ -2088,6 +2119,23 @@ impl Model {
                 }
                 FfnW::Moe(w) => {
                     let mut p = Prof::default();
+                    // router-lookahead: while this layer's experts compute,
+                    // predict the NEXT MoE layer's experts with its own
+                    // router on the current MoE input x and prefetch them
+                    if let Some(cache) = stream.as_ref() {
+                        let n = crate::stream::predict_n();
+                        if n > 0 && crate::stream::lookahead_on() {
+                            let next = (l + 1..cfg.n_layers).find_map(|l2| match &layers[l2].ffn {
+                                FfnW::Moe(w2) => Some((l2, w2)),
+                                _ => None,
+                            });
+                            if let Some((l2, w2)) = next {
+                                let tml = Instant::now();
+                                moe_lookahead(cfg, data, w2, l2, &x, n, cache);
+                                p.t_router += tml.elapsed().as_secs_f64();
+                            }
+                        }
+                    }
                     let out = moe_forward(cfg, data, w, &x, &mut p, l, pos, stream.as_ref());
                     prof.t_router += p.t_router;
                     prof.t_experts += p.t_experts;
