@@ -662,8 +662,21 @@ pub(crate) struct KdaCache {
 
 #[derive(Clone)]
 pub(crate) struct MlaCache {
-    pub k: Vec<f32>, // pos × H×(nope+rope)
-    pub v: Vec<f32>, // pos × H×v
+    /// f32 layout (MICROKIMI_NO_KVQ8=1): k = pos × H×(nope+rope), v = pos × H×v
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    // q8_0 layout (default): the latent (nope) part of K and all of V are
+    // q8_0 (i8 + one f32 scale per 32); the rope part of K stays f32
+    // (position-sensitive) and is stored ONCE per position - the f32 layout
+    // duplicates it per head. With MICROKIMI_KV_HADAMARD=1 the latent K and
+    // V rows are kept in the 64-point Hadamard domain (see hadamard64).
+    pub kq: Vec<i8>,  // pos × H × nope (Hadamard-rotated when `had`)
+    pub ks: Vec<f32>, // pos × H × nope/32 scales
+    pub kr: Vec<f32>, // pos × rope, never quantized
+    pub vq: Vec<i8>,  // pos × H × v (Hadamard-rotated when `had`)
+    pub vs: Vec<f32>, // pos × H × v/32 scales
+    pub q8: bool,
+    pub had: bool,
 }
 
 #[derive(Clone)]
@@ -785,7 +798,7 @@ impl Model {
                 &get(&format!("{}mlp_res_proj.weight", p)),
             );
             let attn = if cfg.is_mla(l) {
-                caches.push(Cache::Mla(MlaCache { k: Vec::new(), v: Vec::new() }));
+                caches.push(Cache::Mla(MlaCache::new()));
                 AttnW::Mla(MlaW {
                     q_a: get(&format!("{}self_attn.q_a_proj.weight", p)),
                     q_a_ln: get(&format!("{}self_attn.q_a_layernorm.weight", p)),
@@ -876,7 +889,7 @@ impl Model {
     pub fn cached_tokens(&self) -> usize {
         for c in &self.caches {
             if let Cache::Mla(m) = c {
-                return m.k.len() / (self.cfg.mla_heads * self.cfg.mla_qh());
+                return m.positions(&self.cfg);
             }
         }
         0
@@ -894,6 +907,11 @@ impl Model {
                 Cache::Mla(m) => {
                     m.k.clear();
                     m.v.clear();
+                    m.kq.clear();
+                    m.ks.clear();
+                    m.kr.clear();
+                    m.vq.clear();
+                    m.vs.clear();
                 }
             }
         }
@@ -1310,6 +1328,321 @@ pub(crate) fn mla_attn_flash_mqa(cfg: &Config, k: &[f32], v: &[f32], q: &[f32], 
     }
 }
 
+// ── MLA KV cache: f32 rows or q8_0 (latent quantized, rope f32) ──
+//
+// The MLA cache is the only engine state that grows with the context (KDA
+// states are fixed-size). By default it is stored q8_0: the latent (nope)
+// part of K and all of V are quantized per block of 32 (i8 + one f32
+// scale), the rope part of K stays f32 (position-sensitive; a farm
+// reference confirms rope must not be quantized) and is stored ONCE per
+// position instead of duplicated per head. Bytes per position per layer:
+//   f32: H*(nope+v)*4 + (H-1)*rope*4 (rope duplicated)   [micro: 5248]
+//   q8:  H*(nope+v) + H*(nope+v)/32*4 + rope*4           [micro: 1936, ÷2.7]
+// The Q.K dot of the latent part runs in INTEGER (q8 query x q8 cache row,
+// q8::block_dot_i8); the rope dot, the softmax and the V accumulation stay
+// f32 (V rows are dequantized tile by tile, never in full). Quantization
+// happens at append (MlaCache::push). MICROKIMI_NO_KVQ8=1 restores the f32
+// cache. MICROKIMI_KV_HADAMARD=1 rotates the latent K and V rows with an
+// unnormalized 64-point Walsh-Hadamard transform before quantization
+// (smearing outliers over the block makes q8 near-lossless; measured in
+// selftest::run_kvq8) and inverts the rotation at read: H = H^T with
+// H.H = 64 I, so one butterfly routine serves both directions.
+
+/// True when the MLA KV cache quantizes to q8_0 (default).
+/// MICROKIMI_NO_KVQ8=1 keeps the historical f32 cache.
+fn kvq8_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_NO_KVQ8").map(|v| v != "1").unwrap_or(true))
+}
+
+/// True when MICROKIMI_KV_HADAMARD=1 (Hadamard rotation before KV
+/// quantization; default off - the measured gain on nanokimi is marginal,
+/// see selftest::run_kvq8).
+fn kv_hadamard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_KV_HADAMARD").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Unnormalized 64-point Walsh-Hadamard butterfly, in place (H = H^T and
+/// H.H = 64 I: applying it twice with a 1/64 scale is the identity, so this
+/// one routine rotates before quantization and de-rotates after).
+pub(crate) fn hadamard64(x: &mut [f32]) {
+    debug_assert_eq!(x.len(), 64);
+    let mut h = 1usize;
+    while h < 64 {
+        for i in (0..64).step_by(2 * h) {
+            for j in i..i + h {
+                let a = x[j];
+                let b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+}
+
+impl MlaCache {
+    fn new() -> MlaCache {
+        MlaCache {
+            k: Vec::new(),
+            v: Vec::new(),
+            kq: Vec::new(),
+            ks: Vec::new(),
+            kr: Vec::new(),
+            vq: Vec::new(),
+            vs: Vec::new(),
+            q8: kvq8_on(),
+            had: kv_hadamard(),
+        }
+    }
+
+    /// Positions held by the cache.
+    fn positions(&self, cfg: &Config) -> usize {
+        if self.q8 {
+            self.kr.len() / cfg.mla_rope
+        } else {
+            self.k.len() / (cfg.mla_heads * cfg.mla_qh())
+        }
+    }
+
+    /// Appends one position's rows (k_row: H x (nope+rope) with the latent
+    /// part first per head, v_row: H x v) - the f32 layout the attention
+    /// builders produce. Quantizes on the fly in q8 mode.
+    pub(crate) fn push(&mut self, cfg: &Config, k_row: &[f32], v_row: &[f32]) {
+        if !self.q8 {
+            self.k.extend_from_slice(k_row);
+            self.v.extend_from_slice(v_row);
+            return;
+        }
+        let (nh, nope, rope, vd) = (cfg.mla_heads, cfg.mla_nope, cfg.mla_rope, cfg.mla_v);
+        let had = self.had && nope % 64 == 0 && vd % 64 == 0;
+        let qh = nope + rope;
+        // rope is shared across heads: stored once, from head 0
+        self.kr.extend_from_slice(&k_row[nope..qh]);
+        let mut scratch = vec![0f32; nope.max(vd)];
+        let mut qv = crate::q8::Q8Vec::new();
+        for h in 0..nh {
+            let row = &k_row[h * qh..h * qh + nope];
+            scratch[..nope].copy_from_slice(row);
+            if had {
+                for b in scratch[..nope].chunks_mut(64) {
+                    hadamard64(b);
+                }
+            }
+            crate::q8::quantize_q8_into(&scratch[..nope], &mut qv);
+            self.kq.extend_from_slice(&qv.q);
+            self.ks.extend_from_slice(&qv.scales);
+            let rowv = &v_row[h * vd..(h + 1) * vd];
+            scratch[..vd].copy_from_slice(rowv);
+            if had {
+                for b in scratch[..vd].chunks_mut(64) {
+                    hadamard64(b);
+                }
+            }
+            crate::q8::quantize_q8_into(&scratch[..vd], &mut qv);
+            self.vq.extend_from_slice(&qv.q);
+            self.vs.extend_from_slice(&qv.scales);
+        }
+    }
+
+    /// Dequantizes back to the f32 row layout (mkmem snapshot; the .mkmem
+    /// format stays f32 whatever the runtime cache mode is). In f32 mode
+    /// this is a plain clone.
+    pub(crate) fn to_f32(&self, cfg: &Config) -> (Vec<f32>, Vec<f32>) {
+        if !self.q8 {
+            return (self.k.clone(), self.v.clone());
+        }
+        let (nh, nope, rope, vd) = (cfg.mla_heads, cfg.mla_nope, cfg.mla_rope, cfg.mla_v);
+        let had = self.had && nope % 64 == 0 && vd % 64 == 0;
+        let qh = nope + rope;
+        let n = self.positions(cfg);
+        let nb_n = nope / 32;
+        let nb_v = vd / 32;
+        let mut k = vec![0f32; n * nh * qh];
+        let mut v = vec![0f32; n * nh * vd];
+        for j in 0..n {
+            for h in 0..nh {
+                // latent K: dequant (+ de-rotate), then rope from the shared row
+                let base_q = (j * nh + h) * nope;
+                let base_s = (j * nh + h) * nb_n;
+                let out = &mut k[(j * nh + h) * qh..(j * nh + h) * qh + nope];
+                for g in 0..nb_n {
+                    let s = self.ks[base_s + g];
+                    for i in 0..32 {
+                        out[g * 32 + i] = self.kq[base_q + g * 32 + i] as f32 * s;
+                    }
+                }
+                if had {
+                    for b in out.chunks_mut(64) {
+                        hadamard64(b);
+                        for x in b.iter_mut() {
+                            *x /= 64.0;
+                        }
+                    }
+                }
+                k[(j * nh + h) * qh + nope..(j * nh + h) * qh + qh].copy_from_slice(&self.kr[j * rope..(j + 1) * rope]);
+                let base_q = (j * nh + h) * vd;
+                let base_s = (j * nh + h) * nb_v;
+                let out = &mut v[(j * nh + h) * vd..(j * nh + h) * vd + vd];
+                for g in 0..nb_v {
+                    let s = self.vs[base_s + g];
+                    for i in 0..32 {
+                        out[g * 32 + i] = self.vq[base_q + g * 32 + i] as f32 * s;
+                    }
+                }
+                if had {
+                    for b in out.chunks_mut(64) {
+                        hadamard64(b);
+                        for x in b.iter_mut() {
+                            *x /= 64.0;
+                        }
+                    }
+                }
+            }
+        }
+        (k, v)
+    }
+
+    /// Replaces the cache contents by f32 rows (mkmem restore; requantizes
+    /// when the runtime cache is in q8 mode).
+    pub(crate) fn assign_f32(&mut self, cfg: &Config, k: Vec<f32>, v: Vec<f32>) {
+        *self = MlaCache::new();
+        if !self.q8 {
+            self.k = k;
+            self.v = v;
+            return;
+        }
+        let (nh, qh, vd) = (cfg.mla_heads, cfg.mla_qh(), cfg.mla_v);
+        let n = k.len() / (nh * qh);
+        for j in 0..n {
+            self.push(cfg, &k[j * nh * qh..(j + 1) * nh * qh], &v[j * nh * vd..(j + 1) * nh * vd]);
+        }
+    }
+}
+
+/// Flash attention over the q8_0 KV cache for one (query, head), positions
+/// 0..=pos. Same online-softmax tile structure as mla_attn_flash; only the
+/// dot inputs differ: the latent part of the score runs in INTEGER (q8
+/// query x q8 K row via q8::block_dot_i8, per-block scale product), the rope
+/// part is an f32 dot on the shared rope rows. V rows are dequantized per
+/// tile (never in full). With the Hadamard option the query is rotated once
+/// (dot(Hq, Hk) = 64 * dot(q, k), folded back as 1/64) and the V accumulator
+/// is de-rotated once at the end (linearity: sum of p.V in the Hadamard
+/// domain, then H./64). `oh` must be zeroed. NOT bit-identical to the f32
+/// path: the q8 rounding of K, V and the query is the deal (measured in
+/// selftest::run_kvq8, max rel << 1e-3).
+pub(crate) fn mla_attn_flash_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize, pos: usize, scale: f32, oh: &mut [f32]) {
+    let (nh, nope, rope, vd) = (cfg.mla_heads, cfg.mla_nope, cfg.mla_rope, cfg.mla_v);
+    let had = c.had && nope % 64 == 0 && vd % 64 == 0;
+    let nb = nope / 32;
+    // query prep: latent part (Hadamard-rotated when enabled) quantized to q8
+    let mut qnope = qh[..nope].to_vec();
+    if had {
+        for b in qnope.chunks_mut(64) {
+            hadamard64(b);
+        }
+    }
+    let qq = crate::q8::quantize_q8(&qnope);
+    let q_rope = &qh[nope..];
+    let had_k = if had { 1.0 / 64.0 } else { 1.0 };
+    let mut m = f32::NEG_INFINITY;
+    let mut l = 0f32;
+    let mut scores = [0f32; FLASH_KV];
+    let mut vtile = vec![0f32; FLASH_KV * vd];
+    let mut t = 0usize;
+    while t <= pos {
+        let end = (t + FLASH_KV - 1).min(pos);
+        let tn = end - t + 1;
+        let mut tm = f32::NEG_INFINITY;
+        for (i, j) in (t..=end).enumerate() {
+            // rope dot (f32) + latent dot (integer, per-block scale product)
+            let mut s = dot(q_rope, &c.kr[j * rope..(j + 1) * rope]);
+            let mut acc = 0f32;
+            let bq = (j * nh + h) * nope;
+            let bs = (j * nh + h) * nb;
+            for g in 0..nb {
+                let d = crate::q8::block_dot_i8(&c.kq[bq + g * 32..bq + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
+                acc += qq.scales[g] * c.ks[bs + g] * d as f32;
+            }
+            s += had_k * acc;
+            let s = s * scale;
+            scores[i] = s;
+            tm = tm.max(s);
+        }
+        let m_new = m.max(tm);
+        let corr = (m - m_new).exp();
+        let mut tile_l = 0f32;
+        for s in scores.iter_mut().take(tn) {
+            *s = (*s - m_new).exp();
+            tile_l += *s;
+        }
+        for d in 0..vd {
+            oh[d] *= corr;
+        }
+        l = l * corr + tile_l;
+        // dequant the tile's V rows (Hadamard domain when enabled: the
+        // accumulator is de-rotated once at the end)
+        for (i, j) in (t..=end).enumerate() {
+            let bq = (j * nh + h) * vd;
+            let bs = (j * nh + h) * (vd / 32);
+            let out = &mut vtile[i * vd..(i + 1) * vd];
+            for g in 0..vd / 32 {
+                let sc = c.vs[bs + g];
+                for d2 in 0..32 {
+                    out[g * 32 + d2] = c.vq[bq + g * 32 + d2] as f32 * sc;
+                }
+            }
+            let p = scores[i];
+            for d in 0..vd {
+                oh[d] += p * out[d];
+            }
+        }
+        m = m_new;
+        t = end + 1;
+    }
+    if had {
+        for b in oh[..vd].chunks_mut(64) {
+            hadamard64(b);
+            for x in b.iter_mut() {
+                *x /= 64.0;
+            }
+        }
+    }
+    for d in 0..vd {
+        oh[d] /= l;
+    }
+}
+
+/// Materialized-score reference over the q8_0 cache (MICROKIMI_NO_FLASH
+/// debug path): dequantizes the cache (to_f32) and runs the historical
+/// three-pass structure. Same q8 rounding as mla_attn_flash_q8, same f32
+/// reassociation as mla_attn_ref.
+pub(crate) fn mla_attn_ref_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize, pos: usize, scale: f32, oh: &mut [f32]) {
+    let (nh, hd, vd) = (cfg.mla_heads, cfg.mla_qh(), cfg.mla_v);
+    let (k, v) = c.to_f32(cfg);
+    let mut scores = vec![0f32; pos + 1];
+    for j in 0..=pos {
+        scores[j] = dot(qh, &k[(j * nh + h) * hd..(j * nh + h + 1) * hd]) * scale;
+    }
+    let mx = scores.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+    let mut z = 0f32;
+    for s in scores.iter_mut() {
+        *s = (*s - mx).exp();
+        z += *s;
+    }
+    for s in scores.iter_mut() {
+        *s /= z;
+    }
+    for j in 0..=pos {
+        let vj = &v[(j * nh + h) * vd..(j * nh + h + 1) * vd];
+        let p = scores[j];
+        for d in 0..vd {
+            oh[d] += p * vj[d];
+        }
+    }
+}
+
 fn mla_forward(
     cfg: &Config,
     data: &[u8],
@@ -1345,14 +1678,25 @@ fn mla_forward(
             &kb[h * (cfg.mla_nope + cfg.mla_v) + cfg.mla_nope..(h + 1) * (cfg.mla_nope + cfg.mla_v)],
         );
     }
-    cache.k.extend_from_slice(&k_new);
-    cache.v.extend_from_slice(&v_new);
-    let pos = cache.k.len() / (cfg.mla_heads * cfg.mla_qh()) - 1;
+    cache.push(cfg, &k_new, &v_new);
+    let pos = cache.positions(cfg) - 1;
     // causal attention, scale (nope+rope)^-0.5
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
     let mut attn = vec![0f32; cfg.mla_heads * cfg.mla_v];
     let flash = !no_flash();
-    if flash && !no_mqa() {
+    if cache.q8 {
+        // q8_0 cache: per-head kernels with the integer latent dot (the
+        // MQA all-heads restructure is f32-only for now)
+        for h in 0..cfg.mla_heads {
+            let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
+            let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
+            if flash {
+                mla_attn_flash_q8(cfg, cache, qh, h, pos, scale, oh);
+            } else {
+                mla_attn_ref_q8(cfg, cache, qh, h, pos, scale, oh);
+            }
+        }
+    } else if flash && !no_mqa() {
         // MQA-style: all heads together, the KV cache is streamed once
         mla_attn_flash_mqa(cfg, &cache.k, &cache.v, &q, pos, scale, &mut attn);
     } else {
@@ -1418,7 +1762,7 @@ fn mla_prefill(
     gemm_batch(Model::t(data, &w.kv_b), kvb, cfg.mla_kva, &kp_n, n, &mut kb);
     // build K[h] = kb[h][..nope] ++ k_rot ; V[h] = kb[h][nope..nope+v] per
     // position and append in order: same cache state as the sequential path
-    let p0 = cache.k.len() / (cfg.mla_heads * cfg.mla_qh());
+    let p0 = cache.positions(cfg);
     for t in 0..n {
         let k_rot = &c[t * c_dim + cfg.mla_kva..t * c_dim + cfg.mla_kva + cfg.mla_rope];
         let kbt = &kb[t * kvb..(t + 1) * kvb];
@@ -1432,8 +1776,7 @@ fn mla_prefill(
                 &kbt[h * (cfg.mla_nope + cfg.mla_v) + cfg.mla_nope..(h + 1) * (cfg.mla_nope + cfg.mla_v)],
             );
         }
-        cache.k.extend_from_slice(&k_new);
-        cache.v.extend_from_slice(&v_new);
+        cache.push(cfg, &k_new, &v_new);
     }
     // causal attention per query position, scale qh^-0.5
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
@@ -1445,7 +1788,13 @@ fn mla_prefill(
         for h in 0..cfg.mla_heads {
             let qh = &qt[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
             let oh = &mut attn[(t * cfg.mla_heads + h) * cfg.mla_v..(t * cfg.mla_heads + h + 1) * cfg.mla_v];
-            if flash {
+            if cache.q8 {
+                if flash {
+                    mla_attn_flash_q8(cfg, cache, qh, h, pos, scale, oh);
+                } else {
+                    mla_attn_ref_q8(cfg, cache, qh, h, pos, scale, oh);
+                }
+            } else if flash {
                 mla_attn_flash(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
             } else {
                 mla_attn_ref(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);

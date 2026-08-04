@@ -90,6 +90,83 @@ pub fn force_q8(v: i8) {
 
 // ── integer block dot: 16 packed mxfp4 bytes (32 e2m1 nibbles) x 32 q8 bytes ──
 
+// ── integer block dot: 32 q8 weights x 32 q8 activations (KV cache) ──
+
+type I8Dot = unsafe fn(&[i8], &[i8]) -> i32;
+
+/// The widest available i8 x i8 block-dot, resolved once per process.
+/// Input: 32 q8 weight bytes and 32 q8 activation bytes (both |q| <= 127 by
+/// the quantize_q8 convention). Output: the exact int32 dot. Used by the
+/// q8_0 MLA KV cache (model.rs): the Q.K score of the latent part runs in
+/// integer between the q8 cache row and the q8 query.
+pub fn block_dot_i8(w32: &[i8], x32: &[i8]) -> i32 {
+    static F: std::sync::OnceLock<I8Dot> = std::sync::OnceLock::new();
+    fn pick() -> I8Dot {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            return dot_i8_avx2;
+        }
+        #[cfg(target_arch = "aarch64")]
+        return dot_i8_neon;
+        #[cfg(not(target_arch = "aarch64"))]
+        return dot_i8_scalar;
+    }
+    let f = F.get_or_init(pick);
+    unsafe { f(w32, x32) }
+}
+
+#[allow(dead_code)] // on aarch64 the scalar kernel is test-only
+fn dot_i8_scalar(w32: &[i8], x32: &[i8]) -> i32 {
+    let mut s = 0i32;
+    for j in 0..32 {
+        s += w32[j] as i32 * x32[j] as i32;
+    }
+    s
+}
+
+/// NEON, portable integer path: widening multiply vmull_s8 + pairwise long
+/// accumulate vpadalq_s16 (exact int32).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_i8_neon(w32: &[i8], x32: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let w0 = vld1q_s8(w32.as_ptr());
+        let w1 = vld1q_s8(w32.as_ptr().add(16));
+        let x0 = vld1q_s8(x32.as_ptr());
+        let x1 = vld1q_s8(x32.as_ptr().add(16));
+        let mut acc = vdupq_n_s32(0);
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w0), vget_low_s8(x0)));
+        acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w0), vget_high_s8(x0)));
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w1), vget_low_s8(x1)));
+        acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w1), vget_high_s8(x1)));
+        vaddvq_s32(acc)
+    }
+}
+
+/// AVX2: the classic maddubs+madd integer dot with the same sign trick as
+/// dot_block_avx2 (both sides |q| <= 127, so |x| takes the unsigned side and
+/// w is sign-flipped to match; pair sums <= 2 * 127 * 127 = 32258, no i16
+/// saturation is possible).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_avx2(w32: &[i8], x32: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let w = _mm256_loadu_si256(w32.as_ptr() as *const __m256i);
+        let x = _mm256_loadu_si256(x32.as_ptr() as *const __m256i);
+        let ax = _mm256_sign_epi8(x, x);
+        let aw = _mm256_sign_epi8(w, x);
+        let pairs = _mm256_maddubs_epi16(ax, aw);
+        let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+        // exact i32 horizontal sum
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(quads), _mm256_extracti128_si256(quads, 1));
+        let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
+        let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32(s64, 0xB1));
+        _mm_cvtsi128_si32(s32)
+    }
+}
+
 type BlockDot = unsafe fn(&[u8], &[i8]) -> i32;
 
 /// The widest available integer block-dot, resolved once per process.
@@ -216,6 +293,26 @@ mod q8_tests {
         assert_eq!(block_dot(&packed, &x), dot_block_scalar(&packed, &x));
         let packed = vec![0xFFu8; 16]; // -6 and -6
         assert_eq!(block_dot(&packed, &x), dot_block_scalar(&packed, &x));
+    }
+
+    /// The i8 x i8 KV dot must equal the scalar kernel EXACTLY (integer
+    /// arithmetic, including the maddubs sign-trick extremes).
+    #[test]
+    fn block_dot_i8_simd_equals_scalar() {
+        let mut rng = Rng(0x12345678);
+        for _ in 0..2000 {
+            let w: Vec<i8> = (0..32).map(|_| (rng.u8() % 255) as i8).collect();
+            let x: Vec<i8> = (0..32).map(|_| (rng.u8() % 255) as i8).collect();
+            assert_eq!(block_dot_i8(&w, &x), dot_i8_scalar(&w, &x));
+        }
+        // extremes: +-127 on both sides (the i16 saturation boundary)
+        let w = vec![127i8; 32];
+        let x = vec![127i8; 32];
+        assert_eq!(block_dot_i8(&w, &x), dot_i8_scalar(&w, &x));
+        let w = vec![-127i8; 32];
+        assert_eq!(block_dot_i8(&w, &x), dot_i8_scalar(&w, &x));
+        let x = vec![-127i8; 32];
+        assert_eq!(block_dot_i8(&w, &x), dot_i8_scalar(&w, &x));
     }
 
     /// quantize_q8 conventions: scale = max|x|/127, values round-trip within

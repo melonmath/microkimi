@@ -41,8 +41,11 @@ pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
             }
             Cache::Mla(m) => {
                 out.push(1);
-                put_vec(&mut out, &m.k);
-                put_vec(&mut out, &m.v);
+                // the .mkmem format stays f32 whatever the runtime cache
+                // mode is (q8 caches dequantize on save, requantize on load)
+                let (kf, vf) = m.to_f32(cfg);
+                put_vec(&mut out, &kf);
+                put_vec(&mut out, &vf);
             }
         }
     }
@@ -85,8 +88,9 @@ pub fn load(model: &mut Model, path: &str) -> Result<Vec<f32>, String> {
                 if r.u8()? != 1 {
                     return Err(format!("{}: corrupt .mkmem (MLA layer tagged as KDA)", path));
                 }
-                m.k = r.vec_f32()?;
-                m.v = r.vec_f32()?;
+                let k = r.vec_f32()?;
+                let v = r.vec_f32()?;
+                m.assign_f32(cfg, k, v);
             }
         }
     }

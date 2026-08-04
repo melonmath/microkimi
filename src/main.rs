@@ -55,7 +55,7 @@ fn main() {
         "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => slice::run(&args),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); selftest::run_flash(); },
+        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); selftest::run_flash(); selftest::run_kvq8(); },
         "metaltest" => metaltest_cmd(),
         "metaltest-packed" => metaltest_packed_cmd(),
         "gputest" => gputest_cmd(),
