@@ -1235,6 +1235,81 @@ pub(crate) fn mla_attn_flash(cfg: &Config, k: &[f32], v: &[f32], qh: &[f32], h: 
     }
 }
 
+/// True when MICROKIMI_NO_MQA=1 (A/B toggle: per-head flash loop instead of
+/// the all-heads MQA-style kernel).
+fn no_mqa() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_MQA").map(|v| v == "1").unwrap_or(false))
+}
+
+/// MQA-style flash attention for ALL heads at once over cache positions
+/// 0..=pos. The per-head loop of mla_forward streams the whole KV cache
+/// once PER HEAD (each pass strided over the full cache: ~H cold
+/// re-traversals of L2/TLB per token). MLA decodes like MQA: the KV row of
+/// one position (all heads' slices, contiguous) is consumed by every head
+/// together, so the cache is streamed exactly ONCE per token, tile by tile.
+///
+/// Bit-identical to the per-head mla_attn_flash loop BY CONSTRUCTION: each
+/// head keeps its own online-softmax state (m, l, accumulator) and sees the
+/// exact same sequence of tiles and operations; only the interleaving
+/// across heads changes, and the heads are independent. `q` is [H * qh],
+/// `attn` (zeroed) is [H * vd].
+pub(crate) fn mla_attn_flash_mqa(cfg: &Config, k: &[f32], v: &[f32], q: &[f32], pos: usize, scale: f32, attn: &mut [f32]) {
+    let (hd, vd, nh) = (cfg.mla_qh(), cfg.mla_v, cfg.mla_heads);
+    let mut m = vec![f32::NEG_INFINITY; nh]; // running max per head
+    let mut l = vec![0f32; nh]; // running normalizer per head
+    let mut scores = vec![0f32; nh * FLASH_KV]; // head-major tile scores
+    let mut t = 0usize;
+    while t <= pos {
+        let end = (t + FLASH_KV - 1).min(pos);
+        let tn = end - t + 1;
+        // scores of every head over the tile: each KV row is read once
+        for (i, j) in (t..=end).enumerate() {
+            let kj = &k[j * nh * hd..(j + 1) * nh * hd];
+            for h in 0..nh {
+                scores[h * FLASH_KV + i] = dot(&q[h * hd..(h + 1) * hd], &kj[h * hd..(h + 1) * hd]) * scale;
+            }
+        }
+        // per-head online-softmax update: the exact tile body of
+        // mla_attn_flash, same order, same values
+        for h in 0..nh {
+            let sh = &mut scores[h * FLASH_KV..h * FLASH_KV + tn];
+            let tm = sh.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+            let m_new = m[h].max(tm);
+            let corr = (m[h] - m_new).exp();
+            let mut tile_l = 0f32;
+            for s in sh.iter_mut() {
+                *s = (*s - m_new).exp();
+                tile_l += *s;
+            }
+            let oh = &mut attn[h * vd..(h + 1) * vd];
+            for d in 0..vd {
+                oh[d] *= corr;
+            }
+            l[h] = l[h] * corr + tile_l;
+            m[h] = m_new;
+        }
+        // V accumulation: each V row is read once for all heads
+        for (i, j) in (t..=end).enumerate() {
+            let vj = &v[j * nh * vd..(j + 1) * nh * vd];
+            for h in 0..nh {
+                let p = scores[h * FLASH_KV + i];
+                let oh = &mut attn[h * vd..(h + 1) * vd];
+                let vh = &vj[h * vd..(h + 1) * vd];
+                for d in 0..vd {
+                    oh[d] += p * vh[d];
+                }
+            }
+        }
+        t = end + 1;
+    }
+    for h in 0..nh {
+        for d in 0..vd {
+            attn[h * vd + d] /= l[h];
+        }
+    }
+}
+
 fn mla_forward(
     cfg: &Config,
     data: &[u8],
@@ -1277,13 +1352,18 @@ fn mla_forward(
     let scale = (cfg.mla_qh() as f32).powf(-0.5);
     let mut attn = vec![0f32; cfg.mla_heads * cfg.mla_v];
     let flash = !no_flash();
-    for h in 0..cfg.mla_heads {
-        let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
-        let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
-        if flash {
-            mla_attn_flash(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
-        } else {
-            mla_attn_ref(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
+    if flash && !no_mqa() {
+        // MQA-style: all heads together, the KV cache is streamed once
+        mla_attn_flash_mqa(cfg, &cache.k, &cache.v, &q, pos, scale, &mut attn);
+    } else {
+        for h in 0..cfg.mla_heads {
+            let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
+            let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
+            if flash {
+                mla_attn_flash(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
+            } else {
+                mla_attn_ref(cfg, &cache.k, &cache.v, qh, h, pos, scale, oh);
+            }
         }
     }
     // output gate + o_proj (g_proj is [H*v, d]: H*v == d only in the micro

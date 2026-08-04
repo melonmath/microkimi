@@ -650,9 +650,11 @@ pub fn run_q8() {
 /// MLA dims, lengths 1 / 7 / 64 / 65 / 512 (tile boundary crossings
 /// included). Tolerance 1e-5 absolute: same math, different f32 association
 /// (running rescales vs a single final normalization) - the measured
-/// deviation is printed.
+/// deviation is printed. Also asserts the MQA-style all-heads kernel is
+/// BIT-IDENTICAL to the per-head flash loop (same per-head op sequence by
+/// construction, verified to_bits).
 pub fn run_flash() {
-    println!("flash MLA attention vs materialized reference (tol 1e-5)");
+    println!("flash MLA attention vs materialized reference (tol 1e-5), MQA kernel bit-identical");
     let cfg = crate::config::Config::microkimi();
     let (nh, hd, vd) = (cfg.mla_heads, cfg.mla_qh(), cfg.mla_v);
     let pattern = |i: usize| -> f32 {
@@ -668,20 +670,28 @@ pub fn run_flash() {
         let q: Vec<f32> = (0..nh * hd).map(|i| pattern(i + 777)).collect();
         let pos = len - 1;
         let mut worst = 0f64;
+        let mut per_head = vec![0f32; nh * vd];
         for h in 0..nh {
             let qh = &q[h * hd..(h + 1) * hd];
             let mut a = vec![0f32; vd];
             let mut b = vec![0f32; vd];
             crate::model::mla_attn_ref(&cfg, &k, &v, qh, h, pos, scale, &mut a);
             crate::model::mla_attn_flash(&cfg, &k, &v, qh, h, pos, scale, &mut b);
+            per_head[h * vd..(h + 1) * vd].copy_from_slice(&b);
             for (x, y) in a.iter().zip(&b) {
                 worst = worst.max((*x as f64 - *y as f64).abs());
             }
         }
+        // MQA kernel: must be BIT-IDENTICAL to the per-head flash loop
+        let mut mqa = vec![0f32; nh * vd];
+        crate::model::mla_attn_flash_mqa(&cfg, &k, &v, &q, pos, scale, &mut mqa);
+        for (x, y) in mqa.iter().zip(&per_head) {
+            assert_eq!(x.to_bits(), y.to_bits(), "MQA kernel not bit-identical at len={}", len);
+        }
         worst_all = worst_all.max(worst);
         let ok = worst <= 1e-5;
         all_ok &= ok;
-        println!("  len={:<4} max_abs={:.3e}  {}", len, worst, if ok { "OK" } else { "FAIL" });
+        println!("  len={:<4} max_abs={:.3e}  mqa bit-identical OK  {}", len, worst, if ok { "OK" } else { "FAIL" });
     }
     println!("  worst over all lengths: {:.3e}", worst_all);
     println!();
