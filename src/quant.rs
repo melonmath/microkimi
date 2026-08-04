@@ -167,6 +167,149 @@ pub fn rel_error(w: &[f32], indices: &[u8], codebook: &[f32]) -> f64 {
     }
 }
 
+// ── activation-weighted VQ (imatrix calibration, slice --imatrix) ──
+//
+// The plain codebook minimizes the unweighted squared error: every weight
+// column counts equally. With calibration statistics the error is weighted
+// per column (weights[i] = normalized second moment of the activation that
+// multiplies w[i]), so columns feeding large activations get more codebook
+// fidelity. Assignment and update both use the weights: nearest centroid
+// under sum_j w_j (v_j - c_j)^2, and a per-dimension weighted mean
+// c_j = sum(w_j v_j) / sum(w_j) inside each cluster. The runtime format is
+// unchanged: the codebook still holds raw weight-space vectors.
+
+/// Weighted squared L2 distance between two VQ_DIM vectors.
+#[inline]
+fn dist2_w(a: &[f32], b: &[f32], w: &[f32]) -> f32 {
+    let mut d = 0f32;
+    for j in 0..VQ_DIM {
+        let e = a[j] - b[j];
+        d += w[j] * e * e;
+    }
+    d
+}
+
+/// Nearest codebook entry under the weighted distance (ties -> lowest index).
+#[inline]
+pub fn nearest_weighted(v: &[f32], w: &[f32], codebook: &[f32]) -> u8 {
+    debug_assert_eq!(codebook.len(), VQ_K * VQ_DIM);
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for k in 0..VQ_K {
+        let d = dist2_w(v, &codebook[k * VQ_DIM..(k + 1) * VQ_DIM], w);
+        if d < best_d {
+            best_d = d;
+            best = k;
+        }
+    }
+    best as u8
+}
+
+/// Weighted Lloyd k-means: same structure as train_codebook, but `weights`
+/// (one weight per sample value, same layout as `samples`) scales both the
+/// assignment distance and the per-dimension cluster means.
+pub fn train_codebook_weighted(samples: &[f32], weights: &[f32], seed: u64) -> Vec<f32> {
+    assert!(samples.len() % VQ_DIM == 0 && !samples.is_empty());
+    assert_eq!(samples.len(), weights.len());
+    let n = samples.len() / VQ_DIM;
+    let vec = |i: usize| &samples[i * VQ_DIM..(i + 1) * VQ_DIM];
+    let wv = |i: usize| &weights[i * VQ_DIM..(i + 1) * VQ_DIM];
+    let mut rng = Rng::new(seed);
+    let mut chosen: Vec<usize> = Vec::with_capacity(VQ_K);
+    while chosen.len() < VQ_K.min(n) {
+        let i = rng.below(n);
+        if !chosen.contains(&i) {
+            chosen.push(i);
+        }
+    }
+    let mut cb = vec![0f32; VQ_K * VQ_DIM];
+    for (k, &i) in chosen.iter().enumerate() {
+        cb[k * VQ_DIM..(k + 1) * VQ_DIM].copy_from_slice(vec(i));
+    }
+    let mut assign = vec![0u8; n];
+    for iter in 0..VQ_ITERS {
+        let mut err = vec![0f32; n];
+        for i in 0..n {
+            let k = nearest_weighted(vec(i), wv(i), &cb);
+            assign[i] = k;
+            err[i] = dist2_w(vec(i), &cb[k as usize * VQ_DIM..(k as usize + 1) * VQ_DIM], wv(i));
+        }
+        // per-dimension weighted means (f64 sums)
+        let mut sums = vec![0f64; VQ_K * VQ_DIM];
+        let mut wsums = vec![0f64; VQ_K * VQ_DIM];
+        let mut counts = vec![0u64; VQ_K];
+        for i in 0..n {
+            let k = assign[i] as usize;
+            counts[k] += 1;
+            for j in 0..VQ_DIM {
+                let w = wv(i)[j] as f64;
+                sums[k * VQ_DIM + j] += w * vec(i)[j] as f64;
+                wsums[k * VQ_DIM + j] += w;
+            }
+        }
+        let mut moved = 0u64;
+        for k in 0..VQ_K {
+            if counts[k] > 0 {
+                for j in 0..VQ_DIM {
+                    let mean = if wsums[k * VQ_DIM + j] > 0.0 {
+                        (sums[k * VQ_DIM + j] / wsums[k * VQ_DIM + j]) as f32
+                    } else {
+                        cb[k * VQ_DIM + j]
+                    };
+                    if mean != cb[k * VQ_DIM + j] {
+                        moved += 1;
+                    }
+                    cb[k * VQ_DIM + j] = mean;
+                }
+            } else {
+                let worst = err
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                cb[k * VQ_DIM..(k + 1) * VQ_DIM].copy_from_slice(vec(worst));
+                err[worst] = 0.0;
+            }
+        }
+        if moved == 0 && iter > 0 {
+            break;
+        }
+    }
+    cb
+}
+
+/// Weighted VQ1 quantization: `weights` has one entry per value of `w`
+/// (activation importance of the corresponding input column).
+pub fn quantize_weighted(w: &[f32], weights: &[f32], codebook: &[f32]) -> Vec<u8> {
+    assert!(w.len() % VQ_DIM == 0);
+    assert_eq!(w.len(), weights.len());
+    w.chunks_exact(VQ_DIM)
+        .zip(weights.chunks_exact(VQ_DIM))
+        .map(|(v, wv)| nearest_weighted(v, wv, codebook))
+        .collect()
+}
+
+/// Activation-weighted relative error sqrt(sum w e^2 / sum w v^2): the error
+/// the model actually feels, large-activation columns first.
+pub fn rel_error_weighted(w: &[f32], weights: &[f32], indices: &[u8], codebook: &[f32]) -> f64 {
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (vi, (v, wv)) in w.chunks_exact(VQ_DIM).zip(weights.chunks_exact(VQ_DIM)).enumerate() {
+        let cb = &codebook[indices[vi] as usize * VQ_DIM..(indices[vi] as usize + 1) * VQ_DIM];
+        for j in 0..VQ_DIM {
+            let e = v[j] as f64 - cb[j] as f64;
+            num += wv[j] as f64 * e * e;
+            den += wv[j] as f64 * v[j] as f64 * v[j] as f64;
+        }
+    }
+    if den == 0.0 {
+        0.0
+    } else {
+        (num / den).sqrt()
+    }
+}
+
 /// VQ1 matvec: out[r] = sum_c W[r,c] * x[c] with W gathered from the
 /// codebook on the fly. The 16 KB codebook stays hot in L1; the index row
 /// is streamed once. Per row the accumulation is vector-sequential (dot of

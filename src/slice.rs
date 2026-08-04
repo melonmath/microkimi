@@ -5,6 +5,7 @@
 //
 //   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
 //                                                [--vocab-top N <freqfile> [--vocab-base <remap.json>]]
+//                                                [--imatrix imatrix.bin [--imatrix-score-only]]
 //
 // Vocabulary pruning (--vocab-top N freqfile): keeps the N most frequent
 // token rows of embed_tokens.weight / lm_head.weight plus ALL special tokens
@@ -33,6 +34,12 @@
 // deterministic) over a reservoir sample of all cold-expert dequantized
 // values, raw (unnormalized) vectors. With --experts M (M >= N): the tail
 // below M is still pruned, top-N hot, ranks N..M cold VQ1.
+// With --imatrix FILE (from `microkimi calibrate`): activation second
+// moments weight both the k-means (distance + per-dimension means) and the
+// nearest-centroid assignment, so weight columns feeding large activations
+// keep more fidelity; the written file format is unchanged.
+// --imatrix-score-only loads the stats only to REPORT the activation-weighted
+// error of the blind codebook (A/B measurement).
 //
 // Ranking (v1, weight magnitude only, no activation calibration):
 //   - channels (--hidden): score[c] = sum of |w| over every tensor touching
@@ -58,7 +65,7 @@
 
 use crate::config::Config;
 use crate::slice_st::{StArch, StDir};
-use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_VQ1, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
+use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_MXFP4SQ, DTYPE_VQ1, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
 use std::io::Read;
 
 /// Row chunk for streaming f32 processing (~256 MB of f32 per chunk: the
@@ -664,31 +671,51 @@ fn expert_score_map(src: &Source, kept_layers: &[usize]) -> std::collections::Ha
 
 /// Reservoir sample (algorithm R, seeded splitmix64) of the raw 16-vectors
 /// of every cold expert tensor, for the global VQ codebook training. Each
-/// tensor is dequantized from mxfp4 one at a time (never the whole model in
-/// RAM). `cold` = per kept MoE layer the cold expert indices (ascending).
+/// tensor is dequantized from mxfp4 (either flavor) one at a time (never the
+/// whole model in RAM). `cold` = per kept MoE layer the cold expert indices
+/// (ascending). With an imatrix, per-value activation weights are sampled
+/// alongside the vectors (same layout) for the weighted codebook training;
+/// without one the rng/sample sequence is exactly the historical one
+/// (bit-identical codebook).
 fn vq_reservoir(
     src: &Source,
     kept_layers: &[usize],
     cold: &std::collections::HashMap<usize, Vec<usize>>,
     cap: usize,
     seed: u64,
-) -> Vec<f32> {
+    im: Option<&crate::imatrix::Imatrix>,
+) -> (Vec<f32>, Option<Vec<f32>>) {
     use crate::quant::{Rng, VQ_DIM};
     let cfg = src.config();
     let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
     let mut rng = Rng::new(seed);
     let mut res: Vec<f32> = Vec::with_capacity(cap * VQ_DIM);
+    let mut wres: Option<Vec<f32>> = im.map(|_| Vec::with_capacity(cap * VQ_DIM));
     let mut seen = 0u64; // vectors offered so far
-    let feed = |w: &[f32], res: &mut Vec<f32>, rng: &mut Rng, seen: &mut u64| {
-        for v in w.chunks_exact(VQ_DIM) {
+    // A tensor without usable imatrix stats falls back to flat weights (1.0),
+    // so `wres` always stays aligned with `res`.
+    let feed = |w: &[f32], cw: Option<&[f32]>, res: &mut Vec<f32>, wres: &mut Option<Vec<f32>>, rng: &mut Rng, seen: &mut u64| {
+        for (vi, v) in w.chunks_exact(VQ_DIM).enumerate() {
             let t = *seen;
             *seen += 1;
             if (t as usize) < cap {
                 res.extend_from_slice(v);
+                if let Some(wr) = wres.as_mut() {
+                    match cw {
+                        Some(cw) => wr.extend_from_slice(&cw[vi * VQ_DIM..(vi + 1) * VQ_DIM]),
+                        None => wr.extend_from_slice(&[1.0; VQ_DIM]),
+                    }
+                }
             } else {
                 let j = rng.below(t as usize + 1);
                 if j < cap {
                     res[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(v);
+                    if let Some(wr) = wres.as_mut() {
+                        match cw {
+                            Some(cw) => wr[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(&cw[vi * VQ_DIM..(vi + 1) * VQ_DIM]),
+                            None => wr[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(&[1.0; VQ_DIM]),
+                        }
+                    }
                 }
             }
         }
@@ -699,29 +726,43 @@ fn vq_reservoir(
             for wn in ["w1", "w2", "w3"] {
                 let name = format!("{}{}.{}", pfx, e, wn);
                 let entry = src.entry(&name);
-                assert_eq!(entry.dtype, DTYPE_MXFP4, "{} is not mxfp4", name);
+                assert!(matches!(entry.dtype, DTYPE_MXFP4 | DTYPE_MXFP4SQ), "{} is not an mxfp4 flavor", name);
                 let blob = src.raw_blob(entry);
                 let (r, c) = (entry.dims[0] as usize, entry.dims[1] as usize);
-                let w = crate::mxfp4::dequant(&blob[..r * c / 2], &blob[r * c / 2..], r, c);
-                feed(&w, &mut res, &mut rng, &mut seen);
+                let w = crate::mxfp4::dequant_any(entry.dtype, &blob, r, c);
+                let cw = im.and_then(|im| im.col_weights(l, wn));
+                feed(&w, cw.as_deref(), &mut res, &mut wres, &mut rng, &mut seen);
             }
         }
     }
     println!("vq: reservoir sampled {}/{} cold-expert vectors (cap {})", res.len() / VQ_DIM, seen, cap);
-    res
+    (res, wres)
 }
 
-/// Dequantizes one source mxfp4 expert tensor and VQ-quantizes it with the
-/// shared codebook. Returns (index bytes, relative Frobenius error).
-fn vq_quantize_tensor(src: &Source, e: &DirEntry, codebook: &[f32]) -> (Vec<u8>, f64) {
-    assert_eq!(e.dtype, DTYPE_MXFP4, "{} is not mxfp4", e.name);
+/// Dequantizes one source expert tensor (either mxfp4 flavor) and VQ-quantizes
+/// it with the shared codebook. With `quant_weights` the nearest-centroid
+/// assignment is the activation-weighted one (slice --imatrix). Returns
+/// (index bytes, relative Frobenius error, activation-weighted relative
+/// error when `score_weights` is given).
+fn vq_quantize_tensor(
+    src: &Source,
+    e: &DirEntry,
+    codebook: &[f32],
+    quant_weights: Option<&[f32]>,
+    score_weights: Option<&[f32]>,
+) -> (Vec<u8>, f64, Option<f64>) {
+    assert!(matches!(e.dtype, DTYPE_MXFP4 | DTYPE_MXFP4SQ), "{} is not an mxfp4 flavor", e.name);
     let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
     assert_eq!(c % crate::quant::VQ_DIM, 0, "{}: cols {} not a multiple of {}", e.name, c, crate::quant::VQ_DIM);
     let blob = src.raw_blob(e);
-    let w = crate::mxfp4::dequant(&blob[..r * c / 2], &blob[r * c / 2..], r, c);
-    let idx = crate::quant::quantize(&w, codebook);
+    let w = crate::mxfp4::dequant_any(e.dtype, &blob, r, c);
+    let idx = match quant_weights {
+        Some(wv) => crate::quant::quantize_weighted(&w, wv, codebook),
+        None => crate::quant::quantize(&w, codebook),
+    };
     let err = crate::quant::rel_error(&w, &idx, codebook);
-    (idx, err)
+    let werr = score_weights.map(|wv| crate::quant::rel_error_weighted(&w, wv, &idx, codebook));
+    (idx, err, werr)
 }
 
 /// One output tensor: what to write and where the data comes from.
@@ -1325,6 +1366,32 @@ pub fn run(args: &[String]) {
     if cold_vq.is_some() {
         assert!(matches!(source, Source::Bin(_)), "--cold-vq requires a .bin source (mxfp4 expert blobs)");
     }
+    // --imatrix FILE: activation importance stats (microkimi calibrate) used
+    // to weight the VQ codebook training + assignment of the cold experts.
+    // --imatrix-score-only: load the same stats but only to REPORT the
+    // activation-weighted error of the blind codebook (A/B measurement).
+    let imatrix_score_only = args.iter().any(|a| a == "--imatrix-score-only");
+    let imatrix: Option<crate::imatrix::Imatrix> = match value_flag(args, "--imatrix") {
+        Some(p) => {
+            assert!(cold_vq.is_some(), "--imatrix only applies to --cold-vq");
+            let im = crate::imatrix::load(&p).unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+            let cfg0 = source.config();
+            assert_eq!(im.routed_hidden, cfg0.routed_hidden, "imatrix routed_hidden {} != model {}", im.routed_hidden, cfg0.routed_hidden);
+            assert_eq!(im.moe_inter, cfg0.moe_inter, "imatrix moe_inter {} != model {}", im.moe_inter, cfg0.moe_inter);
+            println!(
+                "imatrix: {} ({} tokens, {} MoE layers){}",
+                p,
+                im.tokens,
+                im.layers.len(),
+                if imatrix_score_only { " [score only: blind codebook, weighted error report]" } else { "" }
+            );
+            Some(im)
+        }
+        None => None,
+    };
 
     // ── 1. layer selection (then resolve tensor shapes/byte sources) ──
     let kept_layers = match &layers_spec {
@@ -1448,9 +1515,19 @@ pub fn run(args: &[String]) {
                     );
                     let t = std::time::Instant::now();
                     let seed = 0x5EED_C0DE_B00B_1E5u64;
-                    let samples = vq_reservoir(&source, &kept_layers, &cold, 300_000, seed);
-                    let cb = crate::quant::train_codebook(&samples, seed);
-                    println!("vq: global codebook ({}x{}) trained in {:.1?}", crate::quant::VQ_K, crate::quant::VQ_DIM, t.elapsed());
+                    let train_im = if imatrix_score_only { None } else { imatrix.as_ref() };
+                    let (samples, sample_w) = vq_reservoir(&source, &kept_layers, &cold, 300_000, seed, train_im);
+                    let cb = match &sample_w {
+                        Some(sw) => crate::quant::train_codebook_weighted(&samples, sw, seed),
+                        None => crate::quant::train_codebook(&samples, seed),
+                    };
+                    println!(
+                        "vq: global codebook ({}x{}) trained in {:.1?}{}",
+                        crate::quant::VQ_K,
+                        crate::quant::VQ_DIM,
+                        t.elapsed(),
+                        if sample_w.is_some() { " (activation-weighted)" } else { "" }
+                    );
                     (Some(hot), Some(cb))
                 }
             }
@@ -1603,6 +1680,7 @@ pub fn run(args: &[String]) {
     let mut last_fetch_report = 0u64;
     let mut cur_layer: Option<usize> = None;
     let mut vq_err_sum = 0f64;
+    let mut vq_werr_sum = 0f64;
     let mut vq_err_n = 0u64;
     for (p, &off) in plans.iter().zip(&offsets) {
         // the codebook plan has no source tensor: its data is the trained codebook
@@ -1615,13 +1693,32 @@ pub fn run(args: &[String]) {
         let se = source.entry(&p.src_name);
         match p.role {
             Role::Expert if p.dtype == DTYPE_VQ1 => {
-                let (idx, err) = vq_quantize_tensor(&source, se, vq_codebook.as_ref().unwrap());
+                // imatrix column weights for this expert matrix (original
+                // layer numbering: src_name), w1/w3 -> hidden, w2 -> inter
+                let wts = imatrix.as_ref().and_then(|im| {
+                    let (l, rest) = split_layer(&p.src_name)?;
+                    im.col_weights(l, rest.rsplit('.').next()?)
+                });
+                let quant_w = if imatrix_score_only { None } else { wts.as_deref() };
+                let (idx, err, werr) = vq_quantize_tensor(&source, se, vq_codebook.as_ref().unwrap(), quant_w, wts.as_deref());
                 assert_eq!(blob_size(p.dtype, &p.dims), idx.len() as u64, "{}: vq size mismatch", p.src_name);
                 w.write_blob_at(&mut f, off, &idx);
                 vq_err_sum += err;
+                if let Some(we) = werr {
+                    vq_werr_sum += we;
+                }
                 vq_err_n += 1;
                 if vq_err_n % 500 == 0 {
-                    println!("  vq: {} tensors quantized, mean rel Frobenius error {:.3}", vq_err_n, vq_err_sum / vq_err_n as f64);
+                    println!(
+                        "  vq: {} tensors quantized, mean rel Frobenius error {:.3}{}",
+                        vq_err_n,
+                        vq_err_sum / vq_err_n as f64,
+                        if werr.is_some() {
+                            format!(", mean activation-weighted error {:.3}", vq_werr_sum / vq_err_n as f64)
+                        } else {
+                            String::new()
+                        }
+                    );
                 }
             }
             Role::Copy | Role::Expert => {
@@ -1700,6 +1797,13 @@ pub fn run(args: &[String]) {
             cfg.moe_inter * cfg.routed_hidden / crate::quant::VQ_DIM,
             vq_err_sum / vq_err_n as f64
         );
+        if imatrix.is_some() {
+            println!(
+                "  cold-vq: mean activation-weighted rel error {:.3} (imatrix{})",
+                vq_werr_sum / vq_err_n as f64,
+                if imatrix_score_only { ", score only" } else { "-weighted codebook" }
+            );
+        }
     }
     println!("  done in {:.0?}", t0.elapsed());
     if let Some(v) = &vocab_plan {

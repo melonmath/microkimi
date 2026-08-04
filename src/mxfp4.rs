@@ -76,6 +76,184 @@ pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
     (packed, scales)
 }
 
+// ── MXFP4SQ: quadratic scale encoding (DTYPE_MXFP4SQ, see weights.rs) ──
+//
+// Same e2m1 nibbles and group-of-32 layout as MXFP4, but the scale byte
+// decodes quadratically against a per-tensor f32 `smax` stored as the last
+// 4 bytes of the blob: s(q) = ((q+1)/256)^2 * smax, where smax is the exact
+// maximum over groups of maxabs/6. e8m0 scales are powers of two, so a group
+// whose ideal scale sits just above 2^e loses up to a full factor 2 of
+// range; the quadratic grid's relative step is ~2/(q+1) at index q, finest
+// exactly where most groups live (well below smax). Encoding always rounds
+// the index UP, so the decoded scale is >= the ideal one and no value clips.
+// The runtime packed matvec still reads DTYPE_MXFP4 only; MXFP4SQ is a
+// storage/measurement variant at this stage (dequant_any reads both).
+
+/// Scale decoded from a quadratic scale byte: ((q+1)/256)^2 * smax.
+#[inline]
+pub fn scale_sq(q: u8, smax: f32) -> f32 {
+    let t = (q as f32 + 1.0) * (1.0 / 256.0);
+    t * t * smax
+}
+
+/// MXFP4SQ quantization: per group of 32 the ideal scale is maxabs/6 (as
+/// MXFP4), the byte is ceil(256*sqrt(ideal/smax)) - 1 clamped to 0..=255, so
+/// the decoded quadratic scale never clips. Returns (packed, scales, smax).
+pub fn quantize_sq(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>, f32) {
+    assert!(cols % 32 == 0);
+    const BOUNDS: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+    let ng = rows * cols / 32;
+    let mut ideal = vec![0f32; ng];
+    for r in 0..rows {
+        let row = &w[r * cols..(r + 1) * cols];
+        for g in 0..cols / 32 {
+            let maxabs = row[g * 32..(g + 1) * 32].iter().fold(0f32, |m, &v| m.max(v.abs()));
+            ideal[r * cols / 32 + g] = maxabs / 6.0;
+        }
+    }
+    let smax = ideal.iter().fold(0f32, |m, &v| m.max(v));
+    let mut packed = vec![0u8; rows * cols / 2];
+    let mut scales = vec![0u8; rows * cols / 32];
+    for r in 0..rows {
+        let row = &w[r * cols..(r + 1) * cols];
+        for g in 0..cols / 32 {
+            let gi = r * cols / 32 + g;
+            let q = if smax == 0.0 || ideal[gi] == 0.0 {
+                0
+            } else {
+                ((256.0 * (ideal[gi] / smax).sqrt()).ceil() as i32 - 1).clamp(0, 255) as u8
+            };
+            scales[gi] = q;
+            let inv = 1.0 / scale_sq(q, smax);
+            for (j, &v) in row[g * 32..(g + 1) * 32].iter().enumerate() {
+                let qv = (v * inv).clamp(-6.0, 6.0);
+                let mag = qv.abs();
+                let mut idx = 0usize;
+                while idx < 7 && mag >= BOUNDS[idx] {
+                    idx += 1;
+                }
+                if qv.is_sign_negative() {
+                    idx += 8;
+                }
+                let c = g * 32 + j;
+                let byte = &mut packed[r * cols / 2 + c / 2];
+                if c % 2 == 0 {
+                    *byte |= idx as u8;
+                } else {
+                    *byte |= (idx as u8) << 4;
+                }
+            }
+        }
+    }
+    (packed, scales, smax)
+}
+
+/// MXFP4SQ dequantization (mirror of dequant with the quadratic scale).
+pub fn dequant_sq(packed: &[u8], scales: &[u8], smax: f32, rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0f32; rows * cols];
+    for r in 0..rows {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        for c in 0..cols {
+            let byte = prow[c / 2];
+            let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            out[r * cols + c] = E2M1[nib as usize] * scale_sq(srow[c / 32], smax);
+        }
+    }
+    out
+}
+
+/// Dequantizes a raw blob of either mxfp4 flavor (reader supporting both
+/// formats): packed || scales for DTYPE_MXFP4, packed || scales || smax
+/// (trailing f32) for DTYPE_MXFP4SQ.
+pub fn dequant_any(dtype: u8, blob: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let np = rows * cols / 2;
+    match dtype {
+        crate::weights::DTYPE_MXFP4 => dequant(&blob[..np], &blob[np..], rows, cols),
+        crate::weights::DTYPE_MXFP4SQ => {
+            let smax = f32::from_le_bytes(blob[np + rows * cols / 32..np + rows * cols / 32 + 4].try_into().unwrap());
+            dequant_sq(&blob[..np], &blob[np..np + rows * cols / 32], smax, rows, cols)
+        }
+        _ => panic!("dequant_any: dtype {} is not an mxfp4 flavor", dtype),
+    }
+}
+
+/// Hidden measurement behind `microkimi mxfp4test --model X.bin [--tensors N]`:
+/// takes real f32 matrices from a .bin (2D, cols % 32 == 0, >= 16k elements,
+/// first N in name order), quantizes each with the e8m0 (MXFP4) and the
+/// quadratic (MXFP4SQ) scale encodings and reports the per-tensor and
+/// aggregate relative RMS error ||w - wq|| / ||w|| of both.
+pub fn test_cmd(args: &[String]) {
+    let mp = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(crate::bin_path);
+    let n_max: usize = args
+        .iter()
+        .position(|a| a == "--tensors")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let bin = crate::weights::BinFile::open(&mp);
+    let mut names: Vec<&String> = bin
+        .entries
+        .iter()
+        .filter(|(_, e)| {
+            e.dtype == crate::weights::DTYPE_F32
+                && e.dims.len() == 2
+                && e.dims[1] % 32 == 0
+                && e.dims[0] as u64 * e.dims[1] as u64 >= 16384
+        })
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    names.truncate(n_max);
+    let mut err_e8m0 = (0f64, 0f64); // (sum err^2, sum w^2)
+    let mut err_sq = (0f64, 0f64);
+    for name in names {
+        let e = &bin.entries[name];
+        let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
+        let w = bin.f32_vec(name);
+        let (p1, s1) = quantize(&w, r, c);
+        let wq1 = dequant(&p1, &s1, r, c);
+        let (p2, s2, smax) = quantize_sq(&w, r, c);
+        let wq2 = dequant_sq(&p2, &s2, smax, r, c);
+        let acc = |wq: &[f32]| {
+            let mut num = 0f64;
+            let mut den = 0f64;
+            for (&a, &b) in w.iter().zip(wq) {
+                num += (a as f64 - b as f64) * (a as f64 - b as f64);
+                den += a as f64 * a as f64;
+            }
+            (num, den)
+        };
+        let (n1, d) = acc(&wq1);
+        let (n2, _) = acc(&wq2);
+        err_e8m0.0 += n1;
+        err_e8m0.1 += d;
+        err_sq.0 += n2;
+        err_sq.1 += d;
+        println!(
+            "{:50} [{:5}x{:5}]  rel RMS  e8m0 {:.4}   sq {:.4}   ({:+.1}% RMS)",
+            name,
+            r,
+            c,
+            (n1 / d).sqrt(),
+            (n2 / d).sqrt(),
+            ((n2 / n1).sqrt() - 1.0) * 100.0
+        );
+    }
+    println!(
+        "AGGREGATE  rel RMS  e8m0 {:.4}   sq {:.4}   ({:+.1}% RMS, {:+.1}% MSE)",
+        (err_e8m0.0 / err_e8m0.1).sqrt(),
+        (err_sq.0 / err_sq.1).sqrt(),
+        ((err_sq.0 / err_e8m0.0).sqrt() - 1.0) * 100.0,
+        (err_sq.0 / err_e8m0.0 - 1.0) * 100.0
+    );
+}
+
 /// MICROKIMI_NO_PACKED_GPU=1: keep the packed mxfp4 matvecs on the CPU even
 /// with --gpu (A/B toggle for the fused Metal fp4 kernel path).
 #[cfg(target_os = "macos")]

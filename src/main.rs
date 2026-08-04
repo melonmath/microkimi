@@ -12,6 +12,7 @@ mod dstok;
 mod config;
 mod eval;
 mod http;
+mod imatrix;
 mod json;
 #[cfg(target_os = "macos")]
 mod metal;
@@ -132,6 +133,11 @@ fn main() {
         "streamtest" => stream::streamtest(&args),
         // microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
         "eval" => eval::run(&args),
+        // microkimi calibrate --model X.bin --text corpus.txt --out imatrix.bin [--vocab V.json] [--max-tokens N]
+        "calibrate" => imatrix::calibrate_cmd(&args),
+        // microkimi mxfp4test --model X.bin [--tensors N]
+        // (hidden measurement) e8m0 vs quadratic scale encoding on real tensors
+        "mxfp4test" => mxfp4::test_cmd(&args),
         // (hidden bench) matvec kernel timing: 1024x512 and 163840x1024, 100 iters
         "dotbench" => dotbench_cmd(),
         // microkimi cache --info | microkimi cache --clean [--repo X]
@@ -172,6 +178,8 @@ fn main() {
             println!("                                         structural pruning (channels / experts / layers)");
             println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
             println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
+            println!("      --imatrix FILE (with --cold-vq)      activation-weighted VQ codebook (see calibrate);");
+            println!("                                         --imatrix-score-only: report only, blind codebook");
             println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
             println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
             println!("      and, for expert ranking, only the weight_scale bytes are fetched)");
@@ -196,6 +204,9 @@ fn main() {
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
             println!("  microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]");
             println!("                                         deterministic QA probes (40 x 2 formulations) + perplexity scorecard");
+            println!("  microkimi calibrate --model X.bin --text corpus.txt --out imatrix.bin [--max-tokens N]");
+            println!("                                         activation second moments per expert-matrix input column,");
+            println!("                                         consumed by slice --cold-vq --imatrix (weighted VQ)");
             println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
             println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");

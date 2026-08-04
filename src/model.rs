@@ -1465,6 +1465,8 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
     let mut h = vec![0f32; cfg.routed_hidden];
     matvec(Model::t(data, &w.routed_down), cfg.routed_hidden, cfg.d, x, &mut h);
     prof.t_router += tm.elapsed().as_secs_f64();
+    // imatrix calibration hook (no-op unless `calibrate` is running)
+    crate::imatrix::record_hidden(layer, &h);
 
     // MXFP4 experts (dequantized on the fly): SiTU(cat(w1 h, w3 h)) then w2.
     // The 16 experts are independent → one pool job per expert (offsets
@@ -1511,6 +1513,7 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
                         for j in 0..emi {
                             act[j] = situ(a[j], u[j]);
                         }
+                        crate::imatrix::record_inter(layer, &act);
                         let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
                         if vq {
                             let cb = std::slice::from_raw_parts(cbp.0, cblen);
@@ -1567,6 +1570,7 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
                         for j in 0..emi {
                             act[j] = situ(a[j], u[j]);
                         }
+                        crate::imatrix::record_inter(layer, &act);
                         let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
                         if vq {
                             let cb = std::slice::from_raw_parts(cbp.0, cblen);

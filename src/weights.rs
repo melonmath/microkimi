@@ -1,13 +1,16 @@
 // microkimi .bin format (microkimi-debug.bin, nanokimi-0.2b.bin, ...):
 //   magic "MKIM0001" (8 bytes)
 //   u32 n_tensors
-//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32, 3=vq1) |
+//   directory × n : u16 name_len | name (utf-8) | u8 dtype (0=f32, 1=mxfp4, 2=i32, 3=vq1, 4=mxfp4sq) |
 //                   u8 n_dims | u32 dims[n_dims] | u64 offset | u64 size
 //   raw data (offsets from start of file; routed expert blobs 4096-aligned so
 //   mmap demand-paging and streaming preads never pull a neighbor expert's
 //   pages, everything else 64-aligned; padding is zero space readers never
 //   see - they only use the directory's offset/size)
 // mxfp4 dtype: blob = packed (R×C/2 bytes) then scales (R×C/32), dims = logical [R,C].
+// mxfp4sq dtype (4): same layout + one trailing f32 smax; the scale byte decodes
+//   quadratically, s(q) = ((q+1)/256)^2 * smax (see mxfp4.rs). Storage/measurement
+//   variant: the packed runtime matvec reads mxfp4 only, dequant readers take both.
 // vq1 dtype: blob = R×C/16 index bytes, one u8 codebook index per vector of 16
 //   consecutive row-major values; dims = logical [R,C] with C % 16 == 0. The
 //   codebook is NOT in the blob: it is a global f32 tensor "vq_codebook"
@@ -23,6 +26,7 @@ pub const DTYPE_F32: u8 = 0;
 pub const DTYPE_MXFP4: u8 = 1;
 pub const DTYPE_I32: u8 = 2;
 pub const DTYPE_VQ1: u8 = 3;
+pub const DTYPE_MXFP4SQ: u8 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -48,6 +52,12 @@ pub fn blob_size(dtype: u8, dims: &[u32]) -> u64 {
             // ("vq_codebook"), shared by every VQ1 tensor of the file.
             let (r, c) = (dims[0] as u64, dims[1] as u64);
             r * c / crate::quant::VQ_DIM as u64
+        }
+        DTYPE_MXFP4SQ => {
+            // mxfp4 layout + one trailing f32 smax (quadratic scale encoding,
+            // see mxfp4.rs): packed (R*C/2) + scales (R*C/32) + 4 bytes.
+            let (r, c) = (dims[0] as u64, dims[1] as u64);
+            r * c / 2 + r * c / 32 + 4
         }
         _ => panic!("unknown dtype {}", dtype),
     }
