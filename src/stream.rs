@@ -167,9 +167,25 @@ pub fn report_line() -> String {
 
 // ── RAM LRU ──
 
+/// MICROKIMI_NO_LFU=1: restore pure LRU eviction (A/B toggle). The default
+/// is LFU with a recency tie-break: the eviction victim is the entry with
+/// the lowest use count (1 at insert, +1 per demand hit), ties broken by
+/// the oldest last access. Expert reuse is strongly bimodal (a hot working
+/// set of frequently re-routed experts vs one-shot picks), so frequency is
+/// a better residency signal than recency alone; the cachereplay LFU column
+/// quantifies it offline. NOTE: an unused prefetch sits at count 1 like a
+/// one-shot demand pick and ages out by recency - a 0-count scheme was
+/// measured to self-evict fresh prefetch batches BEFORE the router could
+/// consume them (0% prefetch recall), because every count-0 entry is a
+/// better victim than every proven entry.
+fn lfu_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_NO_LFU").map(|v| v != "1").unwrap_or(true))
+}
+
 struct Lru {
-    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch)
-    queue: VecDeque<((u32, u32), u64)>,                   // access order, stale gens skipped
+    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool, u64)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch, hits)
+    queue: VecDeque<((u32, u32), u64)>,                        // access order, stale gens skipped (pure-LRU mode)
     cur: usize,
     tick: u64,
     budget: usize,
@@ -185,6 +201,7 @@ impl Lru {
         self.tick += 1;
         let e = self.map.get_mut(&k).unwrap();
         e.1 = self.tick;
+        e.3 += 1; // LFU: one more demand hit
         let v = e.0.clone();
         let pref = std::mem::take(&mut e.2);
         self.queue.push_back((k, self.tick));
@@ -197,28 +214,44 @@ impl Lru {
             return; // a single expert exceeds the budget: serve without caching
         }
         self.tick += 1;
-        if let Some(old) = self.map.insert(k, (v, self.tick, pref)) {
+        // LFU count: 1 at insert (demand or prefetch alike - see lfu_on's
+        // comment for why prefetch does not start at 0), +1 per demand hit;
+        // a re-insert keeps the hits earned
+        if let Some(old) = self.map.insert(k, (v, self.tick, pref, 0)) {
             self.cur -= old.0.len();
+            self.map.get_mut(&k).unwrap().3 = old.3 + 1;
+        } else {
+            self.map.get_mut(&k).unwrap().3 = 1;
         }
         self.cur += sz;
         self.queue.push_back((k, self.tick));
-        // evict least recently used until back under budget (keep the new entry)
+        // evict until back under budget (keep the new entry)
         while self.cur > self.budget && self.map.len() > 1 {
-            match self.queue.pop_front() {
-                Some((fk, fg)) => {
-                    if let Some(e) = self.map.get(&fk) {
-                        if e.1 == fg {
-                            self.cur -= e.0.len();
-                            self.map.remove(&fk);
+            if lfu_on() {
+                // LFU victim: lowest hit count, then oldest access. O(map)
+                // per victim, negligible next to the disk fetch that
+                // triggered the insert (and amortized: several victims may
+                // leave per insert but each scan is a tight integer pass).
+                let victim = self.map.iter().min_by_key(|(_, e)| (e.3, e.1)).map(|(&k, _)| k).unwrap();
+                self.cur -= self.map[&victim].0.len();
+                self.map.remove(&victim);
+            } else {
+                match self.queue.pop_front() {
+                    Some((fk, fg)) => {
+                        if let Some(e) = self.map.get(&fk) {
+                            if e.1 == fg {
+                                self.cur -= e.0.len();
+                                self.map.remove(&fk);
+                            }
                         }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
         // amortized queue compaction (every access pushes one entry)
         if self.queue.len() > 4 * self.map.len().max(16) {
-            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _))| (k, g)).collect();
+            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _, _))| (k, g)).collect();
             live.sort_by_key(|&(_, g)| g);
             self.queue = live.into();
         }

@@ -14,7 +14,9 @@
 //
 // Policies replayed, at each capacity (in ENTRIES: expert blobs have a
 // uniform size per model, so entry counts and byte budgets are equivalent):
-//   - LRU:    plain least-recently-used (the engine's --stream policy)
+//   - LRU:    plain least-recently-used eviction
+//   - LFU:    lowest demand-hit count evicted first, recency tie-break (the
+//             engine Lru's default eviction, stream.rs)
 //   - Markov: LRU + the engine's Markov prefetcher (stream.rs Predictor,
 //             driven as-is with N predicted experts per MoE layer)
 //   - Belady: optimal OFFLINE eviction (evict the entry reused farthest in
@@ -78,6 +80,36 @@ fn replay_lru(trace: &[Key], cap: usize) -> u64 {
             hits += 1;
         } else {
             lru.insert(k);
+        }
+    }
+    hits
+}
+
+/// LFU (recency tie-break) hit count over the trace at capacity `cap`:
+/// victim = lowest demand-hit count, then oldest last access - the eviction
+/// policy of the engine's Lru (stream.rs) by default.
+fn replay_lfu(trace: &[Key], cap: usize) -> u64 {
+    let mut map: HashMap<Key, (u64, u64)> = HashMap::new(); // key -> (hits, last tick)
+    let mut tick = 0u64;
+    let mut hits = 0;
+    for &k in trace {
+        tick += 1;
+        match map.get_mut(&k) {
+            Some(e) => {
+                e.0 += 1;
+                e.1 = tick;
+                hits += 1;
+            }
+            None => {
+                if cap == 0 {
+                    continue;
+                }
+                if map.len() == cap {
+                    let victim = *map.iter().min_by_key(|p| p.1).unwrap().0;
+                    map.remove(&victim);
+                }
+                map.insert(k, (1, tick));
+            }
         }
     }
     hits
@@ -194,20 +226,23 @@ pub fn run(args: &[String]) {
         n_pred
     );
     println!();
-    println!("{:>8} {:>8} {:>8} {:>8} {:>10} {:>12} {:>12}", "capacity", "LRU", "Markov", "Belady", "gap B-LRU", "LRU fetches", "Markov fetches");
+    println!("{:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>12} {:>12}", "capacity", "LRU", "LFU", "Markov", "Belady", "gap B-LRU", "LRU fetches", "Markov fetches");
     let total = trace.len() as f64;
     let n_req = trace.len() as u64;
     for &cap in &CAPS {
         let lru_h = replay_lru(&trace, cap);
+        let lfu_h = replay_lfu(&trace, cap);
         let (mkv_h, mkv_pref) = replay_markov(&trace, cap, top_k, n_pred);
         let bel_h = replay_belady(&trace, cap);
         let lru = lru_h as f64 / total;
+        let lfu = lfu_h as f64 / total;
         let mkv = mkv_h as f64 / total;
         let bel = bel_h as f64 / total;
         println!(
-            "{:>8} {:>7.1}% {:>7.1}% {:>7.1}% {:>+9.1}% {:>12} {:>12}",
+            "{:>8} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>+9.1}% {:>12} {:>12}",
             cap,
             100.0 * lru,
+            100.0 * lfu,
             100.0 * mkv,
             100.0 * bel,
             100.0 * (bel - lru),
@@ -217,6 +252,7 @@ pub fn run(args: &[String]) {
     }
     println!();
     println!("hit rates over {} requests; Belady is the offline optimum for DEMAND-ONLY policies.", trace.len());
+    println!("LFU = lowest demand-hit count evicted first, recency tie-break (the engine's default policy).");
     println!("Markov is a prefetch policy: its demand hit-rate can exceed Belady at tight capacities;");
     println!("the fetch columns show the bandwidth spent for it (demand misses + prefetches vs misses).");
     println!("capacity unit: cache entries (uniform expert size per model, so entries == byte budget).");
