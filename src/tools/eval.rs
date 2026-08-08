@@ -200,7 +200,7 @@ pub fn run(args: &[String]) {
     let ppl_file = crate::value_flag(args, "--ppl-file");
     let json_out = crate::value_flag(args, "--json");
 
-    let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::weights::read_config(&mp).vocab);
+    let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     // --stream / --stream-ram / --stream-fallback are honored (streaming
     // load): bit-identical scores without the fallback, the degraded-mode
     // quality cost with it (MICROKIMI_FORCE_FALLBACK=1 forces 100% shadows)

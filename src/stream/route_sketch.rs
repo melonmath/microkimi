@@ -2,7 +2,7 @@
 //
 // Records every (layer, expert) pair the noaux_tc router actually selects,
 // without storing the full request stream (that is what MICROKIMI_TRACE does,
-// see stream.rs / tools_replay.rs). A sketch is a fixed 4 x 4096 u32 table
+// see stream.rs / tools/replay.rs). A sketch is a fixed 4 x 4096 u32 table
 // (64 KB), so weeks of runs cost nothing to keep; the per-request order is
 // lost, only the frequencies survive. Intended use: hot/warm expert tiering
 // (which experts deserve the fast tier) fed by real traffic instead of a

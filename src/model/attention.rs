@@ -262,7 +262,7 @@ impl MlaCache {
         // rope is shared across heads: stored once, from head 0
         self.kr.extend_from_slice(&k_row[nope..qh]);
         let mut scratch = vec![0f32; nope.max(vd)];
-        let mut qv = crate::q8::Q8Vec::new();
+        let mut qv = crate::quant::q8::Q8Vec::new();
         for h in 0..nh {
             let row = &k_row[h * qh..h * qh + nope];
             scratch[..nope].copy_from_slice(row);
@@ -271,7 +271,7 @@ impl MlaCache {
                     hadamard64(b);
                 }
             }
-            crate::q8::quantize_q8_into(&scratch[..nope], &mut qv);
+            crate::quant::q8::quantize_q8_into(&scratch[..nope], &mut qv);
             self.kq.extend_from_slice(&qv.q);
             self.ks.extend_from_slice(&qv.scales);
             let rowv = &v_row[h * vd..(h + 1) * vd];
@@ -281,7 +281,7 @@ impl MlaCache {
                     hadamard64(b);
                 }
             }
-            crate::q8::quantize_q8_into(&scratch[..vd], &mut qv);
+            crate::quant::q8::quantize_q8_into(&scratch[..vd], &mut qv);
             self.vq.extend_from_slice(&qv.q);
             self.vs.extend_from_slice(&qv.scales);
         }
@@ -384,7 +384,7 @@ pub(crate) fn mla_attn_flash_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize
             hadamard64(b);
         }
     }
-    let qq = crate::q8::quantize_q8(&qnope);
+    let qq = crate::quant::q8::quantize_q8(&qnope);
     let q_rope = &qh[nope..];
     let had_k = if had { 1.0 / 64.0 } else { 1.0 };
     let mut m = f32::NEG_INFINITY;
@@ -403,7 +403,7 @@ pub(crate) fn mla_attn_flash_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize
             let bq = (j * nh + h) * nope;
             let bs = (j * nh + h) * nb;
             for g in 0..nb {
-                let d = crate::q8::block_dot_i8(&c.kq[bq + g * 32..bq + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
+                let d = crate::quant::q8::block_dot_i8(&c.kq[bq + g * 32..bq + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
                 acc += qq.scales[g] * c.ks[bs + g] * d as f32;
             }
             s += had_k * acc;
@@ -487,7 +487,7 @@ pub(crate) fn mla_attn_flash_q8_mqa(cfg: &Config, c: &MlaCache, q: &[f32], pos: 
                 hadamard64(b);
             }
         }
-        qqs.push(crate::q8::quantize_q8(&qnope));
+        qqs.push(crate::quant::q8::quantize_q8(&qnope));
     }
     let had_k = if had { 1.0 / 64.0 } else { 1.0 };
     let mut m = vec![f32::NEG_INFINITY; nh]; // running max per head
@@ -512,7 +512,7 @@ pub(crate) fn mla_attn_flash_q8_mqa(cfg: &Config, c: &MlaCache, q: &[f32], pos: 
                 let qq = &qqs[h];
                 let mut acc = 0f32;
                 for g in 0..nb {
-                    let d = crate::q8::block_dot_i8(&kq[h * nope + g * 32..h * nope + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
+                    let d = crate::quant::q8::block_dot_i8(&kq[h * nope + g * 32..h * nope + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
                     acc += qq.scales[g] * ks[h * nb + g] * d as f32;
                 }
                 s += had_k * acc;

@@ -27,7 +27,7 @@ pub(crate) fn top_k_probs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     top
 }
 
-// ── sampling: temperature + top-p nucleus, xorshift64* RNG (build.rs style) ──
+// ── sampling: temperature + top-p nucleus, xorshift64* RNG (tools/build.rs style) ──
 
 /// xorshift64* RNG, same generator style as build::Rng, seedable via --seed
 /// for reproducible sampling (same seed + same prompt = same output).
@@ -53,8 +53,8 @@ impl XorShift {
 
 /// Decoding policy: temp <= 0 keeps the exact greedy argmax path; temp > 0
 /// samples from softmax(logits / temp) restricted to the top-p nucleus.
-/// spec > 0 enables n-gram speculative decoding (src/spec.rs, greedy only);
-/// spec_rosa > 0 swaps the proposer for the suffix automaton (src/rosa.rs).
+/// spec > 0 enables n-gram speculative decoding (src/model/spec.rs, greedy only);
+/// spec_rosa > 0 swaps the proposer for the suffix automaton (src/model/rosa.rs).
 /// dry > 0 subtracts a DRY-style anti-repetition penalty from the logits
 /// (apply_dry; 0 = off, the historical bit-exact path).
 pub struct Sampler {
@@ -184,7 +184,7 @@ fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mo
         if sampler.temp > 0.0 {
             eprintln!("warning: --spec/--spec-rosa are greedy-only, ignoring them with --temp > 0");
         } else {
-            let answer = crate::spec::run_turn_spec(ids, max_new, tok, model, pos, init_logits, debug, stop_id, sampler);
+            let answer = crate::model::spec::run_turn_spec(ids, max_new, tok, model, pos, init_logits, debug, stop_id, sampler);
             model.prof.print_cfg(&model.cfg);
             return answer;
         }

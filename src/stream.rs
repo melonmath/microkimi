@@ -7,7 +7,7 @@
 //   is loaded compacted into RAM (weights::BinFile::open_spine); expert blobs
 //   are pread from the .bin itself (the file IS the disk tier).
 // - Remote safetensors (https://huggingface.co/org/repo): every tensor is
-//   fetched ONCE via HTTP range requests (slice_st.rs machinery) and persisted
+//   fetched ONCE via HTTP range requests (tools/slice_st.rs machinery) and persisted
 //   under ~/.cache/microkimi/<sanitized-repo>/<tensor-name> in .bin blob
 //   layout (packed ++ scales for MXFP4, converted f32 LE otherwise); later
 //   runs are served from that disk cache with zero network traffic.
@@ -35,6 +35,10 @@
 mod cmd;
 mod fetch;
 mod prefetch;
+pub mod http;
+pub mod route_history;
+pub mod route_sketch;
+pub mod shadow;
 
 // The public surface stays crate::stream::*; submodules are private.
 pub use cmd::{cache_cmd, streamtest};
@@ -131,8 +135,8 @@ pub fn report_line() -> String {
         RAM_HITS.load(Ordering::Relaxed),
         RAM_MISSES.load(Ordering::Relaxed),
         mb(DISK_BYTES.load(Ordering::Relaxed)),
-        mb(crate::http::fetched_bytes()),
-        crate::http::fetched_requests(),
+        mb(crate::stream::http::fetched_bytes()),
+        crate::stream::http::fetched_requests(),
     );
     let (fe, fr) = (FUSE_EXPERTS.load(Ordering::Relaxed), FUSE_READS.load(Ordering::Relaxed));
     if fe > 0 {
@@ -221,7 +225,7 @@ pub enum Served {
     /// VQ1, shadow codebook, w1 ++ w2 ++ w3 index bytes at this offset of
     /// Shadows::data. DEGRADED (not bit-identical); the full-precision blob
     /// is refilled in the background for the next request.
-    Shadow(Arc<crate::shadow::Shadows>, usize),
+    Shadow(Arc<crate::stream::shadow::Shadows>, usize),
 }
 
 // ── RAM cache: eviction policies ──
@@ -655,7 +659,7 @@ struct CacheInner {
     inflight: (Mutex<std::collections::HashSet<(u32, u32)>>, std::sync::Condvar),
     /// VQ1 shadows of every expert (shadow.rs), resident in RAM under
     /// --stream-fallback. None in the default bit-identical mode.
-    shadows: Option<Arc<crate::shadow::Shadows>>,
+    shadows: Option<Arc<crate::stream::shadow::Shadows>>,
     /// Trace-similarity prefetcher state (MICROKIMI_TRACESIM=1). Some on the
     /// local source even with an empty store: the current session is still
     /// recorded and appended to <model>.routes at drop.
@@ -855,7 +859,7 @@ impl CacheInner {
     }
 
     /// The VQ1 shadow of one expert, when the fallback can serve it.
-    fn shadow(&self, layer: u32, expert: u32) -> Option<(Arc<crate::shadow::Shadows>, usize)> {
+    fn shadow(&self, layer: u32, expert: u32) -> Option<(Arc<crate::stream::shadow::Shadows>, usize)> {
         self.shadows.as_ref().and_then(|s| s.offset(layer, expert).map(|off| (Arc::clone(s), off)))
     }
 }
@@ -871,7 +875,7 @@ impl ExpertCache {
     /// Local streaming source: `path` is the .bin the spine was loaded from.
     /// `shadows`: the resident VQ1 expert shadows (shadow.rs) when
     /// --stream-fallback is active, None in the default bit-identical mode.
-    pub fn local(path: &str, ram_mb: usize, shadows: Option<crate::shadow::Shadows>) -> ExpertCache {
+    pub fn local(path: &str, ram_mb: usize, shadows: Option<crate::stream::shadow::Shadows>) -> ExpertCache {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
         let direct = open_direct(path);
         // one-time startup lines: state of the runtime A/B toggles
@@ -925,7 +929,7 @@ impl ExpertCache {
         // stored session signatures of this model (no-op when off)
         let tsim = if tracesim_on() {
             let rp = format!("{}.routes", path);
-            let store = crate::routes::RouteStore::load(&rp).unwrap_or_else(|_| crate::routes::RouteStore::empty());
+            let store = crate::stream::route_history::RouteStore::load(&rp).unwrap_or_else(|_| crate::stream::route_history::RouteStore::empty());
             println!(
                 "stream-tracesim: {} stored session(s) in {} (MICROKIMI_TRACESIM=1: cold-start/topic-rupture expert prefetch)",
                 store.sessions.len(),
@@ -1051,13 +1055,13 @@ impl ExpertCache {
         miss.sort_by_key(|&(_, o, _)| o[0]);
         let runs = fuse_runs(&miss);
         let t0 = std::time::Instant::now();
-        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(runs.len());
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::with_capacity(runs.len());
         for (s, e) in runs {
             let members: Vec<(u32, [u64; 3], usize)> = miss[s..e].to_vec();
             let inner = Arc::clone(&self.inner);
             jobs.push(Box::new(move || inner.fetch_run(layer, &members, 0, &PREF_ISSUED)));
         }
-        crate::pool::pool().run(jobs);
+        crate::model::pool::pool().run(jobs);
         FUSE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -1328,11 +1332,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let fpath = dir.join(format!("microkimi-fb-test-{}", std::process::id()));
         std::fs::write(&fpath, &file_bytes).unwrap();
-        let sh = crate::shadow::Shadows {
+        let sh = crate::stream::shadow::Shadows {
             layers: vec![0],
             n_experts: 2,
             vq_blob: 8,
-            cb: vec![0.25; crate::quant::VQ_K * crate::quant::VQ_DIM],
+            cb: vec![0.25; crate::quant::quant::VQ_K * crate::quant::quant::VQ_DIM],
             data: (0..2 * 3 * 8).map(|i| (i % 241) as u8).collect(),
         };
         let shadow_bytes = sh.data.clone();

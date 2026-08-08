@@ -51,7 +51,7 @@ pub fn blob_size(dtype: u8, dims: &[u32]) -> u64 {
             // the 256 x VQ_DIM f32 codebook lives in a separate global tensor
             // ("vq_codebook"), shared by every VQ1 tensor of the file.
             let (r, c) = (dims[0] as u64, dims[1] as u64);
-            r * c / crate::quant::VQ_DIM as u64
+            r * c / crate::quant::quant::VQ_DIM as u64
         }
         DTYPE_MXFP4SQ => {
             // mxfp4 layout + one trailing f32 smax (quadratic scale encoding,

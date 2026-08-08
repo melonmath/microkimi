@@ -37,7 +37,7 @@
 // MICROKIMI_NO_KDACHUNK=1 forces the sequential path everywhere.
 
 use crate::config::Config;
-use crate::pool::{Job, MPtr, SPtr};
+use crate::model::pool::{Job, MPtr, SPtr};
 
 /// Chunk size: 64 like the fla reference (T/64 scan steps, 64x64 intra
 /// matrices fit L1 with room for the K=128 row buffers).
@@ -55,7 +55,7 @@ pub(crate) fn disabled() -> bool {
         || *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_KDACHUNK").map(|v| v == "1").unwrap_or(false))
 }
 
-// Runtime pin for src/pck.rs (prefix cache): a snapshot resume splits the
+// Runtime pin for src/memory/prefix_cache.rs: a snapshot resume splits the
 // prefill into two calls, and the chunked form reassociates the recurrence
 // per 64-token chunk, so chunk boundaries moving between the cold and the
 // resumed run would break bit-identity. The sequential loop applies the exact
@@ -101,7 +101,7 @@ pub(crate) fn kda_recur_chunked(
 
     // ── phase 1: per (chunk, head) matrices, independent -> pool ──
     {
-        let p = crate::pool::pool();
+        let p = crate::model::pool::pool();
         let (qp, kp_, vp, gp, bp) = (SPtr(q.as_ptr()), SPtr(k.as_ptr()), SPtr(v.as_ptr()), SPtr(g.as_ptr()), SPtr(beta.as_ptr()));
         let (wp, up, qegp, dkp, aqkp, sdp) = (
             MPtr(w.as_mut_ptr()),
@@ -143,7 +143,7 @@ pub(crate) fn kda_recur_chunked(
     // ── phase 2: inter-chunk state scan, sequential over chunks ──
     // (parallel over heads: each head owns a disjoint S slice)
     {
-        let p = crate::pool::pool();
+        let p = crate::model::pool::pool();
         let (wp, up, qegp, dkp, aqkp, sdp) = (
             SPtr(w.as_ptr()),
             SPtr(u.as_ptr()),

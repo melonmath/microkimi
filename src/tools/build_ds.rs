@@ -7,10 +7,10 @@
 // (norms → 1.0, biases → 0.0), hash tables → seeded pseudo-random.
 
 use crate::config::DsConfig;
-use crate::http;
-use crate::mxfp4;
-use crate::safetensors;
-use crate::weights::{self, BinWriter, DTYPE_F32, DTYPE_I32, DTYPE_MXFP4};
+use crate::stream::http;
+use crate::quant::mxfp4;
+use crate::quant::safetensors;
+use crate::quant::weights::{self, BinWriter, DTYPE_F32, DTYPE_I32, DTYPE_MXFP4};
 use std::collections::HashMap;
 
 const DS_BASE: &str = "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/";
@@ -19,7 +19,7 @@ const SIGMA: f32 = 0.02;
 const REAL_ROWS: usize = 16384; // embed/head: this many real leading rows
 
 // Reuse the K3 builder RNG (same xorshift64* + name-seeded derivation, own base).
-use crate::build::Rng;
+use crate::tools::build::Rng;
 
 fn fill_pool_or_gauss(name: &str, n: usize, pool: &[f32]) -> Vec<f32> {
     let mut rng = Rng::for_tensor(name);
@@ -160,7 +160,7 @@ fn fetch_fp8_corner(
     for r in 0..fetch_rows {
         for c in 0..cols {
             let s = mxfp4::exp2_i(sc[(r / 128) * scols + c / 128] as i32 - 127);
-            vals[r * cols + c] = crate::dequant::e4m3_to_f32(w[r * cols + c]) * s;
+            vals[r * cols + c] = crate::quant::dequant::e4m3_to_f32(w[r * cols + c]) * s;
         }
     }
     let mut corner = vec![0f32; r0 * c0];

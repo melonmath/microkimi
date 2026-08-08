@@ -230,8 +230,8 @@ pub fn dequant_sq(packed: &[u8], scales: &[u8], smax: f32, rows: usize, cols: us
 pub fn dequant_any(dtype: u8, blob: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     let np = rows * cols / 2;
     match dtype {
-        crate::weights::DTYPE_MXFP4 => dequant(&blob[..np], &blob[np..], rows, cols),
-        crate::weights::DTYPE_MXFP4SQ => {
+        crate::quant::weights::DTYPE_MXFP4 => dequant(&blob[..np], &blob[np..], rows, cols),
+        crate::quant::weights::DTYPE_MXFP4SQ => {
             let smax = f32::from_le_bytes(blob[np + rows * cols / 32..np + rows * cols / 32 + 4].try_into().unwrap());
             dequant_sq(&blob[..np], &blob[np..np + rows * cols / 32], smax, rows, cols)
         }
@@ -258,12 +258,12 @@ pub fn test_cmd(args: &[String]) {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let bin = crate::weights::BinFile::open(&mp);
+    let bin = crate::quant::weights::BinFile::open(&mp);
     let mut names: Vec<&String> = bin
         .entries
         .iter()
         .filter(|(_, e)| {
-            e.dtype == crate::weights::DTYPE_F32
+            e.dtype == crate::quant::weights::DTYPE_F32
                 && e.dims.len() == 2
                 && e.dims[1] % 32 == 0
                 && e.dims[0] as u64 * e.dims[1] as u64 >= 16384
@@ -345,7 +345,7 @@ pub fn scale_from_byte(sb: u8) -> f32 {
     }
 }
 
-/// Host-side emulation of the Metal matvec_fp4 kernel (metal.rs, macOS-only):
+/// Host-side emulation of the Metal matvec_fp4 kernel (model/metal.rs, macOS-only):
 /// per-element scaling `lut * s * x[c]` (NOT the CPU's per-group
 /// (Σ lut·x)·s) and the kernel's accumulation order - `lanes` strided
 /// accumulators per row (lane i takes columns i, i+lanes, ...), then a
@@ -395,21 +395,21 @@ pub fn matvec_packed_shader_emul(packed: &[u8], scales: &[u8], rows: usize, cols
 thread_local! {
     /// Reusable q8 activation buffer: matvec_packed quantizes once per call,
     /// and allocating the scratch per call dominated the tiny expert matvecs.
-    static Q8_SCRATCH: std::cell::RefCell<crate::q8::Q8Vec> = std::cell::RefCell::new(crate::q8::Q8Vec::new());
+    static Q8_SCRATCH: std::cell::RefCell<crate::quant::q8::Q8Vec> = std::cell::RefCell::new(crate::quant::q8::Q8Vec::new());
 }
 
 /// Integer q8 matvec (see q8.rs for the scale convention): per 32-block,
 /// out_block = 2^(sb-128) * dx_g * <LUT2 block, q8 block>, the inner dot in
 /// exact int32. NOT bit-identical to the f32 path (that is the deal;
 /// MICROKIMI_NO_Q8=1 disables it). Same row splitting as the f32 path.
-pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xq: &crate::q8::Q8Vec, out: &mut [f32], n_threads: usize) {
+pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xq: &crate::quant::q8::Q8Vec, out: &mut [f32], n_threads: usize) {
     assert_eq!(xq.q.len(), cols);
     assert_eq!(xq.scales.len(), cols / 32);
     #[inline]
-    fn row(prow: &[u8], srow: &[u8], cols: usize, xq: &crate::q8::Q8Vec) -> f32 {
+    fn row(prow: &[u8], srow: &[u8], cols: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
         let mut sum = 0f32;
         for g in 0..cols / 32 {
-            let idot = crate::q8::block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
+            let idot = crate::quant::q8::block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
             // 2^(sb-128) folds the LUT2 = E2M1 x 2 convention (see q8.rs);
             // the i32 -> f32 conversion is exact (|idot| <= 32*127*12 < 2^24)
             sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
@@ -466,8 +466,8 @@ pub fn matvec_packed(
 ) {
     #[cfg(target_os = "macos")]
     {
-        if crate::model::gpu_on() && !no_packed_gpu() && rows * cols >= crate::model::GPU_MIN_ELEMS && crate::metal::gpu_available() {
-            crate::metal::gpu_matvec_fp4(packed, scales, rows, cols, x, out);
+        if crate::model::gpu_on() && !no_packed_gpu() && rows * cols >= crate::model::GPU_MIN_ELEMS && crate::model::metal::gpu_available() {
+            crate::model::metal::gpu_matvec_fp4(packed, scales, rows, cols, x, out);
             return;
         }
     }
@@ -477,10 +477,10 @@ pub fn matvec_packed(
     // O(cols) work against O(rows*cols) for the matvec, so sharing it
     // across the w1/w3 calls of one expert (same input) was measured not
     // worth the call-site churn (< 2% of an expert matvec).
-    if crate::q8::q8_enabled() {
+    if crate::quant::q8::q8_enabled() {
         Q8_SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
-            crate::q8::quantize_q8_into(x, &mut s);
+            crate::quant::q8::quantize_q8_into(x, &mut s);
             matvec_packed_q8(packed, scales, rows, cols, &s, out, n_threads);
         });
         return;
@@ -622,11 +622,11 @@ mod tests {
             eprintln!("smoke model {} not found, skipping", path);
             return;
         }
-        let bin = crate::weights::BinFile::open(&path);
+        let bin = crate::quant::weights::BinFile::open(&path);
         let mut names: Vec<&String> = bin
             .entries
             .iter()
-            .filter(|(_, e)| e.dtype == crate::weights::DTYPE_F32 && e.dims.len() == 2 && e.dims[1] % 32 == 0)
+            .filter(|(_, e)| e.dtype == crate::quant::weights::DTYPE_F32 && e.dims.len() == 2 && e.dims[1] % 32 == 0)
             .map(|(n, _)| n)
             .collect();
         names.sort();

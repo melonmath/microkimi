@@ -25,7 +25,7 @@ pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
 }
 
 /// The .mkmem byte image of the current state (layout above). Split from
-/// `save` so the prefix cache (src/pck.rs) can embed the same image in its
+/// `save` so the prefix cache (src/memory/prefix_cache.rs) can embed the same image in its
 /// own container without a round trip through a file.
 pub fn serialize(model: &Model, logits: &[f32]) -> Vec<u8> {
     let cfg = &model.cfg;

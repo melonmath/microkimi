@@ -314,9 +314,9 @@ pub fn fp8_roundtrip(x: &mut [f32], block: usize) {
         let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-4);
         let e = (amax / 448.0).log2().ceil() as i32;
         let e = e.clamp(-127, 8);
-        let s = crate::mxfp4::exp2_i(e);
+        let s = crate::quant::mxfp4::exp2_i(e);
         for v in chunk.iter_mut() {
-            *v = crate::dequant::e4m3_to_f32(crate::dequant::f32_to_e4m3((*v / s).clamp(-448.0, 448.0))) * s;
+            *v = crate::quant::dequant::e4m3_to_f32(crate::quant::dequant::f32_to_e4m3((*v / s).clamp(-448.0, 448.0))) * s;
         }
     }
 }
@@ -328,7 +328,7 @@ pub fn fp4_roundtrip(x: &mut [f32]) {
         let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs())).max(6.0 * f32::MIN_POSITIVE);
         let e = (amax / 6.0).log2().ceil() as i32;
         let e = e.clamp(-127, 128);
-        let s = crate::mxfp4::exp2_i(e);
+        let s = crate::quant::mxfp4::exp2_i(e);
         for v in chunk.iter_mut() {
             let q = (*v / s).clamp(-6.0, 6.0);
             // nearest e2m1 level (same rule as mxfp4::quantize)
@@ -821,7 +821,7 @@ pub fn grouped_o_proj(cfg: &DsConfig, wo_a: &[f32], wo_b: &[f32], o: &[f32], out
 // packed (MXFP4 layout) and are dequantized on the fly by matvec_packed.
 // ════════════════════════════════════════════════════════════════════════════
 
-use crate::weights::{BinFile, Entry};
+use crate::quant::weights::{BinFile, Entry};
 
 fn as_f32(bytes: &[u8]) -> &[f32] {
     let (pre, mid, post) = unsafe { bytes.align_to::<f32>() };
@@ -1062,11 +1062,11 @@ fn ds_moe(cfg: &DsConfig, data: &[u8], w: &DsLayerW, x: &[f32], token: u32, laye
     let limit = cfg.swiglu_limit as f32;
     let mut outs = vec![0f32; sel.len() * d];
     {
-        let dp = crate::pool::SPtrU8(data.as_ptr());
+        let dp = crate::model::pool::SPtrU8(data.as_ptr());
         let dlen = data.len();
-        let xp = crate::pool::SPtr(x.as_ptr());
-        let op = crate::pool::MPtr(outs.as_mut_ptr());
-        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(sel.len());
+        let xp = crate::model::pool::SPtr(x.as_ptr());
+        let op = crate::model::pool::MPtr(outs.as_mut_ptr());
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::with_capacity(sel.len());
         for (ei, &(eid, wgt)) in sel.iter().enumerate() {
             let offs = w.experts[eid as usize];
             jobs.push(Box::new(move || {
@@ -1077,8 +1077,8 @@ fn ds_moe(cfg: &DsConfig, data: &[u8], w: &DsLayerW, x: &[f32], token: u32, laye
                     let blob_at = |i: usize| &data[offs[i] as usize..offs[i] as usize + blob];
                     let mut gate = vec![0f32; inter];
                     let mut up = vec![0f32; inter];
-                    crate::mxfp4::matvec_packed(&blob_at(0)[..packed], &blob_at(0)[packed..], inter, d, x, &mut gate, 1);
-                    crate::mxfp4::matvec_packed(&blob_at(2)[..packed], &blob_at(2)[packed..], inter, d, x, &mut up, 1);
+                    crate::quant::mxfp4::matvec_packed(&blob_at(0)[..packed], &blob_at(0)[packed..], inter, d, x, &mut gate, 1);
+                    crate::quant::mxfp4::matvec_packed(&blob_at(2)[..packed], &blob_at(2)[packed..], inter, d, x, &mut up, 1);
                     let mut act = vec![0f32; inter];
                     for j in 0..inter {
                         let g = gate[j].min(limit);
@@ -1086,11 +1086,11 @@ fn ds_moe(cfg: &DsConfig, data: &[u8], w: &DsLayerW, x: &[f32], token: u32, laye
                         act[j] = wgt * (g / (1.0 + (-g).exp())) * u; // wgt * silu(g) * u
                     }
                     let o = std::slice::from_raw_parts_mut(op.0.add(ei * d), d);
-                    crate::mxfp4::matvec_packed(&blob_at(1)[..packed], &blob_at(1)[packed..], d, inter, &act, o, 1);
+                    crate::quant::mxfp4::matvec_packed(&blob_at(1)[..packed], &blob_at(1)[packed..], d, inter, &act, o, 1);
                 }
             }));
         }
-        crate::pool::pool().run(jobs);
+        crate::model::pool::pool().run(jobs);
     }
     let mut out = vec![0f32; d];
     for ei in 0..sel.len() {

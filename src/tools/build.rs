@@ -5,10 +5,10 @@
 // reproducible xorshift64* generation (seed per tensor), MXFP4 quantization.
 // Graceful fallback: if the network fails → Qwen + Gaussian σ=0.02.
 
-use crate::http;
-use crate::mxfp4;
-use crate::safetensors;
-use crate::weights::{self, BinWriter, DTYPE_F32, DTYPE_MXFP4};
+use crate::stream::http;
+use crate::quant::mxfp4;
+use crate::quant::safetensors;
+use crate::quant::weights::{self, BinWriter, DTYPE_F32, DTYPE_MXFP4};
 use std::collections::HashMap;
 
 const K3_BASE: &str = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/";
@@ -305,7 +305,7 @@ fn qwen_path() -> String {
     let dst = format!("{}/qwen2.5-0.5b-instruct.safetensors", cache);
     if !std::path::Path::new(&dst).exists() {
         println!("downloading Qwen2.5-0.5B-Instruct model.safetensors (~943 MB) …");
-        let data = crate::http::fetch(
+        let data = crate::stream::http::fetch(
             "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/model.safetensors",
         )
         .expect("failed to download the Qwen checkpoint (no local HF cache, no network)");

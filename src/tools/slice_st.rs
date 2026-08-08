@@ -24,9 +24,9 @@
 
 use crate::config::Config;
 use crate::json::Json;
-use crate::safetensors::{self, TensorInfo};
-use crate::slice::DirEntry;
-use crate::weights::{blob_size, DTYPE_F32, DTYPE_MXFP4};
+use crate::quant::safetensors::{self, TensorInfo};
+use crate::tools::slice::DirEntry;
+use crate::quant::weights::{blob_size, DTYPE_F32, DTYPE_MXFP4};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -181,7 +181,7 @@ impl StDir {
             }
         } else {
             let idx_bytes = if remote {
-                crate::http::fetch(&format!("{}/model.safetensors.index.json", base_url))
+                crate::stream::http::fetch(&format!("{}/model.safetensors.index.json", base_url))
                     .unwrap_or_else(|| panic!("cannot fetch {}/model.safetensors.index.json", base_url))
             } else {
                 let dir = local_dir.clone().unwrap();
@@ -254,7 +254,7 @@ impl StDir {
         let mut has_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (l, _) in &logical {
             has_names.insert(l.clone());
-            if let Some((i, _)) = crate::slice::split_layer(l) {
+            if let Some((i, _)) = crate::tools::slice::split_layer(l) {
                 max_layer = Some(max_layer.map_or(i, |m: usize| m.max(i)));
             }
         }
@@ -291,7 +291,7 @@ impl StDir {
 
         // ── HF config.json (scalars + cross-check; optional) ──
         let hf_config: Option<Json> = if remote {
-            crate::http::fetch(&format!("{}/config.json", base_url)).map(|b| crate::json::parse(&b))
+            crate::stream::http::fetch(&format!("{}/config.json", base_url)).map(|b| crate::json::parse(&b))
         } else {
             local_dir
                 .as_ref()
@@ -326,7 +326,7 @@ impl StDir {
             }
         }
         let sort_key = |name: &str| -> (i64, u8, u64, String) {
-            match crate::slice::split_layer(name) {
+            match crate::tools::slice::split_layer(name) {
                 None => (-1, 0, 0, name.to_string()),
                 Some((l, rest)) => {
                     if let Some(tail) = rest.strip_prefix("block_sparse_moe.experts.") {
@@ -558,9 +558,9 @@ impl StDir {
                     safetensors::parse_header(&buf)
                 }
                 ShardLoc::Remote(url) => {
-                    let first = crate::http::fetch_range(url, Some((0, 7))).unwrap_or_else(|| panic!("cannot fetch header of {}", url));
+                    let first = crate::stream::http::fetch_range(url, Some((0, 7))).unwrap_or_else(|| panic!("cannot fetch header of {}", url));
                     let hlen = u64::from_le_bytes(first[0..8].try_into().unwrap());
-                    let head = crate::http::fetch_range(url, Some((8, 8 + hlen - 1))).unwrap();
+                    let head = crate::stream::http::fetch_range(url, Some((8, 8 + hlen - 1))).unwrap();
                     safetensors::parse_header(&[first, head].concat())
                 }
             };
@@ -590,7 +590,7 @@ impl StDir {
             return;
         }
         let keep = |name: &str| -> bool {
-            match crate::slice::split_layer(name) {
+            match crate::tools::slice::split_layer(name) {
                 None => true,
                 Some((l, _)) => kept_layers.contains(&l),
             }
@@ -899,7 +899,7 @@ impl StDir {
                 if let Some(buf) = mirror_range(url, start, len) {
                     return buf;
                 }
-                crate::http::fetch_range(url, Some((start, start + len - 1)))
+                crate::stream::http::fetch_range(url, Some((start, start + len - 1)))
                     .unwrap_or_else(|| panic!("range fetch failed on {}", url))
             }
         }
@@ -935,7 +935,7 @@ impl StDir {
             let r1 = (r0 + per).min(rows);
             let raw = self.raw_range(t, r0 as u64 * row_bytes, (r1 - r0) as u64 * row_bytes);
             let vals = Self::to_f32(&raw, &t.dtype);
-            f.write_all(&crate::weights::f32_to_bytes(&vals)).unwrap();
+            f.write_all(&crate::quant::weights::f32_to_bytes(&vals)).unwrap();
             r0 = r1;
         }
         drop(f);
@@ -945,7 +945,7 @@ impl StDir {
             name,
             rows,
             t.dtype,
-            gb(crate::http::fetched_bytes())
+            gb(crate::stream::http::fetched_bytes())
         );
         path
     }
@@ -984,7 +984,7 @@ impl StDir {
             EntrySrc::F32(t) => {
                 let raw = self.raw_range(t, 0, t.len);
                 let vals = Self::to_f32(&raw, &t.dtype);
-                crate::weights::f32_to_bytes(&vals)
+                crate::quant::weights::f32_to_bytes(&vals)
             }
             EntrySrc::Expert { packed, scale } => {
                 let mut blob = self.raw_range(packed, 0, packed.len);

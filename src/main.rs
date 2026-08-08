@@ -4,41 +4,18 @@
 // same mechanisms (KDA, MLA NoPE, latent MoE, SiTU, MXFP4, noaux_tc router),
 // reduced dims. std only.
 
-mod build;
-mod build_ds;
-mod deepseek;
-mod dequant;
-mod dstok;
 mod config;
-mod cms;
-mod eval;
-mod http;
-mod imatrix;
+mod deepseek;
+mod dstok;
 mod json;
-mod kda_chunk;
-mod lutgemv;
-#[cfg(target_os = "macos")]
-mod metal;
-mod mkmem;
+mod memory;
 mod model;
-mod mxfp4;
 mod parity;
-mod pck;
-mod pool;
-mod q8;
 mod quant;
-mod rosa;
-mod routes;
-mod safetensors;
 mod selftest;
-mod shadow;
-mod slice;
-mod slice_st;
-mod spec;
 mod stream;
 mod tokenizer;
-mod tools_replay;
-mod weights;
+mod tools;
 
 use std::time::Instant;
 
@@ -57,17 +34,17 @@ fn main() {
 
     // env-armed routing statistics sketch (MICROKIMI_ROUTECMS=path.bin on
     // run/chat/prefill/absorb); no-op when the variable is absent
-    cms::start_from_env();
+    stream::route_sketch::start_from_env();
 
     match cmd {
         "build" => {
-            if arch == "dsv4" { build_ds::run() } else { build::run() }
+            if arch == "dsv4" { tools::build_ds::run() } else { tools::build::run() }
         }
-        "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
+        "build-ds" => tools::build_ds::run(), // alias for `build --arch dsv4`
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
-        "slice" => slice::run(&args),
+        "slice" => tools::slice::run(&args),
         // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
-        "shadow" => shadow::cmd(&args),
+        "shadow" => stream::shadow::cmd(&args),
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); selftest::run_flash(); selftest::run_kvq8(); },
         "metaltest" => metaltest_cmd(),
         "metaltest-packed" => metaltest_packed_cmd(),
@@ -134,7 +111,7 @@ fn main() {
             };
             let shuffle_idx = value_flag(&args, "--shuffle").and_then(|s| s.parse().ok());
             let avg = args.iter().any(|a| a == "--avg");
-            match mkmem::merge(&paths, &out, shuffle_idx, avg) {
+            match memory::memory_pack::merge(&paths, &out, shuffle_idx, avg) {
                 Ok(()) => println!("merged {} states -> {} (KDA s summed, conv/MLA/logits from {})", paths.len(), out, paths[0]),
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -150,7 +127,7 @@ fn main() {
         // runs one turn with the count-min routing sketch armed, then saves it
         "routestats" => routestats_cmd(&args),
         // microkimi cmsinfo sketch.bin: top-50 (layer, expert, count) + coverage
-        "cmsinfo" => cms::info_cmd(&args),
+        "cmsinfo" => stream::route_sketch::info_cmd(&args),
         // microkimi decay mem.mkmem --half-life H --out mem2.mkmem [--units U]
         // exp2 partial forgetting: KDA s *= 2^(-U/H), conv/MLA/logits untouched
         "decay" => {
@@ -171,7 +148,7 @@ fn main() {
                 std::process::exit(1);
             };
             let units = value_flag(&args, "--units").and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            match mkmem::decay(mem, hl, units, &out) {
+            match memory::memory_pack::decay(mem, hl, units, &out) {
                 Ok(f) => println!("decay: {} -> {} ({} units at half-life {}, KDA s scaled by {:.6})", mem, out, units, hl, f),
                 Err(e) => {
                     eprintln!("error: {}", e);
@@ -196,7 +173,7 @@ fn main() {
                 std::process::exit(1);
             };
             let alpha = value_flag(&args, "--alpha").and_then(|s| s.parse().ok()).unwrap_or(0.5);
-            match mkmem::merge_interp(a, b, alpha, &out) {
+            match memory::memory_pack::merge_interp(a, b, alpha, &out) {
                 Ok(()) => println!(
                     "merged {} + {} -> {} (alpha={}, experimental linear blend of two SSM states, not a semantic merge)",
                     a, b, out, alpha
@@ -210,23 +187,23 @@ fn main() {
         // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]
         "streamtest" => stream::streamtest(&args),
         // microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
-        "eval" => eval::run(&args),
+        "eval" => tools::eval::run(&args),
         // microkimi calibrate --model X.bin --text corpus.txt --out imatrix.bin [--vocab V.json] [--max-tokens N]
-        "calibrate" => imatrix::calibrate_cmd(&args),
+        "calibrate" => quant::imatrix::calibrate_cmd(&args),
         // microkimi mxfp4test --model X.bin [--tensors N]
         // (hidden measurement) e8m0 vs quadratic scale encoding on real tensors
-        "mxfp4test" => mxfp4::test_cmd(&args),
+        "mxfp4test" => quant::mxfp4::test_cmd(&args),
         // (hidden bench) matvec kernel timing: 1024x512 and 163840x1024, 100 iters
         "dotbench" => dotbench_cmd(),
         // microkimi cache --info | microkimi cache --clean [--repo X]
         "cache" => stream::cache_cmd(&args),
         // microkimi pck --info | microkimi pck --clean [--model X.bin]
         // prefix cache of the chat (<model>.pck/ by default, MICROKIMI_PCK_DIR)
-        "pck" => pck::cmd(&args),
+        "pck" => memory::prefix_cache::cmd(&args),
         // microkimi cachereplay trace.bin [--top-k K] [--predict N]
-        "cachereplay" => tools_replay::run(&args),
+        "cachereplay" => tools::replay::run(&args),
         // microkimi routebuild store.routes trace.bin [trace2.bin ...]
-        "routebuild" => tools_replay::routebuild(&args),
+        "routebuild" => tools::replay::routebuild(&args),
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
             let tok = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -504,30 +481,30 @@ fn dotbench_cmd() {
     // mxfp4 quantized matvec: f32-dequant path vs integer q8 path
     for (rows, cols, nt) in [(64usize, 128usize, 1usize), (3072, 3584, 1), (163840, 1024, 10)] {
         let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();
-        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        let (p, s) = crate::quant::mxfp4::quantize(&w, rows, cols);
         drop(w);
         let x: Vec<f32> = (0..cols).map(|_| next_f32()).collect();
         let mut out = vec![0f32; rows];
         let mut line = format!("mxfp4 matvec {}x{} (nt={}):", rows, cols, nt);
         for (label, force) in [("f32", 0), ("q8", 1)] {
-            crate::q8::force_q8(force);
-            crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt); // warmup
+            crate::quant::q8::force_q8(force);
+            crate::quant::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt); // warmup
             let iters = 100;
             let t = Instant::now();
             for _ in 0..iters {
-                crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt);
+                crate::quant::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut out, nt);
             }
             let dt = t.elapsed().as_secs_f64() / iters as f64;
             line.push_str(&format!("  {} {:.4} ms/call ({:.2} GFLOP/s)", label, dt * 1000.0, 2.0 * rows as f64 * cols as f64 / dt / 1e9));
         }
-        crate::q8::force_q8(-1);
+        crate::quant::q8::force_q8(-1);
         println!("{}  [checksum {:e}]", line, out.iter().map(|&v| v as f64).sum::<f64>());
     }
 }
 
 #[cfg(target_os = "macos")]
 fn metaltest_cmd() {
-    metal::metaltest();
+    model::metal::metaltest();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -537,7 +514,7 @@ fn metaltest_cmd() {
 
 #[cfg(target_os = "macos")]
 fn metaltest_packed_cmd() {
-    metal::metaltest_packed();
+    model::metal::metaltest_packed();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -547,7 +524,7 @@ fn metaltest_packed_cmd() {
 
 #[cfg(target_os = "macos")]
 fn gputest_cmd() {
-    metal::gputest();
+    model::metal::gputest();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -557,7 +534,7 @@ fn gputest_cmd() {
 
 #[cfg(target_os = "macos")]
 fn dstest_cmd() {
-    metal::dstest();
+    model::metal::dstest();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -569,7 +546,7 @@ fn dstest_cmd() {
 fn gpubench_cmd(args: &[String]) {
     let tl = Instant::now();
     let mp = model_flag(args).unwrap_or_else(bin_path);
-    let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::weights::read_config(&mp).vocab);
+    let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     let mut model = model::Model::load(&mp);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     let question = "Once upon a time";
@@ -654,7 +631,7 @@ fn gpu_status_line() {
 #[cfg(target_os = "macos")]
 fn gpu_prof_maybe_print() {
     if model::gpu_on() {
-        metal::gpu_prof_print();
+        model::metal::gpu_prof_print();
     }
 }
 
@@ -694,17 +671,17 @@ fn mkmem_div_cmd(args: &[String]) {
     let prompt = value_flag(args, "--prompt").unwrap_or_else(|| "Once upon a time".to_string());
     let max_new: usize = value_flag(args, "--max-new").and_then(|s| s.parse().ok()).unwrap_or(20);
     let mp = model_flag(args).unwrap_or_else(bin_path);
-    if crate::weights::read_config(&mp).ds.is_some() {
+    if crate::quant::weights::read_config(&mp).ds.is_some() {
         eprintln!("error: mkmem-div is only supported for K3 models (not DeepSeek-V4)");
         std::process::exit(1);
     }
-    let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::weights::read_config(&mp).vocab);
+    let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     let mut model = model::Model::load(&mp);
     check_tok_compat(&tok, &model);
     let mut seqs: Vec<Vec<u32>> = Vec::new();
     for p in &paths {
         model.reset_cache();
-        let init = match crate::mkmem::load(&mut model, p) {
+        let init = match crate::memory::memory_pack::load(&mut model, p) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -787,7 +764,7 @@ fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
             let pargs: Vec<String> = std::env::args().collect();
             let n: usize = value_flag(&pargs, "--stream-predict").and_then(|s| s.parse().ok()).unwrap_or(0);
             if n > 0 {
-                let top_k = crate::weights::read_config(mp).top_k;
+                let top_k = crate::quant::weights::read_config(mp).top_k;
                 crate::stream::set_predict(n, top_k);
                 println!("stream: predictive prefetch enabled ({} experts/layer, top-k {})", n, top_k);
             }
@@ -900,7 +877,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
-    let mp_cfg = crate::weights::read_config(&mp);
+    let mp_cfg = crate::quant::weights::read_config(&mp);
     if mp_cfg.ds.is_some() {
         if stream_mb.is_some() {
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
@@ -920,7 +897,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         };
         return deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
     }
-    let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
+    let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -929,7 +906,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
 
     let mut init_logits = None;
     if let Some(m) = memory {
-        match crate::mkmem::load(&mut model, m) {
+        match crate::memory::memory_pack::load(&mut model, m) {
             Ok(l) => {
                 println!("memory loaded: {}", m);
                 init_logits = Some(l);
@@ -954,7 +931,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     if let Some(s) = save {
         save_memory(&model, s);
     }
-    crate::cms::finish();
+    crate::stream::route_sketch::finish();
     gpu_prof_maybe_print();
     stream_report_maybe(stream_mb);
     answer
@@ -962,7 +939,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
 
 /// Snapshots the current state (caches + last logits) to a .mkmem file.
 fn save_memory(model: &model::Model, path: &str) {
-    match crate::mkmem::save(model, &model.last_logits, path) {
+    match crate::memory::memory_pack::save(model, &model.last_logits, path) {
         Ok(()) => println!("memory saved: {}", path),
         Err(e) => {
             eprintln!("error: cannot write {}: {}", path, e);
@@ -977,11 +954,11 @@ fn save_memory(model: &model::Model, path: &str) {
 fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Option<String>, chat: bool, stream_mb: Option<usize>) {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
-    if crate::weights::read_config(&mp).ds.is_some() {
+    if crate::quant::weights::read_config(&mp).ds.is_some() {
         eprintln!("error: prefill is only supported for K3 models (not DeepSeek-V4)");
         std::process::exit(1);
     }
-    let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
+    let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -995,7 +972,7 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
         model.prefill(&ids, 0);
     }
     save_memory(&model, save);
-    crate::cms::finish();
+    crate::stream::route_sketch::finish();
     let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
     println!("prefill: {} tokens ingested in {:.1?} - state saved to {} ({:.1} KB)", ids.len(), tp.elapsed(), save, size as f64 / 1024.0);
     stream_report_maybe(stream_mb);
@@ -1018,13 +995,13 @@ fn routestats_cmd(args: &[String]) {
     let out = value_flag(args, "--out").unwrap_or_else(|| "routecms.bin".to_string());
     let mp = model_flag(args);
     let mp_path = mp.clone().unwrap_or_else(bin_path);
-    if crate::weights::read_config(&mp_path).ds.is_some() {
+    if crate::quant::weights::read_config(&mp_path).ds.is_some() {
         eprintln!("error: routestats is only supported for K3 models (not DeepSeek-V4)");
         std::process::exit(1);
     }
-    cms::start(&out);
+    stream::route_sketch::start(&out);
     run_inference(&prompt, max_new, false, &mp, vocab_flag(args), false, args.iter().any(|a| a == "--raw"), &None, &None, &mut sampler_flag(args), stream_ram_flag(args));
-    cms::finish();
+    stream::route_sketch::finish();
 }
 
 /// `microkimi absorb file.txt --out pack.mkmem`: reads a document from disk
@@ -1064,14 +1041,14 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
-    if crate::weights::read_config(&mp).ds.is_some() {
+    if crate::quant::weights::read_config(&mp).ds.is_some() {
         if stream_mb.is_some() {
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
         }
         return chat_loop_ds(&mp, vocab, debug_routing, raw);
     }
-    let tok = load_any_tokenizer(&mp, vocab, crate::weights::read_config(&mp).vocab);
+    let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -1080,7 +1057,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     // top of the loaded state (the history lives in the caches, no re-prefill).
     let mut init_logits = None;
     if let Some(m) = &memory {
-        match crate::mkmem::load(&mut model, m) {
+        match crate::memory::memory_pack::load(&mut model, m) {
             Ok(l) => {
                 println!("memory loaded: {}", m);
                 init_logits = Some(l);
@@ -1103,9 +1080,9 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     let pck = if raw || resumed || sampler.spec > 0 || sampler.spec_rosa > 0 {
         None
     } else {
-        let p = pck::open(&mp);
+        let p = memory::prefix_cache::open(&mp);
         if p.is_some() {
-            crate::kda_chunk::force_sequential();
+            crate::model::kda_chunk::force_sequential();
         }
         p
     };
@@ -1147,14 +1124,14 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
             history.push((q.to_string(), answer));
         } else {
             let ids = tok.encode_chat(&history, q);
-            let answer = pck::run_turn_chat(pck.as_ref(), &ids, 200, &tok, &mut model, debug_routing, tok.end_of_msg(), sampler);
+            let answer = memory::prefix_cache::run_turn_chat(pck.as_ref(), &ids, 200, &tok, &mut model, debug_routing, tok.end_of_msg(), sampler);
             history.push((q.to_string(), answer));
         }
     }
     if let Some(s) = &save {
         save_memory(&model, s);
     }
-    crate::cms::finish();
+    crate::stream::route_sketch::finish();
     stream_report_maybe(stream_mb);
 }
 
@@ -1162,7 +1139,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
 fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool) {
     use std::io::Write;
     let tl = Instant::now();
-    let tok = load_ds_any_tokenizer(mp, vocab, crate::weights::read_config(mp).vocab);
+    let tok = load_ds_any_tokenizer(mp, vocab, crate::quant::weights::read_config(mp).vocab);
     let mut model = deepseek::DsModel::load(mp);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     if raw {
@@ -1256,7 +1233,7 @@ pub fn ds_tokenizer_path(model_path: &str, vocab: Option<String>) -> String {
     }
     std::fs::create_dir_all(&cache).ok();
     println!("downloading tokenizer.json from huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731 …");
-    let data = crate::http::fetch(
+    let data = crate::stream::http::fetch(
         "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/tokenizer.json",
     )
     .expect("failed to download the V4 tokenizer.json (no local file found)");
@@ -1304,7 +1281,7 @@ pub fn tokenizer_path() -> String {
     }
     std::fs::create_dir_all(&cache).ok();
     println!("downloading tiktoken.model from huggingface.co/moonshotai/Kimi-K3 …");
-    let data = crate::http::fetch(
+    let data = crate::stream::http::fetch(
         "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/tiktoken.model",
     )
     .expect("failed to download tiktoken.model (no local file found)");

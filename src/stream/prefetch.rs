@@ -67,12 +67,12 @@ pub fn lookahead_on() -> bool {
 // tokens for real (model.rs moe_prefill), so the experts it will pull are
 // predictable BEFORE the pass starts. Both proposers draft tokens that
 // already occurred in the committed context (n-gram: verbatim lift; Rosa:
-// frequency chain resolved to a source occurrence by spec.rs), and every
+// frequency chain resolved to a source occurrence by model/spec.rs), and every
 // ingested position had its top-k router picks recorded below (real hidden
 // states - routing the token EMBEDDINGS through the routers instead was
 // measured at ~0% recall: embeddings are too far from the hidden states
 // the routers actually see). The prediction for a drafted token is the
-// recorded routing of its source occurrence: spec.rs hands the source
+// recorded routing of its source occurrence: model/spec.rs hands the source
 // positions to Model::draft_prefetch, which unions the recorded top-k sets
 // and background-fetches them here while the verification pass runs, so
 // its warm_batch finds the experts already in the RAM LRU. Same contract
@@ -174,7 +174,7 @@ pub fn route_hist_clear() {
 // The router picks do not depend on the cache contents, so every demand
 // request ExpertCache::get serves can be recorded as an ordered (layer,
 // expert) stream and replayed OFFLINE under any cache policy and capacity
-// (see tools_replay.rs, `microkimi cachereplay`): one traced run yields the
+// (see tools/replay.rs, `microkimi cachereplay`): one traced run yields the
 // whole hit-rate vs capacity curve without rerunning the model.
 //
 // Trace format: raw little-endian record stream, no header. One record per
@@ -223,7 +223,7 @@ pub(super) fn trace_record(layer: u32, expert: u32) {
 // blind in: session COLD START (the Markov has observed no transition yet)
 // and a mid-session TOPIC CHANGE (its decayed statistics describe the old
 // topic). A compact per-layer expert histogram of every past session is
-// kept in <model>.routes (routes.rs); the demand stream of the CURRENT
+// kept in <model>.routes (route_history.rs); the demand stream of the CURRENT
 // session builds the same signature, and once it resembles a stored session
 // (cosine >= TSIM_THRESHOLD), that session's per-layer top experts become
 // the prefetch source for a cold window:
@@ -292,7 +292,7 @@ pub fn tracesim_on() -> bool {
 /// book-keeping prefetch jobs need (same affine-layout trick as Predictor).
 pub(super) struct TraceSim {
     path: String,                      // <model>.routes
-    store: crate::routes::RouteStore,  // past sessions
+    store: crate::stream::route_history::RouteStore,  // past sessions
     cur: HashMap<u32, HashMap<u32, u32>>, // current session: layer -> expert -> count
     recent: VecDeque<(u32, u32)>,      // sliding window for rupture re-matches
     reqs: u64,
@@ -309,7 +309,7 @@ pub(super) struct TraceSim {
 }
 
 impl TraceSim {
-    pub(super) fn new(path: String, store: crate::routes::RouteStore) -> TraceSim {
+    pub(super) fn new(path: String, store: crate::stream::route_history::RouteStore) -> TraceSim {
         TraceSim {
             path,
             store,
@@ -363,7 +363,7 @@ impl TraceSim {
 
     /// Match attempt of the current signature against the stored sessions.
     fn try_match(&mut self, counts: &HashMap<u32, HashMap<u32, u32>>, n: usize, layer: u32) -> Vec<PrefetchJob> {
-        let cur = crate::routes::Session::from_counts(counts);
+        let cur = crate::stream::route_history::Session::from_counts(counts);
         let Some((idx, sim)) = self.store.best_match(&cur, TSIM_THRESHOLD) else { return Vec::new() };
         if self.matched == Some(idx) {
             return Vec::new();
@@ -480,8 +480,8 @@ impl TraceSim {
         if self.reqs < MIN_SAVE_REQS {
             return;
         }
-        let s = crate::routes::Session::from_counts(&self.cur);
-        match crate::routes::RouteStore::append(&self.path, s) {
+        let s = crate::stream::route_history::Session::from_counts(&self.cur);
+        match crate::stream::route_history::RouteStore::append(&self.path, s) {
             Ok(n) => println!("stream-tracesim: session appended to {} ({} requests, {} sessions stored)", self.path, self.reqs, n),
             Err(e) => eprintln!("warning: cannot write {}: {}", self.path, e),
         }

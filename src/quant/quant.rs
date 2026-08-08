@@ -9,7 +9,7 @@
 // indices it serves, and a single global codebook measured good enough
 // (see the microquant report).
 //
-// The codebook is trained by `microkimi slice --cold-vq` (slice.rs) with the
+// The codebook is trained by `microkimi slice --cold-vq` (tools/slice.rs) with the
 // Lloyd k-means below, over a seeded reservoir sample of the dequantized
 // cold-expert values. Everything is deterministic: splitmix64 RNG, fixed
 // iteration count, ties broken by lowest index.
@@ -334,12 +334,12 @@ pub fn matvec_vq_gather(codebook: &[f32], indices: &[u8], rows: usize, cols: usi
     }
 }
 
-/// VQ1 matvec entry point: dispatches to the LUT GEMV (lutgemv.rs,
+/// VQ1 matvec entry point: dispatches to the LUT GEMV (lut_gemv.rs,
 /// bit-identical, faster on every measured shape) unless
 /// MICROKIMI_LUTGEMV=0 forces the legacy gather-dot path.
 pub fn matvec_vq(codebook: &[f32], indices: &[u8], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
-    if crate::lutgemv::enabled() {
-        crate::lutgemv::matvec_vq_lut(codebook, indices, rows, cols, x, out);
+    if crate::quant::lut_gemv::enabled() {
+        crate::quant::lut_gemv::matvec_vq_lut(codebook, indices, rows, cols, x, out);
     } else {
         matvec_vq_gather(codebook, indices, rows, cols, x, out);
     }

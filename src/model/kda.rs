@@ -96,7 +96,7 @@ fn kda_recur_step(cfg: &Config, s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], 
 }
 
 /// Test-only handle on the sequential recurrence (parity reference for the
-/// chunked prefill form in src/kda_chunk.rs).
+/// chunked prefill form in src/model/kda_chunk.rs).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kda_recur_step_pub(cfg: &Config, s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], o: &mut [f32]) {
@@ -174,7 +174,7 @@ pub(super) fn kda_forward(
 /// Batched KDA for prefill: `x` = n position rows [n * d], returns [n * d].
 /// All projections run as gemm_batch (weights streamed once for the whole
 /// prompt); the conv stays sequential over positions (tiny elementwise work)
-/// and the recurrence runs chunked (WY/UT, src/kda_chunk.rs) for n >= MIN_LEN,
+/// and the recurrence runs chunked (WY/UT, src/model/kda_chunk.rs) for n >= MIN_LEN,
 /// sequential below. Both paths update the cache exactly like n single-token
 /// calls; the sequential one is bit-identical to kda_forward per position,
 /// the chunked one deviates < 1e-4 (unit-tested).
@@ -222,8 +222,8 @@ pub(super) fn kda_prefill(
     let a_log = Model::t(data, &w.a_log);
     let dt_bias = Model::t(data, &w.dt_bias);
     let mut o = vec![0f32; n * kp];
-    if n >= crate::kda_chunk::MIN_LEN && !crate::kda_chunk::disabled() {
-        // chunked WY/UT form (src/kda_chunk.rs): same recurrence, deviation
+    if n >= crate::model::kda_chunk::MIN_LEN && !crate::model::kda_chunk::disabled() {
+        // chunked WY/UT form (src/model/kda_chunk.rs): same recurrence, deviation
         // < 1e-4 vs the sequential loop (unit-tested), much faster on long
         // prompts. Short batches (e.g. the --spec verify passes) keep the
         // sequential step below, bit-identical per position.
@@ -235,7 +235,7 @@ pub(super) fn kda_prefill(
         for t in 0..n {
             g[t * kp..(t + 1) * kp].copy_from_slice(&kda_gate(cfg, a_log, dt_bias, &g_low[t * kp..(t + 1) * kp]));
         }
-        crate::kda_chunk::kda_recur_chunked(cfg, &mut cache.s, &q, &k, &v, &g, &beta, n, &mut o);
+        crate::model::kda_chunk::kda_recur_chunked(cfg, &mut cache.s, &q, &k, &v, &g, &beta, n, &mut o);
     } else {
         for t in 0..n {
             kda_norm_head(cfg, &mut q[t * kp..(t + 1) * kp], (cfg.kda_dim as f32).powf(-0.5));

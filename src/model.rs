@@ -17,10 +17,16 @@ mod lens;
 mod moe;
 mod ops;
 mod seam;
+pub(crate) mod kda_chunk;
+#[cfg(target_os = "macos")]
+pub mod metal;
+pub mod pool;
+pub mod rosa;
+pub mod spec;
 
 use crate::config::Config;
 use crate::tokenizer::AnyTokenizer;
-use crate::weights::{BinFile, Entry};
+use crate::quant::weights::{BinFile, Entry};
 use std::time::Instant;
 
 // The public surface stays crate::model::*; submodules are private.
@@ -359,11 +365,11 @@ impl Model {
             let moe_layers: Vec<usize> = (0..cfg.n_layers).filter(|&l| cfg.is_moe(l)).collect();
             assert!(!moe_layers.is_empty(), "--stream-fallback on a MoE-less model is meaningless");
             crate::stream::set_fallback_shape(moe_layers.len() * cfg.top_k);
-            Some(crate::shadow::Shadows::load(
-                &crate::shadow::sidecar_path(path),
+            Some(crate::stream::shadow::Shadows::load(
+                &crate::stream::shadow::sidecar_path(path),
                 &moe_layers,
                 cfg.n_experts,
-                cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM,
+                cfg.routed_hidden * cfg.moe_inter / crate::quant::quant::VQ_DIM,
             ))
         } else {
             None
@@ -454,7 +460,7 @@ impl Model {
                                 .get(&format!("{}{}.{}", pfx, e, wn))
                                 .unwrap_or_else(|| panic!("missing expert: {}{}.{}", pfx, e, wn));
                             if wn == "w1" {
-                                experts_vq.push(entry.dtype == crate::weights::DTYPE_VQ1);
+                                experts_vq.push(entry.dtype == crate::quant::weights::DTYPE_VQ1);
                             }
                             entry.offset
                         })
@@ -463,7 +469,7 @@ impl Model {
                 // one global codebook shared by every VQ1 tensor (16 KB, L1-resident)
                 let vq_cb = if experts_vq.iter().any(|&v| v) {
                     let cb = bin.f32_vec("vq_codebook");
-                    assert_eq!(cb.len(), crate::quant::VQ_K * crate::quant::VQ_DIM, "vq_codebook: bad dims");
+                    assert_eq!(cb.len(), crate::quant::quant::VQ_K * crate::quant::quant::VQ_DIM, "vq_codebook: bad dims");
                     cb
                 } else {
                     Vec::new()
@@ -736,7 +742,7 @@ impl Model {
         let cfg = &self.cfg;
         let expert_packed = cfg.routed_hidden * cfg.moe_inter / 2;
         let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
-        let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM;
+        let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::quant::VQ_DIM;
         let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         let mut jobs: Vec<(u32, u32, [u64; 3], usize)> = Vec::new();
         for src in srcs.iter().flatten() {
@@ -1080,7 +1086,7 @@ mod dot_simd_tests {
             s: vec![0.0; hn * kd * kd],
         };
         let n = 200usize; // > kda_chunk::MIN_LEN, spans 4 chunks
-        assert!(n >= crate::kda_chunk::MIN_LEN);
+        assert!(n >= crate::model::kda_chunk::MIN_LEN);
         let x: Vec<f32> = (0..n * d).map(|_| rng.f32()).collect();
         let mut prof = Prof::default();
         let (mut c_chk, mut c_seq) = (new_cache(), new_cache());
@@ -1148,7 +1154,7 @@ mod q8head_tests {
 mod seam_tests {
     use super::{seam_apply, seam_load, SeamW};
     use crate::config::Config;
-    use crate::weights::{Entry, DTYPE_F32};
+    use crate::quant::weights::{Entry, DTYPE_F32};
     use std::collections::HashMap;
 
     fn entry(dims: &[u32]) -> Entry {
@@ -1227,8 +1233,8 @@ mod seam_tests {
         let (rank, d) = (3usize, 10usize);
         let a: Vec<f32> = (0..rank * d).map(|i| (i as f32 - 7.0) * 0.01).collect();
         let b: Vec<f32> = (0..d * rank).map(|i| (i as f32 - 11.0) * 0.02).collect();
-        let mut data = crate::weights::f32_to_bytes(&a);
-        data.extend_from_slice(&crate::weights::f32_to_bytes(&b));
+        let mut data = crate::quant::weights::f32_to_bytes(&a);
+        data.extend_from_slice(&crate::quant::weights::f32_to_bytes(&b));
         let w = SeamW {
             a: super::T { off: 0, len: rank * d },
             b: super::T { off: rank * d * 4, len: d * rank },

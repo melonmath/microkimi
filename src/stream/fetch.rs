@@ -158,7 +158,7 @@ pub fn default_cache_root(url: &str) -> std::path::PathBuf {
 /// persistent per-tensor disk cache: every remote byte is fetched once, ever
 /// (unless the --stream-disk rollover evicts it).
 pub struct RemoteSource {
-    st: crate::slice_st::StDir,
+    st: crate::tools::slice_st::StDir,
     cache_dir: std::path::PathBuf,
     disk_budget: u64, // bytes, 0 = unlimited (historical behavior)
     manifest: Mutex<Manifest>,
@@ -174,7 +174,7 @@ impl RemoteSource {
 
     /// Same as open, with a disk cache budget of `disk_mb` MB (0 = unlimited).
     pub fn open_disk(url: &str, cache_dir: std::path::PathBuf, kept_layers: &[usize], disk_mb: u64) -> RemoteSource {
-        let mut st = crate::slice_st::StDir::open(url, "/tmp/microkimi-stream");
+        let mut st = crate::tools::slice_st::StDir::open(url, "/tmp/microkimi-stream");
         st.resolve(kept_layers);
         std::fs::create_dir_all(&cache_dir).ok();
         let manifest = Mutex::new(Manifest::load(&cache_dir));

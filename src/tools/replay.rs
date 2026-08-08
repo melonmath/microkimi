@@ -274,7 +274,7 @@ fn flag_value(args: &[String], name: &str) -> Option<usize> {
 //
 // `microkimi routebuild store.routes trace.bin [trace2.bin ...]` converts
 // MICROKIMI_TRACE request streams into routing signature sessions appended
-// to a <model>.routes store (routes.rs): the same records the engine writes
+// to a <model>.routes store (stream/route_history.rs): the same records the engine writes
 // at exit under MICROKIMI_TRACESIM=1, built offline for benchmarking.
 //
 // `microkimi cachereplay trace.bin --tracesim store.routes [--first N]`
@@ -292,12 +292,12 @@ fn pass_of(prev_layer: u32, layer: u32) -> bool {
 }
 
 /// Builds the routing signature of one trace (per-layer expert histogram).
-fn trace_to_session(trace: &[Key]) -> crate::routes::Session {
+fn trace_to_session(trace: &[Key]) -> crate::stream::route_history::Session {
     let mut counts: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
     for &(l, e) in trace {
         *counts.entry(l).or_default().entry(e).or_insert(0) += 1;
     }
-    crate::routes::Session::from_counts(&counts)
+    crate::stream::route_history::Session::from_counts(&counts)
 }
 
 /// Reads a MICROKIMI_TRACE record stream (u32 layer LE ++ u32 expert LE).
@@ -322,14 +322,14 @@ pub fn routebuild(args: &[String]) {
     if files.len() < 2 {
         eprintln!("usage: microkimi routebuild store.routes trace.bin [trace2.bin ...]");
         eprintln!("  appends the routing signature of each MICROKIMI_TRACE stream to the");
-        eprintln!("  store (routes.rs format, the same records MICROKIMI_TRACESIM=1 writes)");
+        eprintln!("  store (stream/route_history.rs format, the same records MICROKIMI_TRACESIM=1 writes)");
         std::process::exit(1);
     }
     let store_path = files[0].as_str();
     for f in &files[1..] {
         let trace = read_trace(f);
         let session = trace_to_session(&trace);
-        let n = crate::routes::RouteStore::append(store_path, session).unwrap_or_else(|e| {
+        let n = crate::stream::route_history::RouteStore::append(store_path, session).unwrap_or_else(|e| {
             eprintln!("error: cannot write {}: {}", store_path, e);
             std::process::exit(1);
         });
@@ -345,7 +345,7 @@ pub fn routebuild(args: &[String]) {
 fn cold_row(
     trace: &[Key],
     cap: usize,
-    store: &crate::routes::RouteStore,
+    store: &crate::stream::route_history::RouteStore,
     top_k: usize,
     n_pred: usize,
     first_passes: u64,
@@ -445,7 +445,7 @@ fn cold_row(
             // cold-start match at the first wrap with enough context, then
             // an immediate chained fire (as try_match does in the engine)
             if matched.is_none() && wrap && reqs >= crate::stream::TSIM_MIN_REQS {
-                let cur = crate::routes::Session::from_counts(&counts);
+                let cur = crate::stream::route_history::Session::from_counts(&counts);
                 if let Some((idx, sim)) = store.best_match(&cur, crate::stream::TSIM_THRESHOLD) {
                     matched = Some((idx, sim));
                     matched_pass = pass;
@@ -454,7 +454,7 @@ fn cold_row(
                         .sessions
                         .iter()
                         .enumerate()
-                        .map(|(i, s)| (i, crate::routes::top_overlap(&cur, s, top_k)))
+                        .map(|(i, s)| (i, crate::stream::route_history::top_overlap(&cur, s, top_k)))
                         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
                     fire(&mut lru, l, pass, matched_pass, matched, &mut tsim_pref);
                 }
@@ -547,7 +547,7 @@ pub fn run(args: &[String]) {
     // column replays the engine's TraceSim policy (stream.rs) mirrored by
     // cold_row above.
     if let Some(store_path) = tsim_store {
-        let store = crate::routes::RouteStore::load(&store_path).unwrap_or_else(|e| {
+        let store = crate::stream::route_history::RouteStore::load(&store_path).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });

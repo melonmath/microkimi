@@ -119,8 +119,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 pub fn matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
     #[cfg(target_os = "macos")]
     {
-        if gpu_on() && rows * cols >= GPU_MIN_ELEMS && crate::metal::gpu_available() {
-            crate::metal::gpu_matvec(w, rows, cols, x, out);
+        if gpu_on() && rows * cols >= GPU_MIN_ELEMS && crate::model::metal::gpu_available() {
+            crate::model::metal::gpu_matvec(w, rows, cols, x, out);
             return;
         }
     }
@@ -132,7 +132,7 @@ pub fn matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
 /// into rows. The pool barrier guarantees the validity of the raw pointers
 /// captured by the jobs.
 pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
-    let p = crate::pool::pool();
+    let p = crate::model::pool::pool();
     let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
     if njobs <= 1 {
         for (r, o) in out.iter_mut().enumerate() {
@@ -141,10 +141,10 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
         return;
     }
     let chunk = rows.div_ceil(njobs);
-    let wp = crate::pool::SPtr(w.as_ptr());
-    let xp = crate::pool::SPtr(x.as_ptr());
-    let op = crate::pool::MPtr(out.as_mut_ptr());
-    let mut jobs: Vec<crate::pool::Job> = Vec::new();
+    let wp = crate::model::pool::SPtr(w.as_ptr());
+    let xp = crate::model::pool::SPtr(x.as_ptr());
+    let op = crate::model::pool::MPtr(out.as_mut_ptr());
+    let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
     for j in 0..njobs {
         let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
         if r0 >= r1 {
@@ -196,9 +196,9 @@ impl Q8Head {
         let nb = cols / 32;
         let mut q = vec![0i8; rows * cols];
         let mut scales = vec![0f32; rows * nb];
-        let mut scratch = crate::q8::Q8Vec::new();
+        let mut scratch = crate::quant::q8::Q8Vec::new();
         for r in 0..rows {
-            crate::q8::quantize_q8_into(&w[r * cols..(r + 1) * cols], &mut scratch);
+            crate::quant::q8::quantize_q8_into(&w[r * cols..(r + 1) * cols], &mut scratch);
             q[r * cols..(r + 1) * cols].copy_from_slice(&scratch.q);
             scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
         }
@@ -210,8 +210,8 @@ impl Q8Head {
     pub(super) fn matvec(&self, x: &[f32], out: &mut [f32]) {
         let (rows, cols) = (self.rows, self.cols);
         let nb = cols / 32;
-        let xq = crate::q8::quantize_q8(x);
-        let p = crate::pool::pool();
+        let xq = crate::quant::q8::quantize_q8(x);
+        let p = crate::model::pool::pool();
         let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
         if njobs <= 1 {
             for (r, o) in out.iter_mut().enumerate() {
@@ -220,12 +220,12 @@ impl Q8Head {
             return;
         }
         let chunk = rows.div_ceil(njobs);
-        let qp = crate::pool::SPtrU8(self.q.as_ptr() as *const u8);
-        let sp = crate::pool::SPtr(self.scales.as_ptr());
-        let xp = crate::pool::SPtrU8(xq.q.as_ptr() as *const u8);
-        let xsp = crate::pool::SPtr(xq.scales.as_ptr());
-        let op = crate::pool::MPtr(out.as_mut_ptr());
-        let mut jobs: Vec<crate::pool::Job> = Vec::new();
+        let qp = crate::model::pool::SPtrU8(self.q.as_ptr() as *const u8);
+        let sp = crate::model::pool::SPtr(self.scales.as_ptr());
+        let xp = crate::model::pool::SPtrU8(xq.q.as_ptr() as *const u8);
+        let xsp = crate::model::pool::SPtr(xq.scales.as_ptr());
+        let op = crate::model::pool::MPtr(out.as_mut_ptr());
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
         for j in 0..njobs {
             let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
             if r0 >= r1 {
@@ -243,7 +243,7 @@ impl Q8Head {
                     for r in r0..r1 {
                         let mut acc = 0f32;
                         for g in 0..nb {
-                            let idot = crate::q8::block_dot_i8(&q[r * cols + g * 32..r * cols + g * 32 + 32], &xq8[g * 32..g * 32 + 32]);
+                            let idot = crate::quant::q8::block_dot_i8(&q[r * cols + g * 32..r * cols + g * 32 + 32], &xq8[g * 32..g * 32 + 32]);
                             acc += ws[r * nb + g] * xs[g] * idot as f32;
                         }
                         out[r] = acc;
@@ -254,13 +254,13 @@ impl Q8Head {
         p.run(jobs);
     }
 
-    fn row_dot(&self, r: usize, xq: &crate::q8::Q8Vec) -> f32 {
+    fn row_dot(&self, r: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
         let nb = self.cols / 32;
         let wq = &self.q[r * self.cols..(r + 1) * self.cols];
         let ws = &self.scales[r * nb..(r + 1) * nb];
         let mut acc = 0f32;
         for g in 0..nb {
-            let idot = crate::q8::block_dot_i8(&wq[g * 32..g * 32 + 32], &xq.q[g * 32..g * 32 + 32]);
+            let idot = crate::quant::q8::block_dot_i8(&wq[g * 32..g * 32 + 32], &xq.q[g * 32..g * 32 + 32]);
             acc += ws[g] * xq.scales[g] * idot as f32;
         }
         acc
@@ -484,18 +484,18 @@ pub fn gemm_batch(w: &[f32], rows: usize, cols: usize, x: &[f32], n: usize, out:
     } else {
         None
     };
-    let p = crate::pool::pool();
+    let p = crate::model::pool::pool();
     let njobs = (rows * cols * n / 240_000).clamp(1, p.workers).min(rows);
     if njobs <= 1 {
         gemm_rows(w, rows, cols, x, xt.as_deref(), n, out, 0, rows);
         return;
     }
     let chunk = rows.div_ceil(njobs);
-    let wp = crate::pool::SPtr(w.as_ptr());
-    let xp = crate::pool::SPtr(x.as_ptr());
-    let xtp = xt.as_ref().map(|v| crate::pool::SPtr(v.as_ptr()));
-    let op = crate::pool::MPtr(out.as_mut_ptr());
-    let mut jobs: Vec<crate::pool::Job> = Vec::new();
+    let wp = crate::model::pool::SPtr(w.as_ptr());
+    let xp = crate::model::pool::SPtr(x.as_ptr());
+    let xtp = xt.as_ref().map(|v| crate::model::pool::SPtr(v.as_ptr()));
+    let op = crate::model::pool::MPtr(out.as_mut_ptr());
+    let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
     for j in 0..njobs {
         let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
         if r0 >= r1 {
@@ -605,7 +605,7 @@ pub(super) fn attn_res_refs(cfg: &Config, prefix: &[f32], blocks: &[&[f32]], w: 
 /// decoded row. Outputs are independent per (row, tile), so the swap and
 /// the hoisted decode keep the result bit-identical.
 pub(crate) fn matvec_packed_nt(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xt: &[f32], m: usize, out: &mut [f32]) {
-    use crate::mxfp4::{E2M1, exp2_i};
+    use crate::quant::mxfp4::{E2M1, exp2_i};
     debug_assert_eq!(cols % 32, 0);
     debug_assert_eq!(m % 8, 0);
     let mut wrow = vec![0f32; cols];

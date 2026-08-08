@@ -181,11 +181,11 @@ pub fn calibrate_cmd(args: &[String]) {
         }
     };
     let mp = crate::model_flag(args).unwrap_or_else(crate::bin_path);
-    if crate::weights::read_config(&mp).ds.is_some() {
+    if crate::quant::weights::read_config(&mp).ds.is_some() {
         eprintln!("error: calibrate is only supported for K3 models (not DeepSeek-V4)");
         std::process::exit(1);
     }
-    let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::weights::read_config(&mp).vocab);
+    let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     let mut model = crate::model::Model::load(&mp);
     crate::check_tok_compat(&tok, &model);
     let cfg_n_layers = model.cfg.n_layers;

@@ -27,8 +27,8 @@
 // full-precision one. OFF by default; opt in with --stream-fallback or
 // MICROKIMI_STREAM_FALLBACK=1.
 
-use crate::quant::{VQ_DIM, VQ_K};
-use crate::weights::{BinFile, DTYPE_MXFP4, DTYPE_MXFP4SQ, DTYPE_VQ1};
+use crate::quant::quant::{VQ_DIM, VQ_K};
+use crate::quant::weights::{BinFile, DTYPE_MXFP4, DTYPE_MXFP4SQ, DTYPE_VQ1};
 
 /// Sidecar magic.
 pub const MAGIC: &[u8; 8] = b"MKSH0001";
@@ -125,7 +125,7 @@ fn dequant_tensor(bin: &BinFile, name: &str, vq1_cb: &Option<Vec<f32>>) -> (Vec<
     let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
     let blob = &bin.data[e.offset as usize..(e.offset + e.size) as usize];
     match e.dtype {
-        DTYPE_MXFP4 | DTYPE_MXFP4SQ => (crate::mxfp4::dequant_any(e.dtype, blob, r, c), r, c),
+        DTYPE_MXFP4 | DTYPE_MXFP4SQ => (crate::quant::mxfp4::dequant_any(e.dtype, blob, r, c), r, c),
         DTYPE_VQ1 => {
             let cb = vq1_cb.as_ref().expect("VQ1 expert tensor without a vq_codebook tensor");
             let mut w = vec![0f32; r * c];
@@ -179,7 +179,7 @@ fn build(model: &str, out: &str) {
 
     // ── 1. codebook: seeded reservoir over the first SHADOW_TRAIN_LAYERS MoE
     // layers (all their experts), then Lloyd k-means ──
-    let mut rng = crate::quant::Rng::new(SHADOW_SEED);
+    let mut rng = crate::quant::quant::Rng::new(SHADOW_SEED);
     let mut res: Vec<f32> = Vec::new();
     let mut seen = 0u64;
     for &l in moe_layers.iter().take(SHADOW_TRAIN_LAYERS) {
@@ -203,7 +203,7 @@ fn build(model: &str, out: &str) {
         println!("shadow: sampled layer {} ({} vectors offered so far)", l, seen);
     }
     let t = std::time::Instant::now();
-    let cb = crate::quant::train_codebook(&res, SHADOW_SEED);
+    let cb = crate::quant::quant::train_codebook(&res, SHADOW_SEED);
     println!(
         "shadow: global codebook ({}x{}) trained on {}/{} sampled vectors ({} MoE layers) in {:.1?}",
         VQ_K,
@@ -238,8 +238,8 @@ fn build(model: &str, out: &str) {
                     for (wi, wn) in ["w1", "w2", "w3"].iter().enumerate() {
                         let name = format!("layers.{}.block_sparse_moe.experts.{}.{}", l, e, wn);
                         let (w, _, _) = dequant_tensor(binp, &name, vq1p);
-                        let idx = crate::quant::quantize(&w, cbp);
-                        err_sum += crate::quant::rel_error(&w, &idx, cbp);
+                        let idx = crate::quant::quant::quantize(&w, cbp);
+                        err_sum += crate::quant::quant::rel_error(&w, &idx, cbp);
                         dchunk[base + wi * vq_blob..base + (wi + 1) * vq_blob].copy_from_slice(&idx);
                     }
                 }
@@ -265,7 +265,7 @@ fn build(model: &str, out: &str) {
     }
     outb.extend_from_slice(&data);
     std::fs::write(out, &outb).unwrap_or_else(|e| panic!("{} unwritable: {}", out, e));
-    let mxfp4_bytes: u64 = bin.entries.iter().filter(|(n, _)| crate::weights::is_expert_tensor(n)).map(|(_, e)| e.size).sum();
+    let mxfp4_bytes: u64 = bin.entries.iter().filter(|(n, _)| crate::quant::weights::is_expert_tensor(n)).map(|(_, e)| e.size).sum();
     println!(
         "shadow: {} MoE layers x {} experts, {} B/expert ({} B/matrix) + 16 KB codebook",
         moe_layers.len(),

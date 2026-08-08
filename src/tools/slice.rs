@@ -11,7 +11,7 @@
 // Expert reordering (--expert-order=frequency --route-cms SKETCH): no
 // pruning, ALL experts stay; per MoE layer the expert blobs are physically
 // rewritten in descending routing-frequency order (the count-min sketch
-// recorded with MICROKIMI_ROUTECMS, cms.rs), hottest first, densely packed
+// recorded with MICROKIMI_ROUTECMS, stream/route_sketch.rs), hottest first, densely packed
 // (64-byte alignment). The router gate rows and bias are permuted with the
 // same order, so expert ids are simply relabeled and the model is
 // mathematically unchanged: any engine reads the reordered .bin, and old
@@ -80,8 +80,8 @@
 // them). Zero requantization loss. All sliced tensors are f32 and stay f32.
 
 use crate::config::Config;
-use crate::slice_st::{StArch, StDir};
-use crate::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_MXFP4SQ, DTYPE_VQ1, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
+use crate::tools::slice_st::{StArch, StDir};
+use crate::quant::weights::{BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_MXFP4SQ, DTYPE_VQ1, MAGIC, MAGIC_V2, blob_size, f32_to_bytes};
 use std::io::Read;
 
 /// Row chunk for streaming f32 processing (~256 MB of f32 per chunk: the
@@ -526,7 +526,7 @@ fn expert_norm_sq(blob_w1: &[u8], blob_w2: &[u8], blob_w3: &[u8], rows_cols: [(u
     let mut s = 0f64;
     for (blob, &(r, c)) in [blob_w1, blob_w2, blob_w3].iter().zip(rows_cols.iter()) {
         let np = r * c / 2;
-        let w = crate::mxfp4::dequant(&blob[..np], &blob[np..], r, c);
+        let w = crate::quant::mxfp4::dequant(&blob[..np], &blob[np..], r, c);
         s += w.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
     }
     s
@@ -699,9 +699,9 @@ fn vq_reservoir(
     cold: &std::collections::HashMap<usize, Vec<usize>>,
     cap: usize,
     seed: u64,
-    im: Option<&crate::imatrix::Imatrix>,
+    im: Option<&crate::quant::imatrix::Imatrix>,
 ) -> (Vec<f32>, Option<Vec<f32>>) {
-    use crate::quant::{Rng, VQ_DIM};
+    use crate::quant::quant::{Rng, VQ_DIM};
     let cfg = src.config();
     let moe_layers: Vec<usize> = kept_layers.iter().copied().filter(|&l| cfg.is_moe(l)).collect();
     let mut rng = Rng::new(seed);
@@ -748,7 +748,7 @@ fn vq_reservoir(
                 assert!(matches!(entry.dtype, DTYPE_MXFP4 | DTYPE_MXFP4SQ), "{} is not an mxfp4 flavor", name);
                 let blob = src.raw_blob(entry);
                 let (r, c) = (entry.dims[0] as usize, entry.dims[1] as usize);
-                let w = crate::mxfp4::dequant_any(entry.dtype, &blob, r, c);
+                let w = crate::quant::mxfp4::dequant_any(entry.dtype, &blob, r, c);
                 let cw = im.and_then(|im| im.col_weights(l, wn));
                 feed(&w, cw.as_deref(), c / VQ_DIM, &mut res, &mut wres, &mut rng, &mut seen);
             }
@@ -773,9 +773,9 @@ fn vq_quantize_tensor(
 ) -> (Vec<u8>, f64, Option<f64>) {
     assert!(matches!(e.dtype, DTYPE_MXFP4 | DTYPE_MXFP4SQ), "{} is not an mxfp4 flavor", e.name);
     let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
-    assert_eq!(c % crate::quant::VQ_DIM, 0, "{}: cols {} not a multiple of {}", e.name, c, crate::quant::VQ_DIM);
+    assert_eq!(c % crate::quant::quant::VQ_DIM, 0, "{}: cols {} not a multiple of {}", e.name, c, crate::quant::quant::VQ_DIM);
     let blob = src.raw_blob(e);
-    let w = crate::mxfp4::dequant_any(e.dtype, &blob, r, c);
+    let w = crate::quant::mxfp4::dequant_any(e.dtype, &blob, r, c);
     // per-column importance -> per-element weights (same row of c weights
     // repeated r times; expert matrices are small enough to materialize it)
     let expand = |cw: &[f32]| -> Vec<f32> {
@@ -789,11 +789,11 @@ fn vq_quantize_tensor(
     let quant_w = quant_col_w.map(expand);
     let score_w = score_col_w.map(expand);
     let idx = match &quant_w {
-        Some(wv) => crate::quant::quantize_weighted(&w, wv, codebook),
-        None => crate::quant::quantize(&w, codebook),
+        Some(wv) => crate::quant::quant::quantize_weighted(&w, wv, codebook),
+        None => crate::quant::quant::quantize(&w, codebook),
     };
-    let err = crate::quant::rel_error(&w, &idx, codebook);
-    let werr = score_w.map(|wv| crate::quant::rel_error_weighted(&w, &wv, &idx, codebook));
+    let err = crate::quant::quant::rel_error(&w, &idx, codebook);
+    let werr = score_w.map(|wv| crate::quant::quant::rel_error_weighted(&w, &wv, &idx, codebook));
     (idx, err, werr)
 }
 
@@ -1398,7 +1398,7 @@ pub fn run(args: &[String]) {
     let vocab_base = value_flag(args, "--vocab-base");
     // --expert-order=frequency --route-cms SKETCH: physical reorder of the
     // expert blobs of every MoE layer by descending routing frequency (the
-    // count-min sketch recorded with MICROKIMI_ROUTECMS, cms.rs), hottest
+    // count-min sketch recorded with MICROKIMI_ROUTECMS, stream/route_sketch.rs), hottest
     // expert first. The router gate rows and bias are permuted with the same
     // order, so expert ids are simply relabeled: the model is mathematically
     // unchanged, any engine reads the reordered .bin (old engines included)
@@ -1446,10 +1446,10 @@ pub fn run(args: &[String]) {
     // --imatrix-score-only: load the same stats but only to REPORT the
     // activation-weighted error of the blind codebook (A/B measurement).
     let imatrix_score_only = args.iter().any(|a| a == "--imatrix-score-only");
-    let imatrix: Option<crate::imatrix::Imatrix> = match value_flag(args, "--imatrix") {
+    let imatrix: Option<crate::quant::imatrix::Imatrix> = match value_flag(args, "--imatrix") {
         Some(p) => {
             assert!(cold_vq.is_some(), "--imatrix only applies to --cold-vq");
-            let im = crate::imatrix::load(&p).unwrap_or_else(|e| {
+            let im = crate::quant::imatrix::load(&p).unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             });
@@ -1496,7 +1496,7 @@ pub fn run(args: &[String]) {
     let mut eorder_key = String::new();
     let expert_order: Option<std::collections::HashMap<usize, Vec<usize>>> = expert_order_flag.as_ref().map(|_| {
         let path = route_cms_path.as_deref().unwrap();
-        let sketch = crate::cms::Cms::load(path).unwrap_or_else(|e| {
+        let sketch = crate::stream::route_sketch::Cms::load(path).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
@@ -1647,13 +1647,13 @@ pub fn run(args: &[String]) {
                     let train_im = if imatrix_score_only { None } else { imatrix.as_ref() };
                     let (samples, sample_w) = vq_reservoir(&source, &kept_layers, &cold, 300_000, seed, train_im);
                     let cb = match &sample_w {
-                        Some(sw) => crate::quant::train_codebook_weighted(&samples, sw, seed),
-                        None => crate::quant::train_codebook(&samples, seed),
+                        Some(sw) => crate::quant::quant::train_codebook_weighted(&samples, sw, seed),
+                        None => crate::quant::quant::train_codebook(&samples, seed),
                     };
                     println!(
                         "vq: global codebook ({}x{}) trained in {:.1?}{}",
-                        crate::quant::VQ_K,
-                        crate::quant::VQ_DIM,
+                        crate::quant::quant::VQ_K,
+                        crate::quant::quant::VQ_DIM,
                         t.elapsed(),
                         if sample_w.is_some() { " (activation-weighted)" } else { "" }
                     );
@@ -1761,7 +1761,7 @@ pub fn run(args: &[String]) {
         plans.push(Plan {
             out_name: "vq_codebook".to_string(),
             dtype: DTYPE_F32,
-            dims: vec![crate::quant::VQ_K as u32, crate::quant::VQ_DIM as u32],
+            dims: vec![crate::quant::quant::VQ_K as u32, crate::quant::quant::VQ_DIM as u32],
             src_name: String::new(),
             role: Role::Copy,
             channels: Vec::new(),
@@ -1935,7 +1935,7 @@ pub fn run(args: &[String]) {
             println!("  {}/{} tensors written ({:.0?})", done, plans.len(), t0.elapsed());
         }
         if source.is_remote() {
-            let fb = crate::http::fetched_bytes();
+            let fb = crate::stream::http::fetched_bytes();
             if fb - last_fetch_report >= (1 << 30) {
                 last_fetch_report = fb;
                 println!("  fetched {:.2} GB so far ({}/{} tensors written)", fb as f64 / 1e9, done, plans.len());
@@ -1957,8 +1957,8 @@ pub fn run(args: &[String]) {
     if source.is_remote() {
         println!(
             "  bandwidth: {:.3} GB fetched in {} HTTP range requests",
-            crate::http::fetched_bytes() as f64 / 1e9,
-            crate::http::fetched_requests()
+            crate::stream::http::fetched_bytes() as f64 / 1e9,
+            crate::stream::http::fetched_requests()
         );
     }
     println!("  config: {} layers (MLA {:?}, dense {:?}), hidden {}, {} experts top-{}", 
@@ -1972,7 +1972,7 @@ pub fn run(args: &[String]) {
         println!(
             "  cold-vq: {} tensors requantized to VQ1 ({} B/expert-matrix + one 16 KB global codebook), mean rel Frobenius error {:.3}",
             vq_err_n,
-            cfg.moe_inter * cfg.routed_hidden / crate::quant::VQ_DIM,
+            cfg.moe_inter * cfg.routed_hidden / crate::quant::quant::VQ_DIM,
             vq_err_sum / vq_err_n as f64
         );
         if imatrix.is_some() {

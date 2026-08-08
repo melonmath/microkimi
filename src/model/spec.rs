@@ -99,11 +99,11 @@ fn source_of(ctx: &[u32], prop: &[u32]) -> Option<(usize, usize)> {
 }
 
 /// Draft proposer: the plain bounded n-gram scan above, or the incremental
-/// suffix automaton (--spec-rosa, src/rosa.rs) fed with every committed
+/// suffix automaton (--spec-rosa, src/model/rosa.rs) fed with every committed
 /// token. Same contract: up to `n` candidate tokens, verified by the model.
 enum Proposer {
     NGram,
-    Rosa(crate::rosa::SuffixAutomaton),
+    Rosa(crate::model::rosa::SuffixAutomaton),
 }
 
 impl Proposer {
@@ -147,7 +147,7 @@ pub fn run_turn_spec(
 ) -> String {
     let k = sampler.spec.max(sampler.spec_rosa);
     let mut proposer = if sampler.spec_rosa > 0 {
-        let mut a = crate::rosa::SuffixAutomaton::new();
+        let mut a = crate::model::rosa::SuffixAutomaton::new();
         for &t in ids {
             a.feed(t); // the prompt is already committed context
         }

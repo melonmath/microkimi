@@ -40,7 +40,7 @@
 // legacy path, MICROKIMI_LUTGEMV=1 forces this one. Only the decode GEMV
 // is routed here; the batched prefill path (matvec_vq_nt) is unchanged.
 
-use crate::quant::{VQ_DIM, VQ_K};
+use crate::quant::quant::{VQ_DIM, VQ_K};
 
 /// Groups of indices (one LUT of 256 f32 = 1 KB each) built and swept per
 /// tile. 16 KB of hot tables: L1-resident next to the index stream and the
@@ -240,7 +240,7 @@ pub fn matvec_vq_lut(codebook: &[f32], indices: &[u8], rows: usize, cols: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant::{matvec_vq_gather, quantize, train_codebook};
+    use crate::quant::quant::{matvec_vq_gather, quantize, train_codebook};
 
     /// deterministic filler (splitmix64), same as the dot_simd tests
     struct Rng(u64);

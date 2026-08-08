@@ -42,7 +42,7 @@ pub(super) fn seam_load(cfg: &Config, entries: &std::collections::HashMap<String
         cfg.n_layers
     );
     for (name, e) in [("seam.A", ea), ("seam.B", eb)] {
-        assert_eq!(e.dtype, crate::weights::DTYPE_F32, "{}: dtype {}, only fp32", name, e.dtype);
+        assert_eq!(e.dtype, crate::quant::weights::DTYPE_F32, "{}: dtype {}, only fp32", name, e.dtype);
         assert_eq!(e.dims.len(), 2, "{}: dims {:?}, expected a 2D matrix", name, e.dims);
     }
     let (rank, d) = (ea.dims[0] as usize, ea.dims[1] as usize);

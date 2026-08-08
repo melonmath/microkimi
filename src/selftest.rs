@@ -158,7 +158,7 @@ pub fn run() {
         let cols = j.get("cols").unwrap().as_num().unwrap() as usize;
         let packed: Vec<u8> = arr(j, "packed").iter().map(|&x| x as u8).collect();
         let scales: Vec<u8> = arr(j, "scales").iter().map(|&x| x as u8).collect();
-        let w = crate::mxfp4::dequant(&packed, &scales, rows, cols);
+        let w = crate::quant::mxfp4::dequant(&packed, &scales, rows, cols);
         all_ok &= check("MXFP4 dequant", &w, &arr(j, "W"));
     }
 
@@ -207,11 +207,11 @@ pub fn run_ds() {
         let cols = j.get("cols").unwrap().as_num().unwrap() as usize;
         let packed: Vec<u8> = arr(j, "w_packed").iter().map(|&x| x as u8).collect();
         let scales: Vec<u8> = arr(j, "scales").iter().map(|&x| x as u8).collect();
-        let w = crate::dequant::dequant_fp8(&packed, &scales, rows, cols);
+        let w = crate::quant::dequant::dequant_fp8(&packed, &scales, rows, cols);
         ok &= check("DS fp8 e4m3 dequant (torch golden)", &w, &arr(j, "dequant"));
         // quantize path: my quantize_fp8 of the ORIGINAL matrix must reproduce the
         // torch-packed bytes exactly (same scale rule + nearest-even cast)
-        let (qw, qs) = crate::dequant::quantize_fp8(&arr(j, "w_orig"), rows, cols);
+        let (qw, qs) = crate::quant::dequant::quantize_fp8(&arr(j, "w_orig"), rows, cols);
         let n_diff = qw.iter().zip(&packed).filter(|(a, b)| a != b).count();
         let n_sdiff = qs.iter().zip(&scales).filter(|(a, b)| a != b).count();
         println!(
@@ -229,7 +229,7 @@ pub fn run_ds() {
         let cols = j.get("cols").unwrap().as_num().unwrap() as usize;
         let packed: Vec<u8> = arr(j, "packed").iter().map(|&x| x as u8).collect();
         let scales: Vec<u8> = arr(j, "scales").iter().map(|&x| x as u8).collect();
-        let w = crate::dequant::dequant_fp4(&packed, &scales, rows, cols);
+        let w = crate::quant::dequant::dequant_fp4(&packed, &scales, rows, cols);
         ok &= check("DS fp4 e2m1 dequant (torch golden)", &w, &arr(j, "dequant"));
     }
 
@@ -534,7 +534,7 @@ pub fn run_ds4() {
 pub fn run_packed_emul() {
     // the q8 path (default) is an approximation mode; this section compares
     // the shader emulation against the EXACT f32 CPU path, so force it off
-    crate::q8::force_q8(0);
+    crate::quant::q8::force_q8(0);
     println!("packed fp4 GPU-kernel emulation vs CPU reference (tol 1e-3 rel)");
     // deterministic pattern (integer hash -> [-1, 1]) - same as metal.rs
     let pattern = |i: usize| -> f32 {
@@ -568,12 +568,12 @@ pub fn run_packed_emul() {
         cases.push((w, rows, cols, "zero block (scale byte 0)".to_string()));
     }
     for (w, rows, cols, label) in &cases {
-        let (p, s) = crate::mxfp4::quantize(w, *rows, *cols);
+        let (p, s) = crate::quant::mxfp4::quantize(w, *rows, *cols);
         let x: Vec<f32> = (0..*cols).map(|i| pattern(i + 4242)).collect();
         let mut y_ref = vec![0f32; *rows];
-        crate::mxfp4::matvec_packed(&p, &s, *rows, *cols, &x, &mut y_ref, 1);
+        crate::quant::mxfp4::matvec_packed(&p, &s, *rows, *cols, &x, &mut y_ref, 1);
         let mut y_emul = vec![0f32; *rows];
-        crate::mxfp4::matvec_packed_shader_emul(&p, &s, *rows, *cols, &x, &mut y_emul, 256);
+        crate::quant::mxfp4::matvec_packed_shader_emul(&p, &s, *rows, *cols, &x, &mut y_emul, 256);
         let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12) as f64;
         let max_abs = y_emul.iter().zip(&y_ref).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
         let rel = max_abs / scale;
@@ -585,7 +585,7 @@ pub fn run_packed_emul() {
     }
     println!("  worst over {} cases: max_abs={:.3e} rel={:.3e}", cases.len(), worst_abs, worst_rel);
     println!();
-    crate::q8::force_q8(-1);
+    crate::quant::q8::force_q8(-1);
     if all_ok {
         println!("PACKED-EMUL OK - the Metal kernel's operation order stays within 1e-3 of the CPU path");
     } else {
@@ -618,15 +618,15 @@ pub fn run_q8() {
         (333, 1024, 4), // threaded skeleton too
     ] {
         let w: Vec<f32> = (0..rows * cols).map(&pattern).collect();
-        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        let (p, s) = crate::quant::mxfp4::quantize(&w, rows, cols);
         let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
-        crate::q8::force_q8(0);
+        crate::quant::q8::force_q8(0);
         let mut y_ref = vec![0f32; rows];
-        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, nt);
-        crate::q8::force_q8(-1);
-        let xq = crate::q8::quantize_q8(&x);
+        crate::quant::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, nt);
+        crate::quant::q8::force_q8(-1);
+        let xq = crate::quant::q8::quantize_q8(&x);
         let mut y_q8 = vec![0f32; rows];
-        crate::mxfp4::matvec_packed_q8(&p, &s, rows, cols, &xq, &mut y_q8, nt);
+        crate::quant::mxfp4::matvec_packed_q8(&p, &s, rows, cols, &xq, &mut y_q8, nt);
         let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12) as f64;
         let max_abs = y_q8.iter().zip(&y_ref).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
         let rel = max_abs / scale;

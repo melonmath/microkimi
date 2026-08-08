@@ -19,7 +19,7 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
     if e == 0 {
         return sign * (m / 8.0) * 2f32.powi(-6);
     }
-    sign * (1.0 + m / 8.0) * crate::mxfp4::exp2_i(e as i32 - 7)
+    sign * (1.0 + m / 8.0) * crate::quant::mxfp4::exp2_i(e as i32 - 7)
 }
 
 /// FP8 e4m3 weight block [rows, cols] u8 + ue8m0 scales [ceil(rows/128), ceil(cols/128)]
@@ -31,7 +31,7 @@ pub fn dequant_fp8(w: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32
     let mut out = vec![0f32; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
-            let s = crate::mxfp4::exp2_i(scales[(r / 128) * cols.div_ceil(128) + c / 128] as i32 - 127);
+            let s = crate::quant::mxfp4::exp2_i(scales[(r / 128) * cols.div_ceil(128) + c / 128] as i32 - 127);
             out[r * cols + c] = e4m3_to_f32(w[r * cols + c]) * s;
         }
     }
@@ -41,7 +41,7 @@ pub fn dequant_fp8(w: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32
 /// FP4 experts = MXFP4 layout (e2m1 low-nibble-first + ue8m0/32). Thin wrapper
 /// over mxfp4::dequant with the V4 naming for clarity at call sites.
 pub fn dequant_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32> {
-    crate::mxfp4::dequant(packed, scales, rows, cols)
+    crate::quant::mxfp4::dequant(packed, scales, rows, cols)
 }
 
 /// e4m3 quantization (for the micro builder): per-128×128 block,
@@ -62,7 +62,7 @@ pub fn quantize_fp8(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
             let e = if maxabs == 0.0 { -127 } else { (maxabs / 448.0).log2().ceil() as i32 }
                 .clamp(-127, 8);
             scales[br * (cols / 128) + bc] = (e + 127) as u8;
-            let inv = 1.0 / crate::mxfp4::exp2_i(e);
+            let inv = 1.0 / crate::quant::mxfp4::exp2_i(e);
             for r in br * 128..(br + 1) * 128 {
                 for c in bc * 128..(bc + 1) * 128 {
                     qw[r * cols + c] = f32_to_e4m3(w[r * cols + c] * inv);

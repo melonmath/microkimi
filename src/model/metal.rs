@@ -947,15 +947,15 @@ pub fn gpu_matvec_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize, x:
     assert_eq!(x.len(), cols);
     assert_eq!(y.len(), rows);
     let Some(ctx) = ctx() else {
-        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
         return;
     };
     if ctx.pipeline_fp4.is_null() {
-        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
         return;
     }
     let Some((buf_p, buf_s)) = weight_buffer_fp4(ctx, packed, scales, rows, cols) else {
-        crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+        crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
         return;
     };
 
@@ -973,7 +973,7 @@ pub fn gpu_matvec_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize, x:
             drop(io);
             msg_void(pool, sel("drain"));
             println!("gpu: fp4 i/o buffer allocation failed — falling back to CPU for this matvec");
-            crate::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
+            crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, x, y, 1);
             return;
         }
         std::ptr::copy_nonoverlapping(x.as_ptr() as *const c_void, x_ptr, x.len() * 4);
@@ -1031,7 +1031,7 @@ pub fn gputest() {
     }
     let path = crate::bin_path();
     println!("gputest — real model matvecs, CPU vs GPU ({})", path);
-    let bin = crate::weights::BinFile::open(&path);
+    let bin = crate::quant::weights::BinFile::open(&path);
 
     // Tensors present in BOTH microkimi-debug.bin and nanokimi-0.2b.bin (any config):
     // a KDA projection, an MLA projection, the MoE router, a routed projection,
@@ -1106,7 +1106,7 @@ pub fn dstest() {
     let check = |label: String, packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> bool {
         let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
         let mut y_cpu = vec![0f32; rows];
-        crate::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
+        crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
         let mut y_gpu = vec![0f32; rows];
         gpu_matvec_fp4(packed, scales, rows, cols, &x, &mut y_gpu);
         let scale = y_cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
@@ -1134,7 +1134,7 @@ pub fn dstest() {
         (4096, 2048),
     ] {
         let w: Vec<f32> = (0..rows * cols).map(pattern).collect();
-        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        keep_alive.push(crate::quant::mxfp4::quantize(&w, rows, cols));
         let (p, s) = &keep_alive[keep_alive.len() - 1];
         all_ok &= check(format!("synthetic [{rows}x{cols}]"), p, s, rows, cols);
     }
@@ -1145,26 +1145,26 @@ pub fn dstest() {
         crate::model::set_gpu(true);
         let (rows, cols) = (2048usize, 4096usize); // 8.4M params ≥ 2M → GPU
         let w: Vec<f32> = (0..rows * cols).map(|i| pattern(i + 77)).collect();
-        let (p, s) = crate::mxfp4::quantize(&w, rows, cols);
+        let (p, s) = crate::quant::mxfp4::quantize(&w, rows, cols);
         let x: Vec<f32> = (0..cols).map(|i| pattern(i + 88)).collect();
         let mut y_routed = vec![0f32; rows];
-        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_routed, 1);
+        crate::quant::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_routed, 1);
         let on_device = ctx()
             .map(|c| c.cache_fp4.lock().unwrap().map.contains_key(&(p.as_ptr() as usize, rows, cols)))
             .unwrap_or(false);
         // sub-threshold: 128x512 = 65K params → must stay on the CPU
         let (r2, c2) = (128usize, 512usize);
         let w2: Vec<f32> = (0..r2 * c2).map(|i| pattern(i + 99)).collect();
-        let (p2, s2) = crate::mxfp4::quantize(&w2, r2, c2);
+        let (p2, s2) = crate::quant::mxfp4::quantize(&w2, r2, c2);
         let x2: Vec<f32> = (0..c2).map(|i| pattern(i + 111)).collect();
         let mut y2 = vec![0f32; r2];
-        crate::mxfp4::matvec_packed(&p2, &s2, r2, c2, &x2, &mut y2, 1);
+        crate::quant::mxfp4::matvec_packed(&p2, &s2, r2, c2, &x2, &mut y2, 1);
         let small_on_device = ctx()
             .map(|c| c.cache_fp4.lock().unwrap().map.contains_key(&(p2.as_ptr() as usize, r2, c2)))
             .unwrap_or(false);
         crate::model::set_gpu(false);
         let mut y_ref = vec![0f32; rows];
-        crate::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, 1);
+        crate::quant::mxfp4::matvec_packed(&p, &s, rows, cols, &x, &mut y_ref, 1);
         let scale = y_ref.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
         let max_abs = y_routed.iter().zip(&y_ref).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let ok = on_device && !small_on_device && max_abs / scale <= 1e-3;
@@ -1184,7 +1184,7 @@ pub fn dstest() {
     match ds_path {
         Some(path) => {
             println!("  model: {}", path);
-            let bin = crate::weights::BinFile::open(&path);
+            let bin = crate::quant::weights::BinFile::open(&path);
             if bin.config.ds.is_none() {
                 println!("  {} is not a deepseek_v4 model — real-blob checks SKIPPED", path);
             } else {
@@ -1271,7 +1271,7 @@ pub fn metaltest_packed() {
     let check = |label: String, packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> bool {
         let x: Vec<f32> = (0..cols).map(|i| pattern(i + 4242)).collect();
         let mut y_cpu = vec![0f32; rows];
-        crate::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
+        crate::quant::mxfp4::matvec_packed(packed, scales, rows, cols, &x, &mut y_cpu, 1);
         let mut y_gpu = vec![0f32; rows];
         gpu_matvec_fp4(packed, scales, rows, cols, &x, &mut y_gpu);
         let scale = y_cpu.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
@@ -1290,7 +1290,7 @@ pub fn metaltest_packed() {
     // differ). keep_alive pins every blob: the fp4 cache keys on (ptr, dims).
     let path = crate::bin_path();
     println!("  model: {}", path);
-    let bin = crate::weights::BinFile::open(&path);
+    let bin = crate::quant::weights::BinFile::open(&path);
     let names = [
         "layers.1.block_sparse_moe.experts.0.w1",
         "layers.1.block_sparse_moe.experts.0.w2",
@@ -1315,7 +1315,7 @@ pub fn metaltest_packed() {
     // 2) synthetic: micro dims, edge shapes, real V4 expert dims
     for (rows, cols) in [(128usize, 512usize), (3, 64), (1, 32), (2048, 4096), (4096, 2048)] {
         let w: Vec<f32> = (0..rows * cols).map(pattern).collect();
-        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        keep_alive.push(crate::quant::mxfp4::quantize(&w, rows, cols));
         let (p, s) = &keep_alive[keep_alive.len() - 1];
         all_ok &= check(format!("synthetic [{rows}x{cols}]"), p, s, rows, cols);
     }
@@ -1327,7 +1327,7 @@ pub fn metaltest_packed() {
         for v in w[2 * cols..4 * cols].iter_mut() {
             *v = 0.0;
         }
-        keep_alive.push(crate::mxfp4::quantize(&w, rows, cols));
+        keep_alive.push(crate::quant::mxfp4::quantize(&w, rows, cols));
         let (p, s) = &keep_alive[keep_alive.len() - 1];
         assert!(s[2 * cols / 32] == 0, "zero block must produce scale byte 0");
         all_ok &= check("zero block (scale byte 0)".to_string(), p, s, rows, cols);

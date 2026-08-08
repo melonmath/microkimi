@@ -56,9 +56,9 @@ pub fn streamtest(args: &[String]) {
     // 1) cold fetch through the persistent cache, byte-compare with slice_st
     println!("-- 1) cold fetch (network) + byte comparison with slice_st's fetch");
     for name in tensors {
-        let net0 = crate::http::fetched_bytes();
+        let net0 = crate::stream::http::fetched_bytes();
         let cached = src.tensor_bytes(name);
-        let net = crate::http::fetched_bytes() - net0;
+        let net = crate::stream::http::fetched_bytes() - net0;
         let reference = src.direct_bytes(name);
         assert_eq!(cached, reference, "{}: cached bytes differ from slice_st's fetch", name);
         println!(
@@ -73,12 +73,12 @@ pub fn streamtest(args: &[String]) {
     // 2) warm fetch: disk cache, zero network
     println!("-- 2) warm fetch (disk cache)");
     for name in tensors {
-        let net0 = crate::http::fetched_bytes();
-        let req0 = crate::http::fetched_requests();
+        let net0 = crate::stream::http::fetched_bytes();
+        let req0 = crate::stream::http::fetched_requests();
         let b = src.tensor_bytes(name);
-        let net = crate::http::fetched_bytes() - net0;
+        let net = crate::stream::http::fetched_bytes() - net0;
         assert_eq!(net, 0, "{}: warm fetch hit the network ({} bytes)", name, net);
-        assert_eq!(crate::http::fetched_requests(), req0);
+        assert_eq!(crate::stream::http::fetched_requests(), req0);
         println!("  {:<48} {} bytes, network 0 B (disk cache): OK", name, b.len());
     }
 
@@ -144,9 +144,9 @@ pub fn streamtest(args: &[String]) {
         }
         println!("  3 expert w1 fetched under {} MB: two oldest evicted, spine intact: OK", disk_mb);
         // an evicted expert is re-fetched over HTTP on its next miss
-        let net0 = crate::http::fetched_bytes();
+        let net0 = crate::stream::http::fetched_bytes();
         let b = roll.tensor_bytes(experts[0]);
-        let net = crate::http::fetched_bytes() - net0;
+        let net = crate::stream::http::fetched_bytes() - net0;
         assert!(net > 0, "{}: evicted expert re-fetch used no network", experts[0]);
         assert!(cached(experts[0]), "{}: re-fetched expert was not re-cached", experts[0]);
         println!("  re-fetch of evicted {}: {} bytes, network {}: OK", experts[0], b.len(), mb(net));

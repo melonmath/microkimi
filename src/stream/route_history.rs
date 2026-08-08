@@ -8,7 +8,7 @@
 // recordings of the nano chat checkpoints, the per-layer expert histograms
 // of different prompts agree at cosine ~0.99 over a full session, and a
 // 4-token prefix already scores ~0.31 against same-model sessions (the
-// chained replay of tools_replay.rs, `cachereplay --tracesim`, turns that
+// chained replay of tools/replay.rs, `cachereplay --tracesim`, turns that
 // signal into +8.5 points of demand hit-rate over the first 50 tokens at
 // tight cache capacities).
 //

@@ -1,7 +1,7 @@
-// pck.rs - prefix cache: .mkmem state snapshots keyed by token prefix.
+// prefix_cache.rs - prefix cache: .mkmem state snapshots keyed by token prefix.
 //
 // A K3 state after N tokens is fully described by the fixed-size KDA states,
-// the short conv windows and the MLA cache (see src/mkmem.rs), so the state
+// the short conv windows and the MLA cache (see src/memory/memory_pack.rs), so the state
 // after ANY prefix of the conversation can be cached and reused: re-running
 // the same chat (or continuing one) only has to prefill the tokens that were
 // not covered by a previous turn.
@@ -10,7 +10,7 @@
 // (override: MICROKIMI_PCK_DIR):
 //   magic    : 8 bytes "MKPCK001"
 //   n_tokens : u32, then n_tokens x u32 token ids (the covered prefix)
-//   payload  : a standard MKMEM001 image (src/mkmem.rs), model fingerprint
+//   payload  : a standard MKMEM001 image (src/memory/memory_pack.rs), model fingerprint
 //              included - a snapshot taken with a different model fails the
 //              fingerprint check on load and degrades to a plain miss.
 // The file name is the FNV-1a hash of the prefix; the stored token list is
@@ -157,7 +157,7 @@ impl Pck {
 
     /// Snapshots the current model state as the entry covering `tokens`.
     pub fn store(&self, model: &Model, tokens: &[u32], logits: &[f32]) {
-        write_entry(&self.dir, tokens, &crate::mkmem::serialize(model, logits));
+        write_entry(&self.dir, tokens, &crate::memory::memory_pack::serialize(model, logits));
         self.evict();
     }
 
@@ -203,7 +203,7 @@ pub fn run_turn_chat(pck: Option<&Pck>, ids: &[u32], max_new: usize, tok: &AnyTo
     let mut k = 0usize;
     let mut init = None;
     if let Some((nk, blob)) = pck.lookup(ids) {
-        match crate::mkmem::load_slice(model, &blob, "pck entry") {
+        match crate::memory::memory_pack::load_slice(model, &blob, "pck entry") {
             Ok(l) => {
                 k = nk;
                 init = Some(l);
