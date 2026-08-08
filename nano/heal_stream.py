@@ -595,8 +595,9 @@ def main():
                     help="insert a trainable low-rank residual-stream correction "
                          "h' = h + B A h (B zero-init: exact identity at step 0) at the "
                          "seam of a sliced model. Lives on the compute device, saved in "
-                         "the checkpoint; merge folds it into the input projections of "
-                         "the next layer (see apply_lora_bin.py)")
+                         "the checkpoint; deployed exactly with apply_lora_bin.py "
+                         "--write-seam (adapter embedded in the .bin, applied by the "
+                         "engine - the fold into the next layer is only approximate)")
     ap.add_argument("--seam-after", type=int, default=11,
                     help="0-based index of the layer after which the seam adapter is "
                          "inserted (default 11: the v3 slice '0-11,83-92' has its seam "

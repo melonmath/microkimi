@@ -37,6 +37,10 @@ pub struct Config {
     /// renumbered layers). None = derive from the historical patterns.
     pub mla_layers: Option<Vec<usize>>,
     pub dense_layers: Option<Vec<usize>>,
+    /// Layer index after which the embedded seam adapter (fp32 tensors
+    /// seam.A / seam.B, written by nano/apply_lora_bin.py --write-seam) is
+    /// applied to the residual stream. None: no seam adapter.
+    pub seam_after: Option<usize>,
     /// Present when the MKIM0002 config JSON declares arch "deepseek_v4"
     /// (parsed from the "ds" object). None for K3 (microkimi/nanokimi).
     pub ds: Option<DsConfig>,
@@ -75,6 +79,7 @@ impl Config {
             ds: None,
             mla_layers: None,
             dense_layers: None,
+            seam_after: None,
         }
     }
 
@@ -121,6 +126,7 @@ impl Config {
         };
         c.mla_layers = ids("mla_layers");
         c.dense_layers = ids("dense_layers");
+        c.seam_after = j.get("seam_after").and_then(|x| x.as_num()).map(|n| n as usize);
         c
     }
 

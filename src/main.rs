@@ -286,6 +286,9 @@ fn main() {
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --logit-lens (top-5 tokens of every layer through final norm + lm_head,");
             println!("                        last prefill position; --logit-lens-all: also on each generated token)");
+            println!("                    a .bin with an embedded seam adapter (apply_lora_bin.py --write-seam) is");
+            println!("                        applied exactly after layer seam_after, in prefill and decode alike;");
+            println!("                        the load line shows 'seam: adapter rank R after layer N'");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
             println!("                    --stream-disk N (remote disk cache budget in MB, default 0 = unlimited;");

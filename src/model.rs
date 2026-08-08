@@ -683,6 +683,85 @@ impl T {
     }
 }
 
+// ── seam adapter (embedded by nano/apply_lora_bin.py --write-seam) ──
+//
+// Exact deployment of the trained residual-stream correction h' = h + B A h
+// (it cannot be folded into the existing weights exactly - see the
+// apply_lora_bin.py docstring). The .bin carries the fp32 tensors "seam.A"
+// [rank, d] and "seam.B" [d, rank] plus the config key "seam_after" (0-based
+// layer index); the engine applies h += (h @ A^T) @ B^T right after that
+// layer, in prefill and decode alike. A and B are tiny (2 * rank * d floats)
+// and are read through the spine mapping like any other plain tensor.
+
+struct SeamW {
+    a: T,
+    b: T,
+    rank: usize,
+    after: usize,
+}
+
+/// Reads the embedded seam adapter, if any. Clear load-time errors on an
+/// inconsistent file: only one of seam.A/seam.B, tensors without the
+/// seam_after config key (or the reverse), a seam_after that leaves no layer
+/// N+1, wrong dtypes or shapes.
+fn seam_load(cfg: &Config, entries: &std::collections::HashMap<String, Entry>) -> Option<SeamW> {
+    let ea = entries.get("seam.A");
+    let eb = entries.get("seam.B");
+    if ea.is_none() && eb.is_none() {
+        assert!(
+            cfg.seam_after.is_none(),
+            "the config declares seam_after {} but the file has no seam.A/seam.B tensors",
+            cfg.seam_after.unwrap()
+        );
+        return None;
+    }
+    let (ea, eb) = (
+        ea.unwrap_or_else(|| panic!("seam.B present but seam.A is missing")),
+        eb.unwrap_or_else(|| panic!("seam.A present but seam.B is missing")),
+    );
+    let after = cfg
+        .seam_after
+        .unwrap_or_else(|| panic!("seam.A/seam.B tensors present but the config has no seam_after key"));
+    assert!(
+        after + 1 < cfg.n_layers,
+        "seam_after {} out of range [0, {}] for a {}-layer model: the seam adapter needs a layer N+1",
+        after,
+        cfg.n_layers.saturating_sub(2),
+        cfg.n_layers
+    );
+    for (name, e) in [("seam.A", ea), ("seam.B", eb)] {
+        assert_eq!(e.dtype, crate::weights::DTYPE_F32, "{}: dtype {}, only fp32", name, e.dtype);
+        assert_eq!(e.dims.len(), 2, "{}: dims {:?}, expected a 2D matrix", name, e.dims);
+    }
+    let (rank, d) = (ea.dims[0] as usize, ea.dims[1] as usize);
+    assert_eq!(d, cfg.d, "seam.A: dims {:?}, expected [rank, {}] (hidden)", ea.dims, cfg.d);
+    assert_eq!(
+        eb.dims,
+        vec![cfg.d as u32, rank as u32],
+        "seam.B: dims {:?}, expected [{}, {}] (hidden, rank)",
+        eb.dims,
+        cfg.d,
+        rank
+    );
+    Some(SeamW { a: T::from(ea), b: T::from(eb), rank, after })
+}
+
+/// h += (h @ A^T) @ B^T on one residual-stream row: the same two matvecs the
+/// Python SeamAdapter computes (h + (h @ A.T) @ B.T), through the engine's
+/// bit-exact dot(), so the batched prefill (per position) and the decode
+/// produce the same values.
+fn seam_apply(data: &[u8], w: &SeamW, d: usize, h: &mut [f32]) {
+    let a = as_f32(&data[w.a.off..w.a.off + w.a.len * 4]);
+    let b = as_f32(&data[w.b.off..w.b.off + w.b.len * 4]);
+    let mut tmp = vec![0f32; w.rank];
+    matvec(a, w.rank, d, h, &mut tmp);
+    let mut delta = vec![0f32; d];
+    matvec(b, d, w.rank, &tmp, &mut delta);
+    for j in 0..d {
+        h[j] += delta[j];
+    }
+}
+
 struct KdaW {
     q_proj: T,
     k_proj: T,
@@ -851,6 +930,9 @@ pub struct Model {
     pub(crate) caches: Vec<Cache>, // pub(crate): saved/restored by mkmem.rs
     pub last_logits: Vec<f32>,     // logits of the last forward (source for mkmem --save)
     pub prof: Prof,
+    /// Embedded seam adapter (seam.A / seam.B + config seam_after), applied
+    /// to the residual stream right after layer seam.after (seam_load).
+    seam: Option<SeamW>,
     /// --stream: RAM LRU of packed expert bytes over the disk/HTTP tiers
     /// (stream.rs). None = historical full-load path, byte-identical behavior.
     stream: Option<crate::stream::ExpertCache>,
@@ -1022,7 +1104,11 @@ impl Model {
             };
             layers.push(LayerW { input_ln, post_ln, sa_res_w, mlp_res_w, attn, ffn });
         }
-        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), stream }
+        let seam = seam_load(&cfg, &bin.entries);
+        if let Some(s) = &seam {
+            println!("seam: adapter rank {} after layer {}", s.rank, s.after);
+        }
+        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), seam, stream }
     }
 
     /// Number of tokens already represented in the caches (from the first MLA
@@ -2889,7 +2975,7 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let embed = Self::t(data, embed);
@@ -2993,6 +3079,14 @@ impl Model {
             };
             for j in 0..cfg.d {
                 hidden[j] = prefix2[j] + mlp_out[j];
+            }
+            // seam adapter: h += (h @ A^T) @ B^T right after layer seam.after
+            // (the residual stream the next layer, the attn_res blocks and the
+            // final norm all read)
+            if let Some(s) = seam {
+                if l == s.after {
+                    seam_apply(data, s, cfg.d, &mut hidden);
+                }
             }
             if hd_on {
                 let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
@@ -3098,7 +3192,7 @@ impl Model {
         if ids.len() == 1 {
             return vec![self.forward(ids[0], pos0)];
         }
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let n = ids.len();
@@ -3201,6 +3295,16 @@ impl Model {
             };
             for j in 0..n * d {
                 hidden[j] = prefix2[j] + mlp_out[j];
+            }
+            // seam adapter, applied per position: the same row-wise matvecs
+            // as the single-token forward, so prefill stays bit-identical to
+            // n sequential forwards
+            if let Some(s) = seam {
+                if l == s.after {
+                    for t in 0..n {
+                        seam_apply(data, s, d, &mut hidden[t * d..(t + 1) * d]);
+                    }
+                }
             }
             if hd_on {
                 let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
@@ -3878,5 +3982,114 @@ mod q8head_tests {
         assert!(max_err / span < 1e-2, "q8 head max err {} vs span {}", max_err, span);
         let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
         assert_eq!(am(&got), am(&want), "q8 head argmax differs from f32");
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::{seam_apply, seam_load, SeamW};
+    use crate::config::Config;
+    use crate::weights::{Entry, DTYPE_F32};
+    use std::collections::HashMap;
+
+    fn entry(dims: &[u32]) -> Entry {
+        Entry { dtype: DTYPE_F32, dims: dims.to_vec(), offset: 0, size: dims.iter().map(|&d| d as u64).product::<u64>() * 4 }
+    }
+
+    fn cfg(d: usize, n_layers: usize, seam_after: Option<usize>) -> Config {
+        let mut c = Config::microkimi();
+        c.d = d;
+        c.n_layers = n_layers;
+        c.seam_after = seam_after;
+        c
+    }
+
+    fn seam_entries(rank: u32, d: u32) -> HashMap<String, Entry> {
+        HashMap::from([("seam.A".to_string(), entry(&[rank, d])), ("seam.B".to_string(), entry(&[d, rank]))])
+    }
+
+    #[test]
+    fn seam_load_valid() {
+        let e = seam_entries(64, 512);
+        let s = seam_load(&cfg(512, 8, Some(3)), &e).expect("valid seam must load");
+        assert_eq!((s.rank, s.after), (64, 3));
+        // after = n_layers - 2 is the last legal position (a layer N+1 remains)
+        let s = seam_load(&cfg(512, 8, Some(6)), &e).expect("after = n_layers - 2 must load");
+        assert_eq!(s.after, 6);
+        // no tensors, no config key: no adapter
+        assert!(seam_load(&cfg(512, 8, None), &HashMap::new()).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "seam_after 7 out of range [0, 6] for a 8-layer model")]
+    fn seam_after_last_layer_rejected() {
+        let e = seam_entries(64, 512);
+        seam_load(&cfg(512, 8, Some(7)), &e);
+    }
+
+    #[test]
+    #[should_panic(expected = "seam_after 8 out of range [0, 6] for a 8-layer model")]
+    fn seam_after_beyond_layers_rejected() {
+        let e = seam_entries(64, 512);
+        seam_load(&cfg(512, 8, Some(8)), &e);
+    }
+
+    #[test]
+    #[should_panic(expected = "no seam_after key")]
+    fn seam_tensors_without_config_key_rejected() {
+        let e = seam_entries(64, 512);
+        seam_load(&cfg(512, 8, None), &e);
+    }
+
+    #[test]
+    #[should_panic(expected = "no seam.A/seam.B tensors")]
+    fn seam_config_key_without_tensors_rejected() {
+        seam_load(&cfg(512, 8, Some(3)), &HashMap::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "seam.B is missing")]
+    fn seam_unpaired_tensors_rejected() {
+        let e = HashMap::from([("seam.A".to_string(), entry(&[64, 512]))]);
+        seam_load(&cfg(512, 8, Some(3)), &e);
+    }
+
+    #[test]
+    #[should_panic(expected = "seam.B: dims")]
+    fn seam_bad_shape_rejected() {
+        let e = HashMap::from([("seam.A".to_string(), entry(&[64, 512])), ("seam.B".to_string(), entry(&[64, 512]))]);
+        seam_load(&cfg(512, 8, Some(3)), &e);
+    }
+
+    /// seam_apply must compute h + (h @ A^T) @ B^T: A [rank, d] row-major
+    /// (tmp[r] = A[r, :] . h), then B [d, rank] row-major (delta[i] = B[i, :] . tmp).
+    #[test]
+    fn seam_apply_matches_reference() {
+        let (rank, d) = (3usize, 10usize);
+        let a: Vec<f32> = (0..rank * d).map(|i| (i as f32 - 7.0) * 0.01).collect();
+        let b: Vec<f32> = (0..d * rank).map(|i| (i as f32 - 11.0) * 0.02).collect();
+        let mut data = crate::weights::f32_to_bytes(&a);
+        data.extend_from_slice(&crate::weights::f32_to_bytes(&b));
+        let w = SeamW {
+            a: super::T { off: 0, len: rank * d },
+            b: super::T { off: rank * d * 4, len: d * rank },
+            rank,
+            after: 0,
+        };
+        let h0: Vec<f32> = (0..d).map(|i| (i as f32 - 5.0) * 0.1).collect();
+        let mut h = h0.clone();
+        seam_apply(&data, &w, d, &mut h);
+        // f64 reference of the Python formula (tolerance: the engine's dot()
+        // uses 8 parallel accumulators, the reference is sequential)
+        let tmp: Vec<f64> = (0..rank)
+            .map(|r| (0..d).map(|c| a[r * d + c] as f64 * h0[c] as f64).sum())
+            .collect();
+        let want: Vec<f64> = (0..d)
+            .map(|i| h0[i] as f64 + (0..rank).map(|r| tmp[r] * b[i * rank + r] as f64).sum::<f64>())
+            .collect();
+        for j in 0..d {
+            let err = (h[j] as f64 - want[j]).abs();
+            assert!(err < 1e-6, "h[{}]: got {} want {}", j, h[j], want[j]);
+        }
     }
 }
