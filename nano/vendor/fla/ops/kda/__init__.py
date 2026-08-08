@@ -59,6 +59,174 @@ KDA_CHUNKED = os.environ.get("NANO_KDA_CHUNKED", "0") == "1"
 KDA_CHUNK = int(os.environ.get("NANO_KDA_CHUNK", "64"))
 _chunked_available = True
 
+# NANO_ACT_OFFLOAD: opt-in async offload of the KDA_SEG segment inputs. The
+# time-segment checkpointing above keeps, per segment, the boundary state S
+# [B,H,K,V] (FIXED size, independent of T) plus the segment input slices in
+# VRAM between forward and backward. With this flag the six segment inputs
+# are instead copied to a ring of pinned host buffers on a side CUDA stream
+# during forward (async D2H, overlapped with the compute of the next
+# segment), and copied back just before the segment is recomputed in backward
+# (events guard both directions). Same math, same recompute: results are
+# bit-identical to the plain checkpoint path. Enabled only on the device
+# types listed in NANO_ACT_OFFLOAD_DEVICES (default "cuda"); on other listed
+# devices (e.g. "cpu" for tests) the stash is a plain host clone - same
+# autograd path, no pinned memory, no side stream. Default OFF. If the
+# offloaded path ever raises OR returns a non-finite output, it disables
+# itself and falls back to the plain checkpoint for the rest of the process
+# (same guard pattern as NANO_KDA_CHUNKED).
+ACT_OFFLOAD = os.environ.get("NANO_ACT_OFFLOAD", "0") == "1"
+ACT_OFFLOAD_DEVICES = tuple(
+    d for d in os.environ.get("NANO_ACT_OFFLOAD_DEVICES", "cuda").split(",") if d
+)
+_offload_available = True
+
+
+class _PinnedRing:
+    """Ring of pinned host buffers for the async activation offload.
+
+    stash(tensors): async D2H copy of every tensor into a pinned buffer, on a
+    dedicated side stream so the copy overlaps the compute of the next
+    segment; returns an opaque handle. fetch(handle): waits (stream-ordered)
+    for the D2H to be complete, copies the buffers back to the device on the
+    current stream and recycles the buffers. A recycled buffer carries the
+    event of its last H2D read; the side stream waits on it before any
+    overwrite, so a buffer is never clobbered while a previous fetch is still
+    reading it. Buffers are keyed by (dtype, shape) and reused across
+    segments, layers and steps: the ring grows to one layer's worth of
+    segments on the first step and is flat after that.
+    """
+
+    def __init__(self, dev):
+        self.dev = dev
+        self.side = torch.cuda.Stream(device=dev)
+        self.free = {}  # (dtype, shape) -> [(buffer, ready_event), ...]
+
+    def _get(self, t):
+        key = (t.dtype, tuple(t.shape))
+        bucket = self.free.setdefault(key, [])
+        if bucket:
+            buf, ev = bucket.pop()
+            # never overwrite a buffer whose previous H2D read may still run
+            self.side.wait_event(ev)
+        else:
+            buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        return buf
+
+    def stash(self, tensors):
+        cur = torch.cuda.current_stream(device=self.dev)
+        self.side.wait_stream(cur)  # inputs are produced on the compute stream
+        bufs = []
+        with torch.cuda.stream(self.side):
+            for t in tensors:
+                buf = self._get(t)
+                buf.copy_(t, non_blocking=True)  # D2H, async on the side stream
+                bufs.append(buf)
+        done = torch.cuda.Event()
+        done.record(self.side)
+        return (bufs, done)
+
+    def fetch(self, handle):
+        bufs, done = handle
+        cur = torch.cuda.current_stream(device=self.dev)
+        cur.wait_event(done)  # the D2H copies must be complete before the H2D
+        out = []
+        for buf in bufs:
+            t = buf.to(self.dev, non_blocking=True)  # H2D, ordered on cur
+            ev = torch.cuda.Event()
+            ev.record(cur)  # buffer reusable once this read is done
+            self.free.setdefault((buf.dtype, tuple(buf.shape)), []).append((buf, ev))
+            out.append(t)
+        return out
+
+
+class _CpuRing:
+    """Host-clone variant of _PinnedRing for non-CUDA devices (tests): same
+    stash/fetch contract, plain contiguous clones, no streams or events."""
+
+    def __init__(self, dev):
+        self.dev = dev
+
+    def stash(self, tensors):
+        return [t.detach().clone() for t in tensors]
+
+    def fetch(self, handle):
+        return [t.clone() for t in handle]
+
+
+_RINGS = {}
+
+
+def _offload_ring(dev):
+    ring = _RINGS.get(str(dev))
+    if ring is None:
+        ring = _PinnedRing(dev) if dev.type == "cuda" else _CpuRing(dev)
+        _RINGS[str(dev)] = ring
+    return ring
+
+
+class _OffloadSeg(torch.autograd.Function):
+    """One KDA_SEG segment with its inputs stashed in host memory between
+    forward and backward (NANO_ACT_OFFLOAD=1) instead of retained in VRAM by
+    the autograd graph. Forward recomputes nothing: it runs the same
+    _kda_recur under no_grad and keeps only the outputs; backward fetches the
+    inputs back, recomputes the segment with autograd on and backprops -
+    exactly the torch.utils.checkpoint recompute pattern, so the results are
+    bit-identical to the plain checkpoint path."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, S):
+        tensors = (q, k, v, g, beta, S)
+        with torch.no_grad():
+            o, S_out = _kda_recur(*tensors)
+        # nothing to stash outside of a training pass (inference / the
+        # no_grad layer forward of the streamed trainer never calls backward)
+        if any(t.requires_grad for t in tensors):
+            ctx.handle = _offload_ring(q.device).stash(tensors)
+        else:
+            ctx.handle = None
+        ctx.dev = q.device
+        return o, S_out
+
+    @staticmethod
+    def backward(ctx, do, dS):
+        if ctx.handle is None:  # no input needed a gradient: nothing to give back
+            return (None,) * 6
+        tensors = _offload_ring(ctx.dev).fetch(ctx.handle)
+        ctx.handle = None
+        ins = []
+        for t, need in zip(tensors, ctx.needs_input_grad):
+            t = t.detach()
+            if need:
+                t.requires_grad_(True)
+            ins.append(t)
+        with torch.enable_grad():
+            o, S_out = _kda_recur(*ins)
+        # an output can be dropped by the caller (final state): a zero
+        # gradient keeps the backward well-defined and contributes nothing
+        torch.autograd.backward(
+            (o, S_out),
+            (do if do is not None else torch.zeros_like(o),
+             dS if dS is not None else torch.zeros_like(S_out)),
+        )
+        return tuple(t.grad if need else None for t, need in zip(ins, ctx.needs_input_grad))
+
+
+def _kda_seg_loop(q, k, v, g, beta, S, o, offload):
+    """The KDA_SEG checkpointed loop over time segments. offload=True swaps
+    the plain torch.utils.checkpoint for _OffloadSeg (host-stashed inputs)."""
+    B, T, H, V = o.shape
+    if not offload:
+        import torch.utils.checkpoint as _ckpt
+    for t0 in range(0, T, KDA_SEG):
+        t1 = min(t0 + KDA_SEG, T)
+        args = (q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g[:, t0:t1], beta[:, t0:t1], S)
+        if offload:
+            o_seg, S = _OffloadSeg.apply(*args)
+        else:
+            o_seg, S = _ckpt.checkpoint(_kda_recur, *args, use_reentrant=False)
+        o[:, t0:t1] = o_seg
+    return o, S
+
 
 def _kda_recur(q, k, v, g, beta, S):
     """Per-token delta-rule recurrence over a (slice of) time steps.
@@ -214,16 +382,25 @@ def _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
         # Identical math (same loop, deterministic recompute); autograd only
         # retains the segment-boundary states plus one segment's internals
         # instead of ~4 state-sized tensors per token per layer.
-        import torch.utils.checkpoint as _ckpt
+        # NANO_ACT_OFFLOAD=1 swaps the plain checkpoint for _OffloadSeg: the
+        # segment inputs are stashed in pinned host memory (async, side
+        # stream) instead of retained in VRAM. Bit-identical results.
+        global _offload_available
+        offload = (ACT_OFFLOAD and _offload_available
+                   and q.device.type in ACT_OFFLOAD_DEVICES)
         o = torch.empty(B, T, H, V, dtype=torch.float32, device=q.device)
-        for t0 in range(0, T, KDA_SEG):
-            t1 = min(t0 + KDA_SEG, T)
-            o_seg, S = _ckpt.checkpoint(
-                _kda_recur,
-                q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g[:, t0:t1], beta[:, t0:t1], S,
-                use_reentrant=False,
-            )
-            o[:, t0:t1] = o_seg
+        try:
+            o, S = _kda_seg_loop(q, k, v, g, beta, S, o, offload)
+            if offload and not (torch.isfinite(o).all() and torch.isfinite(S).all()):
+                raise FloatingPointError("non-finite offloaded output")
+        except Exception as exc:  # never break a run: fall back for good
+            if not offload:
+                raise
+            _offload_available = False
+            import sys as _sys
+            print(f"[kda] NANO_ACT_OFFLOAD path disabled after {exc!r}; "
+                  "falling back to the plain segment checkpoint", file=_sys.stderr)
+            o, S = _kda_seg_loop(q, k, v, g, beta, S, o, False)
     else:
         o, S = _kda_recur(q, k, v, g, beta, S)
     return o, S
