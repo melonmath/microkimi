@@ -329,7 +329,10 @@ class StreamedHealModel:
             t = torch.from_numpy(arr)
             if bin_name.endswith(("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight")) and len(dims) == 2:
                 t = t.view(dims[0], 1, dims[1])
-            assert tuple(t.shape) == tuple(p.shape), f"{bin_name}: {tuple(t.shape)} != {tuple(p.shape)}"
+            if tuple(t.shape) != tuple(p.shape):
+                # slicer-produced .bin may flatten a [1, D] proj weight to [D]
+                assert t.numel() == p.numel(), f"{bin_name}: {tuple(t.shape)} != {tuple(p.shape)}"
+                t = t.view(p.shape)
             if p.requires_grad:
                 new_p = torch.nn.Parameter(t.clone().to(dev), requires_grad=True)
             else:
