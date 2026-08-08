@@ -52,8 +52,9 @@ KDA_SEG_DEVICES = tuple(
 # the deviation is float-noise level (measured <= ~1e-5 relative on outputs
 # and gradients, see nano/test_kda_chunked.py), acceptable for training but
 # never use it where parity with the Rust engine is required. Default OFF.
-# If the chunked path ever raises, it disables itself and falls back to the
-# reference recurrence for the rest of the process.
+# If the chunked path ever raises OR returns a non-finite output, it disables
+# itself and falls back to the reference recurrence for the rest of the
+# process.
 KDA_CHUNKED = os.environ.get("NANO_KDA_CHUNKED", "0") == "1"
 KDA_CHUNK = int(os.environ.get("NANO_KDA_CHUNK", "64"))
 _chunked_available = True
@@ -79,8 +80,9 @@ def _kda_recur(q, k, v, g, beta, S):
 
 def _kda_recur_chunked(q, k, v, g, beta, S, chunk_size):
     """Chunkwise (UT-transform) form of _kda_recur - same math, blocked over
-    time so the cost is O(T/C) groups of batched matmuls instead of T Python
-    steps of small kernels, with autograd flowing through the chunked graph.
+    time so the cost is O(T/C) + O(C) groups of batched ops instead of T
+    Python steps of small kernels, with autograd flowing through the chunked
+    graph.
 
     Within a chunk of C tokens, write G for the inclusive in-chunk cumsum of
     the log-decay g and E[i,j] = exp(G_i - G_j) (kept for j <= i only, and
@@ -93,11 +95,17 @@ def _kda_recur_chunked(q, k, v, g, beta, S, chunk_size):
         v'  = u - w @ S
         o   = (q * exp(G)) @ S + ((q k^T) . E) @ v'
         S  <- S * exp(G_last) + (exp(G_last - G) * k)^T @ v'
-    The triangular inverse is exact and loop-free: L is strictly lower hence
-    nilpotent (L^C = 0), so (I + L)^-1 = (I - L)(I + L^2)(I - L^4)... needs
-    only log2(C) matmuls. T is zero-padded to a multiple of C; padded rows
-    have k = v = beta = 0 and raw g = 0, so they neither update the state nor
-    the valid outputs (their own outputs are sliced away).
+    The triangular inverse MUST be forward substitution (backward stable: the
+    entries of (I + L)^-1 stay O(1)). A closed-form nilpotent factorization
+    (I - L)(I + L^2)(I - L^4)... is exact on paper but catastrophically
+    unstable in fp32 in the real training regime (gates near 0, correlated
+    keys, beta near 1 make L approach the strictly-lower all-ones matrix, the
+    intermediate powers reach ~1e17 and the cancellation NaNs out - the
+    original bug). The substitution runs once, batched over B, H and all
+    chunks; the big [C, C, K] decay tensor never outlives its own chunk.
+    T is zero-padded to a multiple of C; padded rows have k = v = beta = 0 and
+    raw g = 0, so they neither update the state nor the valid outputs (their
+    own outputs are sliced away).
     q,k,g: [B,T,H,K]; v: [B,T,H,V]; beta: [B,T,H]; S: [B,H,K,V] -> (o, S)."""
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -116,28 +124,35 @@ def _kda_recur_chunked(q, k, v, g, beta, S, chunk_size):
     gc = g.cumsum(dim=-2)  # inclusive in-chunk cumulative log-decay [B,H,NT,C,K]
     upper = torch.triu(torch.ones(C, C, dtype=torch.bool, device=q.device), 1)
     eye = torch.eye(C, dtype=torch.float32, device=q.device)
-    o = q.new_empty(B, H, NT, C, V)
+    # pass 1, state-independent: L (coupling) and QK (intra-chunk readout)
+    Ls, QKs = [], []
     for n in range(NT):
-        qn, kn, vn = q[:, :, n], k[:, :, n], v[:, :, n]
-        gn, bn = gc[:, :, n], beta[:, :, n]  # [B,H,C,K], [B,H,C]
+        qn, kn, gn, bn = q[:, :, n], k[:, :, n], gc[:, :, n], beta[:, :, n]
         diff = gn.unsqueeze(3) - gn.unsqueeze(2)  # [B,H,C(i),C(j),K]
         E = diff.masked_fill(upper.unsqueeze(-1), float("-inf")).exp()
         KK = torch.einsum("bhik,bhjk,bhijk->bhij", kn, kn, E)
-        L = (KK * bn.unsqueeze(-1)).tril(-1)
-        # (I + L)^-1 = prod_j (I + (-L)^(2^j)) - exact, L nilpotent
-        X = -L
-        R = eye + X
-        e = 1
-        while 2 * e <= C - 1:
-            X = X @ X
-            R = R + R @ X
-            e *= 2
-        A = R * bn.unsqueeze(-2)  # (I + L)^-1 @ diag(beta)
-        w = A @ (gn.exp() * kn)
-        u = A @ vn
-        QK = torch.einsum("bhik,bhjk,bhijk->bhij", qn, kn, E)
+        Ls.append((KK * bn.unsqueeze(-1)).tril(-1))
+        QKs.append(torch.einsum("bhik,bhjk,bhijk->bhij", qn, kn, E))
+    L = torch.stack(Ls, dim=2)    # [B,H,NT,C,C]
+    QK = torch.stack(QKs, dim=2)  # [B,H,NT,C,C]
+    # (I + L)^-1 by forward substitution, batched over B, H, NT (the clones
+    # keep every value saved for backward private to its op, so the in-place
+    # row writes never corrupt the graph)
+    A = -L
+    for i in range(1, C):
+        A[..., i, :i] = A[..., i, :i].clone() + (
+            A[..., i, :, None].clone() * A[..., :, :i].clone()
+        ).sum(-2)
+    A = (A + eye) * beta.unsqueeze(-2)  # (I + L)^-1 @ diag(beta)
+    # pass 2, stateful scan over the chunks
+    o = q.new_empty(B, H, NT, C, V)
+    for n in range(NT):
+        qn, kn, vn, gn = q[:, :, n], k[:, :, n], v[:, :, n], gc[:, :, n]
+        An = A[:, :, n]
+        w = An @ (gn.exp() * kn)
+        u = An @ vn
         v2 = u - w @ S
-        o[:, :, n] = (qn * gn.exp()) @ S + QK @ v2
+        o[:, :, n] = (qn * gn.exp()) @ S + QK[:, :, n] @ v2
         gl = gn[:, :, -1]  # total in-chunk log-decay [B,H,K]
         kd = (gl.unsqueeze(2) - gn).exp() * kn  # [B,H,C,K]
         S = S * gl.exp().unsqueeze(-1) + kd.transpose(-1, -2) @ v2
@@ -265,6 +280,11 @@ def chunk_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
                              initial_state, use_qk_l2norm_in_kernel,
                              use_gate_in_kernel, use_beta_sigmoid_in_kernel,
                              lower_bound, chunked=True)
+            # output guard: a NaN/Inf anywhere in the chunked result must
+            # never reach the training step - disable the path and redo the
+            # call with the reference recurrence
+            if not (torch.isfinite(o).all() and torch.isfinite(S).all()):
+                raise FloatingPointError("non-finite chunked output")
         except Exception as exc:  # never break a run: fall back for good
             _chunked_available = False
             import sys as _sys

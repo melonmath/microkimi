@@ -78,6 +78,38 @@ for with_state in (False, True):
         for n, a, b in zip(["dq", "dk", "dv", "dbeta"] + (["dS0"] if with_state else []), g0, g1):
             ok &= check(n, a, b, worst)
 
+# adversarial "real training" regime: gates near 0 (slow decay), strongly
+# correlated normalized keys, beta near 1 - L approaches the strictly-lower
+# all-ones matrix, where a closed-form inverse NaNs in fp32 (regression test
+# for the doubling-factorization bug)
+print("  adversarial regime (slow decay, correlated keys, beta ~ 1)")
+g = torch.Generator().manual_seed(5)
+B, T, H, K, V = 1, 512, 4, 128, 128
+base = torch.randn(B, 1, H, K, generator=g)
+kk = torch.nn.functional.normalize(base + 0.01 * torch.randn(B, T, H, K, generator=g), p=2, dim=-1)
+qq = torch.nn.functional.normalize(base + 0.01 * torch.randn(B, T, H, K, generator=g), p=2, dim=-1)
+vv = torch.randn(B, T, H, V, generator=g)
+gg = -1e-3 * torch.rand(B, T, H, K, generator=g)
+bb = 0.999 * torch.ones(B, T, H)
+S_init = torch.zeros(B, H, K, V)
+
+
+def adv_grads(chunked):
+    ts = [t.clone().requires_grad_(True) for t in (qq, kk, vv, gg, bb)]
+    o, S = kda_mod._kda_recur(*ts, S_init.clone()) if not chunked else \
+        kda_mod._kda_recur_chunked(*ts, S_init.clone(), 64)
+    (o.sum() + S.sum()).backward()
+    return o, S, [t.grad for t in ts]
+
+
+o0, S0, g0 = adv_grads(False)
+o1, S1, g1 = adv_grads(True)
+assert torch.isfinite(o1).all() and torch.isfinite(S1).all(), "chunked output not finite"
+ok &= check("o", o0, o1, worst)
+ok &= check("S", S0, S1, worst)
+for n, a, b in zip(["dq", "dk", "dv", "dg", "dbeta"], g0, g1):
+    ok &= check(n, a, b, worst)
+
 # end-to-end through the chunk_kda wrapper, flag toggled at runtime
 print("  chunk_kda wrapper (NANO_KDA_CHUNKED toggled)")
 g = torch.Generator().manual_seed(7)
