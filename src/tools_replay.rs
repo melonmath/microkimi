@@ -270,17 +270,38 @@ fn flag_value(args: &[String], name: &str) -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-/// `microkimi cachereplay trace.bin [--top-k K] [--predict N]`
-pub fn run(args: &[String]) {
-    let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: microkimi cachereplay trace.bin [--top-k K] [--predict N]");
-        eprintln!("  replays a MICROKIMI_TRACE expert-request trace under LRU, Markov");
-        eprintln!("  (prefetch, N experts/layer, default 16) and Belady (optimal offline),");
-        eprintln!("  at cache capacities {:?} entries", CAPS);
-        std::process::exit(1);
-    };
-    let top_k = flag_value(args, "--top-k").unwrap_or(16);
-    let n_pred = flag_value(args, "--predict").unwrap_or(16);
+// ── tracesim: cross-session cold-start prefetch, offline A/B ──
+//
+// `microkimi routebuild store.routes trace.bin [trace2.bin ...]` converts
+// MICROKIMI_TRACE request streams into routing signature sessions appended
+// to a <model>.routes store (routes.rs): the same records the engine writes
+// at exit under MICROKIMI_TRACESIM=1, built offline for benchmarking.
+//
+// `microkimi cachereplay trace.bin --tracesim store.routes [--first N]`
+// replays the trace with the engine's trace-similarity prefetch policy
+// (stream.rs TraceSim, mirrored below) on top of the entry LRU and reports
+// the hit-rate over the first N token passes - the cold-start window where
+// the Markov predictor has no history - against plain LRU and the Markov
+// prefetch. The matching metric check (cosine vs top-k set overlap) is
+// printed at match time.
+
+/// One token pass = one layer wrap in the request stream (layers strictly
+/// ascend within a pass; the prompt prefill is one unioned sweep).
+fn pass_of(prev_layer: u32, layer: u32) -> bool {
+    prev_layer != u32::MAX && layer < prev_layer
+}
+
+/// Builds the routing signature of one trace (per-layer expert histogram).
+fn trace_to_session(trace: &[Key]) -> crate::routes::Session {
+    let mut counts: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
+    for &(l, e) in trace {
+        *counts.entry(l).or_default().entry(e).or_insert(0) += 1;
+    }
+    crate::routes::Session::from_counts(&counts)
+}
+
+/// Reads a MICROKIMI_TRACE record stream (u32 layer LE ++ u32 expert LE).
+fn read_trace(path: &str) -> Vec<Key> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("error: cannot read {}: {}", path, e);
         std::process::exit(1);
@@ -289,10 +310,189 @@ pub fn run(args: &[String]) {
         eprintln!("error: {} is {} bytes, not a multiple of 8 (u32 layer LE ++ u32 expert LE records)", path, bytes.len());
         std::process::exit(1);
     }
-    let trace: Vec<Key> = bytes
+    bytes
         .chunks_exact(8)
         .map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), u32::from_le_bytes(c[4..].try_into().unwrap())))
-        .collect();
+        .collect()
+}
+
+/// `microkimi routebuild store.routes trace.bin [trace2.bin ...]`
+pub fn routebuild(args: &[String]) {
+    let files: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
+    if files.len() < 2 {
+        eprintln!("usage: microkimi routebuild store.routes trace.bin [trace2.bin ...]");
+        eprintln!("  appends the routing signature of each MICROKIMI_TRACE stream to the");
+        eprintln!("  store (routes.rs format, the same records MICROKIMI_TRACESIM=1 writes)");
+        std::process::exit(1);
+    }
+    let store_path = files[0].as_str();
+    for f in &files[1..] {
+        let trace = read_trace(f);
+        let session = trace_to_session(&trace);
+        let n = crate::routes::RouteStore::append(store_path, session).unwrap_or_else(|e| {
+            eprintln!("error: cannot write {}: {}", store_path, e);
+            std::process::exit(1);
+        });
+        println!("routebuild: {} -> {} requests appended to {} ({} sessions stored)", f, trace.len(), store_path, n);
+    }
+}
+
+/// Cold-start A/B row: hit counts over the first `first_passes` token passes
+/// at capacity `cap` - plain LRU, Markov prefetch (the engine's Predictor),
+/// and LRU + the trace-similarity prefetch (the engine's TraceSim policy,
+/// mirrored). Returns (lru, markov, tracesim, tracesim prefetches issued,
+/// matched session (index, cosine), overlap-metric pick (index, overlap)).
+fn cold_row(
+    trace: &[Key],
+    cap: usize,
+    store: &crate::routes::RouteStore,
+    top_k: usize,
+    n_pred: usize,
+    first_passes: u64,
+) -> (u64, u64, u64, u64, Option<(usize, f64)>, Option<(usize, f64)>) {
+    // plain LRU, windowed hits
+    let mut lru_hits = 0u64;
+    {
+        let mut lru = EntryLru::new(cap);
+        let (mut prev, mut pass) = (u32::MAX, 0u64);
+        for &(l, e) in trace {
+            if pass_of(prev, l) {
+                pass += 1;
+            }
+            prev = l;
+            if lru.get((l, e)) {
+                if pass < first_passes {
+                    lru_hits += 1;
+                }
+            } else {
+                lru.insert((l, e));
+            }
+        }
+    }
+    // Markov prefetch (the engine's Predictor, driven as in replay_markov),
+    // windowed hits
+    let mut mkv_hits = 0u64;
+    {
+        let mut pred = crate::stream::Predictor::new();
+        let mut lru = EntryLru::new(cap);
+        let (mut prev, mut pass) = (u32::MAX, 0u64);
+        for &(l, e) in trace {
+            if pass_of(prev, l) {
+                pass += 1;
+            }
+            prev = l;
+            let o = e as u64 * 3;
+            for (jl, je, _) in pred.observe(l, e, [o, o + 1, o + 2], 1, top_k, n_pred) {
+                if !lru.get((jl, je)) {
+                    lru.insert((jl, je));
+                }
+            }
+            if lru.get((l, e)) {
+                if pass < first_passes {
+                    mkv_hits += 1;
+                }
+            } else {
+                lru.insert((l, e));
+            }
+        }
+    }
+    // LRU + trace-similarity prefetch: mirror of stream.rs TraceSim (match at
+    // the first wrap with TSIM_MIN_REQS of context, cosine >= TSIM_THRESHOLD,
+    // chained top-n prefetch of the next MoE layer on every layer transition
+    // during the COLD_PASSES cold window). Windowed hits.
+    let mut tsim_hits = 0u64;
+    let mut tsim_pref = 0u64;
+    let mut matched: Option<(usize, f64)> = None;
+    let mut overlap_pick: Option<(usize, f64)> = None;
+    {
+        let mut lru = EntryLru::new(cap);
+        let mut counts: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
+        let mut reqs = 0u64;
+        let (mut prev, mut pass) = (u32::MAX, 0u64);
+        let mut matched_pass = 0u64;
+        // chained fire: top-n of the matched session for the MoE layer
+        // after `l` (mirror of TraceSim::chained_jobs)
+        let fire = |lru: &mut EntryLru, l: u32, pass: u64, matched_pass: u64, matched: Option<(usize, f64)>, tsim_pref: &mut u64| {
+            let Some((m, _)) = matched else { return };
+            if pass - matched_pass >= crate::stream::COLD_PASSES {
+                return;
+            }
+            let rl = store.sessions[m].routed_layers();
+            let Some(&target) = rl.iter().find(|&&x| x > l).or_else(|| rl.first()) else { return };
+            if target == l {
+                return;
+            }
+            for pe in store.sessions[m].top_n(target, n_pred) {
+                if !lru.get((target, pe)) {
+                    lru.insert((target, pe));
+                    *tsim_pref += 1;
+                }
+            }
+        };
+        for &(l, e) in trace {
+            *counts.entry(l).or_default().entry(e).or_insert(0) += 1;
+            reqs += 1;
+            let wrap = pass_of(prev, l);
+            // chained fire on the transition into layer l (before the wrap
+            // increments the pass, as in TraceSim::observe)
+            if prev != u32::MAX && l != prev {
+                fire(&mut lru, l, pass, matched_pass, matched, &mut tsim_pref);
+            }
+            prev = l;
+            if wrap {
+                pass += 1;
+            }
+            // cold-start match at the first wrap with enough context, then
+            // an immediate chained fire (as try_match does in the engine)
+            if matched.is_none() && wrap && reqs >= crate::stream::TSIM_MIN_REQS {
+                let cur = crate::routes::Session::from_counts(&counts);
+                if let Some((idx, sim)) = store.best_match(&cur, crate::stream::TSIM_THRESHOLD) {
+                    matched = Some((idx, sim));
+                    matched_pass = pass;
+                    // the alternative metric, for the printed comparison
+                    overlap_pick = store
+                        .sessions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i, crate::routes::top_overlap(&cur, s, top_k)))
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    fire(&mut lru, l, pass, matched_pass, matched, &mut tsim_pref);
+                }
+            }
+            if lru.get((l, e)) {
+                if pass < first_passes {
+                    tsim_hits += 1;
+                }
+            } else {
+                lru.insert((l, e));
+            }
+        }
+    }
+    (lru_hits, mkv_hits, tsim_hits, tsim_pref, matched, overlap_pick)
+}
+
+/// `microkimi cachereplay trace.bin [--top-k K] [--predict N] [--tracesim store.routes] [--first N]`
+pub fn run(args: &[String]) {
+    let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: microkimi cachereplay trace.bin [--top-k K] [--predict N] [--tracesim store.routes] [--first N]");
+        eprintln!("  replays a MICROKIMI_TRACE expert-request trace under LRU, Markov");
+        eprintln!("  (prefetch, N experts/layer, default 16) and Belady (optimal offline),");
+        eprintln!("  at cache capacities {:?} entries", CAPS);
+        eprintln!("  --tracesim store.routes: cold-start A/B of the trace-similarity prefetch");
+        eprintln!("  (stream.rs TraceSim policy mirrored offline) over the first --first N");
+        eprintln!("  token passes (default 50)");
+        std::process::exit(1);
+    };
+    let top_k = flag_value(args, "--top-k").unwrap_or(16);
+    let n_pred = flag_value(args, "--predict").unwrap_or(16);
+    let tsim_store: Option<String> = args
+        .iter()
+        .position(|a| a == "--tracesim")
+        .and_then(|i| args.get(i + 1))
+        .filter(|s| !s.starts_with("--"))
+        .cloned();
+    let first_passes = flag_value(args, "--first").unwrap_or(50) as u64;
+    let trace = read_trace(path);
     if trace.is_empty() {
         eprintln!("error: {} holds no requests", path);
         std::process::exit(1);
@@ -341,4 +541,66 @@ pub fn run(args: &[String]) {
     println!("Markov is a prefetch policy: its demand hit-rate can exceed Belady at tight capacities;");
     println!("the fetch columns show the bandwidth spent for it (demand misses + prefetches vs misses).");
     println!("capacity unit: cache entries (uniform expert size per model, so entries == byte budget).");
+
+    // --tracesim store.routes: cold-start A/B over the first --first N token
+    // passes (the window where the Markov has no history). The tracesim
+    // column replays the engine's TraceSim policy (stream.rs) mirrored by
+    // cold_row above.
+    if let Some(store_path) = tsim_store {
+        let store = crate::routes::RouteStore::load(&store_path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+        if store.sessions.is_empty() {
+            eprintln!("error: {} holds no sessions (see routebuild)", store_path);
+            std::process::exit(1);
+        }
+        // requests in the window (pass < first_passes), for the rates
+        let mut window = 0u64;
+        {
+            let (mut prev, mut pass) = (u32::MAX, 0u64);
+            for &(l, _) in &trace {
+                if pass_of(prev, l) {
+                    pass += 1;
+                }
+                prev = l;
+                if pass < first_passes {
+                    window += 1;
+                }
+            }
+        }
+        println!();
+        println!(
+            "tracesim cold-start A/B: first {} token passes ({} requests), store {} ({} sessions)",
+            first_passes,
+            window,
+            store_path,
+            store.sessions.len()
+        );
+        println!("{:>8} {:>8} {:>8} {:>9} {:>10} {:>12}", "capacity", "LRU", "Markov", "tracesim", "gain pts", "tsim fetches");
+        for &cap in &[128usize, 256, 512, 1024] {
+            let (lru_h, mkv_h, tsim_h, tsim_pref, matched, overlap_pick) = cold_row(&trace, cap, &store, top_k, n_pred, first_passes);
+            println!(
+                "{:>8} {:>7.1}% {:>7.1}% {:>8.1}% {:>+9.1} {:>12}",
+                cap,
+                100.0 * lru_h as f64 / window as f64,
+                100.0 * mkv_h as f64 / window as f64,
+                100.0 * tsim_h as f64 / window as f64,
+                100.0 * (tsim_h as f64 - lru_h as f64) / window as f64,
+                tsim_pref
+            );
+            if cap == 128 {
+                match matched {
+                    Some((idx, sim)) => println!("  matched session #{} at the first qualified wrap (cosine {:.3})", idx, sim),
+                    None => println!("  no session matched (cosine below {})", crate::stream::TSIM_THRESHOLD),
+                }
+                if let Some((idx, ov)) = overlap_pick {
+                    println!("  metric check: the top-{} set-overlap metric would have picked session #{} (overlap {:.3})", top_k, idx, ov);
+                }
+            }
+        }
+        println!("tracesim = LRU + the cross-session chained prefetch (MICROKIMI_TRACESIM=1 in the engine);");
+        println!("hit rates over the first {} token passes only (cold start: the Markov column shows the same", first_passes);
+        println!("window for the online predictor, which has no transition history there).");
+    }
 }

@@ -190,7 +190,7 @@ pub fn set_fallback_shape(experts_per_token: usize) {
 }
 
 /// Accounts a consumed prefetched entry to its producer's counter (prefetch
-/// tag: 1 = Markov/lookahead, 2 = draft).
+/// tag: 1 = Markov/lookahead, 2 = draft, 3 = tracesim).
 fn pref_used(tag: u8) {
     match tag {
         1 => {
@@ -199,6 +199,9 @@ fn pref_used(tag: u8) {
         2 => {
             DPREF_USED.fetch_add(1, Ordering::Relaxed);
             DPREF_WIN_U.fetch_add(1, Ordering::Relaxed);
+        }
+        3 => {
+            TS_USED.fetch_add(1, Ordering::Relaxed);
         }
         _ => {}
     }
@@ -320,6 +323,277 @@ fn trace_record(layer: u32, expert: u32) {
     }
 }
 
+// ── trace-similarity prefetch (MICROKIMI_TRACESIM=1, OFF by default) ──
+//
+// Cross-session prediction for the two regimes the online predictors are
+// blind in: session COLD START (the Markov has observed no transition yet)
+// and a mid-session TOPIC CHANGE (its decayed statistics describe the old
+// topic). A compact per-layer expert histogram of every past session is
+// kept in <model>.routes (routes.rs); the demand stream of the CURRENT
+// session builds the same signature, and once it resembles a stored session
+// (cosine >= TSIM_THRESHOLD), that session's per-layer top experts become
+// the prefetch source for a cold window:
+//
+//   - match: at every layer wrap with enough context (the prompt prefill
+//     routing alone is context enough), the best-cosine stored session is
+//     selected; retried on every wrap while unmatched.
+//   - chained prefetch: on every MoE layer transition during the cold
+//     window (COLD_PASSES token passes after the match), the top-N experts
+//     of the matched session for the NEXT MoE layer are background-fetched
+//     (prefetch_one, tag 3), overlapping the current layer's compute. A
+//     one-shot warm of all layers at match time was measured strictly worse
+//     (+0.9-1.3 points of first-50-tokens hit-rate vs +8.4-8.8 chained,
+//     cachereplay --tracesim): the bulk insert thrashes a tight cache
+//     before the decode reaches the later layers.
+//   - rupture: past the cold window, every RUPT_EVERY passes the Markov
+//     rolling accuracy (PRED_HIT/PRED_TOT deltas; the tracesim recall
+//     deltas in lookahead mode, where the Markov does not run) is checked;
+//     below RUPT_RECALL_FLOOR the recent-window signature is re-matched and
+//     a new best session restarts the cold window.
+//
+// The Markov/lookahead predictors stay the primary source in the
+// established regime: the chained fire stops after the cold window. A
+// prefetch only changes WHEN bytes land in the RAM LRU, never WHICH experts
+// are computed: the greedy output stays bit-identical. Local source only
+// (the signature file path derives from the .bin path).
+static TS_ISSUED: AtomicU64 = AtomicU64::new(0); // tracesim prefetches that fetched bytes
+static TS_CACHED: AtomicU64 = AtomicU64::new(0); // predicted experts already in RAM
+static TS_USED: AtomicU64 = AtomicU64::new(0); // tracesim-prefetched entries consumed on demand
+static TS_MATCH: AtomicU64 = AtomicU64::new(0); // accepted session matches
+static TS_RUPT: AtomicU64 = AtomicU64::new(0); // rupture re-matches that switched the session
+
+/// Token passes of context before the first match attempt. The prompt
+/// prefill routing lands in one layer sweep, so the first decode wrap
+/// already carries the full prompt signature.
+pub(crate) const TSIM_MIN_REQS: u64 = 64;
+/// Cosine gate for accepting a session match (routes::cosine). Same-model
+/// prefixes measured at 0.3+ on the nano chat traces, converging to ~0.99
+/// with a full session of context; a mismatched or degenerate store stays
+/// near 0.
+pub(crate) const TSIM_THRESHOLD: f64 = 0.15;
+/// Length of the cold window in token passes: the chained prefetch fires
+/// while pass - matched_pass < COLD_PASSES, then yields to the Markov.
+pub(crate) const COLD_PASSES: u64 = 50;
+/// Rupture check cadence (token passes) past the cold window.
+const RUPT_EVERY: u64 = 64;
+/// Rupture gate: rolling prediction recall below this (over at least
+/// RUPT_MIN_SAMPLE predictions) triggers a re-match of the recent window.
+const RUPT_RECALL_FLOOR: f64 = 0.25;
+const RUPT_MIN_SAMPLE: u64 = 128;
+/// Demand events kept for the recent-window re-match signature.
+const RECENT_WINDOW: usize = 8192;
+/// Minimum demand requests of a session for it to be worth appending to
+/// the store at exit.
+const MIN_SAVE_REQS: u64 = 256;
+
+/// MICROKIMI_TRACESIM=1: cross-session trace-similarity prefetch (default
+/// OFF; see the block comment above).
+pub fn tracesim_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_off("MICROKIMI_TRACESIM"))
+}
+
+/// Engine state of the trace-similarity prefetcher: the stored sessions,
+/// the current session signature, the match state and the offset
+/// book-keeping prefetch jobs need (same affine-layout trick as Predictor).
+struct TraceSim {
+    path: String,                      // <model>.routes
+    store: crate::routes::RouteStore,  // past sessions
+    cur: HashMap<u32, HashMap<u32, u32>>, // current session: layer -> expert -> count
+    recent: VecDeque<(u32, u32)>,      // sliding window for rupture re-matches
+    reqs: u64,
+    pass: u64,                         // token passes (layer wraps)
+    prev_layer: u32,                   // u32::MAX = none yet
+    matched: Option<usize>,            // index of the matched stored session
+    matched_pass: u64,
+    rupt_checked: u64,                 // pass of the last rupture check
+    mk_sample: (u64, u64),             // (PRED_HIT, PRED_TOT) at the last check
+    ts_sample: (u64, u64),             // (TS_USED, TS_ISSUED) at the last check
+    blob: usize,
+    offs: HashMap<(u32, u32), [u64; 3]>,
+    base: HashMap<u32, (u64, bool)>,
+}
+
+impl TraceSim {
+    fn new(path: String, store: crate::routes::RouteStore) -> TraceSim {
+        TraceSim {
+            path,
+            store,
+            cur: HashMap::new(),
+            recent: VecDeque::new(),
+            reqs: 0,
+            pass: 0,
+            prev_layer: u32::MAX,
+            matched: None,
+            matched_pass: 0,
+            rupt_checked: 0,
+            mk_sample: (0, 0),
+            ts_sample: (0, 0),
+            blob: 0,
+            offs: HashMap::new(),
+            base: HashMap::new(),
+        }
+    }
+
+    /// Resolves the top-n experts of the matched session for `layer` into
+    /// prefetch jobs (observed offsets, or the affine layout when verified).
+    fn jobs_for(&self, layer: u32, n: usize) -> Vec<PrefetchJob> {
+        let Some(m) = self.matched else { return Vec::new() };
+        let mut jobs = Vec::new();
+        for e in self.store.sessions[m].top_n(layer, n) {
+            if let Some(o) = self.offs.get(&(layer, e)) {
+                jobs.push((layer, e, *o));
+            } else if let Some(&(b, true)) = self.base.get(&layer) {
+                let o0 = b + e as u64 * 3 * self.blob as u64;
+                jobs.push((layer, e, [o0, o0 + self.blob as u64, o0 + 2 * self.blob as u64]));
+            }
+        }
+        jobs
+    }
+
+    /// Chained prediction fired on the transition INTO `layer`: the top-n
+    /// experts of the matched session for the next MoE layer (wrapping to
+    /// the first layer after the last, i.e. the next token's first layer).
+    fn chained_jobs(&self, layer: u32, n: usize) -> Vec<PrefetchJob> {
+        let Some(m) = self.matched else { return Vec::new() };
+        if self.pass.saturating_sub(self.matched_pass) >= COLD_PASSES {
+            return Vec::new(); // cold window over: the Markov is primary again
+        }
+        let rl = self.store.sessions[m].routed_layers();
+        let Some(&target) = rl.iter().find(|&&l| l > layer).or_else(|| rl.first()) else { return Vec::new() };
+        if target == layer {
+            return Vec::new(); // single-MoE-layer model: nothing to chain to
+        }
+        self.jobs_for(target, n)
+    }
+
+    /// Match attempt of the current signature against the stored sessions.
+    fn try_match(&mut self, counts: &HashMap<u32, HashMap<u32, u32>>, n: usize, layer: u32) -> Vec<PrefetchJob> {
+        let cur = crate::routes::Session::from_counts(counts);
+        let Some((idx, sim)) = self.store.best_match(&cur, TSIM_THRESHOLD) else { return Vec::new() };
+        if self.matched == Some(idx) {
+            return Vec::new();
+        }
+        self.matched = Some(idx);
+        self.matched_pass = self.pass;
+        TS_MATCH.fetch_add(1, Ordering::Relaxed);
+        println!("stream-tracesim: matched stored session #{} (cosine {:.2}, {} requests of context)", idx, sim, self.reqs);
+        self.chained_jobs(layer, n)
+    }
+
+    /// Rupture check (past the cold window, every RUPT_EVERY passes): the
+    /// Markov rolling accuracy is the primary signal (its statistics decay
+    /// with the topic; a cliff means the established regime broke). In
+    /// lookahead mode the Markov does not run, so the tracesim prefetch's
+    /// own consumption recall is the fallback signal. On a rupture the
+    /// recent-window signature is re-matched; a different best session
+    /// restarts the cold window.
+    fn rupture_check(&mut self, layer: u32, n: usize) -> Vec<PrefetchJob> {
+        if self.matched.is_none() || self.pass < self.rupt_checked + RUPT_EVERY {
+            return Vec::new();
+        }
+        self.rupt_checked = self.pass;
+        let (h, t) = (PRED_HIT.load(Ordering::Relaxed), PRED_TOT.load(Ordering::Relaxed));
+        let (dh, dt) = (h - self.mk_sample.0, t - self.mk_sample.1);
+        self.mk_sample = (h, t);
+        let ruptured = if dt >= RUPT_MIN_SAMPLE {
+            (dh as f64) < RUPT_RECALL_FLOOR * dt as f64
+        } else {
+            let (u, i) = (TS_USED.load(Ordering::Relaxed), TS_ISSUED.load(Ordering::Relaxed));
+            let (du, di) = (u - self.ts_sample.0, i - self.ts_sample.1);
+            self.ts_sample = (u, i);
+            di >= RUPT_MIN_SAMPLE && (du as f64) < RUPT_RECALL_FLOOR * di as f64
+        };
+        if !ruptured {
+            return Vec::new();
+        }
+        // re-match on the recent window only: the full-session histogram is
+        // dominated by the old topic after a change
+        let mut counts: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
+        for &(l, e) in &self.recent {
+            *counts.entry(l).or_default().entry(e).or_insert(0) += 1;
+        }
+        let before = self.matched;
+        let jobs = self.try_match(&counts, n, layer);
+        if self.matched != before {
+            TS_RUPT.fetch_add(1, Ordering::Relaxed);
+            println!("stream-tracesim: topic rupture (rolling recall < {}), re-matched session #{}", RUPT_RECALL_FLOOR, self.matched.unwrap());
+        }
+        jobs
+    }
+
+    /// Demand-stream hook (one router pick): maintains the current session
+    /// signature and the offset book-keeping, detects layer transitions and
+    /// token wraps, and returns the prefetch jobs to run in the background
+    /// (match / chained fire / rupture re-match). `n` is the per-layer
+    /// prediction count.
+    fn observe(&mut self, layer: u32, expert: u32, offs: [u64; 3], blob: usize, n: usize) -> Vec<PrefetchJob> {
+        // offset book-keeping (same affine-layout trick as Predictor)
+        self.blob = blob;
+        self.offs.insert((layer, expert), offs);
+        let stride_ok = offs[1] == offs[0] + blob as u64 && offs[2] == offs[1] + blob as u64;
+        let b = offs[0].wrapping_sub(expert as u64 * 3 * blob as u64);
+        match self.base.get_mut(&layer) {
+            None => {
+                self.base.insert(layer, (b, stride_ok));
+            }
+            Some(e) => {
+                if !stride_ok || e.0 != b {
+                    e.1 = false;
+                }
+            }
+        }
+        // session signature
+        *self.cur.entry(layer).or_default().entry(expert).or_insert(0) += 1;
+        self.recent.push_back((layer, expert));
+        if self.recent.len() > RECENT_WINDOW {
+            self.recent.pop_front();
+        }
+        self.reqs += 1;
+        // layer transition / token wrap detection
+        if layer == self.prev_layer {
+            return Vec::new();
+        }
+        let wrap = self.prev_layer != u32::MAX && layer < self.prev_layer;
+        let fired = if self.prev_layer == u32::MAX {
+            Vec::new()
+        } else {
+            self.chained_jobs(layer, n)
+        };
+        self.prev_layer = layer;
+        if wrap {
+            self.pass += 1;
+        }
+        // cold-start match (retried on every wrap while unmatched: more
+        // context only helps the cosine)
+        if self.matched.is_none() && wrap && self.reqs >= TSIM_MIN_REQS {
+            let counts = self.cur.clone();
+            return self.try_match(&counts, n, layer);
+        }
+        // rupture check past the cold window
+        if wrap {
+            let jobs = self.rupture_check(layer, n);
+            if !jobs.is_empty() {
+                return jobs;
+            }
+        }
+        fired
+    }
+
+    /// Appends the current session to the store (CacheInner drop). No-op
+    /// below MIN_SAVE_REQS of context (a probe run is not a signature).
+    fn save(&mut self) {
+        if self.reqs < MIN_SAVE_REQS {
+            return;
+        }
+        let s = crate::routes::Session::from_counts(&self.cur);
+        match crate::routes::RouteStore::append(&self.path, s) {
+            Ok(n) => println!("stream-tracesim: session appended to {} ({} requests, {} sessions stored)", self.path, self.reqs, n),
+            Err(e) => eprintln!("warning: cannot write {}: {}", self.path, e),
+        }
+    }
+}
+
 /// One-line fetch report printed at exit when --stream is active.
 pub fn report_line() -> String {
     let mut s = format!(
@@ -367,6 +641,20 @@ pub fn report_line() -> String {
         s.push_str(&format!(
             "\nstream-draft: {} experts prefetched for the speculative verification ({} already cached), {} consumed on demand ({:.0}% recall)",
             di, dc, used, recall
+        ));
+    }
+    if tracesim_on() {
+        let issued = TS_ISSUED.load(Ordering::Relaxed);
+        let used = TS_USED.load(Ordering::Relaxed);
+        let recall = if issued > 0 { 100.0 * used as f64 / issued as f64 } else { 0.0 };
+        s.push_str(&format!(
+            "\nstream-tracesim: {} session match(es) ({} rupture re-matches), {} experts prefetched ({} already cached), {} consumed on demand ({:.0}% recall)",
+            TS_MATCH.load(Ordering::Relaxed),
+            TS_RUPT.load(Ordering::Relaxed),
+            issued,
+            TS_CACHED.load(Ordering::Relaxed),
+            used,
+            recall
         ));
     }
     let fb = FB_SERVED.load(Ordering::Relaxed);
@@ -1440,6 +1728,21 @@ struct CacheInner {
     /// VQ1 shadows of every expert (shadow.rs), resident in RAM under
     /// --stream-fallback. None in the default bit-identical mode.
     shadows: Option<Arc<crate::shadow::Shadows>>,
+    /// Trace-similarity prefetcher state (MICROKIMI_TRACESIM=1). Some on the
+    /// local source even with an empty store: the current session is still
+    /// recorded and appended to <model>.routes at drop.
+    tsim: Mutex<Option<TraceSim>>,
+}
+
+impl Drop for CacheInner {
+    /// Appends the current session's routing signature to <model>.routes
+    /// (TraceSim::save; no-op when tracesim is off or the session is too
+    /// short to be a signature).
+    fn drop(&mut self) {
+        if let Some(t) = self.tsim.get_mut().unwrap().as_mut() {
+            t.save();
+        }
+    }
 }
 
 impl CacheInner {
@@ -1690,6 +1993,20 @@ impl ExpertCache {
         // initialize the trace sink now so its startup line prints with the
         // other stream lines (no-op when MICROKIMI_TRACE is unset)
         trace_sink();
+        // trace-similarity prefetcher (MICROKIMI_TRACESIM=1): load the
+        // stored session signatures of this model (no-op when off)
+        let tsim = if tracesim_on() {
+            let rp = format!("{}.routes", path);
+            let store = crate::routes::RouteStore::load(&rp).unwrap_or_else(|_| crate::routes::RouteStore::empty());
+            println!(
+                "stream-tracesim: {} stored session(s) in {} (MICROKIMI_TRACESIM=1: cold-start/topic-rupture expert prefetch)",
+                store.sessions.len(),
+                rp
+            );
+            Some(TraceSim::new(rp, store))
+        } else {
+            None
+        };
         ExpertCache {
             inner: Arc::new(CacheInner {
                 lru: Mutex::new(Lru::new(ram_mb << 20)),
@@ -1697,6 +2014,7 @@ impl ExpertCache {
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
                 shadows,
+                tsim: Mutex::new(tsim),
             }),
         }
     }
@@ -1711,6 +2029,7 @@ impl ExpertCache {
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
                 shadows: None, // the shadow fallback is a local-source mode
+                tsim: Mutex::new(None), // the signature file derives from the local .bin path
             }),
         }
     }
@@ -1829,6 +2148,31 @@ impl ExpertCache {
     pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Served {
         // record the demand request (MICROKIMI_TRACE; no-op when unset)
         trace_record(layer, expert);
+        // trace-similarity prefetcher (MICROKIMI_TRACESIM=1): maintain the
+        // session signature, fire the cold-window chained prefetch on layer
+        // transitions. Demand-only observation, same contract as the Markov
+        // path: only fetch timing changes, the output stays bit-identical.
+        if tracesim_on() {
+            let jobs = {
+                let mut g = self.inner.tsim.lock().unwrap();
+                match g.as_mut() {
+                    Some(t) => {
+                        let p = predict_n();
+                        let n = if p > 0 { p } else { TOP_K.load(Ordering::Relaxed) };
+                        t.observe(layer, expert, offs, blob, n)
+                    }
+                    None => Vec::new(),
+                }
+            };
+            if !jobs.is_empty() {
+                let inner = Arc::clone(&self.inner);
+                std::thread::spawn(move || {
+                    for (l, e, o) in jobs {
+                        inner.prefetch_one(l, e, o, blob, &TS_ISSUED, &TS_CACHED, false, 3);
+                    }
+                });
+            }
+        }
         // feed the Markov predictor; on a completed top-k batch this may
         // return prefetch jobs for the next MoE layer, run on a detached
         // thread so they overlap the current layer's compute
@@ -2119,6 +2463,7 @@ pub fn streamtest(args: &[String]) {
             pred: Mutex::new(Predictor::new()),
             inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
             shadows: None,
+            tsim: Mutex::new(None),
         }),
     };
     for e in 0..4u32 {
@@ -2340,6 +2685,7 @@ mod tests {
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
                 shadows: Some(Arc::new(sh)),
+                tsim: Mutex::new(None),
             }),
         };
         let offs = |e: u32| [e as u64 * 192, e as u64 * 192 + 64, e as u64 * 192 + 128];

@@ -28,6 +28,7 @@ mod pool;
 mod q8;
 mod quant;
 mod rosa;
+mod routes;
 mod safetensors;
 mod selftest;
 mod shadow;
@@ -224,6 +225,8 @@ fn main() {
         "pck" => pck::cmd(&args),
         // microkimi cachereplay trace.bin [--top-k K] [--predict N]
         "cachereplay" => tools_replay::run(&args),
+        // microkimi routebuild store.routes trace.bin [trace2.bin ...]
+        "routebuild" => tools_replay::routebuild(&args),
         // debug command (debug helper): prints the tokenization of a text
         "tok" => {
             let tok = tokenizer::Tokenizer::load(&tokenizer_path());
@@ -299,6 +302,11 @@ fn main() {
             println!("                        (--spec/--spec-rosa + --stream: experts predicted from the drafted");
             println!("                        tokens are prefetched before the verification pass; output-preserving)");
             println!("                    env MICROKIMI_TRACE=trace.bin records the expert request stream (see cachereplay)");
+            println!("                    env MICROKIMI_TRACESIM=1 cross-session trace-similarity expert prefetch");
+            println!("                        (default OFF: matches the running session's routing against the per-layer");
+            println!("                        expert histograms of past sessions kept in <model>.routes and prefetches");
+            println!("                        the matched session's experts during the cold start / after a topic rupture;");
+            println!("                        output-preserving, only changes fetch timing; see cachereplay --tracesim)");
             println!("                    env MICROKIMI_CACHE=arc|lru|lfu selects the expert cache eviction policy");
             println!("                        (default lfu; arc = T1/T2 + ghost lists, scan-resistant, non-default)");
             println!("                    env MICROKIMI_ROUTECMS=sketch.bin records a count-min sketch of the routing");
@@ -328,9 +336,12 @@ fn main() {
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
             println!("  microkimi pck --info [--model X.bin]   chat prefix-cache entries (count, covered tokens, bytes)");
             println!("  microkimi pck --clean [--model X.bin]  purge the chat prefix cache, prints freed bytes");
-            println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");
+            println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N] [--tracesim store.routes] [--first N]");
             println!("                                         replay a MICROKIMI_TRACE expert-request trace offline:");
-            println!("                                         hit-rate vs capacity under LRU, LFU, ARC, Markov prefetch, Belady");
+            println!("                                         hit-rate vs capacity under LRU, LFU, ARC, Markov prefetch, Belady;");
+            println!("                                         --tracesim: cold-start A/B of the cross-session prefetch");
+            println!("  microkimi routebuild store.routes trace.bin [trace2.bin ...]");
+            println!("                                         append the routing signature of each trace to a .routes store");
             println!("  microkimi metaltest | metaltest-packed | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }
