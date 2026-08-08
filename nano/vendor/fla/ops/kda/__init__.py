@@ -50,7 +50,7 @@ KDA_SEG_DEVICES = tuple(
 # loop (decays are applied as exp(cumsum) per chunk instead of per-token
 # products, and the triangular inverse uses a different operation order) -
 # the deviation is float-noise level (measured <= ~1e-5 relative on outputs
-# and gradients, see nano/test_kda_chunked.py), acceptable for training but
+# and gradients, see nano/tests/test_kda_chunked.py), acceptable for training but
 # never use it where parity with the Rust engine is required. Default OFF.
 # If the chunked path ever raises OR returns a non-finite output, it disables
 # itself and falls back to the reference recurrence for the rest of the

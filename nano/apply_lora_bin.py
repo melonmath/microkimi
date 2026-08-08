@@ -29,7 +29,7 @@ input_layernorm(stream)): for a linear read, W h' = W (I + B A) h, so
 Same shapes, same sizes: the .bin stays standard and needs no reader
 support.
 
-Measured on the smoke model (nano/test_seam_adapter.py): the fold is exact
+Measured on the smoke model (nano/tests/test_seam_adapter.py): the fold is exact
 at zero-init (B = 0, the merged .bin is byte-identical) but the forward of
 the merged model diverges from the adapted one linearly with |B A| -
 max|logit diff| 5.7e-6 at max|B A| 1e-8, 9.2e-5 at 1e-5, and already 0.21

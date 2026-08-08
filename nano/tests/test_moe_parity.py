@@ -7,7 +7,7 @@ import os
 import sys
 
 os.environ["NANO_MOE_FAST_DEVICES"] = "cpu"
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402
 from model_nano import TrainableSparseMoe, nano_config, NANO  # noqa: E402

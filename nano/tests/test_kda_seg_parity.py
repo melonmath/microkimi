@@ -6,7 +6,9 @@ Run from the nano/ dir with NANO_KDA_SEG_DEVICES=cpu.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "vendor"))
 
 import torch  # noqa: E402
 import vendor.fla.ops.kda as kda_mod  # noqa: E402

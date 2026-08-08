@@ -28,6 +28,8 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 
@@ -50,7 +52,7 @@ def forward_logits(model, ids, lora_cfg=None, seam_cfg=None, sd=None):
 
 def run_heal(model, data, out, extra, steps):
     cmd = [
-        sys.executable, os.path.join(HERE, "heal_stream.py"),
+        sys.executable, os.path.join(HERE, "..", "heal_stream.py"),
         "--model", model, "--data", data, "--out", out,
         "--lora", "8", "--seq", "64", "--batch", "1", "--steps", str(steps),
         "--warmup", "1", "--lr", "1e-3", "--device", "cpu", "--ignore-unk",
@@ -71,7 +73,7 @@ def losses_of(log):
 
 
 def merge(ckpt, model, out, force=False):
-    cmd = [sys.executable, os.path.join(HERE, "apply_lora_bin.py"),
+    cmd = [sys.executable, os.path.join(HERE, "..", "apply_lora_bin.py"),
            "--ckpt", ckpt, "--bin", model, "--out", out]
     if force:
         cmd.append("--force-seam-fold")
@@ -120,7 +122,7 @@ def check_fold_tensors(orig, merged, after, a, b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/workspace/chat_smoke/nanokimi_chat_smoke.bin")
-    ap.add_argument("--data", default=os.path.join(HERE, "..", "nano_chat", "out_smoke", "tokens_chat.bin"))
+    ap.add_argument("--data", default=os.path.join(HERE, "..", "..", "nano_chat", "out_smoke", "tokens_chat.bin"))
     ap.add_argument("--skip-training", action="store_true", help="only (a) and the fabricated parts of (d)")
     args = ap.parse_args()
     tmp = tempfile.mkdtemp(prefix="seam_test_")
@@ -293,7 +295,7 @@ def main():
         ba_max = (ck["model"]["seam_adapter.B"] @ ck["model"]["seam_adapter.A"]).abs().max()
         # a trained seam adapter must be REFUSED without --force-seam-fold
         r = subprocess.run(
-            [sys.executable, os.path.join(HERE, "apply_lora_bin.py"),
+            [sys.executable, os.path.join(HERE, "..", "apply_lora_bin.py"),
              "--ckpt", trained_ckpt, "--bin", args.model, "--out", os.devnull],
             capture_output=True, text=True)
         assert r.returncode != 0 and "refusing to fold a TRAINED seam adapter" in (

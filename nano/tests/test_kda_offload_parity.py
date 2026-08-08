@@ -10,7 +10,9 @@ Run from the nano/ dir: python3 test_kda_offload_parity.py
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "vendor"))
 
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402

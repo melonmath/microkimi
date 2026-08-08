@@ -8,12 +8,14 @@ the deviation must stay at float-noise level, bounded here at 1e-4 relative.
 Also checks the chunk_kda wrapper end to end (qk l2norm + gate + beta sigmoid,
 per-channel A_log) with the flag toggled at runtime, and the automatic
 fallback to the reference path when the chunked path raises.
-Run from anywhere: python3 nano/test_kda_chunked.py
+Run from anywhere: python3 nano/tests/test_kda_chunked.py
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "vendor"))
 
 import torch  # noqa: E402
 import vendor.fla.ops.kda as kda_mod  # noqa: E402
