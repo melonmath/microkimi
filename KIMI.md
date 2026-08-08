@@ -58,8 +58,6 @@ More prompts (raw, unedited): `"Tom was a small boy who loved to play outside."`
 
 ### The training run
 
-![training loss](docs/training_curve.png)
-
 |          |                                                                                                                |
 | -------- | -------------------------------------------------------------------------------------------------------------- |
 | VM       | GCP e2-highcpu-32 spot (32 vCPU, 31 GB RAM, **no GPU**, ~$0.5/h)                                               |
