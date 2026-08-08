@@ -449,6 +449,40 @@ def count_params(model):
 # params and not what LoRA healing targets); the MoE router gate is a custom
 # module (not an nn.Linear) and stays untouched as well.
 
+# NANO_PRETRANSPOSE: opt-in cache of a contiguous transposed copy W_t of the
+# frozen LoRA-targeted base weights (the only Linears whose matmuls run in
+# every micro-batch of both the forward and the backward recompute). The
+# streamed trainer streams W_t alongside W (pinned host copy, see
+# heal_stream.py) and LoRALinear then runs forward as x @ W_t and backward as
+# gy @ W through _WTLinear, so neither direction feeds a transposed VIEW of a
+# freshly streamed weight to the BLAS. Same math as F.linear. Default OFF.
+PRETRANSPOSE = os.environ.get("NANO_PRETRANSPOSE", "0") == "1"
+
+
+class _WTLinear(torch.autograd.Function):
+    """y = x @ W^T + b for a frozen W, driven by the pre-transposed contiguous
+    copy W_t in the forward and by W itself in the backward (grad w.r.t. x is
+    gy @ W). W is frozen: no weight gradient is produced. Both device copies
+    live only for the layer window (see heal_stream._Swap), and the graph
+    nodes they feed are created and consumed inside the same window, so
+    saving W for backward holds no VRAM beyond it."""
+
+    @staticmethod
+    def forward(ctx, x, w, w_t, bias):
+        with torch.no_grad():
+            y = torch.matmul(x, w_t)
+            if bias is not None:
+                y = y + bias
+        ctx.save_for_backward(w)
+        return y
+
+    @staticmethod
+    def backward(ctx, gy):
+        (w,) = ctx.saved_tensors
+        gx = torch.matmul(gy, w) if ctx.needs_input_grad[0] else None
+        return gx, None, None, None
+
+
 class LoRALinear(nn.Module):
     """Frozen nn.Linear + trainable low-rank adapter (A @ x then B @ ., scaled)."""
 
@@ -465,7 +499,16 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
 
     def forward(self, x):
-        return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        w = self.base.weight
+        # pre-transposed path (NANO_PRETRANSPOSE=1): _w_t is the streamed
+        # contiguous W^T copy, present only inside the layer's swap window
+        w_t = getattr(w, "_w_t", None)
+        if (PRETRANSPOSE and w_t is not None and w_t.device == x.device
+                and w_t.shape == (w.shape[1], w.shape[0])):
+            y = _WTLinear.apply(x, w, w_t, self.base.bias)
+        else:
+            y = self.base(x)
+        return y + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
     def merged_weight(self):
         """W + B A * scaling (for the merge-and-export path)."""

@@ -24,6 +24,16 @@ and a full fp32 forward+backward that fits in no GPU. This trainer instead:
     apply_lora / LoRALinear, rank 8 by default), which stay resident on the
     GPU with their AdamW states (a few hundred MB).
 
+Two opt-in accelerations (env, default OFF, safe to combine):
+  - NANO_ACT_OFFLOAD=1: the KDA time-segment checkpointing (NANO_KDA_SEG)
+    stashes each segment's inputs in pinned host memory with async D2H/H2D on
+    a side CUDA stream instead of retaining them in VRAM between forward and
+    backward (bit-identical; see vendor/fla/ops/kda/__init__.py);
+  - NANO_PRETRANSPOSE=1: the frozen LoRA-targeted base weights get a cached
+    contiguous W^T copy in (pinned) host RAM, streamed alongside W, so the
+    per-micro-batch matmuls never feed a transposed view to the BLAS
+    (see model_nano._WTLinear).
+
 Checkpoints hold ONLY the trainable tensors (adapters, optionally norms) plus
 optimizer/step/rng/cfg - a few hundred MB. The merge back into a loadable
 model is apply_lora_bin.py, which patches the fp32 attention tensors of a COPY
@@ -55,7 +65,7 @@ import torch
 import torch.nn.functional as F
 
 from bin2pt import read_bin, CFG_KEYS, E2M1, DTYPE_F32, DTYPE_MXFP4, DTYPE_I32, DTYPE_VQ1
-from model_nano import NanoModel, TrainableSparseMoe, apply_lora, layer_types
+from model_nano import NanoModel, TrainableSparseMoe, apply_lora, layer_types, PRETRANSPOSE
 from vendor.moonshot.modeling_kimi_linear import _apply_attn_res
 from train import load_tokens, make_batch, lr_at, rss_gb
 
@@ -194,11 +204,18 @@ class _Swap:
     def __enter__(self):
         for p, cpu in self.pairs:
             p.data = cpu.to(self.dev)
+            # NANO_PRETRANSPOSE: stream the cached contiguous W^T copy too
+            # (LoRA-targeted weights only) - released on exit like p.data
+            cpu_t = getattr(p, "_cpu_data_t", None)
+            if cpu_t is not None:
+                p._w_t = cpu_t.to(self.dev)
         return self
 
     def __exit__(self, *exc):
         for p, cpu in self.pairs:
             p.data = cpu
+            if hasattr(p, "_w_t"):
+                p._w_t = None
         return False
 
 
@@ -396,6 +413,27 @@ class StreamedHealModel:
                     p.data = p._cpu_data.to(dev)
                     del p._cpu_data
 
+        # NANO_PRETRANSPOSE: cache a contiguous W^T copy of every LoRA-targeted
+        # frozen base weight in host RAM (pinned when the compute device is
+        # CUDA, so _Swap can stream it with async H2D). One extra host copy of
+        # the attention projections; the device copies live only inside the
+        # layer's swap window (see _Swap).
+        self.n_pretrans = 0
+        if PRETRANSPOSE and lora_cfg:
+            for w in model.lora_info["wrapped"]:
+                p = model.get_submodule(w).base.weight
+                cpu = getattr(p, "_cpu_data", None)
+                if cpu is None or cpu.ndim != 2 or hasattr(p, "_cpu_data_t"):
+                    continue
+                wt = cpu.t().contiguous()
+                if dev == "cuda":
+                    try:
+                        wt = wt.pin_memory()
+                    except RuntimeError:
+                        pass  # unpinned fallback: correct, just a slower H2D
+                p._cpu_data_t = wt
+                self.n_pretrans += 1
+
         self.model = model
         self.n_moe = n_moe
         self._mla, _ = layer_types(cfg)
@@ -573,9 +611,10 @@ def main():
     scope = f", layers {lora_cfg['layers']}" if lora_cfg.get("layers") is not None else ""
     if lora_cfg.get("final_norm"):
         scope += ", final-norm only"
+    pretrans = f", {sm.n_pretrans} pre-transposed W^T" if sm.n_pretrans else ""
     print(f"heal_stream: {args.model} - {sm.cfg['n_layers']} layers, hidden {sm.cfg['hidden']}, "
           f"vocab {sm.cfg['vocab']}, {sm.n_moe} moe layers, {sm.n_assigned} mmap-backed tensors, "
-          f"{sm.n_train / 1e6:.2f} M trainable params{scope} ({time.time() - t_load:.1f} s)", flush=True)
+          f"{sm.n_train / 1e6:.2f} M trainable params{scope}{pretrans} ({time.time() - t_load:.1f} s)", flush=True)
 
     trainable = sm.trainable_params()
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
