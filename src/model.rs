@@ -1038,6 +1038,9 @@ impl Model {
                 }
             }
         }
+        // positions restart at 0: the routing history of the previous turn
+        // (draft-aware prefetch) would alias the new positions
+        crate::stream::route_hist_clear();
     }
 }
 
@@ -2172,6 +2175,11 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
     for s in &sel {
         crate::cms::record(layer, s.0);
     }
+    // routing history for the draft-aware prefetch (streaming runs only;
+    // no-op unless MICROKIMI_DRAFTPREFETCH is on)
+    if stream.is_some() {
+        crate::stream::route_record(pos as u32, layer as u32, sel.iter().map(|s| s.0).collect());
+    }
     let mut h = vec![0f32; cfg.routed_hidden];
     matvec(Model::t(data, &w.routed_down), cfg.routed_hidden, cfg.d, x, &mut h);
     prof.t_router += tm.elapsed().as_secs_f64();
@@ -2479,6 +2487,10 @@ fn moe_prefill(
         // count-min routing statistics (no-op unless routestats/MICROKIMI_ROUTECMS)
         for s in &sel {
             crate::cms::record(layer, s.0);
+        }
+        // routing history for the draft-aware prefetch (streaming runs only)
+        if stream.is_some() {
+            crate::stream::route_record((pos0 + t) as u32, layer as u32, sel.iter().map(|s| s.0).collect());
         }
     }
     let mut h = vec![0f32; n * cfg.routed_hidden];
@@ -3003,6 +3015,48 @@ impl Model {
     /// to what a sequential forward of that prefix would produce.
     pub fn prefill_all(&mut self, ids: &[u32], pos0: usize) -> Vec<Vec<f32>> {
         self.prefill_impl(ids, pos0, true)
+    }
+
+    /// Draft-aware expert prefetch (--spec / --spec-rosa with --stream;
+    /// MICROKIMI_DRAFTPREFETCH=0 disables): the batched verification pass
+    /// that ingests `toks` (pending token + drafted proposals) will route
+    /// them for real, so the experts it will pull are predictable before
+    /// the pass starts. Both proposers draft tokens that ALREADY occurred
+    /// in the committed context, and every ingested position had its router
+    /// picks recorded (stream::route_record, real hidden states, not an
+    /// embedding proxy - measured ~0% recall), so the routing of the source
+    /// occurrence, `srcs[t]` = the context position toks[t] was lifted
+    /// from, is the prediction: union of the recorded top-k sets over the
+    /// source positions, background-fetched through the stream cache so the
+    /// pass finds its experts in the RAM LRU. Same contract as the
+    /// router-lookahead prefetch: only WHEN bytes land in the cache
+    /// changes, never WHICH experts the model computes - mispredictions are
+    /// harmless LRU fills and the greedy output stays bit-identical.
+    /// No-op without --stream.
+    pub fn draft_prefetch(&self, toks: &[u32], srcs: &[Option<usize>]) {
+        let Some(cache) = &self.stream else { return };
+        if toks.is_empty() || !crate::stream::draft_prefetch_on() {
+            return;
+        }
+        let cfg = &self.cfg;
+        let expert_packed = cfg.routed_hidden * cfg.moe_inter / 2;
+        let expert_blob = expert_packed + cfg.routed_hidden * cfg.moe_inter / 32;
+        let expert_vq_blob = cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM;
+        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut jobs: Vec<(u32, u32, [u64; 3], usize)> = Vec::new();
+        for src in srcs.iter().flatten() {
+            let Some(layers) = crate::stream::route_lookup(*src as u32) else { continue };
+            for (layer, experts) in layers {
+                let FfnW::Moe(w) = &self.layers[layer as usize].ffn else { continue };
+                for e in experts {
+                    if seen.insert((layer, e)) {
+                        let eblob = if w.experts_vq[e as usize] { expert_vq_blob } else { expert_blob };
+                        jobs.push((layer, e, w.experts[e as usize], eblob));
+                    }
+                }
+            }
+        }
+        cache.prefetch_draft(jobs);
     }
 
     fn prefill_impl(&mut self, ids: &[u32], pos0: usize, all_logits: bool) -> Vec<Vec<f32>> {

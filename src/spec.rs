@@ -28,7 +28,21 @@
 
 use crate::model::{Model, Sampler};
 use crate::tokenizer::AnyTokenizer;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+// MICROKIMI_DRAFTSTATS=1 (debug): quality of the draft-aware prefetch
+// predictor. After each verification pass, compare the routing recorded at
+// the COMMITTED positions (the pass's real picks, just ingested) with the
+// routing replayed from their source positions (the prediction):
+// per position-layer |predicted ∩ actual| / |actual|, summed.
+static DPRED_HIT: AtomicU64 = AtomicU64::new(0);
+static DPRED_TOT: AtomicU64 = AtomicU64::new(0);
+
+fn draft_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_DRAFTSTATS").map(|v| v == "1").unwrap_or(false))
+}
 
 /// Greedy selection, same function and tie-breaking as the
 /// run_turn_core_batch greedy path (required for bit-identity). With
@@ -44,9 +58,11 @@ fn select(logits: &[f32], sampler: &Sampler, gen_ctx: &[u32]) -> u32 {
 }
 
 /// Longest suffix n-gram (2..=8) of ctx that also occurs earlier in ctx;
-/// returns up to `n` tokens following the MOST RECENT earlier occurrence.
+/// returns up to `n` tokens following the MOST RECENT earlier occurrence,
+/// plus the source position `from` the proposal was lifted from (prop[j]
+/// sat at from + j; consumed by the draft-aware prefetch).
 /// Plain nested scan: contexts are modest (one prompt + one answer).
-fn propose(ctx: &[u32], n: usize) -> Vec<u32> {
+fn propose(ctx: &[u32], n: usize) -> (Vec<u32>, Option<(usize, usize)>) {
     for l in (2..=8usize).rev() {
         if ctx.len() <= l {
             continue;
@@ -56,11 +72,30 @@ fn propose(ctx: &[u32], n: usize) -> Vec<u32> {
             if &ctx[i..i + l] == suffix {
                 let from = i + l;
                 let to = (from + n).min(ctx.len());
-                return ctx[from..to].to_vec();
+                return (ctx[from..to].to_vec(), Some((from, to - from)));
             }
         }
     }
-    Vec::new()
+    (Vec::new(), None)
+}
+
+/// Most recent occurrence of the longest prefix of `prop` in ctx:
+/// (start, matched length). The Rosa chain is frequency-stitched, not
+/// lifted from one position, so its source occurrence is recovered by a
+/// plain backward scan (contexts are modest); used by the draft-aware
+/// prefetch to replay the routing recorded at those positions.
+fn source_of(ctx: &[u32], prop: &[u32]) -> Option<(usize, usize)> {
+    for l in (1..=prop.len()).rev() {
+        if ctx.len() < l {
+            continue;
+        }
+        for i in (0..=ctx.len() - l).rev() {
+            if ctx[i..i + l] == prop[..l] {
+                return Some((i, l));
+            }
+        }
+    }
+    None
 }
 
 /// Draft proposer: the plain bounded n-gram scan above, or the incremental
@@ -72,10 +107,17 @@ enum Proposer {
 }
 
 impl Proposer {
-    fn propose(&self, ctx: &[u32], n: usize) -> Vec<u32> {
+    /// Up to `n` candidate tokens, plus the source occurrence they were
+    /// lifted from: (start, matched length) - prop[j] sat at start + j for
+    /// j < matched. None = no usable source (the prefetch skips the draft).
+    fn propose(&self, ctx: &[u32], n: usize) -> (Vec<u32>, Option<(usize, usize)>) {
         match self {
             Proposer::NGram => propose(ctx, n),
-            Proposer::Rosa(a) => a.propose(n),
+            Proposer::Rosa(a) => {
+                let prop = a.propose(n);
+                let src = source_of(ctx, &prop);
+                (prop, src)
+            }
         }
     }
     /// Keeps the automaton in sync with the committed context (no-op for
@@ -144,7 +186,7 @@ pub fn run_turn_spec(
     let mut cool = 0usize;
 
     while generated.len() < max_new && !stop_hit {
-        let prop = if cool > 0 { Vec::new() } else { proposer.propose(&ctx, k) };
+        let (prop, src) = if cool > 0 { (Vec::new(), None) } else { proposer.propose(&ctx, k) };
         if prop.is_empty() {
             // no earlier n-gram to continue from (or cooldown): plain step.
             // With a pending token, just ingest it (it was selected by
@@ -176,6 +218,26 @@ pub fn run_turn_spec(
             batch.push(*generated.last().unwrap());
         }
         batch.extend_from_slice(&prop);
+        // draft-aware prefetch: the pending token continues the source
+        // occurrence (position from - 1), prop[j] sat at from + j. Replay
+        // the routing recorded at those positions to background-fetch the
+        // experts the verification pass will pull (--stream only,
+        // MICROKIMI_DRAFTPREFETCH=0 disables; output-neutral)
+        let srcs: Vec<Option<usize>> = match src {
+            Some((from, matched)) => {
+                let mut v: Vec<Option<usize>> = Vec::with_capacity(batch.len());
+                if pending {
+                    v.push(from.checked_sub(1).filter(|_| matched > 0));
+                }
+                for j in 0..prop.len() {
+                    v.push(if j < matched { Some(from + j) } else { None });
+                }
+                v
+            }
+            None => Vec::new(),
+        };
+        model.draft_prefetch(&batch, &srcs);
+        let pos_batch = pos; // position of batch[0] (for the draft stats)
         let g = model.prefill_all(&batch, pos);
         passes += 1;
         // verification: accept while the argmax matches the proposal
@@ -237,6 +299,26 @@ pub fn run_turn_spec(
         }
         pos += committed;
         pass_tokens += committed;
+        // draft prefetch predictor stats (MICROKIMI_DRAFTSTATS=1): the
+        // committed positions were just re-ingested, so their recorded
+        // routing is the pass's REAL picks; score the replayed source
+        // routing against them
+        if draft_stats_on() {
+            for j in 0..committed {
+                let Some(Some(sp)) = srcs.get(j) else { continue };
+                let (Some(pred), Some(act)) = (crate::stream::route_lookup(*sp as u32), crate::stream::route_lookup((pos_batch + j) as u32)) else { continue };
+                let mut hit = 0u64;
+                let mut tot = 0u64;
+                for (l, ae) in &act {
+                    tot += ae.len() as u64;
+                    if let Some((_, pe)) = pred.iter().find(|(pl, _)| pl == l) {
+                        hit += ae.iter().filter(|e| pe.contains(e)).count() as u64;
+                    }
+                }
+                DPRED_HIT.fetch_add(hit, Ordering::Relaxed);
+                DPRED_TOT.fetch_add(tot, Ordering::Relaxed);
+            }
+        }
         // a pass is fruitful only if it accepted at least one PROPOSED token
         // (beyond the pending one it would have ingested anyway)
         if committed == pending as usize {
@@ -302,5 +384,16 @@ pub fn run_turn_spec(
         pass_tokens as f64 / passes.max(1) as f64,
         singles
     );
+    if draft_stats_on() {
+        let (hit, tot) = (DPRED_HIT.load(Ordering::Relaxed), DPRED_TOT.load(Ordering::Relaxed));
+        if tot > 0 {
+            println!(
+                "  draft-prefetch predictor: {}/{} of the verification picks were in the replayed source routing ({:.0}%)",
+                hit,
+                tot,
+                100.0 * hit as f64 / tot as f64
+            );
+        }
+    }
     answer
 }

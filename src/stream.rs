@@ -101,6 +101,111 @@ pub fn lookahead_on() -> bool {
     *ON.get_or_init(|| std::env::var("MICROKIMI_LOOKAHEAD").map(|v| v != "0").unwrap_or(true))
 }
 
+// ── draft-aware expert prefetch (--spec / --spec-rosa + --stream) ──
+//
+// The batched verification pass of a speculative round routes the drafted
+// tokens for real (model.rs moe_prefill), so the experts it will pull are
+// predictable BEFORE the pass starts. Both proposers draft tokens that
+// already occurred in the committed context (n-gram: verbatim lift; Rosa:
+// frequency chain resolved to a source occurrence by spec.rs), and every
+// ingested position had its top-k router picks recorded below (real hidden
+// states - routing the token EMBEDDINGS through the routers instead was
+// measured at ~0% recall: embeddings are too far from the hidden states
+// the routers actually see). The prediction for a drafted token is the
+// recorded routing of its source occurrence: spec.rs hands the source
+// positions to Model::draft_prefetch, which unions the recorded top-k sets
+// and background-fetches them here while the verification pass runs, so
+// its warm_batch finds the experts already in the RAM LRU. Same contract
+// as the router-lookahead prefetch: only WHEN bytes land in the cache
+// changes, never WHICH experts are computed - a mispredicted draft expert
+// is a harmless LRU fill, so the greedy output stays bit-identical.
+// MICROKIMI_DRAFTPREFETCH=0 disables.
+static DPREF_ISSUED: AtomicU64 = AtomicU64::new(0); // draft prefetches that fetched bytes
+static DPREF_CACHED: AtomicU64 = AtomicU64::new(0); // predicted draft experts already in RAM
+static DPREF_USED: AtomicU64 = AtomicU64::new(0); // draft-prefetched entries consumed on demand
+static DPREF_WIN_I: AtomicU64 = AtomicU64::new(0); // adaptive gate window: issued
+static DPREF_WIN_U: AtomicU64 = AtomicU64::new(0); // adaptive gate window: consumed
+static DPREF_COOL: AtomicU64 = AtomicU64::new(0); // drafts the gate suspends the prefetch for
+
+/// Accounts a consumed prefetched entry to its producer's counter (prefetch
+/// tag: 1 = Markov/lookahead, 2 = draft).
+fn pref_used(tag: u8) {
+    match tag {
+        1 => {
+            PREF_USED.fetch_add(1, Ordering::Relaxed);
+        }
+        2 => {
+            DPREF_USED.fetch_add(1, Ordering::Relaxed);
+            DPREF_WIN_U.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// Draft-aware prefetch toggle (default on; only used in --spec /
+/// --spec-rosa streaming runs).
+pub fn draft_prefetch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_DRAFTPREFETCH").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Positions kept in the routing history (a sliding window: the n-gram
+/// proposer picks the MOST RECENT earlier occurrence, so old positions are
+/// the least useful sources; 4096 positions x per-MoE-layer top-k sets is a
+/// few MB).
+const ROUTE_HIST_WINDOW: usize = 4096;
+
+/// Per-position router picks: pos -> (layer, top-k experts) per MoE layer.
+/// Written by model.rs on every MoE forward/prefill of a streaming run,
+/// read by the draft-aware prefetch.
+struct RouteHist {
+    by_pos: HashMap<u32, Vec<(u32, Vec<u32>)>>,
+    order: VecDeque<u32>, // insertion order of positions, for the window
+}
+
+static ROUTE_HIST: std::sync::LazyLock<Mutex<RouteHist>> = std::sync::LazyLock::new(|| Mutex::new(RouteHist { by_pos: HashMap::new(), order: VecDeque::new() }));
+
+/// Records the top-k router picks of one position at one MoE layer
+/// (no-op when the draft prefetch is disabled). Re-recording a (pos, layer)
+/// pair REPLACES it: the optimistic verification batch records positions a
+/// partial accept then rejects, and the committed re-ingestion of those
+/// positions must overwrite the rejected routing.
+pub fn route_record(pos: u32, layer: u32, experts: Vec<u32>) {
+    if !draft_prefetch_on() {
+        return;
+    }
+    let mut h = ROUTE_HIST.lock().unwrap();
+    if !h.by_pos.contains_key(&pos) {
+        h.order.push_back(pos);
+        if h.order.len() > ROUTE_HIST_WINDOW {
+            if let Some(old) = h.order.pop_front() {
+                h.by_pos.remove(&old);
+            }
+        }
+    }
+    let layers = h.by_pos.entry(pos).or_default();
+    match layers.iter_mut().find(|(l, _)| *l == layer) {
+        Some(e) => e.1 = experts,
+        None => layers.push((layer, experts)),
+    }
+}
+
+/// The recorded router picks of one position (None when unknown: before the
+/// first ingestion, window-evicted, or restored from a .mkmem snapshot).
+pub fn route_lookup(pos: u32) -> Option<Vec<(u32, Vec<u32>)>> {
+    if !draft_prefetch_on() {
+        return None;
+    }
+    ROUTE_HIST.lock().unwrap().by_pos.get(&pos).cloned()
+}
+
+/// Drops the routing history (Model::reset_cache: positions restart at 0).
+pub fn route_hist_clear() {
+    let mut h = ROUTE_HIST.lock().unwrap();
+    h.by_pos.clear();
+    h.order.clear();
+}
+
 fn mb(n: u64) -> String {
     format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
 }
@@ -193,6 +298,15 @@ pub fn report_line() -> String {
             s.push_str(&format!(", markov prediction accuracy {}/{} ({:.0}%)", hit, tot, acc));
         }
     }
+    let (di, dc) = (DPREF_ISSUED.load(Ordering::Relaxed), DPREF_CACHED.load(Ordering::Relaxed));
+    if di + dc > 0 {
+        let used = DPREF_USED.load(Ordering::Relaxed);
+        let recall = if di > 0 { 100.0 * used as f64 / di as f64 } else { 0.0 };
+        s.push_str(&format!(
+            "\nstream-draft: {} experts prefetched for the speculative verification ({} already cached), {} consumed on demand ({:.0}% recall)",
+            di, dc, used, recall
+        ));
+    }
     s
 }
 
@@ -215,7 +329,7 @@ fn lfu_on() -> bool {
 }
 
 struct Lru {
-    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool, u64, bool)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch, hits, warm)
+    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, u8, u64, bool)>, // (layer, expert) -> (w1++w2++w3, tick, prefetch tag, hits, warm)
     queue: VecDeque<((u32, u32), u64)>,                             // access order, stale gens skipped (pure-LRU mode)
     cur: usize,
     tick: u64,
@@ -223,7 +337,8 @@ struct Lru {
 }
 
 impl Lru {
-    /// On a hit, also reports (and clears) the from_prefetch mark, so a
+    /// On a hit, also reports (and clears) the prefetch tag (0 = demand
+    /// fetch, 1 = Markov/lookahead prefetch, 2 = draft prefetch), so a
     /// prefetched entry consumed on demand is counted exactly once. A
     /// warm-marked entry (batched demand fetch, warm_batch) is served
     /// WITHOUT bumping the LFU count: the insert already carries the demand
@@ -233,7 +348,7 @@ impl Lru {
     /// full cache the next warm wave would then find no better victim than
     /// its own fresh inserts (measured: 6x the disk traffic at a tight
     /// budget).
-    fn get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, bool)> {
+    fn get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, u8)> {
         if !self.map.contains_key(&k) {
             return None;
         }
@@ -249,9 +364,22 @@ impl Lru {
         Some((v, pref))
     }
 
+    /// Pure presence check for the draft prefetch's already-cached
+    /// predictions. Deliberately NO recency/LFU update: refreshing thousands
+    /// of predicted entries per pass protects them from eviction at the
+    /// expense of the decode loop's own working set (measured on the smoke
+    /// model at --spec 8, 8 MB: +65% demand misses from the churn), and a
+    /// count bump per draft inflates predicted entries into immortality
+    /// under LFU. A prediction that the pass really needs will be demanded
+    /// - and refreshed - by the pass itself.
+    fn peek(&self, k: (u32, u32)) -> bool {
+        self.map.contains_key(&k)
+    }
+
     /// `warm` marks a batched demand fetch (warm_batch): the first demand
-    /// get is served without a count bump (see get).
-    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: bool, warm: bool) {
+    /// get is served without a count bump (see get). `pref` is the prefetch
+    /// tag (0 = demand, 1 = Markov/lookahead, 2 = draft).
+    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: u8, warm: bool) {
         let sz = v.len();
         if sz > self.budget {
             return; // a single expert exceeds the budget: serve without caching
@@ -934,9 +1062,22 @@ struct CacheInner {
     lru: Mutex<Lru>,
     src: Src,
     pred: Mutex<Predictor>,
+    /// Keys a draft prefetch is currently reading. A demand get on one of
+    /// these WAITS on the condvar for the in-flight read to land instead of
+    /// fetching the same bytes a second time; warm_batch skips them for the
+    /// same reason. Only the draft-aware prefetch marks keys (it launches
+    /// right before the verification pass that will demand them).
+    inflight: (Mutex<std::collections::HashSet<(u32, u32)>>, std::sync::Condvar),
 }
 
 impl CacheInner {
+    /// Marks an in-flight read as landed (draft prefetch): wake the demand
+    /// gets waiting on it. A remove of an unmarked key is a no-op (the
+    /// Markov/lookahead prefetchers never mark).
+    fn land(&self, k: (u32, u32)) {
+        self.inflight.0.lock().unwrap().remove(&k);
+        self.inflight.1.notify_all();
+    }
     /// Raw bytes of one expert from the disk/HTTP tier (no RAM LRU lookup).
     fn fetch(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Vec<u8> {
         match &self.src {
@@ -976,12 +1117,25 @@ impl CacheInner {
     /// its directory offsets and inserted into the RAM LRU. The inserted
     /// bytes are byte-identical to per-expert preads of the same ranges.
     /// Singleton runs go through the plain per-expert fetch.
-    fn fetch_run(&self, layer: u32, members: &[(u32, [u64; 3], usize)]) {
+    /// `pref` is the insert tag: 0 = batched DEMAND fetch (warm_batch: RAM
+    /// miss + fuse counters), 2 = batched background draft prefetch
+    /// (`issued` counter instead). Both insert with the warm mark: for a
+    /// prefetched entry it makes the first demand get count-neutral (net
+    /// LFU count 1, exactly what a demand fetch of the same expert would
+    /// carry - without it a consumed prefetch ends at count 2, the
+    /// predicted union turns unevictable and a tight cache thrashes:
+    /// measured +80% demand misses at 8 MB).
+    fn fetch_run(&self, layer: u32, members: &[(u32, [u64; 3], usize)], pref: u8, issued: &AtomicU64) {
         if members.len() == 1 {
             let (e, offs, blob) = members[0];
             let bytes = self.fetch(layer, e, offs, blob);
-            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), false, true);
-            RAM_MISSES.fetch_add(1, Ordering::Relaxed);
+            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), pref, true);
+            if pref != 0 {
+                issued.fetch_add(1, Ordering::Relaxed);
+                self.land((layer, e));
+            } else {
+                RAM_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         let Src::Local(l) = &self.src else { return };
@@ -1005,27 +1159,42 @@ impl CacheInner {
                 bytes[i * blob..(i + 1) * blob].copy_from_slice(&span[lo..lo + blob]);
             }
             DISK_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            FUSE_EXPERTS.fetch_add(1, Ordering::Relaxed);
-            RAM_MISSES.fetch_add(1, Ordering::Relaxed); // a demand miss served by the batch
-            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), false, true);
+            if pref != 0 {
+                issued.fetch_add(1, Ordering::Relaxed);
+            } else {
+                FUSE_EXPERTS.fetch_add(1, Ordering::Relaxed);
+                RAM_MISSES.fetch_add(1, Ordering::Relaxed); // a demand miss served by the batch
+            }
+            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), pref, true);
+            if pref != 0 {
+                self.land((layer, e));
+            }
         }
     }
 
     /// Background prefetch of one predicted expert: already cached = just
     /// refresh the recency (protects it from eviction), otherwise fetch and
     /// insert with the from_prefetch mark. Never touches the router path.
-    fn prefetch_one(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) {
+    /// `issued`/`cached` are the counter pair of the calling prefetcher
+    /// (PREF_* for --stream-predict, DPREF_* for the draft-aware prefetch).
+    /// `warm` makes the first demand get count-neutral (draft prefetch: the
+    /// consumed entry nets LFU count 1, what a demand fetch would carry -
+    /// see fetch_run); the Markov/lookahead prefetch keeps the historical
+    /// consume-bump. `tag` is the prefetch tag stored with the entry (1 =
+    /// Markov/lookahead, 2 = draft).
+    fn prefetch_one(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize, issued: &AtomicU64, cached: &AtomicU64, warm: bool, tag: u8) {
         let k = (layer, expert);
         {
             let mut lru = self.lru.lock().unwrap();
             if lru.get(k).is_some() {
-                PREF_CACHED.fetch_add(1, Ordering::Relaxed);
+                cached.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
         let bytes = self.fetch(layer, expert, offs, blob);
-        self.lru.lock().unwrap().insert(k, Arc::new(bytes), true, false);
-        PREF_ISSUED.fetch_add(1, Ordering::Relaxed);
+        self.lru.lock().unwrap().insert(k, Arc::new(bytes), tag, warm);
+        issued.fetch_add(1, Ordering::Relaxed);
+        self.land(k);
     }
 }
 
@@ -1065,6 +1234,11 @@ impl ExpertCache {
         if fake_disk_ms() > 0 {
             println!("stream: FAKE disk latency {} ms/read, serialized (MICROKIMI_FAKE_DISK_MS, bench only)", fake_disk_ms());
         }
+        if draft_prefetch_on() {
+            println!("stream: draft-aware expert prefetch on (MICROKIMI_DRAFTPREFETCH=0 to disable; --spec/--spec-rosa only)");
+        } else {
+            println!("stream: draft-aware expert prefetch off (MICROKIMI_DRAFTPREFETCH=0)");
+        }
         // initialize the trace sink now so its startup line prints with the
         // other stream lines (no-op when MICROKIMI_TRACE is unset)
         trace_sink();
@@ -1073,6 +1247,7 @@ impl ExpertCache {
                 lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
                 src: Src::Local(LocalSrc { file, direct }),
                 pred: Mutex::new(Predictor::new()),
+                inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
             }),
         }
     }
@@ -1085,6 +1260,7 @@ impl ExpertCache {
                 lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
                 src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
                 pred: Mutex::new(Predictor::new()),
+                inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
             }),
         }
     }
@@ -1113,12 +1289,15 @@ impl ExpertCache {
         }
         // misses only, offset-sorted (the LRU may change before the reads
         // land: a concurrent prefetch of the same expert is harmless - the
-        // run insert refreshes the same file bytes)
+        // run insert refreshes the same file bytes). Keys a draft prefetch
+        // is already reading are skipped: the compute jobs' get waits for
+        // the in-flight read instead of fetching the same bytes twice.
         let mut miss: Vec<(u32, [u64; 3], usize)> = Vec::with_capacity(items.len());
         {
             let lru = self.inner.lru.lock().unwrap();
+            let inf = self.inner.inflight.0.lock().unwrap();
             for &(e, offs, blob) in items {
-                if !lru.map.contains_key(&(layer, e)) {
+                if !lru.map.contains_key(&(layer, e)) && !inf.contains(&(layer, e)) {
                     miss.push((e, offs, blob));
                 }
             }
@@ -1140,7 +1319,7 @@ impl ExpertCache {
         for (s, e) in runs {
             let members: Vec<(u32, [u64; 3], usize)> = miss[s..e].to_vec();
             let inner = Arc::clone(&self.inner);
-            jobs.push(Box::new(move || inner.fetch_run(layer, &members)));
+            jobs.push(Box::new(move || inner.fetch_run(layer, &members, 0, &PREF_ISSUED)));
         }
         crate::pool::pool().run(jobs);
         FUSE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1164,7 +1343,7 @@ impl ExpertCache {
                 let inner = Arc::clone(&self.inner);
                 std::thread::spawn(move || {
                     for (l, e, o) in jobs {
-                        inner.prefetch_one(l, e, o, blob);
+                        inner.prefetch_one(l, e, o, blob, &PREF_ISSUED, &PREF_CACHED, false, 1);
                     }
                 });
             }
@@ -1173,9 +1352,31 @@ impl ExpertCache {
         {
             let mut lru = self.inner.lru.lock().unwrap();
             if let Some((v, pref)) = lru.get(k) {
-                if pref {
-                    PREF_USED.fetch_add(1, Ordering::Relaxed);
-                }
+                pref_used(pref);
+                RAM_HITS.fetch_add(1, Ordering::Relaxed);
+                return v;
+            }
+        }
+        // a draft prefetch is already reading these bytes: wait for it to
+        // land instead of fetching the same expert a second time. The
+        // prefetcher unmarks strictly AFTER inserting into the LRU, so a
+        // key absent from the set is a key whose read completed (no missed
+        // wakeup; the LRU is never locked while this lock is held, and the
+        // marking side locks LRU-then-inflight, never the reverse).
+        {
+            let (lock, cvar) = &self.inner.inflight;
+            let mut inf = lock.lock().unwrap();
+            while inf.contains(&k) {
+                inf = cvar.wait(inf).unwrap();
+            }
+        }
+        // the in-flight read (if any) landed before the unmark: one cache
+        // pass serves the bytes (they may also have been evicted already
+        // under a full cache: fall through to the demand fetch then)
+        {
+            let mut lru = self.inner.lru.lock().unwrap();
+            if let Some((v, pref)) = lru.get(k) {
+                pref_used(pref);
                 RAM_HITS.fetch_add(1, Ordering::Relaxed);
                 return v;
             }
@@ -1183,7 +1384,7 @@ impl ExpertCache {
         RAM_MISSES.fetch_add(1, Ordering::Relaxed);
         let bytes = self.inner.fetch(layer, expert, offs, blob);
         let v = Arc::new(bytes);
-        self.inner.lru.lock().unwrap().insert(k, v.clone(), false, false);
+        self.inner.lru.lock().unwrap().insert(k, v.clone(), 0, false);
         v
     }
 
@@ -1201,7 +1402,103 @@ impl ExpertCache {
         let inner = Arc::clone(&self.inner);
         std::thread::spawn(move || {
             for (l, e, o, blob) in jobs {
-                inner.prefetch_one(l, e, o, blob);
+                inner.prefetch_one(l, e, o, blob, &PREF_ISSUED, &PREF_CACHED, false, 1);
+            }
+        });
+    }
+
+    /// Draft-aware prefetch (--spec / --spec-rosa + --stream): background-
+    /// fetch the union of experts the drafted tokens are predicted to route
+    /// to (model.rs replays the routing recorded at the draft's source
+    /// occurrence). The missing experts are marked IN FLIGHT synchronously
+    /// (no demand read is running at draft time: the previous pass ended on
+    /// a pool barrier), so the verification pass's warm_batch skips them and
+    /// its ExpertCache::get waits for the in-flight read instead of fetching
+    /// the same bytes twice. The detached thread serves each layer's missing
+    /// experts offset-sorted, one span read per file-adjacent run (same
+    /// fuse_runs machinery as warm_batch, from_prefetch inserts), so the
+    /// reads of the later layers overlap the compute of the earlier ones.
+    /// Never touches the router path: the output is unaffected.
+    pub fn prefetch_draft(&self, jobs: Vec<(u32, u32, [u64; 3], usize)>) {
+        if jobs.is_empty() || !draft_prefetch_on() {
+            return;
+        }
+        // adaptive gate: a prefetch whose entries are evicted before the
+        // pass consumes them only costs disk reads and cache slots. Two
+        // adaptive recall gate: a prefetch whose entries are evicted before
+        // the pass consumes them only costs disk reads and cache slots.
+        // Over a window of GATE_WIN issued prefetches, fewer than 3/4
+        // consumed on demand suspends the prefetch for GATE_COOL drafts
+        // (measured on the smoke model: 78-89% recall runs gain 6-14% of
+        // the demand misses at tight budgets; below that the inserts churn
+        // more than they save).
+        const GATE_WIN: u64 = 128;
+        const GATE_COOL: u64 = 8;
+        let cool = DPREF_COOL.load(Ordering::Relaxed);
+        if cool > 0 {
+            DPREF_COOL.store(cool - 1, Ordering::Relaxed);
+            return;
+        }
+        let (wi, wu) = (DPREF_WIN_I.load(Ordering::Relaxed), DPREF_WIN_U.load(Ordering::Relaxed));
+        if wi >= GATE_WIN {
+            DPREF_WIN_I.store(0, Ordering::Relaxed);
+            DPREF_WIN_U.store(0, Ordering::Relaxed);
+            if wu * 4 < wi * 3 {
+                DPREF_COOL.store(GATE_COOL, Ordering::Relaxed);
+                return;
+            }
+        }
+        // synchronous split: already cached (pure presence check - no
+        // recency/LFU update, see Lru::peek) vs missing (marked in flight).
+        // A key already in flight from the previous draft is left to its
+        // own read.
+        let mut by_layer: HashMap<u32, Vec<(u32, [u64; 3], usize)>> = HashMap::new();
+        for (l, e, o, b) in jobs {
+            by_layer.entry(l).or_default().push((e, o, b));
+        }
+        let mut layers: Vec<u32> = by_layer.keys().copied().collect();
+        layers.sort_unstable();
+        let mut missing: Vec<(u32, u32, [u64; 3], usize)> = Vec::new();
+        {
+            let lru = self.inner.lru.lock().unwrap();
+            let mut inf = self.inner.inflight.0.lock().unwrap();
+            for l in layers {
+                for (e, o, b) in by_layer.remove(&l).unwrap() {
+                    let k = (l, e);
+                    if lru.peek(k) {
+                        DPREF_CACHED.fetch_add(1, Ordering::Relaxed);
+                    } else if inf.insert(k) {
+                        missing.push((l, e, o, b));
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        DPREF_WIN_I.fetch_add(missing.len() as u64, Ordering::Relaxed);
+        let inner = Arc::clone(&self.inner);
+        std::thread::spawn(move || {
+            let mut by_layer: HashMap<u32, Vec<(u32, [u64; 3], usize)>> = HashMap::new();
+            for (l, e, o, b) in missing {
+                by_layer.entry(l).or_default().push((e, o, b));
+            }
+            let mut layers: Vec<u32> = by_layer.keys().copied().collect();
+            layers.sort_unstable(); // layer order: the pass needs the low layers first
+            for l in layers {
+                let mut items = by_layer.remove(&l).unwrap();
+                // fused span reads for the local source, per-expert
+                // otherwise (remote: per-tensor cache files, no shared spans)
+                if items.len() >= 2 && matches!(inner.src, Src::Local(_)) {
+                    items.sort_by_key(|&(_, o, _)| o[0]);
+                    for (s, e) in fuse_runs(&items) {
+                        inner.fetch_run(l, &items[s..e], 2, &DPREF_ISSUED);
+                    }
+                } else {
+                    for (e, o, b) in items {
+                        inner.prefetch_one(l, e, o, b, &DPREF_ISSUED, &DPREF_CACHED, true, 2);
+                    }
+                }
             }
         });
     }
@@ -1293,10 +1590,11 @@ pub fn streamtest(args: &[String]) {
             lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: 3 * entry }),
             src: Src::Remote(src),
             pred: Mutex::new(Predictor::new()),
+            inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
         }),
     };
     for e in 0..4u32 {
-        cache.inner.lru.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]), false, false);
+        cache.inner.lru.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]), 0, false);
     }
     {
         let lru = cache.inner.lru.lock().unwrap();

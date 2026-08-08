@@ -279,6 +279,9 @@ fn main() {
             println!("                        expert-only LRU rollover, spine never evicted; env MICROKIMI_STREAM_DISK)");
             println!("                    --stream-predict N (Markov expert prefetch: N predicted experts/layer,");
             println!("                        0 = off, default; output-preserving, only changes fetch timing)");
+            println!("                    env MICROKIMI_DRAFTPREFETCH=0 disables the draft-aware expert prefetch");
+            println!("                        (--spec/--spec-rosa + --stream: experts predicted from the drafted");
+            println!("                        tokens are prefetched before the verification pass; output-preserving)");
             println!("                    env MICROKIMI_TRACE=trace.bin records the expert request stream (see cachereplay)");
             println!("                    env MICROKIMI_ROUTECMS=sketch.bin records a count-min sketch of the routing");
             println!("                        decisions of the run (4 x 4096 u32, saved on exit; see routestats/cmsinfo)");
