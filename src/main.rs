@@ -14,6 +14,7 @@ mod eval;
 mod http;
 mod imatrix;
 mod json;
+mod kda_chunk;
 #[cfg(target_os = "macos")]
 mod metal;
 mod mkmem;

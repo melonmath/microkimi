@@ -1010,6 +1010,14 @@ fn kda_recur_step(cfg: &Config, s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], 
     }
 }
 
+/// Test-only handle on the sequential recurrence (parity reference for the
+/// chunked prefill form in src/kda_chunk.rs).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kda_recur_step_pub(cfg: &Config, s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], g: &[f32], beta: &[f32], o: &mut [f32]) {
+    kda_recur_step(cfg, s, q, k, v, g, beta, o)
+}
+
 /// Per-head gated rmsnorm: y = o·rsqrt(mean(o²)+eps)·o_norm ; o = y·sigmoid(g2).
 fn kda_gated_onorm(cfg: &Config, o: &mut [f32], o_norm: &[f32], g2: &[f32]) {
     for h in 0..cfg.kda_heads {
@@ -1080,9 +1088,11 @@ fn kda_forward(
 
 /// Batched KDA for prefill: `x` = n position rows [n * d], returns [n * d].
 /// All projections run as gemm_batch (weights streamed once for the whole
-/// prompt); the conv and the recurrence stay sequential over positions
-/// (tiny elementwise work) and update the cache exactly like n single-token
-/// calls. Bit-identical to kda_forward per position.
+/// prompt); the conv stays sequential over positions (tiny elementwise work)
+/// and the recurrence runs chunked (WY/UT, src/kda_chunk.rs) for n >= MIN_LEN,
+/// sequential below. Both paths update the cache exactly like n single-token
+/// calls; the sequential one is bit-identical to kda_forward per position,
+/// the chunked one deviates < 1e-4 (unit-tested).
 #[allow(clippy::too_many_arguments)]
 fn kda_prefill(
     cfg: &Config,
@@ -1127,12 +1137,28 @@ fn kda_prefill(
     let a_log = Model::t(data, &w.a_log);
     let dt_bias = Model::t(data, &w.dt_bias);
     let mut o = vec![0f32; n * kp];
-    for t in 0..n {
-        kda_norm_head(cfg, &mut q[t * kp..(t + 1) * kp], (cfg.kda_dim as f32).powf(-0.5));
-        kda_norm_head(cfg, &mut k[t * kp..(t + 1) * kp], 1.0);
-        let g = kda_gate(cfg, a_log, dt_bias, &g_low[t * kp..(t + 1) * kp]);
-        let (qr, kr, vr) = (&q[t * kp..(t + 1) * kp], &k[t * kp..(t + 1) * kp], &v[t * kp..(t + 1) * kp]);
-        kda_recur_step(cfg, &mut cache.s, qr, kr, vr, &g, &beta[t * cfg.kda_heads..(t + 1) * cfg.kda_heads], &mut o[t * kp..(t + 1) * kp]);
+    if n >= crate::kda_chunk::MIN_LEN && !crate::kda_chunk::disabled() {
+        // chunked WY/UT form (src/kda_chunk.rs): same recurrence, deviation
+        // < 1e-4 vs the sequential loop (unit-tested), much faster on long
+        // prompts. Short batches (e.g. the --spec verify passes) keep the
+        // sequential step below, bit-identical per position.
+        for t in 0..n {
+            kda_norm_head(cfg, &mut q[t * kp..(t + 1) * kp], (cfg.kda_dim as f32).powf(-0.5));
+            kda_norm_head(cfg, &mut k[t * kp..(t + 1) * kp], 1.0);
+        }
+        let mut g = vec![0f32; n * kp];
+        for t in 0..n {
+            g[t * kp..(t + 1) * kp].copy_from_slice(&kda_gate(cfg, a_log, dt_bias, &g_low[t * kp..(t + 1) * kp]));
+        }
+        crate::kda_chunk::kda_recur_chunked(cfg, &mut cache.s, &q, &k, &v, &g, &beta, n, &mut o);
+    } else {
+        for t in 0..n {
+            kda_norm_head(cfg, &mut q[t * kp..(t + 1) * kp], (cfg.kda_dim as f32).powf(-0.5));
+            kda_norm_head(cfg, &mut k[t * kp..(t + 1) * kp], 1.0);
+            let g = kda_gate(cfg, a_log, dt_bias, &g_low[t * kp..(t + 1) * kp]);
+            let (qr, kr, vr) = (&q[t * kp..(t + 1) * kp], &k[t * kp..(t + 1) * kp], &v[t * kp..(t + 1) * kp]);
+            kda_recur_step(cfg, &mut cache.s, qr, kr, vr, &g, &beta[t * cfg.kda_heads..(t + 1) * cfg.kda_heads], &mut o[t * kp..(t + 1) * kp]);
+        }
     }
     prof.t_kda_recur += tm.elapsed().as_secs_f64();
 
@@ -3277,5 +3303,91 @@ mod dot_simd_tests {
                 }
             }
         }
+    }
+
+    /// Integration: kda_prefill over n = 200 positions (chunked recurrence,
+    /// n >= kda_chunk::MIN_LEN) vs n single-token kda_forward calls (the
+    /// sequential step) on one synthetic KDA layer. The conv caches must be
+    /// bit-identical (same sequential code path); the recurrence state and
+    /// the layer outputs must match within the chunk transform tolerance.
+    #[test]
+    fn kda_prefill_chunked_matches_forward() {
+        use super::{kda_forward, kda_prefill, KdaCache, KdaW, Prof, T};
+        let cfg = crate::config::Config::microkimi();
+        let (d, kp, fa, hn, kd) = (cfg.d, cfg.kda_proj(), cfg.kda_fa, cfg.kda_heads, cfg.kda_dim);
+        let mut rng = Rng(0xDA7A_DA7A_DA7A_DA7A);
+        // f32 weights laid out back to back in one byte buffer, KdaW field order
+        let lens = [
+            kp * d, // q_proj
+            kp * d, // k_proj
+            kp * d, // v_proj
+            kp * cfg.kda_conv, // q_conv
+            kp * cfg.kda_conv, // k_conv
+            kp * cfg.kda_conv, // v_conv
+            fa * d, // f_a
+            kp * fa, // f_b
+            kp,     // a_log
+            kp,     // dt_bias
+            hn * d, // b_proj
+            kp * d, // g_proj
+            kp,     // o_norm
+            d * kp, // o_proj
+        ];
+        let mut buf: Vec<f32> = Vec::new();
+        let mut offs: Vec<usize> = Vec::new();
+        for &len in &lens {
+            offs.push(buf.len() * 4);
+            buf.extend((0..len).map(|_| rng.f32() * 0.1));
+        }
+        let data: Vec<u8> = buf.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let t = |i: usize| T { off: offs[i], len: lens[i] };
+        let w = KdaW {
+            q_proj: t(0),
+            k_proj: t(1),
+            v_proj: t(2),
+            q_conv: t(3),
+            k_conv: t(4),
+            v_conv: t(5),
+            f_a: t(6),
+            f_b: t(7),
+            a_log: t(8),
+            dt_bias: t(9),
+            b_proj: t(10),
+            g_proj: t(11),
+            o_norm: t(12),
+            o_proj: t(13),
+        };
+        let new_cache = || KdaCache {
+            conv_q: vec![0.0; 3 * kp],
+            conv_k: vec![0.0; 3 * kp],
+            conv_v: vec![0.0; 3 * kp],
+            s: vec![0.0; hn * kd * kd],
+        };
+        let n = 200usize; // > kda_chunk::MIN_LEN, spans 4 chunks
+        assert!(n >= crate::kda_chunk::MIN_LEN);
+        let x: Vec<f32> = (0..n * d).map(|_| rng.f32()).collect();
+        let mut prof = Prof::default();
+        let (mut c_chk, mut c_seq) = (new_cache(), new_cache());
+        let out_chk = kda_prefill(&cfg, &data, &w, &mut c_chk, &x, n, &mut prof);
+        let mut out_seq = vec![0f32; n * d];
+        for t in 0..n {
+            let o = kda_forward(&cfg, &data, &w, &mut c_seq, &x[t * d..(t + 1) * d], &mut prof);
+            out_seq[t * d..(t + 1) * d].copy_from_slice(&o);
+        }
+        // conv caches: identical sequential code in both paths
+        for (a, b) in c_chk.conv_q.iter().zip(c_seq.conv_q.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "conv_q not bit-identical");
+        }
+        for (a, b) in c_chk.conv_k.iter().zip(c_seq.conv_k.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "conv_k not bit-identical");
+        }
+        for (a, b) in c_chk.conv_v.iter().zip(c_seq.conv_v.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "conv_v not bit-identical");
+        }
+        let max_o = out_chk.iter().zip(out_seq.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let max_s = c_chk.s.iter().zip(c_seq.s.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("kda_prefill chunked vs forward: max|dO|={:.3e}  max|dS|={:.3e}", max_o, max_s);
+        assert!(max_o < 1e-4, "layer output deviation {}", max_o);
+        assert!(max_s < 1e-4, "recurrence state deviation {}", max_s);
     }
 }
