@@ -2,7 +2,9 @@
 - recurrence: fla/ops/kda/naive.py (naive_recurrent_kda)
 - gate:       fla/ops/kda/gate.py  (naive_kda_lowerbound_gate / naive_kda_gate)
 chunk_kda == fused_recurrent_kda mathematically (chunking is exact); both run the
-same per-token recurrence here. Handles per-head A_log [H] and per-channel A_log [K]
+same per-token recurrence here, unless NANO_KDA_CHUNKED=1 switches chunk_kda to
+the chunkwise UT-transform form (_kda_recur_chunked, training-only speed path,
+not bit-identical - see below). Handles per-head A_log [H] and per-channel A_log [K]
 (the K3 checkpoint ships [128] = per-channel; broadcast across heads).
 State layout [B, H, K, V] internally; square (128x128) here, and the state only
 round-trips through this module, so transpose_state_layout is a no-op for us."""
@@ -38,6 +40,24 @@ KDA_SEG_DEVICES = tuple(
     d for d in os.environ.get("NANO_KDA_SEG_DEVICES", "cuda").split(",") if d
 )
 
+# NANO_KDA_CHUNKED: opt-in chunkwise (UT-transform) form of the delta rule for
+# TRAINING (chunk_kda only; the decode recurrence is untouched). Same
+# mathematics as the per-token loop, blocked into NANO_KDA_CHUNK-token chunks
+# so the work runs as a handful of batched matmuls per chunk instead of one
+# kernel launch per token per layer, and autograd flows through the same
+# chunked graph (chunked backward). Pure PyTorch: no Triton, no new
+# dependency, runs on CPU and CUDA alike. NOT bit-identical to the reference
+# loop (decays are applied as exp(cumsum) per chunk instead of per-token
+# products, and the triangular inverse uses a different operation order) -
+# the deviation is float-noise level (measured <= ~1e-5 relative on outputs
+# and gradients, see nano/test_kda_chunked.py), acceptable for training but
+# never use it where parity with the Rust engine is required. Default OFF.
+# If the chunked path ever raises, it disables itself and falls back to the
+# reference recurrence for the rest of the process.
+KDA_CHUNKED = os.environ.get("NANO_KDA_CHUNKED", "0") == "1"
+KDA_CHUNK = int(os.environ.get("NANO_KDA_CHUNK", "64"))
+_chunked_available = True
+
 
 def _kda_recur(q, k, v, g, beta, S):
     """Per-token delta-rule recurrence over a (slice of) time steps.
@@ -55,6 +75,74 @@ def _kda_recur(q, k, v, g, beta, S):
         S = S + (b_t.unsqueeze(-1) * k_t).unsqueeze(-1) * delta.unsqueeze(-2)
         o[:, i] = (q_t.unsqueeze(-1) * S).sum(-2)
     return o, S
+
+
+def _kda_recur_chunked(q, k, v, g, beta, S, chunk_size):
+    """Chunkwise (UT-transform) form of _kda_recur - same math, blocked over
+    time so the cost is O(T/C) groups of batched matmuls instead of T Python
+    steps of small kernels, with autograd flowing through the chunked graph.
+
+    Within a chunk of C tokens, write G for the inclusive in-chunk cumsum of
+    the log-decay g and E[i,j] = exp(G_i - G_j) (kept for j <= i only, and
+    masked BEFORE the exp so nothing ever overflows - every pairwise decay is
+    <= 0, the classic cumsum trap). Then:
+        L[i,j] = beta_i * (k_i . k_j) * E[i,j]         (strictly lower)
+        A      = (I + L)^-1 @ diag(beta)
+        w      = A @ (exp(G) * k),   u = A @ v
+    and per chunk, given the incoming state S [B,H,K,V]:
+        v'  = u - w @ S
+        o   = (q * exp(G)) @ S + ((q k^T) . E) @ v'
+        S  <- S * exp(G_last) + (exp(G_last - G) * k)^T @ v'
+    The triangular inverse is exact and loop-free: L is strictly lower hence
+    nilpotent (L^C = 0), so (I + L)^-1 = (I - L)(I + L^2)(I - L^4)... needs
+    only log2(C) matmuls. T is zero-padded to a multiple of C; padded rows
+    have k = v = beta = 0 and raw g = 0, so they neither update the state nor
+    the valid outputs (their own outputs are sliced away).
+    q,k,g: [B,T,H,K]; v: [B,T,H,V]; beta: [B,T,H]; S: [B,H,K,V] -> (o, S)."""
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = chunk_size
+    NT = (T + C - 1) // C
+    pad = NT * C - T
+
+    def chunked(x):  # [B,T,H,*] -> [B,H,NT,C,*], zero-padded on T
+        if pad:
+            shape = (B, pad) + tuple(x.shape[2:])
+            x = torch.cat([x, x.new_zeros(shape)], dim=1)
+        return x.reshape(B, NT, C, H, *x.shape[3:]).permute(
+            0, 3, 1, 2, *range(4, x.dim() + 1))
+
+    q, k, v, g, beta = (chunked(x) for x in (q, k, v, g, beta))
+    gc = g.cumsum(dim=-2)  # inclusive in-chunk cumulative log-decay [B,H,NT,C,K]
+    upper = torch.triu(torch.ones(C, C, dtype=torch.bool, device=q.device), 1)
+    eye = torch.eye(C, dtype=torch.float32, device=q.device)
+    o = q.new_empty(B, H, NT, C, V)
+    for n in range(NT):
+        qn, kn, vn = q[:, :, n], k[:, :, n], v[:, :, n]
+        gn, bn = gc[:, :, n], beta[:, :, n]  # [B,H,C,K], [B,H,C]
+        diff = gn.unsqueeze(3) - gn.unsqueeze(2)  # [B,H,C(i),C(j),K]
+        E = diff.masked_fill(upper.unsqueeze(-1), float("-inf")).exp()
+        KK = torch.einsum("bhik,bhjk,bhijk->bhij", kn, kn, E)
+        L = (KK * bn.unsqueeze(-1)).tril(-1)
+        # (I + L)^-1 = prod_j (I + (-L)^(2^j)) - exact, L nilpotent
+        X = -L
+        R = eye + X
+        e = 1
+        while 2 * e <= C - 1:
+            X = X @ X
+            R = R + R @ X
+            e *= 2
+        A = R * bn.unsqueeze(-2)  # (I + L)^-1 @ diag(beta)
+        w = A @ (gn.exp() * kn)
+        u = A @ vn
+        QK = torch.einsum("bhik,bhjk,bhijk->bhij", qn, kn, E)
+        v2 = u - w @ S
+        o[:, :, n] = (qn * gn.exp()) @ S + QK @ v2
+        gl = gn[:, :, -1]  # total in-chunk log-decay [B,H,K]
+        kd = (gl.unsqueeze(2) - gn).exp() * kn  # [B,H,C,K]
+        S = S * gl.exp().unsqueeze(-1) + kd.transpose(-1, -2) @ v2
+    o = o.permute(0, 2, 3, 1, 4).reshape(B, NT * C, H, V)
+    return (o[:, :T] if pad else o), S
 
 
 def _kda_gate(g, A_log, dt_bias, lower_bound):
@@ -78,7 +166,7 @@ def _kda_gate(g, A_log, dt_bias, lower_bound):
 
 def _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
               use_qk_l2norm_in_kernel, use_gate_in_kernel,
-              use_beta_sigmoid_in_kernel, lower_bound):
+              use_beta_sigmoid_in_kernel, lower_bound, chunked=False):
     # shapes: q,k [B,T,H,K]; v [B,T,H,V]; g [B,T,H,K]; beta [B,T,H]
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -101,7 +189,12 @@ def _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
     if initial_state is not None:
         S = S + initial_state.to(torch.float32)
     q = q * scale
-    if KDA_SEG > 0 and T > KDA_SEG and q.device.type in KDA_SEG_DEVICES:
+    if chunked:
+        # NANO_KDA_CHUNKED=1: chunkwise form, no per-token Python loop. The
+        # per-token intermediate states are never materialized, so the SEG
+        # checkpointing above is unnecessary on this path.
+        o, S = _kda_recur_chunked(q, k, v, g, beta, S, KDA_CHUNK)
+    elif KDA_SEG > 0 and T > KDA_SEG and q.device.type in KDA_SEG_DEVICES:
         # training on GPU: checkpoint the recurrence every KDA_SEG tokens.
         # Identical math (same loop, deterministic recompute); autograd only
         # retains the segment-boundary states plus one segment's internals
@@ -165,7 +258,24 @@ def chunk_kda(q, k, v, g, beta, A_log=None, dt_bias=None, scale=None,
     assert cu_seqlens is None, "shim: cu_seqlens unsupported (batch=1 only)"
     if not safe_gate:
         lower_bound = None
-    o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
-                     use_qk_l2norm_in_kernel, use_gate_in_kernel,
-                     use_beta_sigmoid_in_kernel, lower_bound)
+    global _chunked_available
+    if KDA_CHUNKED and _chunked_available:
+        try:
+            o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale,
+                             initial_state, use_qk_l2norm_in_kernel,
+                             use_gate_in_kernel, use_beta_sigmoid_in_kernel,
+                             lower_bound, chunked=True)
+        except Exception as exc:  # never break a run: fall back for good
+            _chunked_available = False
+            import sys as _sys
+            print(f"[kda] NANO_KDA_CHUNKED path disabled after {exc!r}; "
+                  "falling back to the reference recurrence", file=_sys.stderr)
+            o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale,
+                             initial_state, use_qk_l2norm_in_kernel,
+                             use_gate_in_kernel, use_beta_sigmoid_in_kernel,
+                             lower_bound)
+    else:
+        o, S = _kda_core(q, k, v, g, beta, A_log, dt_bias, scale, initial_state,
+                         use_qk_l2norm_in_kernel, use_gate_in_kernel,
+                         use_beta_sigmoid_in_kernel, lower_bound)
     return o.to(v.dtype), (S if output_final_state else None)
