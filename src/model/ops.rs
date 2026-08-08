@@ -1,0 +1,642 @@
+// Math kernels: SIMD dot products (scalar reference plus AVX2/NEON, dispatch is
+// bit-identical to scalar on every length), f32 matvec/GEMM, q8 lm-head matvec,
+// packed-weight matvec for the MoE prefill, rmsnorm, SiLU/SiTU, AttnRes.
+// Pure functions over slices: no model state, no I/O, no caching.
+
+use super::*;
+
+/// Scalar dot: the historical path, reference for the SIMD kernels and
+/// fallback when no SIMD feature is present.
+#[inline]
+#[allow(dead_code)] // on aarch64 the dispatched dot() never reaches this
+pub(super) fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    loop {
+        match (ca.next(), cb.next()) {
+            (Some(av), Some(bv)) => {
+                for j in 0..8 {
+                    acc[j] += av[j] * bv[j];
+                }
+            }
+            _ => break,
+        }
+    }
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]) + (acc[4] + acc[5]) + (acc[6] + acc[7]);
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        s += x * y;
+    }
+    s
+}
+
+/// NEON dot (aarch64): the 8 accumulators live in two float32x4 registers
+/// (lanes = acc[0..4], acc[4..8]); each lane sees the same mul-then-add as
+/// the scalar loop (vaddq of vmulq, never vfmaq). The horizontal reduction
+/// replays the scalar reduction order exactly (see the contract above).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut lo = vdupq_n_f32(0.0);
+        let mut hi = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            lo = vaddq_f32(lo, vmulq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i))));
+            hi = vaddq_f32(hi, vmulq_f32(vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4))));
+            i += 8;
+        }
+        let mut acc = [0f32; 8];
+        vst1q_f32(acc.as_mut_ptr(), lo);
+        vst1q_f32(acc.as_mut_ptr().add(4), hi);
+        let (p01, p23) = (acc[0] + acc[1], acc[2] + acc[3]);
+        let (p45, p67) = (acc[4] + acc[5], acc[6] + acc[7]);
+        let mut s = ((p01 + p23) + p45) + p67;
+        while i < n {
+            s += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        s
+    }
+}
+
+/// AVX2 dot (x86_64): the 8 accumulators are the 8 lanes of one __m256
+/// (_mm256_add_ps of _mm256_mul_ps, never _mm256_fmadd_ps). Same reduction
+/// replay as NEON. Bit-identical to dot_scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = a.len().min(b.len());
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut vacc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            vacc = _mm256_add_ps(vacc, _mm256_mul_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i))));
+            i += 8;
+        }
+        let mut acc = [0f32; 8];
+        _mm256_storeu_ps(acc.as_mut_ptr(), vacc);
+        let (p01, p23) = (acc[0] + acc[1], acc[2] + acc[3]);
+        let (p45, p67) = (acc[4] + acc[5], acc[6] + acc[7]);
+        let mut s = ((p01 + p23) + p45) + p67;
+        while i < n {
+            s += *a.get_unchecked(i) * *b.get_unchecked(i);
+            i += 1;
+        }
+        s
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2_available() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| is_x86_feature_detected!("avx2"))
+}
+
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64: unconditional, zero dispatch cost
+        return unsafe { dot_neon(a, b) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    #[allow(unreachable_code)]
+    dot_scalar(a, b)
+}
+
+/// f32 matrix × vector. Entry point for the whole engine.
+pub fn matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    {
+        if gpu_on() && rows * cols >= GPU_MIN_ELEMS && crate::metal::gpu_available() {
+            crate::metal::gpu_matvec(w, rows, cols, x, out);
+            return;
+        }
+    }
+    matvec_cpu(w, rows, cols, x, out);
+}
+
+/// f32 matrix × vector on the persistent pool (std::thread). Adaptive job
+/// count (~200k MACs/job): small matvecs stay inline, large ones are split
+/// into rows. The pool barrier guarantees the validity of the raw pointers
+/// captured by the jobs.
+pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    let p = crate::pool::pool();
+    let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
+    if njobs <= 1 {
+        for (r, o) in out.iter_mut().enumerate() {
+            *o = dot(&w[r * cols..(r + 1) * cols], x);
+        }
+        return;
+    }
+    let chunk = rows.div_ceil(njobs);
+    let wp = crate::pool::SPtr(w.as_ptr());
+    let xp = crate::pool::SPtr(x.as_ptr());
+    let op = crate::pool::MPtr(out.as_mut_ptr());
+    let mut jobs: Vec<crate::pool::Job> = Vec::new();
+    for j in 0..njobs {
+        let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+        if r0 >= r1 {
+            break;
+        }
+        jobs.push(Box::new(move || {
+            // rebind → capture whole structs (Send), not fields
+            let (wp, xp, op) = (wp, xp, op);
+            unsafe {
+                let w = std::slice::from_raw_parts(wp.0, rows * cols);
+                let x = std::slice::from_raw_parts(xp.0, cols);
+                let out = std::slice::from_raw_parts_mut(op.0, rows);
+                for r in r0..r1 {
+                    out[r] = dot(&w[r * cols..(r + 1) * cols], x);
+                }
+            }
+        }));
+    }
+    p.run(jobs);
+}
+
+// ── q8_0 lm_head (runtime copy, built once at load) ──
+//
+// The final logits projection re-reads the whole f32 lm_head tensor every
+// token (vocab x d: the largest single matvec of the engine). Keeping a
+// row-wise q8_0 copy (same convention as q8.rs: int8 values + one f32 scale
+// per block of 32) shrinks that stream ~3.5x and moves the dot to the integer
+// SIMD kernel (block_dot_i8). NOT bit-identical to the f32 matvec: q8
+// rounding of both the weights and the input, error bounded by dx/2 per
+// element. Greedy token parity is validated on the nanokimi smoke model;
+// MICROKIMI_Q8HEAD=0 at load time keeps the exact f32 path.
+
+/// Row-wise q8_0 quantized matrix (built from an f32 [rows, cols] tensor).
+pub struct Q8Head {
+    q: Vec<i8>,      // rows x cols, row-major
+    scales: Vec<f32>, // rows x cols/32
+    rows: usize,
+    cols: usize,
+}
+
+/// MICROKIMI_Q8HEAD=0 disables the q8 lm_head copy (exact f32 fallback).
+pub(super) fn q8head_enabled() -> bool {
+    std::env::var("MICROKIMI_Q8HEAD").map(|v| v != "0").unwrap_or(true)
+}
+
+impl Q8Head {
+    pub(super) fn from_f32(w: &[f32], rows: usize, cols: usize) -> Q8Head {
+        assert!(cols % 32 == 0, "q8 blocks are 32 wide");
+        let nb = cols / 32;
+        let mut q = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows * nb];
+        let mut scratch = crate::q8::Q8Vec::new();
+        for r in 0..rows {
+            crate::q8::quantize_q8_into(&w[r * cols..(r + 1) * cols], &mut scratch);
+            q[r * cols..(r + 1) * cols].copy_from_slice(&scratch.q);
+            scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
+        }
+        Q8Head { q, scales, rows, cols }
+    }
+
+    /// out[r] = <row r, x> computed in integer per 32-block, rescaled to f32.
+    /// Same pool split as matvec_cpu.
+    pub(super) fn matvec(&self, x: &[f32], out: &mut [f32]) {
+        let (rows, cols) = (self.rows, self.cols);
+        let nb = cols / 32;
+        let xq = crate::q8::quantize_q8(x);
+        let p = crate::pool::pool();
+        let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
+        if njobs <= 1 {
+            for (r, o) in out.iter_mut().enumerate() {
+                *o = self.row_dot(r, &xq);
+            }
+            return;
+        }
+        let chunk = rows.div_ceil(njobs);
+        let qp = crate::pool::SPtrU8(self.q.as_ptr() as *const u8);
+        let sp = crate::pool::SPtr(self.scales.as_ptr());
+        let xp = crate::pool::SPtrU8(xq.q.as_ptr() as *const u8);
+        let xsp = crate::pool::SPtr(xq.scales.as_ptr());
+        let op = crate::pool::MPtr(out.as_mut_ptr());
+        let mut jobs: Vec<crate::pool::Job> = Vec::new();
+        for j in 0..njobs {
+            let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+            if r0 >= r1 {
+                break;
+            }
+            jobs.push(Box::new(move || {
+                // rebind → capture whole structs (Send), not fields
+                let (qp, sp, xp, xsp, op) = (qp, sp, xp, xsp, op);
+                unsafe {
+                    let q = std::slice::from_raw_parts(qp.0 as *const i8, rows * cols);
+                    let ws = std::slice::from_raw_parts(sp.0, rows * nb);
+                    let xq8 = std::slice::from_raw_parts(xp.0 as *const i8, cols);
+                    let xs = std::slice::from_raw_parts(xsp.0, nb);
+                    let out = std::slice::from_raw_parts_mut(op.0, rows);
+                    for r in r0..r1 {
+                        let mut acc = 0f32;
+                        for g in 0..nb {
+                            let idot = crate::q8::block_dot_i8(&q[r * cols + g * 32..r * cols + g * 32 + 32], &xq8[g * 32..g * 32 + 32]);
+                            acc += ws[r * nb + g] * xs[g] * idot as f32;
+                        }
+                        out[r] = acc;
+                    }
+                }
+            }));
+        }
+        p.run(jobs);
+    }
+
+    fn row_dot(&self, r: usize, xq: &crate::q8::Q8Vec) -> f32 {
+        let nb = self.cols / 32;
+        let wq = &self.q[r * self.cols..(r + 1) * self.cols];
+        let ws = &self.scales[r * nb..(r + 1) * nb];
+        let mut acc = 0f32;
+        for g in 0..nb {
+            let idot = crate::q8::block_dot_i8(&wq[g * 32..g * 32 + 32], &xq.q[g * 32..g * 32 + 32]);
+            acc += ws[g] * xq.scales[g] * idot as f32;
+        }
+        acc
+    }
+}
+
+/// dot() for 8 positions at once against the same weight row, positions in
+/// vector lanes: the row is loaded once for all eight and the vector unit
+/// works across positions, while each position keeps the exact 8-lane
+/// accumulation order of dot() (bit-identical results).
+/// `xt` is x transposed: xt[c * n + t].
+/// dot8t scalar (reference + fallback): 8 positions at once against the
+/// same weight row. Each position keeps the exact 8-accumulator order of
+/// dot() (bit-identical); the SIMD kernels below replay the same per-lane
+/// mul-then-add and the same reduction order, so they are bit-identical to
+/// this reference BY CONSTRUCTION (see the contract above dot()).
+#[inline]
+#[allow(dead_code)] // on aarch64 the dispatched dot8t never reaches this
+fn dot8t_scalar(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    let mut acc = [[0f32; 8]; 8]; // acc[lane][position]
+    let mut cw = wr.chunks_exact(8);
+    let mut c = 0;
+    for w8 in &mut cw {
+        for (j, &wv) in w8.iter().enumerate() {
+            let xc = &xt[(c + j) * n + t0..(c + j) * n + t0 + 8];
+            for p in 0..8 {
+                acc[j][p] += wv * xc[p];
+            }
+        }
+        c += 8;
+    }
+    let mut s = [0f32; 8];
+    for p in 0..8 {
+        s[p] = (acc[0][p] + acc[1][p]) + (acc[2][p] + acc[3][p]) + (acc[4][p] + acc[5][p]) + (acc[6][p] + acc[7][p]);
+    }
+    for (i, &wv) in cw.remainder().iter().enumerate() {
+        let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 8];
+        for p in 0..8 {
+            s[p] += wv * xc[p];
+        }
+    }
+    s
+}
+
+/// NEON dot8t: the 8 column-accumulators live in 16 float32x4 registers
+/// (positions in lanes, acc[j][0] = positions 0-3, acc[j][1] = 4-7). Each
+/// lane sees the same mul-then-add as the scalar kernel (vaddq of vmulq,
+/// never fma). The per-position reduction replays the scalar reduction
+/// order exactly, so the result is bit-identical to dot8t_scalar.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot8t_neon(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = [[vdupq_n_f32(0.0); 2]; 8];
+        let xp = xt.as_ptr();
+        let mut cw = wr.chunks_exact(8);
+        let mut c = 0usize;
+        for w8 in &mut cw {
+            for (j, &wv) in w8.iter().enumerate() {
+                let w = vdupq_n_f32(wv);
+                let p = xp.add((c + j) * n + t0);
+                acc[j][0] = vaddq_f32(acc[j][0], vmulq_f32(w, vld1q_f32(p)));
+                acc[j][1] = vaddq_f32(acc[j][1], vmulq_f32(w, vld1q_f32(p.add(4))));
+            }
+            c += 8;
+        }
+        let mut accs = [[0f32; 8]; 8];
+        for j in 0..8 {
+            vst1q_f32(accs[j].as_mut_ptr(), acc[j][0]);
+            vst1q_f32(accs[j].as_mut_ptr().add(4), acc[j][1]);
+        }
+        let mut s = [0f32; 8];
+        for p in 0..8 {
+            s[p] = (accs[0][p] + accs[1][p]) + (accs[2][p] + accs[3][p]) + (accs[4][p] + accs[5][p]) + (accs[6][p] + accs[7][p]);
+        }
+        for (i, &wv) in cw.remainder().iter().enumerate() {
+            let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 8];
+            for p in 0..8 {
+                s[p] += wv * xc[p];
+            }
+        }
+        s
+    }
+}
+
+/// AVX2 dot8t: the 8 column-accumulators live in 8 __m256 registers (the 8
+/// positions in lanes). Same mul-then-add discipline (never fmadd), same
+/// reduction replay: bit-identical to dot8t_scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot8t_avx2(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 8];
+        let xp = xt.as_ptr();
+        let mut cw = wr.chunks_exact(8);
+        let mut c = 0usize;
+        for w8 in &mut cw {
+            for (j, &wv) in w8.iter().enumerate() {
+                let w = _mm256_set1_ps(wv);
+                acc[j] = _mm256_add_ps(acc[j], _mm256_mul_ps(w, _mm256_loadu_ps(xp.add((c + j) * n + t0))));
+            }
+            c += 8;
+        }
+        let mut accs = [[0f32; 8]; 8];
+        for j in 0..8 {
+            _mm256_storeu_ps(accs[j].as_mut_ptr(), acc[j]);
+        }
+        let mut s = [0f32; 8];
+        for p in 0..8 {
+            s[p] = (accs[0][p] + accs[1][p]) + (accs[2][p] + accs[3][p]) + (accs[4][p] + accs[5][p]) + (accs[6][p] + accs[7][p]);
+        }
+        for (i, &wv) in cw.remainder().iter().enumerate() {
+            let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 8];
+            for p in 0..8 {
+                s[p] += wv * xc[p];
+            }
+        }
+        s
+    }
+}
+
+/// dot8t: 8 positions at once against the same weight row, dispatched to
+/// the widest bit-identical SIMD kernel (positions in vector lanes: the row
+/// is loaded once for all eight).
+#[inline]
+pub(super) fn dot8t(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64: unconditional, zero dispatch cost
+        return unsafe { dot8t_neon(wr, xt, n, t0) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            return unsafe { dot8t_avx2(wr, xt, n, t0) };
+        }
+    }
+    #[allow(unreachable_code)]
+    dot8t_scalar(wr, xt, n, t0)
+}
+
+/// dot4t: dot8t for a tail block of 4 positions.
+#[inline]
+fn dot4t(wr: &[f32], xt: &[f32], n: usize, t0: usize) -> [f32; 4] {
+    let mut acc = [[0f32; 4]; 8];
+    let mut cw = wr.chunks_exact(8);
+    let mut c = 0;
+    for w8 in &mut cw {
+        for (j, &wv) in w8.iter().enumerate() {
+            let xc = &xt[(c + j) * n + t0..(c + j) * n + t0 + 4];
+            for p in 0..4 {
+                acc[j][p] += wv * xc[p];
+            }
+        }
+        c += 8;
+    }
+    let mut s = [0f32; 4];
+    for p in 0..4 {
+        s[p] = (acc[0][p] + acc[1][p]) + (acc[2][p] + acc[3][p]) + (acc[4][p] + acc[5][p]) + (acc[6][p] + acc[7][p]);
+    }
+    for (i, &wv) in cw.remainder().iter().enumerate() {
+        let xc = &xt[(c + i) * n + t0..(c + i) * n + t0 + 4];
+        for p in 0..4 {
+            s[p] += wv * xc[p];
+        }
+    }
+    s
+}
+
+/// gemm_batch over the row range r0..r1 (shared by the inline and the
+/// pooled paths). `x` is position-major [n * cols], `xt` its transpose
+/// [cols * n] (None when n < 4: plain per-position dots).
+#[allow(clippy::too_many_arguments)]
+fn gemm_rows(w: &[f32], rows: usize, cols: usize, x: &[f32], xt: Option<&[f32]>, n: usize, out: &mut [f32], r0: usize, r1: usize) {
+    for r in r0..r1 {
+        let wr = &w[r * cols..(r + 1) * cols];
+        let mut t = 0;
+        if let Some(xt) = xt {
+            while t + 8 <= n {
+                let r8 = dot8t(wr, xt, n, t);
+                for p in 0..8 {
+                    out[(t + p) * rows + r] = r8[p];
+                }
+                t += 8;
+            }
+            if t + 4 <= n {
+                let r4 = dot4t(wr, xt, n, t);
+                for p in 0..4 {
+                    out[(t + p) * rows + r] = r4[p];
+                }
+                t += 4;
+            }
+        }
+        while t < n {
+            out[t * rows + r] = dot(wr, &x[t * cols..(t + 1) * cols]);
+            t += 1;
+        }
+    }
+}
+
+/// Batched matvec (position-major GEMM) for prefill:
+/// out[t * rows + r] = dot(w_row_r, x_t) for t in 0..n.
+/// Loop order is row-major: each weight row is read once and dotted against
+/// all n position vectors, so the weights are streamed from RAM once per
+/// layer instead of once per token. Bit-identical to n separate matvec
+/// calls: each (row, position) dot keeps the exact same accumulation order.
+pub fn gemm_batch(w: &[f32], rows: usize, cols: usize, x: &[f32], n: usize, out: &mut [f32]) {
+    debug_assert_eq!(x.len(), n * cols);
+    debug_assert_eq!(out.len(), n * rows);
+    // transposed copy of x for the position-in-lane kernel (n >= 4 only)
+    let xt: Option<Vec<f32>> = if n >= 4 {
+        let mut xt = vec![0f32; n * cols];
+        for t in 0..n {
+            for c in 0..cols {
+                xt[c * n + t] = x[t * cols + c];
+            }
+        }
+        Some(xt)
+    } else {
+        None
+    };
+    let p = crate::pool::pool();
+    let njobs = (rows * cols * n / 240_000).clamp(1, p.workers).min(rows);
+    if njobs <= 1 {
+        gemm_rows(w, rows, cols, x, xt.as_deref(), n, out, 0, rows);
+        return;
+    }
+    let chunk = rows.div_ceil(njobs);
+    let wp = crate::pool::SPtr(w.as_ptr());
+    let xp = crate::pool::SPtr(x.as_ptr());
+    let xtp = xt.as_ref().map(|v| crate::pool::SPtr(v.as_ptr()));
+    let op = crate::pool::MPtr(out.as_mut_ptr());
+    let mut jobs: Vec<crate::pool::Job> = Vec::new();
+    for j in 0..njobs {
+        let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+        if r0 >= r1 {
+            break;
+        }
+        jobs.push(Box::new(move || {
+            // rebind → capture whole structs (Send), not fields
+            let (wp, xp, xtp, op) = (wp, xp, xtp, op);
+            unsafe {
+                let w = std::slice::from_raw_parts(wp.0, rows * cols);
+                let x = std::slice::from_raw_parts(xp.0, n * cols);
+                let xt = xtp.map(|p| std::slice::from_raw_parts(p.0, n * cols));
+                let out = std::slice::from_raw_parts_mut(op.0, n * rows);
+                gemm_rows(w, rows, cols, x, xt, n, out, r0, r1);
+            }
+        }));
+    }
+    p.run(jobs);
+}
+
+pub fn rmsnorm(cfg: &Config, x: &[f32], w: &[f32], out: &mut [f32]) {
+    let ss = dot(x, x) / x.len() as f32;
+    let inv = 1.0 / (ss + cfg.rms_eps).sqrt();
+    for i in 0..x.len() {
+        out[i] = x[i] * inv * w[i];
+    }
+}
+
+#[inline]
+pub(super) fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+pub(super) fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
+}
+
+/// SiTU: a = 4·tanh(g/4)·sigmoid(g) ; u = 25·tanh(u/25) ; out = a·u
+#[inline]
+pub fn situ(g: f32, u: f32) -> f32 {
+    4.0 * (g / 4.0).tanh() * sigmoid(g) * (25.0 * (u / 25.0).tanh())
+}
+
+/// AttnRes: softmax over the RMS-normed scores of blocks + prefix,
+/// RAW values as output. `w` = norm.weight · proj.weight (pre-combined).
+pub fn attn_res(cfg: &Config, prefix: &[f32], blocks: &[Vec<f32>], w: &[f32], out: &mut [f32]) {
+    let refs: Vec<&[f32]> = blocks.iter().map(|b| b.as_slice()).collect();
+    attn_res_refs(cfg, prefix, &refs, w, out);
+}
+
+/// Slice-based core of attn_res, shared by the single-token path and the
+/// batched prefill (each block slice is one position of a [n * d] buffer).
+pub(super) fn attn_res_refs(cfg: &Config, prefix: &[f32], blocks: &[&[f32]], w: &[f32], out: &mut [f32]) {
+    let b = blocks.len();
+    let mut scores = vec![0f32; b + 1];
+    let mut kbuf = vec![0f32; cfg.d];
+    let mut score_of = |v: &[f32]| {
+        let ss = dot(v, v) / cfg.d as f32;
+        let inv = 1.0 / (ss + cfg.rms_eps).sqrt();
+        for j in 0..cfg.d {
+            kbuf[j] = v[j] * inv;
+        }
+        dot(&kbuf, w)
+    };
+    for (i, v) in blocks.iter().enumerate() {
+        scores[i] = score_of(v);
+    }
+    scores[b] = score_of(prefix);
+    let m = scores.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+    let mut z = 0f32;
+    for s in scores.iter_mut() {
+        *s = (*s - m).exp();
+        z += *s;
+    }
+    for s in scores.iter_mut() {
+        *s /= z;
+    }
+    for j in 0..cfg.d {
+        out[j] = 0.0;
+    }
+    for (i, v) in blocks.iter().enumerate() {
+        for j in 0..cfg.d {
+            out[j] += scores[i] * v[j];
+        }
+    }
+    let p = scores[b];
+    for j in 0..cfg.d {
+        out[j] += p * prefix[j];
+    }
+}
+
+// ── weights: (offset, dims) descriptors into the file ──
+
+/// MXFP4 packed matvec for a batch of m inputs (positions in vector lanes,
+/// blocks of 8): the packed weights are read and dequantized ONCE per
+/// element for the whole block instead of once per position.
+/// `xt` = the m inputs transposed [cols * m], zero-padded so that m is a
+/// multiple of 8 (pad columns produce zero outputs, ignored by the caller);
+/// `out` is position-major [m * rows]. Per position the accumulation is the
+/// exact per-group sequence of mxfp4::matvec_packed (gsum over the 32
+/// columns of a group in order, then sum += gsum * scale): bit-identical
+/// results.
+/// Loop order is row-outer: each row's nibbles are decoded to their f32 LUT
+/// values ONCE (they were re-decoded for every 8-position tile - 75x
+/// redundant work on a 600-token prompt), then all tiles run against the
+/// decoded row. Outputs are independent per (row, tile), so the swap and
+/// the hoisted decode keep the result bit-identical.
+pub(crate) fn matvec_packed_nt(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xt: &[f32], m: usize, out: &mut [f32]) {
+    use crate::mxfp4::{E2M1, exp2_i};
+    debug_assert_eq!(cols % 32, 0);
+    debug_assert_eq!(m % 8, 0);
+    let mut wrow = vec![0f32; cols];
+    for r in 0..rows {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        for c in 0..cols {
+            let byte = prow[c / 2];
+            let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            wrow[c] = E2M1[nib as usize];
+        }
+        for t0 in (0..m).step_by(8) {
+            let mut sum = [0f32; 8];
+            for g in 0..cols / 32 {
+                let mut gsum = [0f32; 8];
+                for j in 0..32 {
+                    let c = g * 32 + j;
+                    let wv = wrow[c];
+                    let xc = &xt[c * m + t0..c * m + t0 + 8];
+                    for p in 0..8 {
+                        gsum[p] += wv * xc[p];
+                    }
+                }
+                let sc = exp2_i(srow[g] as i32 - 127);
+                for p in 0..8 {
+                    sum[p] += gsum[p] * sc;
+                }
+            }
+            for p in 0..8 {
+                out[(t0 + p) * rows + r] = sum[p];
+            }
+        }
+    }
+}
