@@ -14,6 +14,28 @@ A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** a
 >
 > - nanokimi-0.2b, running on microkimi
 
+## What's new in 0.4.0
+
+| feature | what it does |
+|---|---|
+| suffix-automaton speculation | `--spec-rosa N`: unbounded-context proposer, frequency-ordered continuations, greedy only |
+| q8 MLA KV cache | the one growing state stored q8_0, all-heads kernel streams it once per token: /3.6 bytes per position, 4.4x faster at 16k context |
+| q8 lm_head | logits projection requantized to q8_0 at load, ~3.5x fewer bytes per token (`MICROKIMI_Q8HEAD=0` restores f32) |
+| faster prefill, invisibly | chunked KDA recurrence (T/64 sequential steps instead of T) + kernel spine warm-up in stream mode |
+| LUT GEMV | additions-only matvec for codebook weights, 7x on VQ1 experts (`MICROKIMI_LUTGEMV=0` restores the old loop) |
+| logit lens | `--logit-lens` / `--logit-lens-all`: per-layer top-5 tokens through the final norm |
+| routing sketch | `routestats` / `cmsinfo` / `MICROKIMI_ROUTECMS`: count-min sketch of router decisions, feeds hot-expert tiering |
+| chat prefix cache | a repeated chat prefills nothing, bit-identical (`microkimi pck`, `MICROKIMI_NO_PCK=1` disables) |
+| tracesim prefetch | cross-session expert prefetch at cold start, opt-in `MICROKIMI_TRACESIM=1` |
+| shadow fallback | `--stream-fallback`: VQ1 shadow served on a cache miss - DEGRADED latency mode, default OFF (see below) |
+| frequency-ordered experts | `slice --expert-order=frequency --route-cms S` + fused span reads: 12.8x prefill on a latency-bound disk |
+| pack decay / merge | `microkimi decay --half-life H`, `microkimi merge --alpha A` (experimental) |
+| ARC cache policy | `MICROKIMI_CACHE=arc` available; LFU stays default (ARC never beat it in our measurements) |
+| full-scale LoRA healing | `nano/heal_stream.py` + `nano/apply_lora_bin.py` straight from the .bin, incl. `--seam-adapter` |
+| training opts | `NANO_KDA_CHUNKED=1` / `NANO_ACT_OFFLOAD=1` / `NANO_PRETRANSPOSE=1` (opt-in, default OFF) |
+
+Measured numbers and caveats per feature: [KIMI.md](KIMI.md). DeepSeek applicability: [DEEPSEEK.md](DEEPSEEK.md).
+
 ## Quickstart
 
 You need nothing but a Rust toolchain (`rustup`). The GitHub Releases ship only the trained **nano** models (`nanokimi-0.2b.bin` + `vocab_nano.json`) - the debug models are generated locally with `microkimi build` (they are architecture demos, not shipped).

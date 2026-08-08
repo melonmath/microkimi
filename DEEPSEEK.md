@@ -29,6 +29,18 @@ python3 ref/make_ds_parity.py                 # regenerates ref/ds_parity_golden
 
 Same caveat as microkimi-debug: output is deterministic gibberish by design (untrained synthetic weights) - the point is the engine.
 
+## 0.4.0 engine features: what applies here
+
+Most of the 0.4.0 batch (see [KIMI.md](KIMI.md)) is K3-only and does NOT apply to the DeepSeek path:
+
+- `--stream` refuses DSV4 models - and with it everything built on the stream engine: shadow fallback (`--stream-fallback`), tracesim prefetch (`MICROKIMI_TRACESIM`), contiguous-run fusion, and the cache policies (`MICROKIMI_CACHE=arc|lru|lfu`).
+- `--spec` / `--spec-rosa` are ignored on DeepSeek (a warning says so): speculative decoding is K3-only for now.
+- The routing count-min sketch (`routestats`, `cmsinfo`, `MICROKIMI_ROUTECMS`) hooks the K3 noaux_tc router; DeepSeek's sqrtsoftplus router is not instrumented, and `routestats` refuses DSV4 models.
+- Memory packs (absorb/decay/merge), the chat prefix cache (`microkimi pck`) and the logit lens are K3-only: DeepSeek has no KDA state to snapshot and its chat loop takes the DsModel path.
+- The q8 MLA KV cache, q8 lm_head, chunked KDA prefill and LUT GEMV live in the K3 model path: DeepSeek has no KDA layers, its sparse-attention KV layout differs, and `slice` refuses DSV4 models.
+
+What does apply: the shared infrastructure only - `build --arch dsv4`, `parity --arch dsv4`, and mmap demand-paging with the per-region madvise (RANDOM on expert spans, sequential readahead on the spine). Even `eval` is K3-only today.
+
 ## Benchmarks
 
 Greedy decode.
