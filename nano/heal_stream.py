@@ -22,7 +22,18 @@ and a full fp32 forward+backward that fits in no GPU. This trainer instead:
     re-dequantized during backward instead of being retained;
   - trains only LoRA adapters on the attention projections (model_nano's
     apply_lora / LoRALinear, rank 8 by default), which stay resident on the
-    GPU with their AdamW states (a few hundred MB).
+    GPU with their AdamW states (a few hundred MB);
+  - optionally inserts a SEAM ADAPTER (--seam-adapter RANK, --seam-after N):
+    a low-rank correction on the residual stream right after layer N,
+    h' = h + B A h with B zero-initialized (exact identity at step 0), for
+    sliced models whose layer N+1 was trained against a different
+    predecessor (the v3 slice "0-11,83-92" seams original layer 11 to 83,
+    renumbered 11 to 12). The adapter is resident on the compute device and
+    saved/restored with the checkpoint. At merge time apply_lora_bin.py folds
+    it into the input projections of layer N+1 - exactly at zero-init, but
+    only approximately once trained (the residual pass-through part of the
+    correction is not foldable; trained adapters are refused by default
+    there, see its docstring).
 
 Two opt-in accelerations (env, default OFF, safe to combine):
   - NANO_ACT_OFFLOAD=1: the KDA time-segment checkpointing (NANO_KDA_SEG)
@@ -65,7 +76,7 @@ import torch
 import torch.nn.functional as F
 
 from bin2pt import read_bin, CFG_KEYS, E2M1, DTYPE_F32, DTYPE_MXFP4, DTYPE_I32, DTYPE_VQ1
-from model_nano import NanoModel, TrainableSparseMoe, apply_lora, layer_types, PRETRANSPOSE
+from model_nano import NanoModel, TrainableSparseMoe, apply_lora, apply_seam, layer_types, PRETRANSPOSE
 from vendor.moonshot.modeling_kimi_linear import _apply_attn_res
 from train import load_tokens, make_batch, lr_at, rss_gb
 
@@ -273,7 +284,7 @@ class StreamedHealModel:
     """The .bin-backed model: meta-device NanoModel whose frozen params point
     at mmap views, streamed to `dev` layer by layer during forward/backward."""
 
-    def __init__(self, bin_path, dev, lora_cfg=None):
+    def __init__(self, bin_path, dev, lora_cfg=None, seam_cfg=None):
         self.path = bin_path
         self.dev = dev
         config, entries, f = read_bin(bin_path)
@@ -356,6 +367,15 @@ class StreamedHealModel:
             for p in model.parameters():
                 p.requires_grad = False
             self.n_train = 0
+
+        # seam adapter (residual-stream correction right after layer
+        # seam_cfg["after"]): created outside the meta context like the LoRA
+        # adapters, so A/B are real CPU tensors here and are moved to the
+        # compute device below, where they stay resident. Attached AFTER the
+        # freeze above so only A/B (and the LoRA adapters) carry gradients.
+        if seam_cfg:
+            apply_seam(model, seam_cfg["rank"], seam_cfg["after"])
+            self.n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
         # replace every meta param by its .bin tensor (frozen: mmap view flipped
         # per layer; trainable: real copy resident on the compute device). The
@@ -446,10 +466,23 @@ class StreamedHealModel:
         return {k: v.detach().cpu() for k, v in self.model.named_parameters() if v.requires_grad}
 
     def load_trainable(self, sd):
+        # resume ACROSS a config change: a ckpt saved without the seam adapter
+        # loads into a run that has one (the deployment scenario: the LoRA
+        # weights and their Adam state resume, the adapter starts fresh from
+        # its zero-init) - and a ckpt with a seam adapter loads into a run
+        # without one (the adapter tensors are dropped)
+        has_seam = hasattr(self.model, "seam_adapter")
+        if not has_seam and any(k.startswith("seam_adapter.") for k in sd):
+            sd = {k: v for k, v in sd.items() if not k.startswith("seam_adapter.")}
+            print("load_trainable: checkpoint seam adapter dropped (run has none)", flush=True)
         missing, unexpected = self.model.load_state_dict(sd, strict=False)
         assert not unexpected, f"unexpected keys: {unexpected[:4]}"
         left = [k for k in missing if k.endswith((".lora_A", ".lora_B"))]
         assert not left, f"missing LoRA keys: {left[:4]}"
+        fresh_seam = has_seam and any(k.startswith("seam_adapter.") for k in missing)
+        if fresh_seam:
+            print("load_trainable: no seam adapter in checkpoint - fresh zero-init", flush=True)
+        return fresh_seam
 
     def forward(self, ids):
         """ids [B, T] on the compute device -> logits [B, T, V]. Same flow as
@@ -466,9 +499,14 @@ class StreamedHealModel:
             float("-inf"),
         )
         blocks = h.new_zeros(B * T, 0, D)
+        seam = getattr(m, "seam_adapter", None)
+        seam_after = getattr(m, "seam_after", -1)
         for l, layer in enumerate(m.layers):
             mask = causal if l in self._mla else None
             h, blocks = _StreamedLayer.apply(h, blocks, layer, mask, dev)
+            if l == seam_after:
+                # resident module, no streaming: plain differentiable call
+                h = seam(h)
         h = _apply_attn_res(
             h.view(-1, D), blocks, m.output_attn_res_proj, m.output_attn_res_norm
         ).view(B, T, D)
@@ -486,6 +524,7 @@ def save_ckpt(sm, opt, step, rng, args, lora_info, path):
         "cfg": sm.cfg,
         "args": vars(args),
         "lora": lora_info,
+        "seam": getattr(sm.model, "seam_info", None),
         "bin_source": sm.path,
         "streamed": True,
     }
@@ -552,6 +591,16 @@ def main():
     ap.add_argument("--lora-final-norm", action="store_true",
                     help="train ONLY the trunk norms (final norm + output attn_res norm), "
                          "not the per-layer norms")
+    ap.add_argument("--seam-adapter", type=int, default=None, metavar="RANK",
+                    help="insert a trainable low-rank residual-stream correction "
+                         "h' = h + B A h (B zero-init: exact identity at step 0) at the "
+                         "seam of a sliced model. Lives on the compute device, saved in "
+                         "the checkpoint; merge folds it into the input projections of "
+                         "the next layer (see apply_lora_bin.py)")
+    ap.add_argument("--seam-after", type=int, default=11,
+                    help="0-based index of the layer after which the seam adapter is "
+                         "inserted (default 11: the v3 slice '0-11,83-92' has its seam "
+                         "between the renumbered layers 11 and 12)")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--accum", type=int, default=1, help="micro-batches per optimizer step")
@@ -604,9 +653,15 @@ def main():
             "layers": parse_layers(args.lora_layers) if args.lora_layers else None,
             "final_norm": args.lora_final_norm,
         }
+    # seam adapter: from the checkpoint being resumed when it has one, else the
+    # flags (a ckpt WITHOUT seam + --seam-adapter grows the run: LoRA resumes,
+    # the adapter starts fresh - the scenario load_trainable documents)
+    seam_cfg = (pre_ck or {}).get("seam")
+    if seam_cfg is None and args.seam_adapter:
+        seam_cfg = {"rank": args.seam_adapter, "after": args.seam_after}
 
     t_load = time.time()
-    sm = StreamedHealModel(args.model, dev, lora_cfg)
+    sm = StreamedHealModel(args.model, dev, lora_cfg, seam_cfg)
     m = sm.model
     scope = f", layers {lora_cfg['layers']}" if lora_cfg.get("layers") is not None else ""
     if lora_cfg.get("final_norm"):
@@ -615,6 +670,9 @@ def main():
     print(f"heal_stream: {args.model} - {sm.cfg['n_layers']} layers, hidden {sm.cfg['hidden']}, "
           f"vocab {sm.cfg['vocab']}, {sm.n_moe} moe layers, {sm.n_assigned} mmap-backed tensors, "
           f"{sm.n_train / 1e6:.2f} M trainable params{scope}{pretrans} ({time.time() - t_load:.1f} s)", flush=True)
+    if seam_cfg:
+        print(f"seam adapter: rank {seam_cfg['rank']} after layer {seam_cfg['after']} "
+              f"(h' = h + B A h, B zero-init)", flush=True)
 
     trainable = sm.trainable_params()
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -627,7 +685,27 @@ def main():
     if pre_ck is not None:
         print(f"resuming from {ckpt_latest} ...", flush=True)
         sm.load_trainable(pre_ck["model"])
-        opt.load_state_dict(pre_ck["opt"])
+        try:
+            opt.load_state_dict(pre_ck["opt"])
+        except ValueError:
+            # the trainable set GREW since the checkpoint (a fresh seam
+            # adapter was appended after every other trainable param, so the
+            # saved AdamW state maps to a strict prefix of the current param
+            # list): restore the saved states by index, the new params start
+            # with empty Adam state
+            saved = pre_ck["opt"]
+            assert len(saved["param_groups"]) == len(opt.param_groups) == 1, (
+                "optimizer growth across param groups is not supported")
+            n_saved = len(saved["param_groups"][0]["params"])
+            n_now = len(opt.param_groups[0]["params"])
+            assert n_saved < n_now, f"optimizer state has {n_saved} params, run has {n_now}"
+            patched = {
+                "state": saved["state"],
+                "param_groups": [dict(saved["param_groups"][0], params=list(range(n_now)))],
+            }
+            opt.load_state_dict(patched)
+            print(f"  -> optimizer state grew {n_saved} -> {n_now} params "
+                  f"(fresh Adam state for the new ones)", flush=True)
         if dev != "cpu":
             for st in opt.state.values():
                 for key, val in st.items():

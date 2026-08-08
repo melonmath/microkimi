@@ -404,6 +404,8 @@ class NanoModel(nn.Module):
             float("-inf"),
         )
         blocks = hidden.new_zeros(B * T, 0, D)
+        seam = getattr(self, "seam_adapter", None)
+        seam_after = getattr(self, "seam_after", -1)
         for l, layer in enumerate(self.layers):
             mask = causal if l in self._mla else None
             if self.grad_ckpt and torch.is_grad_enabled():
@@ -423,6 +425,8 @@ class NanoModel(nn.Module):
                 hidden, blocks = layer._forward_attn_residual(
                     hidden, attention_mask=mask, block_residual=blocks
                 )
+            if l == seam_after:
+                hidden = seam(hidden)
         hidden = _apply_attn_res(
             hidden.view(-1, D), blocks, self.output_attn_res_proj, self.output_attn_res_norm
         ).view(B, T, D)
@@ -559,6 +563,54 @@ def apply_lora(model, rank, alpha, targets, lora_norms=False):
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     return n_train, n_total
+
+
+# ── seam adapter (healing across a layer boundary) ──
+#
+# A sliced model (e.g. K3 layers "0-11,83-92" renumbered 0-21) stitches two
+# non-contiguous ranges: layer N+1 was trained to consume the residual
+# distribution of its ORIGINAL predecessor (layer 82), not of layer N (11).
+# The seam adapter is a low-rank correction applied to the residual stream
+# right after layer N:
+#     h' = h + B @ (A @ h)      A [rank, hidden], B [hidden, rank]
+# B is zero-initialized, so the adapter is an exact identity at step 0 (h + 0,
+# bit-identical: a matmul against the zero matrix is an exact zero). No alpha
+# scaling: the rank already bounds the correction. Only A and B carry
+# gradients; they are tiny (2 * rank * hidden floats) and stay resident on the
+# compute device, so they are saved and restored with the LoRA tensors in the
+# checkpoint.
+
+
+class SeamAdapter(nn.Module):
+    """Low-rank residual-stream correction h' = h + B A h, identity at init."""
+
+    def __init__(self, hidden: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.A = nn.Parameter(torch.empty(rank, hidden))
+        self.B = nn.Parameter(torch.zeros(hidden, rank))
+        nn.init.kaiming_uniform_(self.A, a=5**0.5)
+
+    def forward(self, h):
+        return h + (h @ self.A.T) @ self.B.T
+
+
+def apply_seam(model, rank, after):
+    """Attach a SeamAdapter on the residual stream right after layer `after`
+    (0-based). Records model.seam_info for the checkpoint. The adapter params
+    are created trainable; the base weights are left untouched (apply_lora
+    already froze them when LoRA is combined, and the no-LoRA path freezes
+    them as well). `after` must leave a layer N+1: the merge folds the adapter
+    into the input projections of that layer (exactly at zero-init, only
+    approximately once trained - refused by default, see apply_lora_bin.py)."""
+    n = model.c["n_layers"]
+    if not 0 <= after < n - 1:
+        raise SystemExit(f"apply_seam: --seam-after {after} out of range [0, {n - 2}] "
+                         f"for a {n}-layer model")
+    model.seam_adapter = SeamAdapter(model.c["hidden"], rank)
+    model.seam_after = after
+    model.seam_info = {"rank": rank, "after": after}
+    return model.seam_adapter
 
 
 if __name__ == "__main__":
