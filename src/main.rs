@@ -23,6 +23,7 @@ mod mkmem;
 mod model;
 mod mxfp4;
 mod parity;
+mod pck;
 mod pool;
 mod q8;
 mod quant;
@@ -218,6 +219,9 @@ fn main() {
         "dotbench" => dotbench_cmd(),
         // microkimi cache --info | microkimi cache --clean [--repo X]
         "cache" => stream::cache_cmd(&args),
+        // microkimi pck --info | microkimi pck --clean [--model X.bin]
+        // prefix cache of the chat (<model>.pck/ by default, MICROKIMI_PCK_DIR)
+        "pck" => pck::cmd(&args),
         // microkimi cachereplay trace.bin [--top-k K] [--predict N]
         "cachereplay" => tools_replay::run(&args),
         // debug command (debug helper): prints the tokenization of a text
@@ -299,6 +303,10 @@ fn main() {
             println!("                        (default lfu; arc = T1/T2 + ghost lists, scan-resistant, non-default)");
             println!("                    env MICROKIMI_ROUTECMS=sketch.bin records a count-min sketch of the routing");
             println!("                        decisions of the run (4 x 4096 u32, saved on exit; see routestats/cmsinfo)");
+            println!("                    env MICROKIMI_NO_PCK=1 disables the chat prefix cache (default on: the state");
+            println!("                        after each turn's prompt is snapshotted in <model>.pck/ and a turn whose");
+            println!("                        prompt extends a cached prefix resumes from the snapshot, bit-identical;");
+            println!("                        MICROKIMI_PCK_DIR overrides the cache directory; see `microkimi pck`)");
             println!("  microkimi routestats \"prompt\" [--model X.bin] [--max-new N] [--out routecms.bin]");
             println!("                                         one turn with the routing sketch armed, sketch saved on exit");
             println!("  microkimi cmsinfo sketch.bin           top-50 (layer, expert, count) + coverage curve of a sketch");
@@ -318,6 +326,8 @@ fn main() {
             println!("                                         consumed by slice --cold-vq --imatrix (weighted VQ)");
             println!("  microkimi cache --info             per-repo disk cache usage (bytes, tensors, access span)");
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
+            println!("  microkimi pck --info [--model X.bin]   chat prefix-cache entries (count, covered tokens, bytes)");
+            println!("  microkimi pck --clean [--model X.bin]  purge the chat prefix cache, prints freed bytes");
             println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");
             println!("                                         replay a MICROKIMI_TRACE expert-request trace offline:");
             println!("                                         hit-rate vs capacity under LRU, LFU, ARC, Markov prefetch, Belady");
@@ -1068,6 +1078,23 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
         }
     }
     let resumed = memory.is_some();
+    // prefix cache (default on for K3 chat; MICROKIMI_NO_PCK=1 disables):
+    // after each turn the state after the full prompt is snapshotted into
+    // <model>.pck/, and a turn whose prompt extends a cached prefix resumes
+    // from the snapshot instead of re-prefilling. Bit-identity with a full
+    // prefill requires the sequential KDA loop (the chunked form reassociates
+    // per 64-token chunk, so a moved chunk boundary would break it). Off in
+    // raw mode, with --memory (state comes from elsewhere) and with an active
+    // speculative proposer.
+    let pck = if raw || resumed || sampler.spec > 0 || sampler.spec_rosa > 0 {
+        None
+    } else {
+        let p = pck::open(&mp);
+        if p.is_some() {
+            crate::kda_chunk::force_sequential();
+        }
+        p
+    };
     if raw {
         println!("\nRAW interactive mode - each line is a story beginning to continue (type 'quit' to exit)");
     } else {
@@ -1106,7 +1133,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
             history.push((q.to_string(), answer));
         } else {
             let ids = tok.encode_chat(&history, q);
-            let answer = model::run_turn(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg(), sampler);
+            let answer = pck::run_turn_chat(pck.as_ref(), &ids, 200, &tok, &mut model, debug_routing, tok.end_of_msg(), sampler);
             history.push((q.to_string(), answer));
         }
     }

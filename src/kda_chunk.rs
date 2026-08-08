@@ -47,10 +47,24 @@ const BT: usize = 64;
 /// pool barriers dominate on tiny batches, e.g. the --spec verify passes).
 pub(crate) const MIN_LEN: usize = 16;
 
-/// True when MICROKIMI_NO_KDACHUNK=1 (A/B toggle, sequential fallback).
+/// True when MICROKIMI_NO_KDACHUNK=1 (A/B toggle, sequential fallback) or when
+/// the sequential path was pinned at runtime (force_sequential).
 pub(crate) fn disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_KDACHUNK").map(|v| v == "1").unwrap_or(false))
+    FORCE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+        || *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_KDACHUNK").map(|v| v == "1").unwrap_or(false))
+}
+
+// Runtime pin for src/pck.rs (prefix cache): a snapshot resume splits the
+// prefill into two calls, and the chunked form reassociates the recurrence
+// per 64-token chunk, so chunk boundaries moving between the cold and the
+// resumed run would break bit-identity. The sequential loop applies the exact
+// same per-position operations however the sequence is split, so the pck path
+// pins it for the whole process.
+static FORCE_SEQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn force_sequential() {
+    FORCE_SEQ.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Chunked KDA recurrence over n positions. Same inputs/outputs as n calls

@@ -21,6 +21,13 @@ const MAGIC: &[u8; 8] = b"MKMEM001";
 
 /// Serializes the layer caches + the logits after the last ingested token.
 pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
+    std::fs::write(path, serialize(model, logits))
+}
+
+/// The .mkmem byte image of the current state (layout above). Split from
+/// `save` so the prefix cache (src/pck.rs) can embed the same image in its
+/// own container without a round trip through a file.
+pub fn serialize(model: &Model, logits: &[f32]) -> Vec<u8> {
     let cfg = &model.cfg;
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -50,14 +57,21 @@ pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
         }
     }
     put_vec(&mut out, logits);
-    std::fs::write(path, out)
+    out
 }
 
 /// Restores the caches into `model` and returns the stored logits.
 /// Refuses to load when the fingerprint does not match the loaded model.
 pub fn load(model: &mut Model, path: &str) -> Result<Vec<f32>, String> {
     let b = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let mut r = Reader { b: &b, p: 0 };
+    load_slice(model, &b, path)
+}
+
+/// In-memory variant of `load` (prefix cache entries embed a .mkmem image);
+/// `label` only names the source in error messages.
+pub fn load_slice(model: &mut Model, b: &[u8], label: &str) -> Result<Vec<f32>, String> {
+    let path = label;
+    let mut r = Reader { b, p: 0 };
     if r.take(8)? != MAGIC {
         return Err(format!("{}: not a .mkmem file (bad magic)", path));
     }
