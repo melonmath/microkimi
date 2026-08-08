@@ -63,6 +63,32 @@ fn propose(ctx: &[u32], n: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Draft proposer: the plain bounded n-gram scan above, or the incremental
+/// suffix automaton (--spec-rosa, src/rosa.rs) fed with every committed
+/// token. Same contract: up to `n` candidate tokens, verified by the model.
+enum Proposer {
+    NGram,
+    Rosa(crate::rosa::SuffixAutomaton),
+}
+
+impl Proposer {
+    fn propose(&self, ctx: &[u32], n: usize) -> Vec<u32> {
+        match self {
+            Proposer::NGram => propose(ctx, n),
+            Proposer::Rosa(a) => a.propose(n),
+        }
+    }
+    /// Keeps the automaton in sync with the committed context (no-op for
+    /// the n-gram proposer, which rescans ctx on every call).
+    fn feed(&mut self, toks: &[u32]) {
+        if let Proposer::Rosa(a) = self {
+            for &t in toks {
+                a.feed(t);
+            }
+        }
+    }
+}
+
 /// Speculative generation loop (see the header comment). Mirrors
 /// run_turn_core_batch's contract: prefill, generate up to max_new tokens,
 /// stop on stop_id (not emitted), print the answer + tok/s line.
@@ -77,7 +103,16 @@ pub fn run_turn_spec(
     stop_id: u32,
     sampler: &mut Sampler,
 ) -> String {
-    let k = sampler.spec;
+    let k = sampler.spec.max(sampler.spec_rosa);
+    let mut proposer = if sampler.spec_rosa > 0 {
+        let mut a = crate::rosa::SuffixAutomaton::new();
+        for &t in ids {
+            a.feed(t); // the prompt is already committed context
+        }
+        Proposer::Rosa(a)
+    } else {
+        Proposer::NGram
+    };
     let t0 = Instant::now();
     let mut pos = pos0;
     let mut logits = init_logits.unwrap_or_default();
@@ -109,7 +144,7 @@ pub fn run_turn_spec(
     let mut cool = 0usize;
 
     while generated.len() < max_new && !stop_hit {
-        let prop = if cool > 0 { Vec::new() } else { propose(&ctx, k) };
+        let prop = if cool > 0 { Vec::new() } else { proposer.propose(&ctx, k) };
         if prop.is_empty() {
             // no earlier n-gram to continue from (or cooldown): plain step.
             // With a pending token, just ingest it (it was selected by
@@ -126,6 +161,7 @@ pub fn run_turn_spec(
                 logits = model.prefill(&[sel], pos);
                 pos += 1;
                 ctx.push(sel);
+                proposer.feed(&[sel]);
                 generated.push(sel);
             }
             cool = cool.saturating_sub(1);
@@ -213,6 +249,7 @@ pub fn run_turn_spec(
             strikes = 0;
         }
         ctx.extend_from_slice(&batch[..committed]);
+        proposer.feed(&batch[..committed]);
         if committed > 0 {
             logits = g[committed - 1].clone();
         }
@@ -226,6 +263,7 @@ pub fn run_turn_spec(
         let clamped = newtoks.len() > room;
         newtoks.truncate(room);
         ctx.extend_from_slice(&newtoks[n_acc.min(newtoks.len())..]); // the pending tail
+        proposer.feed(&newtoks[n_acc.min(newtoks.len())..]);
         generated.extend_from_slice(&newtoks);
         pending = !clamped && !stop_hit && next_sel.is_some();
         if clamped {

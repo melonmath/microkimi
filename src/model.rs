@@ -2839,7 +2839,8 @@ impl XorShift {
 
 /// Decoding policy: temp <= 0 keeps the exact greedy argmax path; temp > 0
 /// samples from softmax(logits / temp) restricted to the top-p nucleus.
-/// spec > 0 enables n-gram speculative decoding (src/spec.rs, greedy only).
+/// spec > 0 enables n-gram speculative decoding (src/spec.rs, greedy only);
+/// spec_rosa > 0 swaps the proposer for the suffix automaton (src/rosa.rs).
 /// dry > 0 subtracts a DRY-style anti-repetition penalty from the logits
 /// (apply_dry; 0 = off, the historical bit-exact path).
 pub struct Sampler {
@@ -2847,12 +2848,13 @@ pub struct Sampler {
     pub top_p: f32,
     pub rng: XorShift,
     pub spec: usize,
+    pub spec_rosa: usize,
     pub dry: f32,
 }
 
 impl Sampler {
     pub fn new(temp: f32, top_p: f32, seed: u64) -> Sampler {
-        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0, dry: 0.0 }
+        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0, spec_rosa: 0, dry: 0.0 }
     }
     /// Default no-op decoding: the historical greedy behavior.
     pub fn greedy() -> Sampler {
@@ -2962,11 +2964,11 @@ pub fn run_turn_resume(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &
 fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Model, debug: bool, debug_routing: bool, stop_id: u32, resumed: bool, init_logits: Option<Vec<f32>>, sampler: &mut Sampler) -> String {
     model.prof = Prof::default();
     let mut pos = if resumed { model.cached_tokens() } else { 0 };
-    // --spec N: n-gram speculative decoding, greedy only (rejection sampling
-    // for temp > 0 is future work; the flag is ignored there)
-    if sampler.spec > 0 {
+    // --spec N / --spec-rosa N: speculative decoding, greedy only (rejection
+    // sampling for temp > 0 is future work; the flags are ignored there)
+    if sampler.spec > 0 || sampler.spec_rosa > 0 {
         if sampler.temp > 0.0 {
-            eprintln!("warning: --spec is greedy-only, ignoring it with --temp > 0");
+            eprintln!("warning: --spec/--spec-rosa are greedy-only, ignoring them with --temp > 0");
         } else {
             let answer = crate::spec::run_turn_spec(ids, max_new, tok, model, pos, init_logits, debug, stop_id, sampler);
             model.prof.print_cfg(&model.cfg);

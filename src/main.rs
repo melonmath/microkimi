@@ -23,6 +23,7 @@ mod parity;
 mod pool;
 mod q8;
 mod quant;
+mod rosa;
 mod safetensors;
 mod selftest;
 mod slice;
@@ -192,6 +193,7 @@ fn main() {
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
+            println!("                    --spec-rosa N (suffix-automaton proposer, unbounded context, greedy only)");
             println!("                    --dry P (DRY anti-repetition penalty, 0 = off)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
@@ -617,7 +619,8 @@ fn stream_report_maybe(stream_mb: Option<usize>) {
     }
 }
 
-/// Builds the decoding policy from --temp / --top-p / --seed / --spec.
+/// Builds the decoding policy from --temp / --top-p / --seed / --spec /
+/// --spec-rosa / --dry.
 /// temp absent or 0 -> greedy (the exact historical path). With temp > 0 and
 /// no --seed, the RNG is seeded from the wall clock (non reproducible).
 fn sampler_flag(args: &[String]) -> model::Sampler {
@@ -631,6 +634,7 @@ fn sampler_flag(args: &[String]) -> model::Sampler {
     });
     let mut s = model::Sampler::new(temp, top_p, seed);
     s.spec = value_flag(args, "--spec").and_then(|v| v.parse().ok()).unwrap_or(0);
+    s.spec_rosa = value_flag(args, "--spec-rosa").and_then(|v| v.parse().ok()).unwrap_or(0);
     s.dry = value_flag(args, "--dry").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     s
 }
@@ -710,8 +714,8 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
         }
-        if sampler.spec > 0 {
-            eprintln!("warning: --spec is only supported for K3 models, ignoring it (DeepSeek-V4)");
+        if sampler.spec > 0 || sampler.spec_rosa > 0 {
+            eprintln!("warning: --spec/--spec-rosa are only supported for K3 models, ignoring them (DeepSeek-V4)");
         }
         let tok = load_ds_any_tokenizer(&mp, vocab, mp_cfg.vocab);
         let mut model = deepseek::DsModel::load(&mp);
