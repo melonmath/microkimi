@@ -2631,6 +2631,67 @@ fn dump_hidden_print(per_layer: &[(usize, &'static str, f64)], residual_rms: f64
     DUMP_HIDDEN_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ── --logit-lens collection (inactive by default) ──
+//
+// Logit lens: each post-layer hidden state is projected through the FINAL
+// norm + lm_head and the top-5 softmax tokens are printed, showing where in
+// depth the next-token semantics emerge (or die). Read-only diagnostic: the
+// captured hiddens are clones, the forward math is untouched (bit-exact).
+pub static LOGIT_LENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOGIT_LENS_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOGIT_LENS_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// on: lens active at the last prefill position. all: also on every
+/// generated token (--logit-lens-all).
+pub fn set_logit_lens(on: bool, all: bool) {
+    LOGIT_LENS.store(on, std::sync::atomic::Ordering::Relaxed);
+    LOGIT_LENS_ALL.store(all, std::sync::atomic::Ordering::Relaxed);
+    LOGIT_LENS_DONE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn logit_lens_on() -> bool {
+    use std::sync::atomic::Ordering;
+    LOGIT_LENS.load(Ordering::Relaxed) && (LOGIT_LENS_ALL.load(Ordering::Relaxed) || !LOGIT_LENS_DONE.load(Ordering::Relaxed))
+}
+
+/// One lens row: (layer index, attention kind, top-5 (token id, softmax prob)).
+type LensRows = Vec<(usize, &'static str, Vec<(usize, f32)>)>;
+static LENS_PENDING: std::sync::Mutex<Option<LensRows>> = std::sync::Mutex::new(None);
+
+/// Projects every captured post-layer hidden through norm_f + lm_head (the
+/// same rmsnorm/matvec pair as the normal path) and stashes the top-5 rows
+/// for logit_lens_print_maybe. The last layer reuses the real logits: the
+/// output residual mix (out_res_w) sits between it and the final norm, so
+/// this keeps the bottom row bit-identical to the model's own candidates.
+fn logit_lens_compute(cfg: &Config, lm_head: &[f32], norm_f: &[f32], per_layer: &[(usize, &'static str, Vec<f32>)], final_logits: &[f32]) {
+    let mut rows: LensRows = Vec::with_capacity(per_layer.len());
+    let mut xf = vec![0f32; cfg.d];
+    let mut logits = vec![0f32; cfg.vocab];
+    for (i, (l, kind, h)) in per_layer.iter().enumerate() {
+        if i + 1 == per_layer.len() {
+            rows.push((*l, kind, top_k_probs(final_logits, 5)));
+        } else {
+            rmsnorm(cfg, h, norm_f, &mut xf);
+            matvec(lm_head, cfg.vocab, cfg.d, &xf, &mut logits);
+            rows.push((*l, kind, top_k_probs(&logits, 5)));
+        }
+    }
+    LOGIT_LENS_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    *LENS_PENDING.lock().unwrap() = Some(rows);
+}
+
+/// Prints the pending lens table (called by the generation loop, which owns
+/// the tokenizer, right after each forward/prefill). No-op without a dump.
+pub fn logit_lens_print_maybe(tok: &AnyTokenizer, label: &str) {
+    let rows = LENS_PENDING.lock().unwrap().take();
+    let Some(rows) = rows else { return };
+    println!("── logit lens ({}): top-5 of each layer through final norm + lm_head ──", label);
+    for (l, kind, top) in rows {
+        let segs: Vec<String> = top.iter().map(|&(id, p)| format!("{} {:.1}%", py_repr(&tok.decode_id(id as u32)), p * 100.0)).collect();
+        println!("  layer {:>2} ({}): {}", l, kind, segs.join("  "));
+    }
+}
+
 // ── full forward ──
 
 impl Model {
@@ -2647,6 +2708,8 @@ impl Model {
         let mut x = vec![0f32; cfg.d];
         let hd_on = dump_hidden_on();
         let mut hd: Vec<(usize, &'static str, f64)> = Vec::new();
+        let lens_on = logit_lens_on();
+        let mut lens: Vec<(usize, &'static str, Vec<f32>)> = Vec::new();
 
         for l in 0..cfg.n_layers {
             let prefix: Option<Vec<f32>> = Some(hidden.clone());
@@ -2744,6 +2807,10 @@ impl Model {
                 let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
                 hd.push((l, kind, vec_rms(&hidden)));
             }
+            if lens_on {
+                let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
+                lens.push((l, kind, hidden.clone()));
+            }
             if DUMP_LAYERS.contains(&l) {
                 let h = hidden.clone();
                 parity_rec(|d| {
@@ -2764,6 +2831,9 @@ impl Model {
         prof.t_lm_head += tm.elapsed().as_secs_f64();
         if hd_on {
             dump_hidden_print(&hd, vec_rms(&hidden), &logits);
+        }
+        if lens_on {
+            logit_lens_compute(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), &lens, &logits);
         }
         *last_logits = logits.clone();
         logits
@@ -2810,6 +2880,8 @@ impl Model {
         let mut x = vec![0f32; n * d];
         let hd_on = dump_hidden_on();
         let mut hd: Vec<(usize, &'static str, f64)> = Vec::new();
+        let lens_on = logit_lens_on();
+        let mut lens: Vec<(usize, &'static str, Vec<f32>)> = Vec::new();
 
         for l in 0..cfg.n_layers {
             let layer = &layers[l];
@@ -2901,6 +2973,10 @@ impl Model {
                 let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
                 hd.push((l, kind, vec_rms(&hidden[(n - 1) * d..n * d])));
             }
+            if lens_on {
+                let kind = if matches!(layer.attn, AttnW::Kda(_)) { "KDA" } else { "MLA" };
+                lens.push((l, kind, hidden[(n - 1) * d..n * d].to_vec()));
+            }
             if DUMP_LAYERS.contains(&l) {
                 for t in 0..n {
                     let h = hidden[t * d..(t + 1) * d].to_vec();
@@ -2931,6 +3007,9 @@ impl Model {
                 out.push(logits);
             }
             prof.t_norm_res += tm.elapsed().as_secs_f64();
+            if lens_on {
+                logit_lens_compute(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), &lens, out.last().unwrap());
+            }
             *last_logits = out.last().unwrap().clone();
             return out;
         }
@@ -2945,6 +3024,9 @@ impl Model {
             // per-layer rms was taken on the LAST position (the one the
             // logits are computed from)
             dump_hidden_print(&hd, vec_rms(&hidden[(n - 1) * d..n * d]), &logits);
+        }
+        if lens_on {
+            logit_lens_compute(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), &lens, &logits);
         }
         *last_logits = logits.clone();
         vec![logits]
@@ -3213,6 +3295,7 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
     let mut logits = init_logits.unwrap_or_default();
     if !ids.is_empty() {
         logits = fwd(ids);
+        logit_lens_print_maybe(tok, "last prefill position");
     }
     if logits.is_empty() {
         eprintln!("error: nothing to continue from (empty prompt and no logits stored in the .mkmem snapshot)");
@@ -3295,6 +3378,7 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
         }
         let ta = Instant::now();
         logits = fwd(&[next_id]);
+        logit_lens_print_maybe(tok, &format!("generated token {}", i + 1));
         let dt = ta.elapsed().as_secs_f64();
         gen_times.push(dt);
         generated.push(next_id);

@@ -87,6 +87,10 @@ fn main() {
                 .unwrap_or(20);
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
             model::set_dump_hidden(args.iter().any(|a| a == "--dump-hidden"));
+            model::set_logit_lens(
+                args.iter().any(|a| a == "--logit-lens" || a == "--logit-lens-all"),
+                args.iter().any(|a| a == "--logit-lens-all"),
+            );
             run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args));
         }
         "chat" => {
@@ -264,6 +268,8 @@ fn main() {
             println!("                    --spec-rosa N (suffix-automaton proposer, unbounded context, greedy only)");
             println!("                    --dry P (DRY anti-repetition penalty, 0 = off)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
+            println!("                    --logit-lens (top-5 tokens of every layer through final norm + lm_head,");
+            println!("                        last prefill position; --logit-lens-all: also on each generated token)");
             println!("                    --stream (lazy expert loading: RAM LRU + disk/HTTP tiers, bit-identical)");
             println!("                    --stream-ram N (expert cache budget in MB, default 512; implies --stream)");
             println!("                    --stream-disk N (remote disk cache budget in MB, default 0 = unlimited;");
