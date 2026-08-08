@@ -349,6 +349,15 @@ class StreamedHealModel:
                 p.data = p.data.to(dev)
 
         model.eval()  # gate assert + swapped MoE blocks default to training=True
+        # trunk norms / projections are used outside the per-layer swap: the
+        # frozen ones become device-resident (a few KB), embed stays on the CPU
+        # (gather only) and lm_head is streamed by _StreamedLinear
+        for trunk in (model.norm, model.output_attn_res_norm, model.output_attn_res_proj):
+            for p in trunk.parameters():
+                if not p.requires_grad and hasattr(p, "_cpu_data"):
+                    p.data = p._cpu_data.to(dev)
+                    del p._cpu_data
+
         self.model = model
         self.n_moe = n_moe
         self._mla, _ = layer_types(cfg)
