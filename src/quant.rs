@@ -314,7 +314,7 @@ pub fn rel_error_weighted(w: &[f32], weights: &[f32], indices: &[u8], codebook: 
 /// codebook on the fly. The 16 KB codebook stays hot in L1; the index row
 /// is streamed once. Per row the accumulation is vector-sequential (dot of
 /// each 16-vector in order), deterministic.
-pub fn matvec_vq(codebook: &[f32], indices: &[u8], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+pub fn matvec_vq_gather(codebook: &[f32], indices: &[u8], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
     debug_assert_eq!(cols % VQ_DIM, 0);
     debug_assert_eq!(out.len(), rows);
     let vpr = cols / VQ_DIM; // vectors per row
@@ -331,6 +331,17 @@ pub fn matvec_vq(codebook: &[f32], indices: &[u8], rows: usize, cols: usize, x: 
             sum += s;
         }
         *o = sum;
+    }
+}
+
+/// VQ1 matvec entry point: dispatches to the LUT GEMV (lutgemv.rs,
+/// bit-identical, faster on every measured shape) unless
+/// MICROKIMI_LUTGEMV=0 forces the legacy gather-dot path.
+pub fn matvec_vq(codebook: &[f32], indices: &[u8], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    if crate::lutgemv::enabled() {
+        crate::lutgemv::matvec_vq_lut(codebook, indices, rows, cols, x, out);
+    } else {
+        matvec_vq_gather(codebook, indices, rows, cols, x, out);
     }
 }
 
