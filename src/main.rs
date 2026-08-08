@@ -10,6 +10,7 @@ mod deepseek;
 mod dequant;
 mod dstok;
 mod config;
+mod cms;
 mod eval;
 mod http;
 mod imatrix;
@@ -50,6 +51,10 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
         .unwrap_or("k3");
+
+    // env-armed routing statistics sketch (MICROKIMI_ROUTECMS=path.bin on
+    // run/chat/prefill/absorb); no-op when the variable is absent
+    cms::start_from_env();
 
     match cmd {
         "build" => {
@@ -132,6 +137,67 @@ fn main() {
         // (hidden debug tool) greedy-generates N tokens from the prompt on top
         // of each state and reports the top-1 agreement of X, Y, ... vs REF.
         "mkmem-div" => mkmem_div_cmd(&args),
+        // microkimi routestats "prompt" [--model X.bin] [--max-new N] [--out routecms.bin]
+        // runs one turn with the count-min routing sketch armed, then saves it
+        "routestats" => routestats_cmd(&args),
+        // microkimi cmsinfo sketch.bin: top-50 (layer, expert, count) + coverage
+        "cmsinfo" => cms::info_cmd(&args),
+        // microkimi decay mem.mkmem --half-life H --out mem2.mkmem [--units U]
+        // exp2 partial forgetting: KDA s *= 2^(-U/H), conv/MLA/logits untouched
+        "decay" => {
+            let skip = flag_value_positions(&args, &["--half-life", "--out", "--units"]);
+            let positional: Vec<&String> = args
+                .iter()
+                .enumerate()
+                .skip(2)
+                .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+                .map(|(_, a)| a)
+                .collect();
+            let (Some(mem), Some(hl), Some(out)) = (
+                positional.first(),
+                value_flag(&args, "--half-life").and_then(|s| s.parse::<f64>().ok()),
+                value_flag(&args, "--out"),
+            ) else {
+                eprintln!("error: usage: microkimi decay mem.mkmem --half-life H --out mem2.mkmem [--units U]");
+                std::process::exit(1);
+            };
+            let units = value_flag(&args, "--units").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            match mkmem::decay(mem, hl, units, &out) {
+                Ok(f) => println!("decay: {} -> {} ({} units at half-life {}, KDA s scaled by {:.6})", mem, out, units, hl, f),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // microkimi merge a.mkmem b.mkmem --alpha A --out m.mkmem
+        // (experiment) linear interpolation of the KDA states AND conv windows
+        // (same alpha); MLA caches + logits from file A. NOT a semantic merge.
+        "merge" => {
+            let skip = flag_value_positions(&args, &["--alpha", "--out"]);
+            let positional: Vec<&String> = args
+                .iter()
+                .enumerate()
+                .skip(2)
+                .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+                .map(|(_, a)| a)
+                .collect();
+            let (Some(a), Some(b), Some(out)) = (positional.first(), positional.get(1), value_flag(&args, "--out")) else {
+                eprintln!("error: usage: microkimi merge a.mkmem b.mkmem --alpha A --out m.mkmem");
+                std::process::exit(1);
+            };
+            let alpha = value_flag(&args, "--alpha").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            match mkmem::merge_interp(a, b, alpha, &out) {
+                Ok(()) => println!(
+                    "merged {} + {} -> {} (alpha={}, experimental linear blend of two SSM states, not a semantic merge)",
+                    a, b, out, alpha
+                ),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         // microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]
         "streamtest" => stream::streamtest(&args),
         // microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
@@ -205,6 +271,18 @@ fn main() {
             println!("                    --stream-predict N (Markov expert prefetch: N predicted experts/layer,");
             println!("                        0 = off, default; output-preserving, only changes fetch timing)");
             println!("                    env MICROKIMI_TRACE=trace.bin records the expert request stream (see cachereplay)");
+            println!("                    env MICROKIMI_ROUTECMS=sketch.bin records a count-min sketch of the routing");
+            println!("                        decisions of the run (4 x 4096 u32, saved on exit; see routestats/cmsinfo)");
+            println!("  microkimi routestats \"prompt\" [--model X.bin] [--max-new N] [--out routecms.bin]");
+            println!("                                         one turn with the routing sketch armed, sketch saved on exit");
+            println!("  microkimi cmsinfo sketch.bin           top-50 (layer, expert, count) + coverage curve of a sketch");
+            println!("  microkimi decay mem.mkmem --half-life H --out mem2.mkmem [--units U]");
+            println!("                                         exp2 partial forgetting: KDA states scaled by 2^(-U/H)");
+            println!("  microkimi merge a.mkmem b.mkmem --alpha A --out m.mkmem");
+            println!("                                         (experiment) linear blend of two states: alpha*A + (1-alpha)*B");
+            println!("                                         on KDA states + conv windows; NOT a semantic merge");
+            println!("  microkimi mkmem-merge A.mkmem B.mkmem [C.mkmem ...] --out AB.mkmem [--shuffle N] [--avg]");
+            println!("                                         (experiment) KDA state additivity: s summed over inputs");
             println!("  microkimi streamtest --model https://huggingface.co/org/repo [--cache-dir D] [--stream-disk N]");
             println!("                                         remote per-tensor cache + LRU budget proof (bandwidth-safe)");
             println!("  microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]");
@@ -819,6 +897,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     if let Some(s) = save {
         save_memory(&model, s);
     }
+    crate::cms::finish();
     gpu_prof_maybe_print();
     stream_report_maybe(stream_mb);
     answer
@@ -859,9 +938,36 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
         model.prefill(&ids, 0);
     }
     save_memory(&model, save);
+    crate::cms::finish();
     let size = std::fs::metadata(save).map(|m| m.len()).unwrap_or(0);
     println!("prefill: {} tokens ingested in {:.1?} - state saved to {} ({:.1} KB)", ids.len(), tp.elapsed(), save, size as f64 / 1024.0);
     stream_report_maybe(stream_mb);
+}
+
+/// `microkimi routestats "prompt" [--out routecms.bin]`: runs one generation
+/// turn with the count-min routing sketch armed and saves the sketch at the
+/// end (same result as MICROKIMI_ROUTECMS on `run`, packaged as a command).
+fn routestats_cmd(args: &[String]) {
+    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--max-new"]);
+    let positional: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .skip(2)
+        .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+        .map(|(_, a)| a)
+        .collect();
+    let prompt = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "Hello".to_string());
+    let max_new = value_flag(args, "--max-new").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let out = value_flag(args, "--out").unwrap_or_else(|| "routecms.bin".to_string());
+    let mp = model_flag(args);
+    let mp_path = mp.clone().unwrap_or_else(bin_path);
+    if crate::weights::read_config(&mp_path).ds.is_some() {
+        eprintln!("error: routestats is only supported for K3 models (not DeepSeek-V4)");
+        std::process::exit(1);
+    }
+    cms::start(&out);
+    run_inference(&prompt, max_new, false, &mp, vocab_flag(args), false, args.iter().any(|a| a == "--raw"), &None, &None, &mut sampler_flag(args), stream_ram_flag(args));
+    cms::finish();
 }
 
 /// `microkimi absorb file.txt --out pack.mkmem`: reads a document from disk
@@ -974,6 +1080,7 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     if let Some(s) = &save {
         save_memory(&model, s);
     }
+    crate::cms::finish();
     stream_report_maybe(stream_mb);
 }
 

@@ -2045,6 +2045,10 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
             }
         }
     });
+    // count-min routing statistics (no-op unless routestats/MICROKIMI_ROUTECMS)
+    for s in &sel {
+        crate::cms::record(layer, s.0);
+    }
     let mut h = vec![0f32; cfg.routed_hidden];
     matvec(Model::t(data, &w.routed_down), cfg.routed_hidden, cfg.d, x, &mut h);
     prof.t_router += tm.elapsed().as_secs_f64();
@@ -2336,6 +2340,10 @@ fn moe_prefill(
             }
         });
         sels.push(sel.iter().map(|s| (s.0, s.1 / sumw)).collect());
+        // count-min routing statistics (no-op unless routestats/MICROKIMI_ROUTECMS)
+        for s in &sel {
+            crate::cms::record(layer, s.0);
+        }
     }
     let mut h = vec![0f32; n * cfg.routed_hidden];
     gemm_batch(Model::t(data, &w.routed_down), cfg.routed_hidden, cfg.d, x, n, &mut h);
