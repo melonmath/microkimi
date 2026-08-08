@@ -239,6 +239,42 @@ pub fn merge(paths: &[String], out: &str, shuffle_idx: Option<usize>, avg: bool)
     Ok(())
 }
 
+// ── decay (exp2 partial forgetting) ──
+//
+// `microkimi decay mem.mkmem --half-life H --out mem2.mkmem [--units U]`
+// multiplies every KDA recurrent state s by 2^(-U/H): after H "units" of
+// age the state keeps half of its magnitude, after 2H a quarter, and so on.
+// Only s is scaled: the short conv windows are a verbatim copy of the last
+// few tokens (they expire on their own as new tokens push them out) and the
+// MLA caches are a per-position sequence, where one global age has no
+// meaning. The stored logits are kept unchanged.
+//
+// The MKMEM001 header carries no age field, so the number of units comes
+// from --units (default 1: one direct decay step). If a future format
+// revision stores the state age in the header, that value should win.
+
+/// Applies the exp2 decay to the KDA states of `path` and writes the result
+/// as a standard .mkmem that loads with the normal path.
+pub fn decay(path: &str, half_life: f64, units: f64, out: &str) -> Result<f64, String> {
+    if !(half_life > 0.0) {
+        return Err("decay: --half-life must be > 0".to_string());
+    }
+    if !(units >= 0.0) {
+        return Err("decay: --units must be >= 0".to_string());
+    }
+    let factor = 2f64.powf(-units / half_life) as f32;
+    let mut m = parse(path)?;
+    for l in m.layers.iter_mut() {
+        if let LayerMem::Kda { s, .. } = l {
+            for x in s.iter_mut() {
+                *x *= factor;
+            }
+        }
+    }
+    write_mem(&m, out).map_err(|e| format!("cannot write {}: {}", out, e))?;
+    Ok(factor as f64)
+}
+
 fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
     for x in v {
@@ -283,4 +319,96 @@ impl<'a> Reader<'a> {
         let raw = self.take(n * 4)?;
         Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        std::env::temp_dir().join(format!("microkimi_mkmem_test_{}_{}.mkmem", std::process::id(), name)).to_string_lossy().into_owned()
+    }
+
+    /// A minimal 2-layer state (1 KDA + 1 MLA) with a constant KDA s.
+    fn mem(s_val: f32, s_len: usize) -> MemFile {
+        let mut header = Vec::new();
+        header.extend_from_slice(MAGIC);
+        for v in [2u32, 8, 2, 4, 16] {
+            header.extend_from_slice(&v.to_le_bytes());
+        }
+        header.extend_from_slice(&[0u8, 1u8]); // KDA, MLA
+        MemFile {
+            header,
+            layers: vec![
+                LayerMem::Kda {
+                    conv_q: vec![s_val; 6],
+                    conv_k: vec![s_val; 6],
+                    conv_v: vec![s_val; 6],
+                    s: vec![s_val; s_len],
+                },
+                LayerMem::Mla { k: vec![1.0, 2.0], v: vec![3.0, 4.0] },
+            ],
+            logits: vec![0.0; 16],
+        }
+    }
+
+    fn write(m: &MemFile, name: &str) -> String {
+        let p = tmp(name);
+        write_mem(m, &p).unwrap();
+        p
+    }
+
+    fn kda_s(m: &MemFile) -> &Vec<f32> {
+        match &m.layers[0] {
+            LayerMem::Kda { s, .. } => s,
+            _ => panic!("layer 0 is KDA"),
+        }
+    }
+
+    fn norm(v: &[f32]) -> f64 {
+        v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn decay_half_life_halves_after_h_units() {
+        let src = write(&mem(2.0, 32), "decay_src");
+        let dst = tmp("decay_dst");
+        let f = decay(&src, 8.0, 8.0, &dst).unwrap();
+        assert!((f - 0.5).abs() < 1e-12);
+        let m = parse(&dst).unwrap();
+        let s = kda_s(&m);
+        assert!((norm(s) / norm(&vec![2.0f32; 32]) - 0.5).abs() < 1e-6);
+        for &x in s {
+            assert!((x - 1.0).abs() < 1e-6);
+        }
+        // conv windows and MLA caches are not decayed
+        match &m.layers[0] {
+            LayerMem::Kda { conv_q, .. } => assert!(conv_q.iter().all(|&x| x == 2.0)),
+            _ => unreachable!(),
+        }
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn decay_quarter_after_two_half_lives() {
+        let src = write(&mem(1.0, 8), "decay2_src");
+        let dst = tmp("decay2_dst");
+        decay(&src, 4.0, 8.0, &dst).unwrap();
+        let m = parse(&dst).unwrap();
+        assert!(kda_s(&m).iter().all(|&x| (x - 0.25).abs() < 1e-6));
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn decay_rejects_bad_args() {
+        let src = write(&mem(1.0, 8), "decay3_src");
+        assert!(decay(&src, 0.0, 1.0, &tmp("x")).is_err());
+        assert!(decay(&src, -1.0, 1.0, &tmp("x")).is_err());
+        std::fs::remove_file(&src).ok();
+    }
+
+
+
 }
