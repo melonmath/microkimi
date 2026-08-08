@@ -253,6 +253,9 @@ fn main() {
             println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
             println!("      --imatrix FILE (with --cold-vq)      activation-weighted VQ codebook (see calibrate);");
             println!("                                         --imatrix-score-only: report only, blind codebook");
+            println!("      --expert-order=frequency           physical reorder of expert blobs, hottest first");
+            println!("      --route-cms SKETCH (with --expert-order)  routing frequency sketch (MICROKIMI_ROUTECMS);");
+            println!("                                         hot experts become file-adjacent for stream run fusion");
             println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
             println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
             println!("      and, for expert ranking, only the weight_scale bytes are fetched)");

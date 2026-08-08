@@ -74,6 +74,11 @@ impl Cms {
         (0..ROWS).map(|r| self.table[r * COLS + hash(k, r)]).min().unwrap()
     }
 
+    /// Total routing decisions recorded in the sketch.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let mut out = Vec::with_capacity(8 + 6 * 4 + 8 + self.table.len() * 4);
         out.extend_from_slice(MAGIC);

@@ -2577,6 +2577,14 @@ fn moe_prefill(
             if crate::stream::offset_sort() {
                 order.sort_by_key(|(e, _)| w.experts[*e as usize][0]);
             }
+            // fused run fetch, same as moe_forward: missing experts of this
+            // layer land in the RAM LRU with one span read per file-adjacent
+            // run, the compute jobs below then hit the cache
+            let items: Vec<(u32, [u64; 3], usize)> = order
+                .iter()
+                .map(|(e, _)| (*e, w.experts[*e as usize], if w.experts_vq[*e as usize] { expert_vq_blob } else { expert_blob }))
+                .collect();
+            cache.warm_batch(layer32, &items);
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(order.len());
             for (e, pairs) in order {
                 let offs = w.experts[e as usize];

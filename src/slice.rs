@@ -6,6 +6,22 @@
 //   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
 //                                                [--vocab-top N <freqfile> [--vocab-base <remap.json>]]
 //                                                [--imatrix imatrix.bin [--imatrix-score-only]]
+//                                                [--expert-order=frequency --route-cms sketch.bin]
+//
+// Expert reordering (--expert-order=frequency --route-cms SKETCH): no
+// pruning, ALL experts stay; per MoE layer the expert blobs are physically
+// rewritten in descending routing-frequency order (the count-min sketch
+// recorded with MICROKIMI_ROUTECMS, cms.rs), hottest first, densely packed
+// (64-byte alignment). The router gate rows and bias are permuted with the
+// same order, so expert ids are simply relabeled and the model is
+// mathematically unchanged: any engine reads the reordered .bin, and old
+// .bins keep working (the permutation rides in the MKIM0002 config as an
+// "expert_order" index table, new_id -> old_id). The point is physical: hot
+// experts become file-adjacent, so the stream engine's contiguous-run
+// fusion (stream.rs warm_batch) serves a layer's top-k batch in far fewer
+// physical reads on latency-bound disks. Combined with --experts N, the
+// Frobenius keep-set membership is unchanged and only the file order
+// follows the frequency.
 //
 // Vocabulary pruning (--vocab-top N freqfile): keeps the N most frequent
 // token rows of embed_tokens.weight / lm_head.weight plus ALL special tokens
@@ -1336,6 +1352,22 @@ impl ScoreCache {
     }
 }
 
+/// (new expert id, w index) of an expert plan's output name
+/// "layers.N.block_sparse_moe.experts.<id>.<w>", for the physical re-sort of
+/// a reordered (--expert-order) layer's expert run.
+fn expert_plan_key(out_name: &str) -> (usize, u8) {
+    let tail = out_name.rsplit(".experts.").next().unwrap();
+    let dot = tail.find('.').unwrap();
+    let id: usize = tail[..dot].parse().unwrap();
+    let w = match &tail[dot + 1..] {
+        "w1" => 0,
+        "w2" => 1,
+        "w3" => 2,
+        _ => 3,
+    };
+    (id, w)
+}
+
 pub fn run(args: &[String]) {
     let t0 = std::time::Instant::now();
     let Some(model) = value_flag(args, "--model") else {
@@ -1364,8 +1396,35 @@ pub fn run(args: &[String]) {
         (n, f)
     });
     let vocab_base = value_flag(args, "--vocab-base");
-    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() {
-        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq / --vocab-top");
+    // --expert-order=frequency --route-cms SKETCH: physical reorder of the
+    // expert blobs of every MoE layer by descending routing frequency (the
+    // count-min sketch recorded with MICROKIMI_ROUTECMS, cms.rs), hottest
+    // expert first. The router gate rows and bias are permuted with the same
+    // order, so expert ids are simply relabeled: the model is mathematically
+    // unchanged, any engine reads the reordered .bin (old engines included)
+    // and old .bins keep working. The point is physical: hot experts become
+    // file-adjacent, so the stream engine's contiguous-run fusion (stream.rs
+    // warm_batch) serves the top-k batch of a layer in far fewer physical
+    // reads. The permutation rides in the MKIM0002 config as an index table
+    // ("expert_order"). Combined with --experts N the keep-set membership
+    // still comes from the Frobenius scores, only the file order changes.
+    let kv_flag = |name: &str| {
+        value_flag(args, name).or_else(|| args.iter().find_map(|a| a.strip_prefix(&format!("{}=", name)).map(|s| s.to_string())))
+    };
+    let expert_order_flag = kv_flag("--expert-order");
+    let route_cms_path = kv_flag("--route-cms");
+    if let Some(o) = &expert_order_flag {
+        if o != "frequency" {
+            eprintln!("error: --expert-order supports only 'frequency' (got '{}')", o);
+            std::process::exit(1);
+        }
+        if route_cms_path.is_none() {
+            eprintln!("error: --expert-order=frequency requires --route-cms SKETCH (record one with MICROKIMI_ROUTECMS=SKETCH)");
+            std::process::exit(1);
+        }
+    }
+    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() && expert_order_flag.is_none() {
+        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq / --vocab-top / --expert-order");
         std::process::exit(1);
     }
     if let (Some(m), Some(n)) = (experts, cold_vq) {
@@ -1430,6 +1489,36 @@ pub fn run(args: &[String]) {
     );
     println!("layers: keeping {}/{} {:?}", kept_layers.len(), cfg.n_layers, kept_layers);
 
+    // physical expert order (--expert-order=frequency): per kept MoE layer
+    // the old expert ids in write order, hottest first by count-min estimate
+    // (ties and never-recorded experts id-ascending, deterministic). Computed
+    // before the checkpoint key: the sketch identity is part of the key.
+    let mut eorder_key = String::new();
+    let expert_order: Option<std::collections::HashMap<usize, Vec<usize>>> = expert_order_flag.as_ref().map(|_| {
+        let path = route_cms_path.as_deref().unwrap();
+        let sketch = crate::cms::Cms::load(path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+        eorder_key = format!("frequency:{}:{}", path, sketch.total());
+        let mut m = std::collections::HashMap::new();
+        for &l in &kept_layers {
+            if !cfg.is_moe(l) {
+                continue;
+            }
+            let mut ids: Vec<usize> = (0..cfg.n_experts).collect();
+            ids.sort_by_key(|&e| (std::cmp::Reverse(sketch.estimate(l as u32, e as u32)), e));
+            m.insert(l, ids);
+        }
+        println!(
+            "expert-order: frequency from {} ({} routing decisions, {} MoE layers reordered, hottest first)",
+            path,
+            sketch.total(),
+            m.len()
+        );
+        m
+    });
+
     // crash-safe resume checkpoint: model + kept layers + pruning params
     // (vocab-top is part of the key: N and the freqfile content hash)
     let vocabtop_key = vocab_top
@@ -1440,12 +1529,13 @@ pub fn run(args: &[String]) {
         })
         .unwrap_or_default();
     let ckpt_key = format!(
-        "model={}|layers={}|hidden={}|experts={}|vocabtop={}",
+        "model={}|layers={}|hidden={}|experts={}|vocabtop={}|eorder={}",
         model,
         join_csv(&kept_layers),
         hidden.map(|h| h.to_string()).unwrap_or_default(),
         experts.map(|e| e.to_string()).unwrap_or_default(),
-        vocabtop_key
+        vocabtop_key,
+        eorder_key
     );
     let ckpt = SliceCkpt::open(&out, &ckpt_key);
 
@@ -1490,6 +1580,29 @@ pub fn run(args: &[String]) {
         println!("experts: keeping {}/{} per MoE layer ({}), scored in {:.1?}", n, cfg.n_experts, how, t.elapsed());
         sets
     });
+
+    // fold --expert-order into the per-layer expert lists the plan builder
+    // uses: the list order IS the new expert id order (Expert rename and
+    // RouterW/RouterB row gather both follow it). With --experts N the
+    // Frobenius keep-set membership is preserved, only the order changes.
+    let expert_sets = match &expert_order {
+        None => expert_sets,
+        Some(order) => Some(
+            order
+                .iter()
+                .map(|(&l, ids)| {
+                    let ids: Vec<usize> = match &expert_sets {
+                        Some(sets) => {
+                            let keep: std::collections::HashSet<usize> = sets[&l].iter().copied().collect();
+                            ids.iter().copied().filter(|e| keep.contains(e)).collect()
+                        }
+                        None => ids.clone(),
+                    };
+                    (l, ids)
+                })
+                .collect(),
+        ),
+    };
 
     // ── 3b. precision tiering (--cold-vq): hot/cold split + global codebook ──
     // vq_hot: per kept MoE layer the hot (mxfp4) expert indices, ascending.
@@ -1621,6 +1734,28 @@ pub fn run(args: &[String]) {
             vocab: vrows,
         });
     }
+    // physical write order with --expert-order: the plan list follows the
+    // SOURCE directory order (old expert ids), which would scatter the
+    // relabeled blobs. Re-sort each layer's expert run by new expert id
+    // (then w1/w2/w3) so file-adjacent ids are byte-adjacent - the
+    // precondition of the stream engine's run fusion. Everything else keeps
+    // the source order.
+    if expert_order.is_some() {
+        let mut i = 0;
+        while i < plans.len() {
+            if plans[i].role != Role::Expert {
+                i += 1;
+                continue;
+            }
+            let layer = split_layer(&plans[i].out_name).map(|(l, _)| l);
+            let mut j = i + 1;
+            while j < plans.len() && plans[j].role == Role::Expert && split_layer(&plans[j].out_name).map(|(l, _)| l) == layer {
+                j += 1;
+            }
+            plans[i..j].sort_by_key(|p| expert_plan_key(&p.out_name));
+            i = j;
+        }
+    }
     // the global VQ codebook rides as one extra f32 tensor (src_name "" marks it)
     if vq_codebook.is_some() {
         plans.push(Plan {
@@ -1663,6 +1798,19 @@ pub fn run(args: &[String]) {
         .unwrap_or_default();
     let arch_kv = source.arch_config_key();
     let list = |v: &[usize]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    // --expert-order audit table: new_id -> old_id per (renumbered) MoE layer
+    let expert_order_kv = expert_order.as_ref().map(|m| {
+        let layers: Vec<String> = kept_layers
+            .iter()
+            .enumerate()
+            .filter_map(|(nl, &l)| m.get(&l).map(|ids| format!("\"{}\": [{}]", nl, list(ids))))
+            .collect();
+        format!(
+            ", \"expert_order\": {{\"method\": \"frequency\", \"source\": \"{}\", \"new_to_old\": {{{}}}}}",
+            route_cms_path.as_deref().unwrap(),
+            layers.join(", ")
+        )
+    });
     let config_json = format!(
         "{{\"format\": 2{}, \"n_layers\": {}, \"hidden\": {}, \"vocab\": {}, \"n_experts\": {}, \"top_k\": {}, \"n_shared\": {}, \
 \"kda_heads\": {}, \"kda_dim\": {}, \"kda_conv\": {}, \"kda_fa_rank\": {}, \"gate_lower_bound\": {}, \
@@ -1684,9 +1832,20 @@ pub fn run(args: &[String]) {
         cold_vq.map(|n| format!(", \"cold_vq\": {}", n)).unwrap_or_default(),
         vocab_top.as_ref().map(|(n, _)| format!(", \"vocab_top\": {}", n)).unwrap_or_default(),
     );
+    // the expert_order audit table goes in as a top-level key (inserted
+    // post-hoc: one less placeholder in an already dense format string)
+    let mut config_json = config_json;
+    if let Some(kv) = expert_order_kv {
+        config_json.insert_str(config_json.len() - 1, &kv);
+    }
 
     // ── 6. write ──
     let mut w = BinWriter::new();
+    if expert_order.is_some() {
+        // dense expert packing: the reordered blobs are read in fused spans,
+        // page-alignment padding would be read and discarded on every span
+        w.set_expert_align(64);
+    }
     for p in &plans {
         w.add(&p.out_name, p.dtype, p.dims.clone());
     }
@@ -1806,6 +1965,9 @@ pub fn run(args: &[String]) {
         new_n_layers, mla_layers, dense_layers, new_d, new_n_experts, new_top_k);
     println!("  AttnRes: block={} re-applied on the renumbered layers", cfg.attn_res_block);
     println!("  experts: mxfp4 blobs copied verbatim (no requantization)");
+    if expert_order.is_some() {
+        println!("  expert-order: frequency (route-cms) - router rows and expert blobs relabeled, hot experts file-adjacent, dense packing");
+    }
     if vq_err_n > 0 {
         println!(
             "  cold-vq: {} tensors requantized to VQ1 ({} B/expert-matrix + one 16 KB global codebook), mean rel Frobenius error {:.3}",

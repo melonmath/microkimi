@@ -51,6 +51,27 @@ static PREF_USED: AtomicU64 = AtomicU64::new(0); // prefetched entries later con
 static PRED_HIT: AtomicU64 = AtomicU64::new(0); // predicted experts the router actually picked
 static PRED_TOT: AtomicU64 = AtomicU64::new(0); // total predicted experts
 
+// ── contiguous-run fusion (--stream, local source) ──
+//
+// The top-k experts of one MoE layer are submitted offset-sorted, but each
+// used to be pread individually: k physical reads per layer per token, each
+// paying the fixed latency of the disk tier (a network PD serves ~1700 4K
+// IOPS, so that latency dominates). Expert blobs of a layer are stored as a
+// near-contiguous run (see weights.rs BinWriter), so when the router picks
+// file-adjacent experts their payloads can be served by ONE span read
+// covering the first to the last, each expert extracted by its directory
+// offsets. warm_batch (below) does this once per MoE layer before the
+// compute jobs start; their ExpertCache::get then hits the RAM LRU. The
+// bytes served are exactly those the individual preads would return, so the
+// model output is bit-identical; only the number of physical reads changes.
+// Measured adjacency on the nano checkpoints: 0% (their routers happen to
+// pick only odd expert ids), which is why the slicer can physically reorder
+// experts by routing frequency (slice --expert-order=frequency) to create
+// the adjacency this fusion then exploits.
+static FUSE_READS: AtomicU64 = AtomicU64::new(0); // physical span reads issued by warm_batch
+static FUSE_EXPERTS: AtomicU64 = AtomicU64::new(0); // experts served by those span reads
+static FUSE_NS: AtomicU64 = AtomicU64::new(0); // wall time of the warm_batch read phase
+
 /// `--stream-predict N`: enable the Markov expert prefetcher with N predicted
 /// experts per MoE layer (0 = off, the default). `top_k` is the router's
 /// top-k from the model config (the expert batch size of one MoE layer).
@@ -142,6 +163,16 @@ pub fn report_line() -> String {
         mb(crate::http::fetched_bytes()),
         crate::http::fetched_requests(),
     );
+    let (fe, fr) = (FUSE_EXPERTS.load(Ordering::Relaxed), FUSE_READS.load(Ordering::Relaxed));
+    if fe > 0 {
+        s.push_str(&format!(
+            "\nstream-fuse: {} experts served by {} span reads ({:.2} experts/read, {:.2}s in the batched read phase)",
+            fe,
+            fr,
+            fe as f64 / fr.max(1) as f64,
+            FUSE_NS.load(Ordering::Relaxed) as f64 / 1e9,
+        ));
+    }
     if PREDICT_N.load(Ordering::Relaxed) > 0 {
         let issued = PREF_ISSUED.load(Ordering::Relaxed);
         let used = PREF_USED.load(Ordering::Relaxed);
@@ -184,8 +215,8 @@ fn lfu_on() -> bool {
 }
 
 struct Lru {
-    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool, u64)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch, hits)
-    queue: VecDeque<((u32, u32), u64)>,                        // access order, stale gens skipped (pure-LRU mode)
+    map: HashMap<(u32, u32), (Arc<Vec<u8>>, u64, bool, u64, bool)>, // (layer, expert) -> (w1++w2++w3, tick, from_prefetch, hits, warm)
+    queue: VecDeque<((u32, u32), u64)>,                             // access order, stale gens skipped (pure-LRU mode)
     cur: usize,
     tick: u64,
     budget: usize,
@@ -193,7 +224,15 @@ struct Lru {
 
 impl Lru {
     /// On a hit, also reports (and clears) the from_prefetch mark, so a
-    /// prefetched entry consumed on demand is counted exactly once.
+    /// prefetched entry consumed on demand is counted exactly once. A
+    /// warm-marked entry (batched demand fetch, warm_batch) is served
+    /// WITHOUT bumping the LFU count: the insert already carries the demand
+    /// credit of the request consuming it now. Counting it again would push
+    /// every fused entry to count >= 2 (even one-shot picks) and drown the
+    /// one-shot/reused distinction the LFU victim choice relies on - with a
+    /// full cache the next warm wave would then find no better victim than
+    /// its own fresh inserts (measured: 6x the disk traffic at a tight
+    /// budget).
     fn get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, bool)> {
         if !self.map.contains_key(&k) {
             return None;
@@ -201,14 +240,18 @@ impl Lru {
         self.tick += 1;
         let e = self.map.get_mut(&k).unwrap();
         e.1 = self.tick;
-        e.3 += 1; // LFU: one more demand hit
+        if !std::mem::take(&mut e.4) {
+            e.3 += 1; // LFU: one more demand hit
+        }
         let v = e.0.clone();
         let pref = std::mem::take(&mut e.2);
         self.queue.push_back((k, self.tick));
         Some((v, pref))
     }
 
-    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: bool) {
+    /// `warm` marks a batched demand fetch (warm_batch): the first demand
+    /// get is served without a count bump (see get).
+    fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: bool, warm: bool) {
         let sz = v.len();
         if sz > self.budget {
             return; // a single expert exceeds the budget: serve without caching
@@ -217,7 +260,7 @@ impl Lru {
         // LFU count: 1 at insert (demand or prefetch alike - see lfu_on's
         // comment for why prefetch does not start at 0), +1 per demand hit;
         // a re-insert keeps the hits earned
-        if let Some(old) = self.map.insert(k, (v, self.tick, pref, 0)) {
+        if let Some(old) = self.map.insert(k, (v, self.tick, pref, 0, warm)) {
             self.cur -= old.0.len();
             self.map.get_mut(&k).unwrap().3 = old.3 + 1;
         } else {
@@ -251,7 +294,7 @@ impl Lru {
         }
         // amortized queue compaction (every access pushes one entry)
         if self.queue.len() > 4 * self.map.len().max(16) {
-            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _, _))| (k, g)).collect();
+            let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _, _, _))| (k, g)).collect();
             live.sort_by_key(|&(_, g)| g);
             self.queue = live.into();
         }
@@ -710,8 +753,74 @@ pub fn offset_sort() -> bool {
     !*OFF.get_or_init(|| env_off("MICROKIMI_NO_OFFSORT"))
 }
 
+/// MICROKIMI_NO_RUNFUSE=1 disables the contiguous-run fusion of the expert
+/// reads of a layer (warm_batch becomes a no-op and every expert is pread
+/// individually by its compute job, the historical behavior).
+pub fn run_fuse() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| env_off("MICROKIMI_NO_RUNFUSE"))
+}
+
+/// MICROKIMI_FAKE_DISK_MS=N (debug/bench only): sleep N ms per physical disk
+/// read of the local tier, behind a process-wide lock so the sleeps
+/// serialize the way a latency/IOPS-bound disk (network PD) serializes its
+/// requests. One sleep per expert pread without fusion, one per merged span
+/// read with fusion: exactly the A/B the run fusion is built for.
+fn fake_disk_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("MICROKIMI_FAKE_DISK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// One serialized fake disk latency, no-op unless MICROKIMI_FAKE_DISK_MS set.
+fn fake_disk_sleep() {
+    let ms = fake_disk_ms();
+    if ms > 0 {
+        static FAKE_DISK: Mutex<()> = Mutex::new(());
+        let _io = FAKE_DISK.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 fn env_off(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1").unwrap_or(false)
+}
+
+// ── run fusion: merge file-adjacent expert reads into one span read ──
+
+/// Maximum hole between two expert footprints still merged into one physical
+/// read: covers the format alignment padding between blobs (zero on densely
+/// packed .bins). The hole bytes are read and discarded; on a latency-bound
+/// disk one span read still beats two separate reads.
+const FUSE_GAP_MAX: u64 = 4096;
+
+/// An expert request is compact when its three blobs span at most their
+/// payload plus per-blob alignment padding. Non-compact requests (scattered
+/// w1/w2/w3) never join a run: merging them would read an unbounded hole.
+fn compact(offs: &[u64; 3], blob: usize) -> bool {
+    offs[1] >= offs[0] && offs[2] >= offs[1] && offs[2] + blob as u64 - offs[0] <= 3 * blob as u64 + 2 * FUSE_GAP_MAX
+}
+
+/// Groups offset-sorted expert requests (expert, offs, blob) into maximal
+/// runs of file-adjacent compact footprints (footprint = [offs[0], offs[2] +
+/// blob)): two consecutive requests merge when both are compact and the gap
+/// between their footprints is at most FUSE_GAP_MAX. Returns (start, end)
+/// index ranges into the input slice. Pure: unit-tested directly.
+fn fuse_runs(sorted: &[(u32, [u64; 3], usize)]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    for i in 1..=sorted.len() {
+        let merges = i < sorted.len() && {
+            let (_, po, pb) = &sorted[i - 1];
+            let (_, co, cb) = &sorted[i];
+            let prev_end = po[2] + *pb as u64;
+            compact(po, *pb) && compact(co, *cb) && co[0] >= prev_end && co[0] - prev_end <= FUSE_GAP_MAX
+        };
+        if !merges {
+            runs.push((start, i));
+            start = i;
+        }
+    }
+    runs
 }
 
 // ── Direct I/O (Linux O_DIRECT / macOS F_NOCACHE): cache-bypassing reads ──
@@ -852,10 +961,53 @@ impl CacheInner {
                         }
                     }
                 }
+                fake_disk_sleep(); // one physical read batch served (bench knob)
                 DISK_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
                 out
             }
             Src::Remote(r) => r.expert_blobs(layer, expert),
+        }
+    }
+
+    /// One fused run of file-adjacent experts (see fuse_runs): the span from
+    /// the first member's w1 to the last member's w3 tail is served by a
+    /// single physical read (O_DIRECT when available, buffered pread
+    /// otherwise), then each member's w1 ++ w2 ++ w3 payload is extracted by
+    /// its directory offsets and inserted into the RAM LRU. The inserted
+    /// bytes are byte-identical to per-expert preads of the same ranges.
+    /// Singleton runs go through the plain per-expert fetch.
+    fn fetch_run(&self, layer: u32, members: &[(u32, [u64; 3], usize)]) {
+        if members.len() == 1 {
+            let (e, offs, blob) = members[0];
+            let bytes = self.fetch(layer, e, offs, blob);
+            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), false, true);
+            RAM_MISSES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let Src::Local(l) = &self.src else { return };
+        use std::os::unix::fs::FileExt;
+        let start = members[0].1[0];
+        let end = members.iter().map(|&(_, o, b)| o[2] + b as u64).max().unwrap();
+        let mut span = vec![0u8; (end - start) as usize];
+        let served = match &l.direct {
+            Some(df) => read_direct(df, start, &mut span).is_ok(),
+            None => false,
+        };
+        if !served {
+            l.file.read_exact_at(&mut span, start).unwrap();
+        }
+        fake_disk_sleep(); // ONE physical read for the whole run
+        FUSE_READS.fetch_add(1, Ordering::Relaxed);
+        for &(e, offs, blob) in members {
+            let mut bytes = vec![0u8; 3 * blob];
+            for i in 0..3 {
+                let lo = (offs[i] - start) as usize;
+                bytes[i * blob..(i + 1) * blob].copy_from_slice(&span[lo..lo + blob]);
+            }
+            DISK_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            FUSE_EXPERTS.fetch_add(1, Ordering::Relaxed);
+            RAM_MISSES.fetch_add(1, Ordering::Relaxed); // a demand miss served by the batch
+            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), false, true);
         }
     }
 
@@ -872,7 +1024,7 @@ impl CacheInner {
             }
         }
         let bytes = self.fetch(layer, expert, offs, blob);
-        self.lru.lock().unwrap().insert(k, Arc::new(bytes), true);
+        self.lru.lock().unwrap().insert(k, Arc::new(bytes), true, false);
         PREF_ISSUED.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -905,6 +1057,14 @@ impl ExpertCache {
         } else {
             println!("stream: offset-sorted expert reads off (MICROKIMI_NO_OFFSORT=1)");
         }
+        if run_fuse() {
+            println!("stream: contiguous-run read fusion on (MICROKIMI_NO_RUNFUSE=1 to disable)");
+        } else {
+            println!("stream: contiguous-run read fusion off (MICROKIMI_NO_RUNFUSE=1)");
+        }
+        if fake_disk_ms() > 0 {
+            println!("stream: FAKE disk latency {} ms/read, serialized (MICROKIMI_FAKE_DISK_MS, bench only)", fake_disk_ms());
+        }
         // initialize the trace sink now so its startup line prints with the
         // other stream lines (no-op when MICROKIMI_TRACE is unset)
         trace_sink();
@@ -927,6 +1087,63 @@ impl ExpertCache {
                 pred: Mutex::new(Predictor::new()),
             }),
         }
+    }
+
+    /// Batched demand fetch of one MoE layer's selected experts (local
+    /// source): every requested expert missing from the RAM LRU is fetched,
+    /// but maximal runs of file-adjacent experts (fuse_runs over the
+    /// offset-sorted requests) are served by ONE span read each instead of
+    /// one pread per expert. model.rs calls this once per MoE layer before
+    /// submitting the compute jobs, whose ExpertCache::get then hits the RAM
+    /// LRU; the run reads themselves run in parallel pool jobs (one per
+    /// run), keeping the cross-run parallelism of the historical per-expert
+    /// submission. Only the number of physical reads changes: the served
+    /// bytes are exactly those of the individual preads, so the model output
+    /// is bit-identical. No-op for the remote source (per-tensor cache
+    /// files, no shared spans), for batches smaller than 2, and with
+    /// MICROKIMI_NO_RUNFUSE=1.
+    ///
+    /// Note on accounting: the experts fetched here count as RAM misses
+    /// (they were not in the cache) and the compute jobs' gets then count as
+    /// RAM hits, so the report's hits inflate by the batched amount; the
+    /// stream-fuse line carries the real batched-fetch figures.
+    pub fn warm_batch(&self, layer: u32, items: &[(u32, [u64; 3], usize)]) {
+        if items.len() < 2 || !run_fuse() || !matches!(self.inner.src, Src::Local(_)) {
+            return;
+        }
+        // misses only, offset-sorted (the LRU may change before the reads
+        // land: a concurrent prefetch of the same expert is harmless - the
+        // run insert refreshes the same file bytes)
+        let mut miss: Vec<(u32, [u64; 3], usize)> = Vec::with_capacity(items.len());
+        {
+            let lru = self.inner.lru.lock().unwrap();
+            for &(e, offs, blob) in items {
+                if !lru.map.contains_key(&(layer, e)) {
+                    miss.push((e, offs, blob));
+                }
+            }
+            // a batch larger than the budget would evict its own earliest
+            // inserts before the compute jobs consume them (double fetch):
+            // leave those to the plain per-expert path
+            let miss_bytes: usize = miss.iter().map(|&(_, _, b)| 3 * b).sum();
+            if miss_bytes > lru.budget {
+                return;
+            }
+        }
+        if miss.len() < 2 {
+            return; // a lone miss is fetched by its compute job as usual
+        }
+        miss.sort_by_key(|&(_, o, _)| o[0]);
+        let runs = fuse_runs(&miss);
+        let t0 = std::time::Instant::now();
+        let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(runs.len());
+        for (s, e) in runs {
+            let members: Vec<(u32, [u64; 3], usize)> = miss[s..e].to_vec();
+            let inner = Arc::clone(&self.inner);
+            jobs.push(Box::new(move || inner.fetch_run(layer, &members)));
+        }
+        crate::pool::pool().run(jobs);
+        FUSE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// The 3 MXFP4 blobs of expert `expert` of `layer`, concatenated
@@ -966,7 +1183,7 @@ impl ExpertCache {
         RAM_MISSES.fetch_add(1, Ordering::Relaxed);
         let bytes = self.inner.fetch(layer, expert, offs, blob);
         let v = Arc::new(bytes);
-        self.inner.lru.lock().unwrap().insert(k, v.clone(), false);
+        self.inner.lru.lock().unwrap().insert(k, v.clone(), false, false);
         v
     }
 
@@ -1079,7 +1296,7 @@ pub fn streamtest(args: &[String]) {
         }),
     };
     for e in 0..4u32 {
-        cache.inner.lru.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]), false);
+        cache.inner.lru.lock().unwrap().insert((0, e), Arc::new(vec![(e + 1) as u8; entry]), false, false);
     }
     {
         let lru = cache.inner.lru.lock().unwrap();
@@ -1253,5 +1470,73 @@ pub fn cache_cmd(args: &[String]) {
             tot += freed;
         }
         println!("cache: freed {} total", mb(tot));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// request with a compact w1++w2++w3 footprint starting at `off`
+    fn req(e: u32, off: u64, blob: u64) -> (u32, [u64; 3], usize) {
+        (e, [off, off + blob, off + 2 * blob], blob as usize)
+    }
+
+    #[test]
+    fn fuse_runs_merges_adjacent() {
+        // 4 experts, 1000-byte blobs: 0-1 adjacent, hole, 2-3 adjacent
+        let v = vec![req(0, 0, 1000), req(1, 3000, 1000), req(2, 100_000, 1000), req(3, 103_000, 1000)];
+        assert_eq!(fuse_runs(&v), vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn fuse_runs_no_adjacency() {
+        let v: Vec<_> = (0..16).map(|e| req(e, e as u64 * 1_000_000, 1000)).collect();
+        assert_eq!(fuse_runs(&v).len(), 16);
+    }
+
+    #[test]
+    fn fuse_runs_gap_boundary() {
+        // gap exactly FUSE_GAP_MAX merges, FUSE_GAP_MAX + 1 splits
+        let v = vec![req(0, 0, 1000), req(1, 3000 + FUSE_GAP_MAX, 1000)];
+        assert_eq!(fuse_runs(&v), vec![(0, 2)]);
+        let v = vec![req(0, 0, 1000), req(1, 3000 + FUSE_GAP_MAX + 64, 1000)];
+        assert_eq!(fuse_runs(&v), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn fuse_runs_overlap_never_merges() {
+        // overlapping footprints (corrupt input) split instead of merging
+        let v = vec![req(0, 0, 1000), req(1, 100, 1000)];
+        assert_eq!(fuse_runs(&v), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn fuse_runs_scattered_blobs_stay_singleton() {
+        // expert 1 has its w3 far away (non-compact): no run across it
+        let mut v = vec![req(0, 0, 1000), req(1, 3000, 1000), req(2, 6000, 1000)];
+        v[1].1[2] = 50_000_000;
+        assert_eq!(fuse_runs(&v), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn fuse_runs_padded_blobs_merge() {
+        // 4096-aligned 4352-byte blobs (re-sliced layout): 3840-byte padding
+        // holes inside and between footprints still merge into one span
+        let b = 4352u64;
+        let stride = 3 * b.next_multiple_of(4096);
+        let v: Vec<_> = (0..4)
+            .map(|e| {
+                let o = e as u64 * stride;
+                (e, [o, o + 8192, o + 16384], b as usize)
+            })
+            .collect();
+        assert_eq!(fuse_runs(&v), vec![(0, 4)]);
+    }
+
+    #[test]
+    fn fuse_runs_empty_and_single() {
+        assert_eq!(fuse_runs(&[]), Vec::<(usize, usize)>::new());
+        assert_eq!(fuse_runs(&[req(7, 42, 1000)]), vec![(0, 1)]);
     }
 }

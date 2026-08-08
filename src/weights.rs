@@ -71,11 +71,21 @@ fn dir_entry_size(name: &str, dims: &[u32]) -> u64 {
 
 pub struct BinWriter {
     pub names_order: Vec<(String, u8, Vec<u32>)>, // (name, dtype, dims) in write order
+    expert_align: u64,                            // start alignment of routed expert blobs (see layout)
 }
 
 impl BinWriter {
     pub fn new() -> Self {
-        BinWriter { names_order: Vec::new() }
+        BinWriter { names_order: Vec::new(), expert_align: 4096 }
+    }
+
+    /// Overrides the routed-expert blob alignment (default 4096: mmap
+    /// demand-paging and single-expert preads never touch a neighbor's
+    /// pages). slice --expert-order packs experts densely (64) instead: the
+    /// reordered blobs are meant to be read in fused spans, where page
+    /// padding would be read and discarded on every fused read.
+    pub fn set_expert_align(&mut self, a: u64) {
+        self.expert_align = a;
     }
 
     pub fn add(&mut self, name: &str, dtype: u8, dims: Vec<u32>) {
@@ -85,13 +95,15 @@ impl BinWriter {
     /// Computes the blob offsets in write order; `prefix` = number of bytes
     /// before the u32 tensor count (8 for MKIM0001, 8+4+config_len for
     /// MKIM0002). Alignment: routed expert blobs (the MXFP4 w1/w2/w3 the
-    /// stream engine preads one routed expert at a time) start on a 4096
-    /// page boundary, so the mmap demand-paging and those preads never touch
-    /// a neighbor expert's pages - a token faults only the pages of its
-    /// routed experts, never fragments of the unrouted ones. Everything else
-    /// keeps the historical 64-byte alignment (vectorized loads, f32 slice
-    /// alignment). The padding is plain zero space between blobs: readers
-    /// only ever use the directory's (offset, size) and never see it.
+    /// stream engine preads one routed expert at a time) start on a
+    /// `expert_align` boundary - 4096 by default, so the mmap demand-paging
+    /// and those preads never touch a neighbor expert's pages (a token
+    /// faults only the pages of its routed experts, never fragments of the
+    /// unrouted ones); 64 when the writer packs experts densely for fused
+    /// span reads (set_expert_align). Everything else keeps the historical
+    /// 64-byte alignment (vectorized loads, f32 slice alignment). The
+    /// padding is plain zero space between blobs: readers only ever use the
+    /// directory's (offset, size) and never see it.
     fn layout(&self, prefix: u64) -> Vec<u64> {
         let dir_size: u64 = self
             .names_order
@@ -102,7 +114,7 @@ impl BinWriter {
         let mut offsets = Vec::with_capacity(self.names_order.len());
         let mut pos = data_start;
         for (name, dtype, dims) in &self.names_order {
-            let align = if is_expert_tensor(name) { 4096 } else { 64 };
+            let align = if is_expert_tensor(name) { self.expert_align } else { 64 };
             pos = pos.div_ceil(align) * align;
             offsets.push(pos);
             pos += blob_size(*dtype, dims);
