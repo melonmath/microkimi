@@ -431,8 +431,9 @@ def selftest(args):
         out_new = sm.forward(ids.to(dev)).cpu()
     diff = (out_ref - out_new).abs()
     rel = diff.max() / out_ref.abs().max()
+    fp = f"mean {out_ref.mean():.6e} std {out_ref.std():.6e} head16 {out_ref[0, 0, :16].sum():.6e}"
     print(f"selftest: logits {tuple(out_new.shape)}, max|diff| {diff.max():.3e}, "
-          f"rel {rel:.3e} (ref std {out_ref.std():.3f})", flush=True)
+          f"rel {rel:.3e} | ref fingerprint: {fp}", flush=True)
     assert rel < 1e-3, f"streamed forward diverges from the reference: rel {rel}"
     print("selftest OK", flush=True)
 

@@ -12,6 +12,17 @@ exactly the names Moonshot's `modeling_kimi_linear.py` imports
 index helpers, `tensor_cache`), correctness-first. Each file carries the
 upstream copyright notice.
 
+## Vendored here: `transformers/` and `einops.py` (compatibility shims)
+
+The downloaded Moonshot files import a handful of names from the `transformers`
+and `einops` packages at module level. These shims provide exactly that surface
+(config base class, activation dict, typing helpers, no-op decorators, and the
+three `rearrange` patterns the model code uses) so the training stack runs on
+hosts with only torch installed. When the real packages ARE installed they are
+loaded and re-exported instead, so a provisioned host sees zero behavior change
+(`NANO_VENDOR_FORCE_SHIM=1` forces the shim, used to validate it: the
+heal_stream --selftest logits fingerprint is identical in both modes).
+
 ## Downloaded at runtime, never vendored: `moonshot/`
 
 Moonshot AI's reference files (`modeling_kimi_linear.py`,
