@@ -46,6 +46,7 @@ import gc
 import json
 import math
 import os
+import re
 import time
 import warnings
 
@@ -302,11 +303,36 @@ class StreamedHealModel:
         # LoRA before the spine assignment: the wrapped base weights resolve to
         # their original .bin name via the ".base.weight" -> ".weight" rewrite
         if lora_cfg:
-            n_train, _ = apply_lora(
+            want_norms = lora_cfg.get("norms", False) or bool(lora_cfg.get("final_norm"))
+            apply_lora(
                 model, lora_cfg["rank"], lora_cfg["alpha"], lora_cfg["targets"],
-                lora_cfg.get("norms", False),
+                want_norms,
             )
-            self.n_train = n_train
+            # optional layer scope: unwrap the adapters outside the targeted
+            # layers (the base Linear takes its place and gets the mmap weight)
+            if lora_cfg.get("layers") is not None:
+                keep = set(lora_cfg["layers"])
+                wrapped = []
+                for w in model.lora_info["wrapped"]:
+                    m_l = re.match(r"layers\.(\d+)\.", w)
+                    if m_l and int(m_l.group(1)) in keep:
+                        wrapped.append(w)
+                    else:
+                        parent = model.get_submodule(w.rsplit(".", 1)[0])
+                        leaf = w.rsplit(".", 1)[1]
+                        setattr(parent, leaf, getattr(parent, leaf).base)
+                assert wrapped, f"lora layers {sorted(keep)}: no adapter left"
+                model.lora_info["wrapped"] = wrapped
+                model.lora_info["layers"] = sorted(keep)
+            # optional norm scope: keep only the trunk norms trainable
+            if lora_cfg.get("final_norm"):
+                for name, p in model.named_parameters():
+                    if p.requires_grad and "norm" in name and not name.startswith(
+                        ("norm.", "output_attn_res_norm.")
+                    ):
+                        p.requires_grad = False
+                model.lora_info["final_norm"] = True
+            self.n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         else:
             # no adapters (selftest): the base is frozen all the same, so the
             # assignment below takes the mmap branch for every parameter
@@ -459,6 +485,19 @@ def selftest(args):
     print("selftest OK", flush=True)
 
 
+def parse_layers(spec):
+    """\"19-21\" / \"19,20,21\" -> sorted list of layer indices."""
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        elif part:
+            out.add(int(part))
+    return sorted(out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="microkimi .bin (MKIM0002), read via mmap")
@@ -468,6 +507,13 @@ def main():
     ap.add_argument("--lora-alpha", type=float, default=None)
     ap.add_argument("--lora-targets", default="attn")
     ap.add_argument("--lora-norms", action="store_true")
+    ap.add_argument("--lora-layers", default=None,
+                    help="restrict the adapters to these layers, e.g. \"19-21\" or "
+                         "\"19,20,21\" (default: every layer). For a wound localized by "
+                         "the logit lens - much faster to read a signal from")
+    ap.add_argument("--lora-final-norm", action="store_true",
+                    help="train ONLY the trunk norms (final norm + output attn_res norm), "
+                         "not the per-layer norms")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--accum", type=int, default=1, help="micro-batches per optimizer step")
@@ -517,14 +563,19 @@ def main():
             "alpha": args.lora_alpha if args.lora_alpha is not None else args.lora,
             "targets": [t.strip() for t in args.lora_targets.split(",") if t.strip()],
             "norms": args.lora_norms,
+            "layers": parse_layers(args.lora_layers) if args.lora_layers else None,
+            "final_norm": args.lora_final_norm,
         }
 
     t_load = time.time()
     sm = StreamedHealModel(args.model, dev, lora_cfg)
     m = sm.model
+    scope = f", layers {lora_cfg['layers']}" if lora_cfg.get("layers") is not None else ""
+    if lora_cfg.get("final_norm"):
+        scope += ", final-norm only"
     print(f"heal_stream: {args.model} - {sm.cfg['n_layers']} layers, hidden {sm.cfg['hidden']}, "
           f"vocab {sm.cfg['vocab']}, {sm.n_moe} moe layers, {sm.n_assigned} mmap-backed tensors, "
-          f"{sm.n_train / 1e6:.2f} M trainable params ({time.time() - t_load:.1f} s)", flush=True)
+          f"{sm.n_train / 1e6:.2f} M trainable params{scope} ({time.time() - t_load:.1f} s)", flush=True)
 
     trainable = sm.trainable_params()
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
