@@ -264,6 +264,15 @@ class StreamedHealModel:
         self.cfg = cfg
         index = {n: (dt, d, o, s) for n, dt, d, o, s in entries}
         mm = np.memmap(bin_path, dtype=np.uint8, mode="r")
+        # every step re-reads the whole file through the page cache: ask the
+        # kernel to stream it in (the fault-driven 4k default readahead is
+        # hopeless on a network-attached disk)
+        if hasattr(os, "posix_fadvise"):
+            try:
+                with open(bin_path, "rb") as fw:
+                    os.posix_fadvise(fw.fileno(), 0, 0, os.POSIX_FADV_WILLNEED)
+            except OSError:
+                pass
 
         with torch.device("meta"):
             model = NanoModel(cfg)  # zero allocation: every param is meta
