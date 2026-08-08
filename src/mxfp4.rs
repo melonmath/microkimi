@@ -30,10 +30,68 @@ pub fn dequant(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f3
     out
 }
 
-/// Quantization: per group of 32, scale_exp = max(-127, ceil(log2(maxabs/6))),
-/// each value → nearest e2m1 level to v/2^scale_exp (midpoint cutoffs).
-/// Returns (packed, scales).
+/// Quantization: per group of 32 the e8m0 scale exponent is searched over
+/// {e-1, e, e+1} around the naive e = max(-127, ceil(log2(maxabs/6)))
+/// (search_mx_scale), keeping the candidate with the lowest block squared
+/// error; each value → nearest e2m1 level to v/2^scale_exp (midpoint
+/// cutoffs). Returns (packed, scales).
 pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+    quantize_impl(w, rows, cols, true)
+}
+
+/// The pre-search scale rule (naive e = ceil(log2(maxabs/6)) verbatim, no
+/// candidate search). Kept for the A/B measurement in test_cmd and for the
+/// never-worse unit test.
+pub fn quantize_naive(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+    quantize_impl(w, rows, cols, false)
+}
+
+/// Squared quantization error of one 32-value group at scale exponent e,
+/// under the same nearest-level e2m1 assignment quantize_impl packs with.
+fn group_sse(group: &[f32], e: i32) -> f64 {
+    const BOUNDS: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+    let inv = 1.0 / exp2_i(e);
+    let s = exp2_i(e) as f64;
+    let mut sse = 0f64;
+    for &v in group {
+        let q = (v * inv).clamp(-6.0, 6.0);
+        let mag = q.abs();
+        let mut idx = 0usize;
+        while idx < 7 && mag >= BOUNDS[idx] {
+            idx += 1;
+        }
+        let lvl = E2M1[idx] as f64;
+        let dq = (if q.is_sign_negative() { -lvl } else { lvl }) * s;
+        let d = v as f64 - dq;
+        sse += d * d;
+    }
+    sse
+}
+
+/// SSE-optimal e8m0 scale exponent for one 32-value group, searched over
+/// {e-1, e, e+1} (e8m0 scales are powers of two, so the immediate neighbors
+/// of the naive e are the only useful candidates: a coarser e-1 clips the
+/// group max but doubles the grid step, a finer e+1 wastes range). The naive
+/// e is scored first and wins ties, candidates outside [-127, 128] are
+/// skipped, so the returned exponent is never worse than e on the group.
+pub fn search_mx_scale(group: &[f32], e: i32) -> i32 {
+    debug_assert_eq!(group.len(), 32);
+    let mut best = e;
+    let mut best_sse = group_sse(group, e);
+    for cand in [e - 1, e + 1] {
+        if !(-127..=128).contains(&cand) {
+            continue;
+        }
+        let sse = group_sse(group, cand);
+        if sse < best_sse {
+            best_sse = sse;
+            best = cand;
+        }
+    }
+    best
+}
+
+fn quantize_impl(w: &[f32], rows: usize, cols: usize, search: bool) -> (Vec<u8>, Vec<u8>) {
     assert!(cols % 32 == 0);
     let mut packed = vec![0u8; rows * cols / 2];
     let mut scales = vec![0u8; rows * cols / 32];
@@ -44,13 +102,16 @@ pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
         for g in 0..cols / 32 {
             let group = &row[g * 32..(g + 1) * 32];
             let maxabs = group.iter().fold(0f32, |m, &v| m.max(v.abs()));
-            let e = if maxabs == 0.0 {
+            let mut e = if maxabs == 0.0 {
                 -127
             } else {
                 (maxabs / 6.0).log2().ceil() as i32
             }
             .max(-127)
             .min(128);
+            if search && maxabs != 0.0 {
+                e = search_mx_scale(group, e);
+            }
             scales[r * cols / 32 + g] = (e + 127).clamp(0, 255) as u8;
             let inv = 1.0 / exp2_i(e);
             for (j, &v) in group.iter().enumerate() {
@@ -180,9 +241,10 @@ pub fn dequant_any(dtype: u8, blob: &[u8], rows: usize, cols: usize) -> Vec<f32>
 
 /// Hidden measurement behind `microkimi mxfp4test --model X.bin [--tensors N]`:
 /// takes real f32 matrices from a .bin (2D, cols % 32 == 0, >= 16k elements,
-/// first N in name order), quantizes each with the e8m0 (MXFP4) and the
-/// quadratic (MXFP4SQ) scale encodings and reports the per-tensor and
-/// aggregate relative RMS error ||w - wq|| / ||w|| of both.
+/// first N in name order), quantizes each with the naive e8m0 scale rule, the
+/// searched e8m0 scale (search_mx_scale, the default of quantize) and the
+/// quadratic (MXFP4SQ) scale encoding, and reports the per-tensor and
+/// aggregate relative RMS error ||w - wq|| / ||w|| of each.
 pub fn test_cmd(args: &[String]) {
     let mp = args
         .iter()
@@ -210,12 +272,15 @@ pub fn test_cmd(args: &[String]) {
         .collect();
     names.sort();
     names.truncate(n_max);
-    let mut err_e8m0 = (0f64, 0f64); // (sum err^2, sum w^2)
+    let mut err_naive = (0f64, 0f64); // (sum err^2, sum w^2)
+    let mut err_e8m0 = (0f64, 0f64);
     let mut err_sq = (0f64, 0f64);
     for name in names {
         let e = &bin.entries[name];
         let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
         let w = bin.f32_vec(name);
+        let (p0, s0) = quantize_naive(&w, r, c);
+        let wq0 = dequant(&p0, &s0, r, c);
         let (p1, s1) = quantize(&w, r, c);
         let wq1 = dequant(&p1, &s1, r, c);
         let (p2, s2, smax) = quantize_sq(&w, r, c);
@@ -229,28 +294,33 @@ pub fn test_cmd(args: &[String]) {
             }
             (num, den)
         };
-        let (n1, d) = acc(&wq1);
+        let (n0, d) = acc(&wq0);
+        let (n1, _) = acc(&wq1);
         let (n2, _) = acc(&wq2);
+        err_naive.0 += n0;
+        err_naive.1 += d;
         err_e8m0.0 += n1;
         err_e8m0.1 += d;
         err_sq.0 += n2;
         err_sq.1 += d;
         println!(
-            "{:50} [{:5}x{:5}]  rel RMS  e8m0 {:.4}   sq {:.4}   ({:+.1}% RMS)",
+            "{:50} [{:5}x{:5}]  rel RMS  naive {:.4}   search {:.4}   sq {:.4}   ({:+.1}% RMS search vs naive)",
             name,
             r,
             c,
+            (n0 / d).sqrt(),
             (n1 / d).sqrt(),
             (n2 / d).sqrt(),
-            ((n2 / n1).sqrt() - 1.0) * 100.0
+            ((n1 / n0).sqrt() - 1.0) * 100.0
         );
     }
     println!(
-        "AGGREGATE  rel RMS  e8m0 {:.4}   sq {:.4}   ({:+.1}% RMS, {:+.1}% MSE)",
+        "AGGREGATE  rel RMS  naive {:.4}   search {:.4}   sq {:.4}   ({:+.1}% RMS, {:+.1}% MSE search vs naive)",
+        (err_naive.0 / err_naive.1).sqrt(),
         (err_e8m0.0 / err_e8m0.1).sqrt(),
         (err_sq.0 / err_sq.1).sqrt(),
-        ((err_sq.0 / err_e8m0.0).sqrt() - 1.0) * 100.0,
-        (err_sq.0 / err_e8m0.0 - 1.0) * 100.0
+        ((err_e8m0.0 / err_naive.0).sqrt() - 1.0) * 100.0,
+        (err_e8m0.0 / err_naive.0 - 1.0) * 100.0
     );
 }
 
@@ -466,4 +536,118 @@ pub fn matvec_packed(
             });
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Per-32-group squared errors between w and dequant(packed, scales).
+    fn block_errors(w: &[f32], rows: usize, cols: usize, packed: &[u8], scales: &[u8]) -> Vec<f64> {
+        let wq = dequant(packed, scales, rows, cols);
+        (0..rows * cols / 32)
+            .map(|g| {
+                w[g * 32..(g + 1) * 32]
+                    .iter()
+                    .zip(&wq[g * 32..(g + 1) * 32])
+                    .map(|(&a, &b)| {
+                        let d = a as f64 - b as f64;
+                        d * d
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// The searched scale never scores worse than the naive one on ANY block:
+    /// the naive exponent is one of the three candidates and wins ties.
+    fn assert_never_worse(w: &[f32], rows: usize, cols: usize) {
+        let (p0, s0) = quantize_naive(w, rows, cols);
+        let (p1, s1) = quantize(w, rows, cols);
+        let e0 = block_errors(w, rows, cols, &p0, &s0);
+        let e1 = block_errors(w, rows, cols, &p1, &s1);
+        for (g, (&a, &b)) in e0.iter().zip(&e1).enumerate() {
+            assert!(b <= a * (1.0 + 1e-9) + 1e-20, "block {} worse with search: {} > {}", g, b, a);
+        }
+    }
+
+    #[test]
+    fn search_never_worse_synthetic() {
+        let pattern = |i: usize| -> f32 {
+            let h = (i as u64).wrapping_mul(2654435761).wrapping_add(0x9E3779B9);
+            ((h >> 13) % 2000) as f32 / 1000.0 - 1.0
+        };
+        for (rows, cols) in [(64usize, 128usize), (128, 64), (3, 64), (1, 32), (256, 1024)] {
+            let w: Vec<f32> = (0..rows * cols).map(&pattern).collect();
+            assert_never_worse(&w, rows, cols);
+        }
+        // spike blocks: one large outlier per group, the e-1 candidate clips
+        // it but halves every other error
+        let (rows, cols) = (16usize, 64usize);
+        let mut w = vec![0.01f32; rows * cols];
+        for g in 0..rows * cols / 32 {
+            w[g * 32] = if g % 2 == 0 { 3.7 } else { -5.9 };
+        }
+        assert_never_worse(&w, rows, cols);
+        // all-zero groups (scale byte 0) and exact-level groups
+        let w = vec![0f32; 64];
+        assert_never_worse(&w, 2, 32);
+        let w: Vec<f32> = (0..64).map(|i| E2M1[i % 16] * 0.125).collect();
+        assert_never_worse(&w, 2, 32);
+    }
+
+    #[test]
+    fn roundtrip_exact_levels() {
+        // values already on the e2m1 grid at the naive group scale round-trip
+        // exactly (maxabs = 6 * 0.25, so naive e = -2 and the scale is exact)
+        let (rows, cols) = (4usize, 64usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| E2M1[i % 16] * 0.25).collect();
+        let (p, s) = quantize(&w, rows, cols);
+        let wq = dequant(&p, &s, rows, cols);
+        for (&a, &b) in w.iter().zip(&wq) {
+            assert_eq!(a, b);
+        }
+    }
+
+    /// Proof on real weights: every f32 2D tensor of the smoke model
+    /// (shared experts, routed projections, embeddings) quantizes with a
+    /// per-block error never worse than the naive scale rule. Skipped when
+    /// the file is absent (MICROKIMI_SMOKE_BIN overrides the path).
+    #[test]
+    fn search_never_worse_smoke_model() {
+        let path = std::env::var("MICROKIMI_SMOKE_BIN")
+            .unwrap_or_else(|_| "/workspace/chat_smoke/nanokimi_chat_smoke.bin".to_string());
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("smoke model {} not found, skipping", path);
+            return;
+        }
+        let bin = crate::weights::BinFile::open(&path);
+        let mut names: Vec<&String> = bin
+            .entries
+            .iter()
+            .filter(|(_, e)| e.dtype == crate::weights::DTYPE_F32 && e.dims.len() == 2 && e.dims[1] % 32 == 0)
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        assert!(!names.is_empty(), "no f32 2D tensors in {}", path);
+        let (mut sum0, mut sum1, mut sumw) = (0f64, 0f64, 0f64);
+        for name in names {
+            let e = &bin.entries[name];
+            let (r, c) = (e.dims[0] as usize, e.dims[1] as usize);
+            let w = bin.f32_vec(name);
+            assert_never_worse(&w, r, c);
+            let (p0, s0) = quantize_naive(&w, r, c);
+            let (p1, s1) = quantize(&w, r, c);
+            sum0 += block_errors(&w, r, c, &p0, &s0).iter().sum::<f64>();
+            sum1 += block_errors(&w, r, c, &p1, &s1).iter().sum::<f64>();
+            sumw += w.iter().map(|&v| v as f64 * v as f64).sum::<f64>();
+        }
+        eprintln!(
+            "smoke model f32 tensors: rel RMS naive {:.5} -> search {:.5} ({:+.2}% MSE)",
+            (sum0 / sumw).sqrt(),
+            (sum1 / sumw).sqrt(),
+            (sum1 / sum0 - 1.0) * 100.0
+        );
+    }
 }
