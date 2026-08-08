@@ -1251,6 +1251,7 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
     for name in ["nanokimi-0.2b.bin", "nanokimi.bin", "microkimi-debug.bin", "microkimi.bin"] {
         let candidates = [
             std::path::PathBuf::from(name),
+            std::path::PathBuf::from(format!("models/{}", name)),
             exe_dir.join(name),
             exe_dir.join(format!("../../{}", name)),
         ];

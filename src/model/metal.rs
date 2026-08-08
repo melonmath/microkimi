@@ -1177,7 +1177,7 @@ pub fn dstest() {
     }
 
     // 2) real expert blobs + 3) lm_head routing (need microdeepseek-debug.bin)
-    let ds_path = ["microdeepseek-debug.bin", "microdeepseek.bin"]
+    let ds_path = ["models/microdeepseek-debug.bin", "models/microdeepseek.bin"]
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .map(|s| s.to_string());

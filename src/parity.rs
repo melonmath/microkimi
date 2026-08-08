@@ -376,10 +376,10 @@ pub fn run_ds() {
     println!("microkimi dsparity - {} vs Rust forward (QAT-aware tol 2e-3+1e-3·scale)", path);
     println!("sequence: {} positions", t_max);
 
-    let bin = if std::path::Path::new("microdeepseek-debug.bin").exists() {
-        "microdeepseek-debug.bin".to_string()
+    let bin = if std::path::Path::new("models/microdeepseek-debug.bin").exists() {
+        "models/microdeepseek-debug.bin".to_string()
     } else {
-        "microdeepseek.bin".to_string() // legacy name from older builds
+        "models/microdeepseek.bin".to_string() // legacy name from older builds
     };
     let mut model = crate::deepseek::DsModel::load(&bin);
     model.reset();
