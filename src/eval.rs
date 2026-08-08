@@ -201,7 +201,11 @@ pub fn run(args: &[String]) {
     let json_out = crate::value_flag(args, "--json");
 
     let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::weights::read_config(&mp).vocab);
-    let mut model = crate::model::Model::load(&mp);
+    // --stream / --stream-ram / --stream-fallback are honored (streaming
+    // load): bit-identical scores without the fallback, the degraded-mode
+    // quality cost with it (MICROKIMI_FORCE_FALLBACK=1 forces 100% shadows)
+    let stream_mb = crate::stream_ram_flag(args);
+    let mut model = crate::load_k3_model(&mp, stream_mb);
     crate::check_tok_compat(&tok, &model);
     let model_size = std::fs::metadata(&mp).map(|m| m.len()).unwrap_or(0);
 
@@ -329,4 +333,5 @@ pub fn run(args: &[String]) {
         std::fs::write(&jp, j).unwrap_or_else(|e| panic!("cannot write {}: {}", jp, e));
         println!("json: {}", jp);
     }
+    crate::stream_report_maybe(stream_mb);
 }

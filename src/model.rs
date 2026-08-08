@@ -879,9 +879,28 @@ impl Model {
     /// blobs excluded), experts are served on demand by the three-tier cache
     /// (RAM LRU of `ram_mb` MB -> the .bin on disk). Same weights, same
     /// dequant, same matvec: the output is bit-identical to `load`.
-    pub fn load_streaming(path: &str, ram_mb: usize) -> Self {
+    /// `fallback` (--stream-fallback): the VQ1 expert shadows sidecar
+    /// (<path>.shadows, shadow.rs) is loaded resident in RAM and the stream
+    /// engine serves it on expert cache misses while refilling full
+    /// precision in the background - a DEGRADED latency mode, NOT
+    /// bit-identical, off by default.
+    pub fn load_streaming(path: &str, ram_mb: usize, fallback: bool) -> Self {
         let bin = BinFile::open_spine(path);
-        Self::from_bin(bin, Some(crate::stream::ExpertCache::local(path, ram_mb)))
+        let shadows = if fallback {
+            let cfg = &bin.config;
+            let moe_layers: Vec<usize> = (0..cfg.n_layers).filter(|&l| cfg.is_moe(l)).collect();
+            assert!(!moe_layers.is_empty(), "--stream-fallback on a MoE-less model is meaningless");
+            crate::stream::set_fallback_shape(moe_layers.len() * cfg.top_k);
+            Some(crate::shadow::Shadows::load(
+                &crate::shadow::sidecar_path(path),
+                &moe_layers,
+                cfg.n_experts,
+                cfg.routed_hidden * cfg.moe_inter / crate::quant::VQ_DIM,
+            ))
+        } else {
+            None
+        };
+        Self::from_bin(bin, Some(crate::stream::ExpertCache::local(path, ram_mb, shadows)))
     }
 
     fn from_bin(bin: BinFile, stream: Option<crate::stream::ExpertCache>) -> Self {
@@ -2284,13 +2303,23 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
                     let (hp, op, cbp) = (hp, op, cbp);
                     unsafe {
                         let cache = &*(cp as *const crate::stream::ExpertCache);
-                        let bytes = cache.get(layer32, e, offs, eblob);
+                        let served = cache.get(layer32, e, offs, eblob);
                         let h = std::slice::from_raw_parts(hp.0, erh);
-                        let blob = |i: usize| &bytes[i * eblob..(i + 1) * eblob];
+                        // shadow fallback (--stream-fallback): a cache miss
+                        // comes back as the resident VQ1 shadow (shadow
+                        // codebook, 3 x expert_vq_blob bytes) - degraded,
+                        // refilled in the background. Served::Full is the
+                        // historical bit-identical path.
+                        let (bytes, vq, eb, cb): (&[u8], bool, usize, &[f32]) = match &served {
+                            crate::stream::Served::Full(b) => (&b[..], vq, eblob, std::slice::from_raw_parts(cbp.0, cblen)),
+                            crate::stream::Served::Shadow(s, off) => {
+                                (&s.data[*off..*off + 3 * expert_vq_blob], true, expert_vq_blob, &s.cb[..])
+                            }
+                        };
+                        let blob = |i: usize| &bytes[i * eb..(i + 1) * eb];
                         let mut a = vec![0f32; emi];
                         let mut u = vec![0f32; emi];
                         if vq {
-                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
                             crate::quant::matvec_vq(cb, blob(0), emi, erh, h, &mut a);
                             crate::quant::matvec_vq(cb, blob(2), emi, erh, h, &mut u);
                         } else {
@@ -2304,7 +2333,6 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
                         crate::imatrix::record_inter(layer, &act);
                         let o = std::slice::from_raw_parts_mut(op.0.add(ei * erh), erh);
                         if vq {
-                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
                             crate::quant::matvec_vq(cb, blob(1), erh, emi, &act, o);
                         } else {
                             crate::mxfp4::matvec_packed(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act, o, 1);
@@ -2606,8 +2634,17 @@ fn moe_prefill(
                     let (hp, op, cbp) = (hp, op, cbp);
                     unsafe {
                         let cache = &*(cp as *const crate::stream::ExpertCache);
-                        let bytes = cache.get(layer32, e, offs, eblob);
-                        let blob = |i: usize| &bytes[i * eblob..(i + 1) * eblob];
+                        let served = cache.get(layer32, e, offs, eblob);
+                        // shadow fallback, same contract as moe_forward:
+                        // Served::Shadow = VQ1 shadow bytes + shadow codebook
+                        // (degraded); Served::Full = historical path.
+                        let (bytes, vq, eb, cb): (&[u8], bool, usize, &[f32]) = match &served {
+                            crate::stream::Served::Full(b) => (&b[..], vq, eblob, std::slice::from_raw_parts(cbp.0, cblen)),
+                            crate::stream::Served::Shadow(s, off) => {
+                                (&s.data[*off..*off + 3 * expert_vq_blob], true, expert_vq_blob, &s.cb[..])
+                            }
+                        };
+                        let blob = |i: usize| &bytes[i * eb..(i + 1) * eb];
                         let m = pairs.len();
                         let m8 = m.next_multiple_of(8); // zero-padded lanes (outputs ignored)
                         // gather the inputs of this expert's pairs, transposed [erh][m8]
@@ -2621,7 +2658,6 @@ fn moe_prefill(
                         let mut a = vec![0f32; m8 * emi];
                         let mut u = vec![0f32; m8 * emi];
                         if vq {
-                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
                             crate::quant::matvec_vq_nt(cb, blob(0), emi, erh, &ht, m8, &mut a);
                             crate::quant::matvec_vq_nt(cb, blob(2), emi, erh, &ht, m8, &mut u);
                         } else {
@@ -2637,7 +2673,6 @@ fn moe_prefill(
                         }
                         let mut o = vec![0f32; m8 * erh];
                         if vq {
-                            let cb = std::slice::from_raw_parts(cbp.0, cblen);
                             crate::quant::matvec_vq_nt(cb, blob(1), erh, emi, &act_t, m8, &mut o);
                         } else {
                             matvec_packed_nt(&blob(1)[..expert_packed], &blob(1)[expert_packed..], erh, emi, &act_t, m8, &mut o);

@@ -29,6 +29,7 @@ mod quant;
 mod rosa;
 mod safetensors;
 mod selftest;
+mod shadow;
 mod slice;
 mod slice_st;
 mod spec;
@@ -63,6 +64,8 @@ fn main() {
         "build-ds" => build_ds::run(), // alias for `build --arch dsv4`
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => slice::run(&args),
+        // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
+        "shadow" => shadow::cmd(&args),
         "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); selftest::run_flash(); selftest::run_kvq8(); },
         "metaltest" => metaltest_cmd(),
         "metaltest-packed" => metaltest_packed_cmd(),
@@ -248,8 +251,7 @@ fn main() {
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
-            println!("                                         structural pruning (channels / experts / layers)");
-            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
+            println!("                                         structural pruning (channels / experts / layers)");            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
             println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
             println!("      --imatrix FILE (with --cold-vq)      activation-weighted VQ codebook (see calibrate);");
             println!("                                         --imatrix-score-only: report only, blind codebook");
@@ -259,6 +261,10 @@ fn main() {
             println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
             println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
             println!("      and, for expert ranking, only the weight_scale bytes are fetched)");
+            println!("  microkimi shadow --model X.bin [--out X.shadows]");
+            println!("                                         VQ1 (0.5-bit) shadows of EVERY expert + one global");
+            println!("                                         codebook, the resident low-precision tier served on");
+            println!("                                         expert cache misses by --stream-fallback");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
             println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
@@ -279,6 +285,12 @@ fn main() {
             println!("                        expert-only LRU rollover, spine never evicted; env MICROKIMI_STREAM_DISK)");
             println!("                    --stream-predict N (Markov expert prefetch: N predicted experts/layer,");
             println!("                        0 = off, default; output-preserving, only changes fetch timing)");
+            println!("                    --stream-fallback (DEGRADED latency mode, default OFF: on an expert cache");
+            println!("                        miss, serve the resident 0.5-bit VQ1 shadow immediately and refill the");
+            println!("                        full-precision expert in the background - the decode never blocks on the");
+            println!("                        disk, but a shadow-served token is NOT bit-identical: a latency mode,");
+            println!("                        not a quality mode; needs <model>.shadows, see `microkimi shadow`;");
+            println!("                        env MICROKIMI_STREAM_FALLBACK=1 is equivalent)");
             println!("                    env MICROKIMI_DRAFTPREFETCH=0 disables the draft-aware expert prefetch");
             println!("                        (--spec/--spec-rosa + --stream: experts predicted from the drafted");
             println!("                        tokens are prefetched before the verification pass; output-preserving)");
@@ -756,7 +768,14 @@ fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
                 println!("stream: predictive prefetch enabled ({} experts/layer, top-k {})", n, top_k);
             }
             println!("stream: expert streaming enabled (RAM LRU budget {} MB)", mb);
-            model::Model::load_streaming(mp, mb)
+            // --stream-fallback (or MICROKIMI_STREAM_FALLBACK=1): VQ1 shadow
+            // fallback on expert cache misses. DEGRADED latency mode, NOT
+            // bit-identical; needs the <model>.shadows sidecar (microkimi
+            // shadow). Parsed from the process args like --stream-predict.
+            let fallback = pargs.iter().any(|a| a == "--stream-fallback")
+                || std::env::var("MICROKIMI_STREAM_FALLBACK").map(|v| v == "1").unwrap_or(false);
+            crate::stream::set_fallback(fallback);
+            model::Model::load_streaming(mp, mb, fallback)
         }
         None => model::Model::load(mp),
     }

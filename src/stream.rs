@@ -18,9 +18,16 @@
 // the compute consumes. Bit-exactness: the bytes served are byte-identical
 // to the full-load path (same file bytes / same fetched blob), and the same
 // matvec sequence runs on them.
+//
+// Optional degraded mode (--stream-fallback, OFF by default): a VQ1 shadow
+// of EVERY expert (shadow.rs, 0.5 bit/weight, resident in RAM) is served
+// immediately on a cache miss while the full-precision blob is refilled in
+// the background, so the decode never blocks on the disk tier. A
+// shadow-served expert is NOT bit-identical - a latency mode, not a
+// quality mode; the report line counts the degraded computations.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // global fetch report counters (one model per process)
@@ -126,6 +133,61 @@ static DPREF_USED: AtomicU64 = AtomicU64::new(0); // draft-prefetched entries co
 static DPREF_WIN_I: AtomicU64 = AtomicU64::new(0); // adaptive gate window: issued
 static DPREF_WIN_U: AtomicU64 = AtomicU64::new(0); // adaptive gate window: consumed
 static DPREF_COOL: AtomicU64 = AtomicU64::new(0); // drafts the gate suspends the prefetch for
+
+// ── VQ1 shadow fallback (--stream-fallback, DEGRADED latency mode) ──
+//
+// On an expert cache miss the historical path blocks the decode on the disk
+// tier (the worst case on a latency-bound network disk). With the fallback
+// active, the engine instead serves IMMEDIATELY the expert's VQ1 shadow
+// (shadow.rs: 0.5 bit/weight, fully resident in RAM, a few microseconds of
+// LUT matvec) and refills the full-precision mxfp4 blob in the background:
+// the NEXT request for the expert hits the RAM LRU as usual. The miss
+// latency becomes bounded by the shadow serve, the decode never stops on
+// the disk.
+//
+// HONESTY: a token whose experts were shadow-served is computed with
+// degraded weights - this path is NOT bit-identical. It is a latency mode,
+// not a quality mode, and it is OFF by default: opt in with the explicit
+// --stream-fallback flag or MICROKIMI_STREAM_FALLBACK=1, and the report
+// line counts exactly how many expert computations were degraded.
+// MICROKIMI_FORCE_FALLBACK=1 (test knob) serves the shadow for EVERY
+// expert, hit or miss, to measure the quality cost of a VQ1 expert in
+// place of an mxfp4 one.
+static FALLBACK_FLAG: AtomicBool = AtomicBool::new(false); // --stream-fallback
+static FB_SERVED: AtomicU64 = AtomicU64::new(0); // expert computations served from a shadow
+static FB_GETS: AtomicU64 = AtomicU64::new(0); // total demand gets while the fallback is active
+static FB_FETCH: AtomicU64 = AtomicU64::new(0); // background full-precision refills
+static FB_READS: AtomicU64 = AtomicU64::new(0); // span reads issued by the fused refills
+static FB_EPT: AtomicUsize = AtomicUsize::new(0); // experts per token (MoE layers x top-k)
+
+/// `--stream-fallback`: enable the VQ1 shadow fallback (DEGRADED latency
+/// mode, see the block comment above). The shadows are loaded by
+/// Model::load_streaming; without a sidecar the flag only arms the toggle.
+pub fn set_fallback(on: bool) {
+    FALLBACK_FLAG.store(on, Ordering::Relaxed);
+}
+
+/// Shadow fallback toggle: the --stream-fallback flag or
+/// MICROKIMI_STREAM_FALLBACK=1. Default OFF (bit-identical decode).
+pub fn fallback_on() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FALLBACK_FLAG.load(Ordering::Relaxed) || *ENV.get_or_init(|| env_off("MICROKIMI_STREAM_FALLBACK"))
+}
+
+/// MICROKIMI_FORCE_FALLBACK=1 (test knob): serve the shadow for EVERY
+/// expert demand, hit or miss, and skip all refills. Deterministic (the
+/// shadow bytes are constant), used to measure the quality cost of a fully
+/// VQ1 expert set.
+fn force_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_off("MICROKIMI_FORCE_FALLBACK"))
+}
+
+/// Experts computed per token (MoE layers x router top-k), for the
+/// per-token degraded share of the report line. Set at model load.
+pub fn set_fallback_shape(experts_per_token: usize) {
+    FB_EPT.store(experts_per_token, Ordering::Relaxed);
+}
 
 /// Accounts a consumed prefetched entry to its producer's counter (prefetch
 /// tag: 1 = Markov/lookahead, 2 = draft).
@@ -307,7 +369,41 @@ pub fn report_line() -> String {
             di, dc, used, recall
         ));
     }
+    let fb = FB_SERVED.load(Ordering::Relaxed);
+    if fb > 0 {
+        let tot = FB_GETS.load(Ordering::Relaxed).max(1);
+        let mut line = format!(
+            "\nstream-fallback: {} expert computations served from the VQ1 shadows ({:.1}% of {} demands) - DEGRADED latency mode, NOT bit-identical",
+            fb,
+            100.0 * fb as f64 / tot as f64,
+            tot
+        );
+        let ept = FB_EPT.load(Ordering::Relaxed);
+        if ept > 0 {
+            let tokens = (tot as f64 / ept as f64).max(1.0);
+            line.push_str(&format!(" (~{:.1} degraded experts/token of {})", fb as f64 / tokens, ept));
+        }
+        line.push_str(&format!(
+            ", {} full-precision refills in the background ({} span reads)",
+            FB_FETCH.load(Ordering::Relaxed),
+            FB_READS.load(Ordering::Relaxed)
+        ));
+        s.push_str(&line);
+    }
     s
+}
+
+/// Expert bytes served by ExpertCache::get.
+pub enum Served {
+    /// The blob from the expert cache (mxfp4, or VQ1 for a --cold-vq sliced
+    /// expert): interpret with the model's own experts_vq flag and
+    /// vq_codebook. Byte-identical to the full-load path.
+    Full(Arc<Vec<u8>>),
+    /// A VQ1 shadow served on a cache miss under --stream-fallback: always
+    /// VQ1, shadow codebook, w1 ++ w2 ++ w3 index bytes at this offset of
+    /// Shadows::data. DEGRADED (not bit-identical); the full-precision blob
+    /// is refilled in the background for the next request.
+    Shadow(Arc<crate::shadow::Shadows>, usize),
 }
 
 // ── RAM cache: eviction policies ──
@@ -1336,8 +1432,14 @@ struct CacheInner {
     /// these WAITS on the condvar for the in-flight read to land instead of
     /// fetching the same bytes a second time; warm_batch skips them for the
     /// same reason. Only the draft-aware prefetch marks keys (it launches
-    /// right before the verification pass that will demand them).
+    /// right before the verification pass that will demand them). The shadow
+    /// fallback reuses the same set for its background refills: a demand get
+    /// on a marked key serves the shadow WITHOUT waiting (bounded latency is
+    /// the whole point of the mode).
     inflight: (Mutex<std::collections::HashSet<(u32, u32)>>, std::sync::Condvar),
+    /// VQ1 shadows of every expert (shadow.rs), resident in RAM under
+    /// --stream-fallback. None in the default bit-identical mode.
+    shadows: Option<Arc<crate::shadow::Shadows>>,
 }
 
 impl CacheInner {
@@ -1466,6 +1568,65 @@ impl CacheInner {
         issued.fetch_add(1, Ordering::Relaxed);
         self.land(k);
     }
+
+    /// Background full-precision refill of one expert (shadow fallback): the
+    /// demand get already served the VQ1 shadow, so this only lands the
+    /// mxfp4 bytes in the RAM LRU for the NEXT request, then unmarks the
+    /// in-flight key. Insert tag 0 (demand-like LFU credit), no warm mark.
+    fn fill_one(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) {
+        let bytes = self.fetch(layer, expert, offs, blob);
+        self.lru.lock().unwrap().insert((layer, expert), Arc::new(bytes), 0, false);
+        FB_FETCH.fetch_add(1, Ordering::Relaxed);
+        self.land((layer, expert));
+    }
+
+    /// Background fused refill of one run of file-adjacent experts (shadow
+    /// fallback warm_batch): the same span-read fusion as fetch_run (the
+    /// served bytes are byte-identical to per-expert preads), with the
+    /// fallback's own counters and every member landed. Singleton runs and
+    /// the remote source go through plain per-expert refills.
+    fn fill_run(&self, layer: u32, members: &[(u32, [u64; 3], usize)]) {
+        if members.len() == 1 {
+            let (e, offs, blob) = members[0];
+            self.fill_one(layer, e, offs, blob);
+            return;
+        }
+        let Src::Local(l) = &self.src else {
+            for &(e, offs, blob) in members {
+                self.fill_one(layer, e, offs, blob);
+            }
+            return;
+        };
+        use std::os::unix::fs::FileExt;
+        let start = members[0].1[0];
+        let end = members.iter().map(|&(_, o, b)| o[2] + b as u64).max().unwrap();
+        let mut span = vec![0u8; (end - start) as usize];
+        let served = match &l.direct {
+            Some(df) => read_direct(df, start, &mut span).is_ok(),
+            None => false,
+        };
+        if !served {
+            l.file.read_exact_at(&mut span, start).unwrap();
+        }
+        fake_disk_sleep(); // ONE physical read for the whole run
+        FB_READS.fetch_add(1, Ordering::Relaxed);
+        for &(e, offs, blob) in members {
+            let mut bytes = vec![0u8; 3 * blob];
+            for i in 0..3 {
+                let lo = (offs[i] - start) as usize;
+                bytes[i * blob..(i + 1) * blob].copy_from_slice(&span[lo..lo + blob]);
+            }
+            DISK_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.lru.lock().unwrap().insert((layer, e), Arc::new(bytes), 0, false);
+            FB_FETCH.fetch_add(1, Ordering::Relaxed);
+            self.land((layer, e));
+        }
+    }
+
+    /// The VQ1 shadow of one expert, when the fallback can serve it.
+    fn shadow(&self, layer: u32, expert: u32) -> Option<(Arc<crate::shadow::Shadows>, usize)> {
+        self.shadows.as_ref().and_then(|s| s.offset(layer, expert).map(|off| (Arc::clone(s), off)))
+    }
 }
 
 /// RAM LRU of packed expert bytes keyed by (layer, expert), budgeted by
@@ -1477,7 +1638,9 @@ pub struct ExpertCache {
 
 impl ExpertCache {
     /// Local streaming source: `path` is the .bin the spine was loaded from.
-    pub fn local(path: &str, ram_mb: usize) -> ExpertCache {
+    /// `shadows`: the resident VQ1 expert shadows (shadow.rs) when
+    /// --stream-fallback is active, None in the default bit-identical mode.
+    pub fn local(path: &str, ram_mb: usize, shadows: Option<crate::shadow::Shadows>) -> ExpertCache {
         let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{} unreadable: {}", path, e));
         let direct = open_direct(path);
         // one-time startup lines: state of the runtime A/B toggles
@@ -1510,6 +1673,20 @@ impl ExpertCache {
             println!("stream: draft-aware expert prefetch off (MICROKIMI_DRAFTPREFETCH=0)");
         }
         println!("stream: expert cache policy {} (MICROKIMI_CACHE=arc|lru|lfu; default lfu)", policy_name(policy()));
+        let shadows = shadows.map(|s| {
+            let bytes = s.data.len() + s.cb.len() * 4;
+            println!(
+                "memory: expert shadows {} resident in RAM ({} MoE layers x {} experts, VQ1 0.5-bit, --stream-fallback)",
+                mb(bytes as u64),
+                s.layers.len(),
+                s.n_experts
+            );
+            println!("stream: fallback mode DEGRADED (VQ1 shadows served on expert cache misses, background full-precision refill) - a latency mode, NOT bit-identical");
+            if force_fallback() {
+                println!("stream: FORCE_FALLBACK on (MICROKIMI_FORCE_FALLBACK=1, test knob: every expert served from its shadow)");
+            }
+            Arc::new(s)
+        });
         // initialize the trace sink now so its startup line prints with the
         // other stream lines (no-op when MICROKIMI_TRACE is unset)
         trace_sink();
@@ -1519,6 +1696,7 @@ impl ExpertCache {
                 src: Src::Local(LocalSrc { file, direct }),
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
+                shadows,
             }),
         }
     }
@@ -1532,6 +1710,7 @@ impl ExpertCache {
                 src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
+                shadows: None, // the shadow fallback is a local-source mode
             }),
         }
     }
@@ -1555,6 +1734,45 @@ impl ExpertCache {
     /// RAM hits, so the report's hits inflate by the batched amount; the
     /// stream-fuse line carries the real batched-fetch figures.
     pub fn warm_batch(&self, layer: u32, items: &[(u32, [u64; 3], usize)]) {
+        // Shadow fallback: the decode must NEVER block on the disk tier, so
+        // there is no synchronous batched read phase. Every missing expert is
+        // marked in flight and refilled on ONE detached thread (offset-sorted,
+        // one fused span read per file-adjacent run - the same bytes the
+        // synchronous path would read); the compute jobs' gets serve the VQ1
+        // shadow until the refill lands. No-op under MICROKIMI_FORCE_FALLBACK
+        // (test knob: shadows always served, refills useless).
+        if self.inner.shadows.is_some() && fallback_on() {
+            if force_fallback() {
+                return;
+            }
+            let mut miss: Vec<(u32, [u64; 3], usize)> = Vec::new();
+            {
+                let lru = self.inner.lru.lock().unwrap();
+                let mut inf = self.inner.inflight.0.lock().unwrap();
+                for &(e, offs, blob) in items {
+                    if !lru.map.contains_key(&(layer, e)) && inf.insert((layer, e)) {
+                        miss.push((e, offs, blob));
+                    }
+                }
+            }
+            if miss.is_empty() {
+                return;
+            }
+            miss.sort_by_key(|&(_, o, _)| o[0]);
+            let inner = Arc::clone(&self.inner);
+            std::thread::spawn(move || {
+                if run_fuse() && matches!(inner.src, Src::Local(_)) {
+                    for (s, e) in fuse_runs(&miss) {
+                        inner.fill_run(layer, &miss[s..e]);
+                    }
+                } else {
+                    for (e, o, b) in miss {
+                        inner.fill_one(layer, e, o, b);
+                    }
+                }
+            });
+            return;
+        }
         if items.len() < 2 || !run_fuse() || !matches!(self.inner.src, Src::Local(_)) {
             return;
         }
@@ -1599,7 +1817,16 @@ impl ExpertCache {
     /// The 3 MXFP4 blobs of expert `expert` of `layer`, concatenated
     /// w1 ++ w2 ++ w3, `blob` bytes each. `offs` = absolute file offsets of
     /// the three blobs (local source; ignored by the remote one).
-    pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Arc<Vec<u8>> {
+    ///
+    /// Return value (Served): normally Served::Full with the cache bytes.
+    /// Under --stream-fallback (shadows resident), a cache MISS returns
+    /// Served::Shadow immediately - the VQ1 shadow, a degraded
+    /// low-precision stand-in - and the full-precision blob is refilled in
+    /// the background for the next request: the decode never blocks on the
+    /// disk tier. NOT bit-identical; off by default. With
+    /// MICROKIMI_FORCE_FALLBACK=1 (test knob) EVERY demand returns the
+    /// shadow, hit or miss, and nothing is fetched.
+    pub fn get(&self, layer: u32, expert: u32, offs: [u64; 3], blob: usize) -> Served {
         // record the demand request (MICROKIMI_TRACE; no-op when unset)
         trace_record(layer, expert);
         // feed the Markov predictor; on a completed top-k batch this may
@@ -1620,12 +1847,41 @@ impl ExpertCache {
             }
         }
         let k = (layer, expert);
+        let fb = self.inner.shadows.is_some() && fallback_on();
+        if fb {
+            FB_GETS.fetch_add(1, Ordering::Relaxed);
+            // test knob (quality measurement): every expert degraded
+            if force_fallback() {
+                if let Some((s, off)) = self.inner.shadow(layer, expert) {
+                    FB_SERVED.fetch_add(1, Ordering::Relaxed);
+                    return Served::Shadow(s, off);
+                }
+            }
+        }
         {
             let mut lru = self.inner.lru.lock().unwrap();
             if let Some((v, pref)) = lru.get(k) {
                 pref_used(pref);
                 RAM_HITS.fetch_add(1, Ordering::Relaxed);
-                return v;
+                return Served::Full(v);
+            }
+        }
+        // shadow fallback: serve the resident VQ1 shadow NOW (bounded miss
+        // latency) and make sure a background refill of the full-precision
+        // bytes is running (the key may already be in flight from
+        // warm_batch or a draft prefetch - their fills land it either way).
+        if fb {
+            if let Some((s, off)) = self.inner.shadow(layer, expert) {
+                FB_SERVED.fetch_add(1, Ordering::Relaxed);
+                let spawn = {
+                    let mut inf = self.inner.inflight.0.lock().unwrap();
+                    inf.insert(k)
+                };
+                if spawn {
+                    let inner = Arc::clone(&self.inner);
+                    std::thread::spawn(move || inner.fill_one(layer, expert, offs, blob));
+                }
+                return Served::Shadow(s, off);
             }
         }
         // a draft prefetch is already reading these bytes: wait for it to
@@ -1649,14 +1905,14 @@ impl ExpertCache {
             if let Some((v, pref)) = lru.get(k) {
                 pref_used(pref);
                 RAM_HITS.fetch_add(1, Ordering::Relaxed);
-                return v;
+                return Served::Full(v);
             }
         }
         RAM_MISSES.fetch_add(1, Ordering::Relaxed);
         let bytes = self.inner.fetch(layer, expert, offs, blob);
         let v = Arc::new(bytes);
         self.inner.lru.lock().unwrap().insert(k, v.clone(), 0, false);
-        v
+        Served::Full(v)
     }
 
     /// Router-lookahead prefetch (streaming v2): background-fetch the
@@ -1862,6 +2118,7 @@ pub fn streamtest(args: &[String]) {
             src: Src::Remote(src),
             pred: Mutex::new(Predictor::new()),
             inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
+            shadows: None,
         }),
     };
     for e in 0..4u32 {
@@ -2049,6 +2306,68 @@ mod tests {
     /// request with a compact w1++w2++w3 footprint starting at `off`
     fn req(e: u32, off: u64, blob: u64) -> (u32, [u64; 3], usize) {
         (e, [off, off + blob, off + 2 * blob], blob as usize)
+    }
+
+    // ── VQ1 shadow fallback (--stream-fallback) ──
+
+    /// A miss serves the resident VQ1 shadow immediately and the background
+    /// refill lands the full-precision file bytes in the LRU for the next
+    /// demand, which is then served Full (bit-identical bytes).
+    #[test]
+    fn fallback_serves_shadow_then_refills() {
+        set_fallback(true);
+        // two fake experts, 64-byte blobs, expert e at file offset e*192
+        let blob = 64usize;
+        let file_bytes: Vec<u8> = (0..2 * 3 * blob).map(|i| (i % 253) as u8).collect();
+        let dir = std::env::temp_dir();
+        let fpath = dir.join(format!("microkimi-fb-test-{}", std::process::id()));
+        std::fs::write(&fpath, &file_bytes).unwrap();
+        let sh = crate::shadow::Shadows {
+            layers: vec![0],
+            n_experts: 2,
+            vq_blob: 8,
+            cb: vec![0.25; crate::quant::VQ_K * crate::quant::VQ_DIM],
+            data: (0..2 * 3 * 8).map(|i| (i % 241) as u8).collect(),
+        };
+        let shadow_bytes = sh.data.clone();
+        let cache = ExpertCache {
+            inner: Arc::new(CacheInner {
+                lru: Mutex::new(Lru::new(512)),
+                src: Src::Local(LocalSrc {
+                    file: std::fs::File::open(&fpath).unwrap(),
+                    direct: None,
+                }),
+                pred: Mutex::new(Predictor::new()),
+                inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
+                shadows: Some(Arc::new(sh)),
+            }),
+        };
+        let offs = |e: u32| [e as u64 * 192, e as u64 * 192 + 64, e as u64 * 192 + 128];
+        // cold miss: shadow served at the expert's byte offset, refill spawned
+        match cache.get(0, 1, offs(1), blob) {
+            Served::Shadow(s, off) => {
+                assert_eq!(off, 3 * 8, "expert 1 shadow offset");
+                assert_eq!(&s.data[off..off + 8], &shadow_bytes[off..off + 8]);
+            }
+            Served::Full(_) => panic!("cold miss must serve the shadow under the fallback"),
+        }
+        // the background refill lands the file bytes in the LRU
+        let t0 = std::time::Instant::now();
+        loop {
+            if cache.inner.lru.lock().unwrap().peek((0, 1)) {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "background refill never landed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // the next demand is a full-precision hit with the exact file bytes
+        match cache.get(0, 1, offs(1), blob) {
+            Served::Full(v) => assert_eq!(&v[..], &file_bytes[192..384], "refill must serve the exact file bytes"),
+            Served::Shadow(..) => panic!("refilled expert must be served Full"),
+        }
+        // the in-flight set is clean after the refill
+        assert!(cache.inner.inflight.0.lock().unwrap().is_empty());
+        std::fs::remove_file(&fpath).ok();
     }
 
     #[test]
