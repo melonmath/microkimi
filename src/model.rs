@@ -246,6 +246,107 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
     p.run(jobs);
 }
 
+// ── q8_0 lm_head (runtime copy, built once at load) ──
+//
+// The final logits projection re-reads the whole f32 lm_head tensor every
+// token (vocab x d: the largest single matvec of the engine). Keeping a
+// row-wise q8_0 copy (same convention as q8.rs: int8 values + one f32 scale
+// per block of 32) shrinks that stream ~3.5x and moves the dot to the integer
+// SIMD kernel (block_dot_i8). NOT bit-identical to the f32 matvec: q8
+// rounding of both the weights and the input, error bounded by dx/2 per
+// element. Greedy token parity is validated on the nanokimi smoke model;
+// MICROKIMI_Q8HEAD=0 at load time keeps the exact f32 path.
+
+/// Row-wise q8_0 quantized matrix (built from an f32 [rows, cols] tensor).
+pub struct Q8Head {
+    q: Vec<i8>,      // rows x cols, row-major
+    scales: Vec<f32>, // rows x cols/32
+    rows: usize,
+    cols: usize,
+}
+
+/// MICROKIMI_Q8HEAD=0 disables the q8 lm_head copy (exact f32 fallback).
+fn q8head_enabled() -> bool {
+    std::env::var("MICROKIMI_Q8HEAD").map(|v| v != "0").unwrap_or(true)
+}
+
+impl Q8Head {
+    fn from_f32(w: &[f32], rows: usize, cols: usize) -> Q8Head {
+        assert!(cols % 32 == 0, "q8 blocks are 32 wide");
+        let nb = cols / 32;
+        let mut q = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows * nb];
+        let mut scratch = crate::q8::Q8Vec::new();
+        for r in 0..rows {
+            crate::q8::quantize_q8_into(&w[r * cols..(r + 1) * cols], &mut scratch);
+            q[r * cols..(r + 1) * cols].copy_from_slice(&scratch.q);
+            scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
+        }
+        Q8Head { q, scales, rows, cols }
+    }
+
+    /// out[r] = <row r, x> computed in integer per 32-block, rescaled to f32.
+    /// Same pool split as matvec_cpu.
+    fn matvec(&self, x: &[f32], out: &mut [f32]) {
+        let (rows, cols) = (self.rows, self.cols);
+        let nb = cols / 32;
+        let xq = crate::q8::quantize_q8(x);
+        let p = crate::pool::pool();
+        let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
+        if njobs <= 1 {
+            for (r, o) in out.iter_mut().enumerate() {
+                *o = self.row_dot(r, &xq);
+            }
+            return;
+        }
+        let chunk = rows.div_ceil(njobs);
+        let qp = crate::pool::SPtrU8(self.q.as_ptr() as *const u8);
+        let sp = crate::pool::SPtr(self.scales.as_ptr());
+        let xp = crate::pool::SPtrU8(xq.q.as_ptr() as *const u8);
+        let xsp = crate::pool::SPtr(xq.scales.as_ptr());
+        let op = crate::pool::MPtr(out.as_mut_ptr());
+        let mut jobs: Vec<crate::pool::Job> = Vec::new();
+        for j in 0..njobs {
+            let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+            if r0 >= r1 {
+                break;
+            }
+            jobs.push(Box::new(move || {
+                // rebind → capture whole structs (Send), not fields
+                let (qp, sp, xp, xsp, op) = (qp, sp, xp, xsp, op);
+                unsafe {
+                    let q = std::slice::from_raw_parts(qp.0 as *const i8, rows * cols);
+                    let ws = std::slice::from_raw_parts(sp.0, rows * nb);
+                    let xq8 = std::slice::from_raw_parts(xp.0 as *const i8, cols);
+                    let xs = std::slice::from_raw_parts(xsp.0, nb);
+                    let out = std::slice::from_raw_parts_mut(op.0, rows);
+                    for r in r0..r1 {
+                        let mut acc = 0f32;
+                        for g in 0..nb {
+                            let idot = crate::q8::block_dot_i8(&q[r * cols + g * 32..r * cols + g * 32 + 32], &xq8[g * 32..g * 32 + 32]);
+                            acc += ws[r * nb + g] * xs[g] * idot as f32;
+                        }
+                        out[r] = acc;
+                    }
+                }
+            }));
+        }
+        p.run(jobs);
+    }
+
+    fn row_dot(&self, r: usize, xq: &crate::q8::Q8Vec) -> f32 {
+        let nb = self.cols / 32;
+        let wq = &self.q[r * self.cols..(r + 1) * self.cols];
+        let ws = &self.scales[r * nb..(r + 1) * nb];
+        let mut acc = 0f32;
+        for g in 0..nb {
+            let idot = crate::q8::block_dot_i8(&wq[g * 32..g * 32 + 32], &xq.q[g * 32..g * 32 + 32]);
+            acc += ws[g] * xq.scales[g] * idot as f32;
+        }
+        acc
+    }
+}
+
 /// dot() for 8 positions at once against the same weight row, positions in
 /// vector lanes: the row is loaded once for all eight and the vector unit
 /// works across positions, while each position keeps the exact 8-lane
@@ -740,6 +841,10 @@ pub struct Model {
     bin: BinFile,
     embed: T,
     lm_head: T,
+    /// q8_0 runtime copy of lm_head (see the Q8Head section above): None when
+    /// MICROKIMI_Q8HEAD=0, when --gpu serves the large matvecs, or when the
+    /// dims do not divide into 32-wide blocks.
+    lm_head_q8: Option<Q8Head>,
     norm_f: T,
     out_res_w: Vec<f32>,
     layers: Vec<LayerW>,
@@ -754,6 +859,16 @@ pub struct Model {
 impl Model {
     fn t<'a>(data: &'a [u8], t: &T) -> &'a [f32] {
         as_f32(&data[t.off..t.off + t.len * 4])
+    }
+
+    /// Final logits projection: the q8_0 copy of lm_head when it was built at
+    /// load (default), the exact f32 matvec otherwise (MICROKIMI_Q8HEAD=0).
+    /// The q8 path is not bit-identical to f32 (q8 rounding, see q8.rs).
+    fn logits_project(data: &[u8], lm_head: &T, q8: Option<&Q8Head>, cfg: &Config, x: &[f32], out: &mut [f32]) {
+        match q8 {
+            Some(h) => h.matvec(x, out),
+            None => matvec(Self::t(data, lm_head), cfg.vocab, cfg.d, x, out),
+        }
     }
 
     pub fn load(path: &str) -> Self {
@@ -781,6 +896,14 @@ impl Model {
         };
         let embed = get("embed_tokens.weight");
         let lm_head = get("lm_head.weight");
+        // q8_0 runtime copy of lm_head (default on): the .bin format is
+        // unchanged, this is a load-time requantization of the f32 tensor.
+        // Skipped under --gpu (Metal already serves the large matvecs).
+        let lm_head_q8 = if q8head_enabled() && !gpu_on() && cfg.d % 32 == 0 && lm_head.len == cfg.vocab * cfg.d {
+            Some(Q8Head::from_f32(Self::t(&bin.data, &lm_head), cfg.vocab, cfg.d))
+        } else {
+            None
+        };
         let norm_f = get("norm.weight");
         let out_res_w = combine(&get("output_attn_res_norm.weight"), &get("output_attn_res_proj.weight"));
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -880,7 +1003,7 @@ impl Model {
             };
             layers.push(LayerW { input_ln, post_ln, sa_res_w, mlp_res_w, attn, ffn });
         }
-        Model { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), stream }
+        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), stream }
     }
 
     /// Number of tokens already represented in the caches (from the first MLA
@@ -2130,6 +2253,19 @@ fn moe_forward(cfg: &Config, data: &[u8], w: &MoeW, x: &[f32], prof: &mut Prof, 
             if crate::stream::offset_sort() {
                 order.sort_by_key(|&ei| w.experts[sel[ei].0 as usize][0]);
             }
+            // fused run fetch: the missing experts of this layer are pulled
+            // through the cache in as few physical reads as possible (one
+            // span read per run of file-adjacent experts); the compute jobs
+            // below then hit the RAM LRU. No-op when fusion is off or the
+            // source is remote.
+            let items: Vec<(u32, [u64; 3], usize)> = order
+                .iter()
+                .map(|&ei| {
+                    let e = sel[ei].0;
+                    (e, w.experts[e as usize], if w.experts_vq[e as usize] { expert_vq_blob } else { expert_blob })
+                })
+                .collect();
+            cache.warm_batch(layer32, &items);
             let mut jobs: Vec<crate::pool::Job> = Vec::with_capacity(cfg.top_k);
             for &ei in &order {
                 let e = sel[ei].0;
@@ -2698,7 +2834,7 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let embed = Self::t(data, embed);
@@ -2827,7 +2963,7 @@ impl Model {
         prof.t_norm_res += tm.elapsed().as_secs_f64();
         let tm = Instant::now();
         let mut logits = vec![0f32; cfg.vocab];
-        matvec(Self::t(data, &lm_head), cfg.vocab, cfg.d, &xf, &mut logits);
+        Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
         prof.t_lm_head += tm.elapsed().as_secs_f64();
         if hd_on {
             dump_hidden_print(&hd, vec_rms(&hidden), &logits);
@@ -2865,7 +3001,7 @@ impl Model {
         if ids.len() == 1 {
             return vec![self.forward(ids[0], pos0)];
         }
-        let Self { cfg, bin, embed, lm_head, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, stream } = self;
         let cfg = &*cfg;
         let data = &bin.data[..];
         let n = ids.len();
@@ -3003,7 +3139,7 @@ impl Model {
                 let mut xf = vec![0f32; d];
                 rmsnorm(cfg, &hidden[t * d..(t + 1) * d], Self::t(data, &norm_f), &mut xf);
                 let mut logits = vec![0f32; cfg.vocab];
-                matvec(Self::t(data, &lm_head), cfg.vocab, d, &xf, &mut logits);
+                Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
                 out.push(logits);
             }
             prof.t_norm_res += tm.elapsed().as_secs_f64();
@@ -3018,7 +3154,7 @@ impl Model {
         prof.t_norm_res += tm.elapsed().as_secs_f64();
         let tm = Instant::now();
         let mut logits = vec![0f32; cfg.vocab];
-        matvec(Self::t(data, &lm_head), cfg.vocab, d, &xf, &mut logits);
+        Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
         prof.t_lm_head += tm.elapsed().as_secs_f64();
         if hd_on {
             // per-layer rms was taken on the LAST position (the one the
@@ -3609,5 +3745,41 @@ mod dot_simd_tests {
         eprintln!("kda_prefill chunked vs forward: max|dO|={:.3e}  max|dS|={:.3e}", max_o, max_s);
         assert!(max_o < 1e-4, "layer output deviation {}", max_o);
         assert!(max_s < 1e-4, "recurrence state deviation {}", max_s);
+    }
+}
+
+#[cfg(test)]
+mod q8head_tests {
+    use super::Q8Head;
+
+    struct Rng(u64);
+    impl Rng {
+        fn f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) as f64 / u64::MAX as f64 - 0.5) as f32
+        }
+    }
+
+    /// The q8 lm_head projection must track the f32 matvec: max error small
+    /// relative to the logit span, and identical argmax (the greedy token).
+    #[test]
+    fn q8head_matches_f32() {
+        let (rows, cols) = (512usize, 1024usize); // multi-job split (>60k MACs)
+        let mut rng = Rng(0xC0FFEE);
+        let w: Vec<f32> = (0..rows * cols).map(|_| rng.f32() * 0.02).collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.f32()).collect();
+        let h = Q8Head::from_f32(&w, rows, cols);
+        let mut got = vec![0f32; rows];
+        let mut want = vec![0f32; rows];
+        h.matvec(&x, &mut got);
+        super::matvec_cpu(&w, rows, cols, &x, &mut want);
+        let span = want.iter().map(|v| v.abs()).fold(0f32, f32::max) as f64;
+        let max_err = got.iter().zip(&want).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0f64, f64::max);
+        assert!(max_err / span < 1e-2, "q8 head max err {} vs span {}", max_err, span);
+        let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        assert_eq!(am(&got), am(&want), "q8 head argmax differs from f32");
     }
 }
