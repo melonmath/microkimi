@@ -1279,8 +1279,8 @@ pub(crate) fn mla_attn_flash(cfg: &Config, k: &[f32], v: &[f32], qh: &[f32], h: 
     }
 }
 
-/// True when MICROKIMI_NO_MQA=1 (A/B toggle: per-head flash loop instead of
-/// the all-heads MQA-style kernel).
+/// True when MICROKIMI_NO_MQA=1 (A/B toggle: per-head flash loops instead of
+/// the all-heads MQA-style kernels, f32 and q8 alike).
 fn no_mqa() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var("MICROKIMI_NO_MQA").map(|v| v == "1").unwrap_or(false))
@@ -1640,6 +1640,128 @@ pub(crate) fn mla_attn_flash_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize
     }
 }
 
+/// MQA-style flash attention over the q8_0 KV cache for ALL heads at once:
+/// the tile-outer / head-inner restructure of mla_attn_flash_q8, exactly
+/// like mla_attn_flash_mqa is for mla_attn_flash. The per-head q8 loop
+/// re-streams the whole quantized cache once PER HEAD; here one position's
+/// row (all heads' latent slices contiguous in kq/ks, the shared rope row,
+/// then all heads' V slices in vq/vs) is consumed while it is hot, so the
+/// cache is streamed exactly ONCE per token. The integer latent dot is
+/// unchanged (q8 query x q8 cache row via q8::block_dot_i8, per-block scale
+/// product): for a fixed position the head-inner loop keeps every head's q8
+/// query (H * nope bytes, L1-resident) against the streamed row.
+///
+/// Bit-identical to the per-head mla_attn_flash_q8 loop BY CONSTRUCTION:
+/// each head keeps its own online-softmax state and sees the exact same
+/// tile sequence, the same integer dots (exact int32) and the same f32
+/// operations in the same order; only the interleaving across independent
+/// heads changes. `q` is [H * (nope+rope)], `attn` (zeroed) is [H * vd].
+pub(crate) fn mla_attn_flash_q8_mqa(cfg: &Config, c: &MlaCache, q: &[f32], pos: usize, scale: f32, attn: &mut [f32]) {
+    let (nh, nope, rope, vd) = (cfg.mla_heads, cfg.mla_nope, cfg.mla_rope, cfg.mla_v);
+    let had = c.had && nope % 64 == 0 && vd % 64 == 0;
+    let hd = nope + rope;
+    let nb = nope / 32;
+    let nbv = vd / 32;
+    // query prep, per head: latent part (Hadamard-rotated when enabled)
+    // quantized to q8 - the exact prep of mla_attn_flash_q8
+    let mut qqs = Vec::with_capacity(nh);
+    for h in 0..nh {
+        let mut qnope = q[h * hd..h * hd + nope].to_vec();
+        if had {
+            for b in qnope.chunks_mut(64) {
+                hadamard64(b);
+            }
+        }
+        qqs.push(crate::q8::quantize_q8(&qnope));
+    }
+    let had_k = if had { 1.0 / 64.0 } else { 1.0 };
+    let mut m = vec![f32::NEG_INFINITY; nh]; // running max per head
+    let mut l = vec![0f32; nh]; // running normalizer per head
+    let mut scores = vec![0f32; nh * FLASH_KV]; // head-major tile scores
+    let mut vtile = vec![0f32; vd]; // one head's dequantized V row
+    let mut t = 0usize;
+    while t <= pos {
+        let end = (t + FLASH_KV - 1).min(pos);
+        let tn = end - t + 1;
+        // scores of every head over the tile: the position's K row (rope
+        // shared + all latent slices, contiguous) is read once
+        for (i, j) in (t..=end).enumerate() {
+            let kr = &c.kr[j * rope..(j + 1) * rope];
+            let kq = &c.kq[j * nh * nope..(j + 1) * nh * nope];
+            let ks = &c.ks[j * nh * nb..(j + 1) * nh * nb];
+            for h in 0..nh {
+                // rope dot (f32) + latent dot (integer, per-block scale
+                // product): the same operations, in the same order, as
+                // mla_attn_flash_q8
+                let mut s = dot(&q[h * hd + nope..(h + 1) * hd], kr);
+                let qq = &qqs[h];
+                let mut acc = 0f32;
+                for g in 0..nb {
+                    let d = crate::q8::block_dot_i8(&kq[h * nope + g * 32..h * nope + g * 32 + 32], &qq.q[g * 32..g * 32 + 32]);
+                    acc += qq.scales[g] * ks[h * nb + g] * d as f32;
+                }
+                s += had_k * acc;
+                scores[h * FLASH_KV + i] = s * scale;
+            }
+        }
+        // per-head online-softmax update: the exact tile body of
+        // mla_attn_flash_q8, same order, same values
+        for h in 0..nh {
+            let sh = &mut scores[h * FLASH_KV..h * FLASH_KV + tn];
+            let tm = sh.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x));
+            let m_new = m[h].max(tm);
+            let corr = (m[h] - m_new).exp();
+            let mut tile_l = 0f32;
+            for s in sh.iter_mut() {
+                *s = (*s - m_new).exp();
+                tile_l += *s;
+            }
+            let oh = &mut attn[h * vd..(h + 1) * vd];
+            for d in 0..vd {
+                oh[d] *= corr;
+            }
+            l[h] = l[h] * corr + tile_l;
+            m[h] = m_new;
+        }
+        // V accumulation: the position's V row (all heads' slices,
+        // contiguous) is read once, dequantized head by head (Hadamard
+        // domain when enabled: the accumulators are de-rotated at the end)
+        for (i, j) in (t..=end).enumerate() {
+            let vq = &c.vq[j * nh * vd..(j + 1) * nh * vd];
+            let vs = &c.vs[j * nh * nbv..(j + 1) * nh * nbv];
+            for h in 0..nh {
+                for g in 0..nbv {
+                    let sc = vs[h * nbv + g];
+                    for d2 in 0..32 {
+                        vtile[g * 32 + d2] = vq[h * vd + g * 32 + d2] as f32 * sc;
+                    }
+                }
+                let p = scores[h * FLASH_KV + i];
+                let oh = &mut attn[h * vd..(h + 1) * vd];
+                for d in 0..vd {
+                    oh[d] += p * vtile[d];
+                }
+            }
+        }
+        t = end + 1;
+    }
+    if had {
+        for h in 0..nh {
+            for b in attn[h * vd..(h + 1) * vd].chunks_mut(64) {
+                hadamard64(b);
+                for x in b.iter_mut() {
+                    *x /= 64.0;
+                }
+            }
+        }
+    }
+    for h in 0..nh {
+        for d in 0..vd {
+            attn[h * vd + d] /= l[h];
+        }
+    }
+}
+
 /// Materialized-score reference over the q8_0 cache (MICROKIMI_NO_FLASH
 /// debug path): dequantizes the cache (to_f32) and runs the historical
 /// three-pass structure. Same q8 rounding as mla_attn_flash_q8, same f32
@@ -1711,15 +1833,21 @@ fn mla_forward(
     let mut attn = vec![0f32; cfg.mla_heads * cfg.mla_v];
     let flash = !no_flash();
     if cache.q8 {
-        // q8_0 cache: per-head kernels with the integer latent dot (the
-        // MQA all-heads restructure is f32-only for now)
-        for h in 0..cfg.mla_heads {
-            let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
-            let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
-            if flash {
-                mla_attn_flash_q8(cfg, cache, qh, h, pos, scale, oh);
-            } else {
-                mla_attn_ref_q8(cfg, cache, qh, h, pos, scale, oh);
+        if flash && !no_mqa() {
+            // q8_0 cache, MQA-style: all heads together, the quantized
+            // cache is streamed once (integer latent dot, bit-identical
+            // to the per-head q8 loop)
+            mla_attn_flash_q8_mqa(cfg, cache, &q, pos, scale, &mut attn);
+        } else {
+            // q8_0 cache: per-head kernels with the integer latent dot
+            for h in 0..cfg.mla_heads {
+                let qh = &q[h * cfg.mla_qh()..(h + 1) * cfg.mla_qh()];
+                let oh = &mut attn[h * cfg.mla_v..(h + 1) * cfg.mla_v];
+                if flash {
+                    mla_attn_flash_q8(cfg, cache, qh, h, pos, scale, oh);
+                } else {
+                    mla_attn_ref_q8(cfg, cache, qh, h, pos, scale, oh);
+                }
             }
         }
     } else if flash && !no_mqa() {

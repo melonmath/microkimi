@@ -261,41 +261,96 @@ fn dotbench_cmd() {
             out.iter().map(|&v| v as f64).sum::<f64>()
         );
     }
-    // MLA decode attention at real K3 dims (96 heads, latent 192/head):
-    // per-head flash loop (cache re-streamed per head) vs MQA all-heads
-    // kernel (cache streamed once), synthetic 512-position cache
+    // MLA decode attention at real K3 dims (96 heads, latent 128+64/head, v
+    // 128/head): per-head loops (cache re-streamed per head) vs MQA-style
+    // all-heads kernels (cache streamed once), q8_0 cache vs f32 cache, at
+    // 4k/16k/64k positions. The two q8 kernels share the exact integer dots
+    // and per-head op sequence: their maxdiff must be 0 (bit-identical).
+    // f32 timings are skipped past 16k (the f32 cache would not fit in RAM).
     {
         let mut cfg = crate::config::Config::microkimi();
         cfg.mla_heads = 96; // real K3 head count (micro dims otherwise)
         let (nh, hd, vd) = (cfg.mla_heads, cfg.mla_qh(), cfg.mla_v);
-        let pos = 511usize;
-        let k: Vec<f32> = (0..(pos + 1) * nh * hd).map(|_| next_f32()).collect();
-        let v: Vec<f32> = (0..(pos + 1) * nh * vd).map(|_| next_f32()).collect();
-        let q: Vec<f32> = (0..nh * hd).map(|_| next_f32()).collect();
+        let (nope, rope) = (cfg.mla_nope, cfg.mla_rope);
         let scale = (hd as f32).powf(-0.5);
-        let mut attn = vec![0f32; nh * vd];
-        let t = Instant::now();
-        for h in 0..nh {
-            let (qh, oh) = (&q[h * hd..(h + 1) * hd], &mut attn[h * vd..(h + 1) * vd]);
-            crate::model::mla_attn_flash(&cfg, &k, &v, qh, h, pos, scale, oh);
+        let q: Vec<f32> = (0..nh * hd).map(|_| next_f32()).collect();
+        for &len in &[4096usize, 16384, 65536] {
+            let pos = len - 1;
+            let store_f32 = len <= 16384;
+            let mut c = crate::model::MlaCache {
+                k: Vec::new(),
+                v: Vec::new(),
+                kq: Vec::new(),
+                ks: Vec::new(),
+                kr: Vec::new(),
+                vq: Vec::new(),
+                vs: Vec::new(),
+                q8: true,
+                had: false,
+            };
+            let mut kf: Vec<f32> = Vec::new();
+            let mut vf: Vec<f32> = Vec::new();
+            let mut kr_row = vec![0f32; nh * hd];
+            let mut vr_row = vec![0f32; nh * vd];
+            let mut rope_tmp = vec![0f32; 64];
+            for _j in 0..len {
+                for i in 0..nh * hd {
+                    kr_row[i] = next_f32();
+                }
+                for i in 0..nh * vd {
+                    vr_row[i] = next_f32();
+                }
+                // engine invariant: the rope part of K is shared across heads
+                rope_tmp[..rope].copy_from_slice(&kr_row[nope..nope + rope]);
+                for h in 1..nh {
+                    kr_row[h * hd + nope..h * hd + hd].copy_from_slice(&rope_tmp[..rope]);
+                }
+                c.push(&cfg, &kr_row, &vr_row);
+                if store_f32 {
+                    kf.extend_from_slice(&kr_row);
+                    vf.extend_from_slice(&vr_row);
+                }
+            }
+            let q8_mb = ((c.kq.len() + c.ks.len() * 4 + c.kr.len() * 4 + c.vq.len() + c.vs.len() * 4) as f64) / 1e6;
+            // q8 per-head loop
+            let mut attn = vec![0f32; nh * vd];
+            let t = Instant::now();
+            for h in 0..nh {
+                let (qh, oh) = (&q[h * hd..(h + 1) * hd], &mut attn[h * vd..(h + 1) * vd]);
+                crate::model::mla_attn_flash_q8(&cfg, &c, qh, h, pos, scale, oh);
+            }
+            let dt_q8_head = t.elapsed();
+            // q8 all-heads (MQA-style, integer dot)
+            let mut attn2 = vec![0f32; nh * vd];
+            let t = Instant::now();
+            crate::model::mla_attn_flash_q8_mqa(&cfg, &c, &q, pos, scale, &mut attn2);
+            let dt_q8_mqa = t.elapsed();
+            let maxdiff = attn.iter().zip(&attn2).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
+            print!(
+                "mla decode H={} pos={} (q8 cache {:.0} MB): q8 per-head {:.1} ms  q8 mqa {:.1} ms ({:.1}x)  [maxdiff {:e}]",
+                nh,
+                len,
+                q8_mb,
+                dt_q8_head.as_secs_f64() * 1000.0,
+                dt_q8_mqa.as_secs_f64() * 1000.0,
+                dt_q8_head.as_secs_f64() / dt_q8_mqa.as_secs_f64(),
+                maxdiff
+            );
+            if store_f32 {
+                let f32_mb = (len * nh * (hd + vd) * 4) as f64 / 1e6;
+                let mut attn3 = vec![0f32; nh * vd];
+                let t = Instant::now();
+                crate::model::mla_attn_flash_mqa(&cfg, &kf, &vf, &q, pos, scale, &mut attn3);
+                let dt_f32_mqa = t.elapsed();
+                print!(
+                    "  f32 mqa ({:.0} MB) {:.1} ms  q8-mqa gain {:.0}%",
+                    f32_mb,
+                    dt_f32_mqa.as_secs_f64() * 1000.0,
+                    100.0 * (1.0 - dt_q8_mqa.as_secs_f64() / dt_f32_mqa.as_secs_f64())
+                );
+            }
+            println!();
         }
-        let dt_head = t.elapsed();
-        let mut attn2 = vec![0f32; nh * vd];
-        let t = Instant::now();
-        crate::model::mla_attn_flash_mqa(&cfg, &k, &v, &q, pos, scale, &mut attn2);
-        let dt_mqa = t.elapsed();
-        let maxdiff = attn.iter().zip(&attn2).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0f64, f64::max);
-        let kv_mb = ((pos + 1) * nh * (hd + vd) * 4) as f64 / 1e6;
-        println!(
-            "mla decode H={} pos={} (KV cache {:.0} MB): per-head {:.1} ms  mqa {:.1} ms  ({:.1}x)  [maxdiff {:e}]",
-            nh,
-            pos + 1,
-            kv_mb,
-            dt_head.as_secs_f64() * 1000.0,
-            dt_mqa.as_secs_f64() * 1000.0,
-            dt_head.as_secs_f64() / dt_mqa.as_secs_f64(),
-            maxdiff
-        );
     }
     // gemm_batch (batched prefill projections): position-major GEMM
     for (rows, cols, n) in [(512usize, 512usize, 600usize), (896, 512, 600)] {        let w: Vec<f32> = (0..rows * cols).map(|_| next_f32()).collect();

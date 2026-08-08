@@ -708,8 +708,10 @@ pub fn run_flash() {
 /// 1 / 7 / 64 / 65 / 512, with and without the Hadamard rotation. The
 /// reference is mla_attn_flash on the f32 rows; the q8 path is
 /// mla_attn_flash_q8 on a q8 cache filled by MlaCache::push. Also covered:
-/// an outlier-spiked latent row (Hadamard's home turf) and the
-/// ref-vs-flash consistency of the q8 kernels themselves. Tolerance 1e-3
+/// the BIT-IDENTITY of the all-heads q8 MQA kernel (mla_attn_flash_q8_mqa)
+/// against the per-head q8 loop (to_bits, every case), an outlier-spiked
+/// latent row (Hadamard's home turf) and the ref-vs-flash consistency of
+/// the q8 kernels themselves. Tolerance 1e-3
 /// relative (the q8 deal: dx/2 per element); the measured gaps are printed.
 pub fn run_kvq8() {
     println!("q8_0 MLA KV cache vs f32 cache (tol 1e-3 rel)");
@@ -769,6 +771,22 @@ pub fn run_kvq8() {
         }
         let q: Vec<f32> = (0..nh * hd).map(|i| pattern(i + 4242)).collect();
         let pos = len - 1;
+        // the MQA-style all-heads q8 kernel must be BIT-IDENTICAL to the
+        // per-head q8 flash loop (same per-head op sequence, exact integer
+        // dots - verified to_bits)
+        {
+            let mut per_head = vec![0f32; nh * vd];
+            for h in 0..nh {
+                let qh = &q[h * hd..(h + 1) * hd];
+                let oh = &mut per_head[h * vd..(h + 1) * vd];
+                crate::model::mla_attn_flash_q8(&cfg, &c, qh, h, pos, scale, oh);
+            }
+            let mut mqa = vec![0f32; nh * vd];
+            crate::model::mla_attn_flash_q8_mqa(&cfg, &c, &q, pos, scale, &mut mqa);
+            for (x, y) in mqa.iter().zip(&per_head) {
+                assert_eq!(x.to_bits(), y.to_bits(), "{}: q8 MQA kernel not bit-identical", label);
+            }
+        }
         // hard check: the quantize/dequantize roundtrip (to_f32) stays within
         // the q8_0 bound dx/2 per element (dx = block max|x|/127; Hadamard:
         // dx' of the rotated block, the inverse rotation spreads but never
