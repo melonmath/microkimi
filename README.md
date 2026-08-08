@@ -58,7 +58,7 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | feature | what it does (measured, not promised) |
 |---|---|
 | MoE expert streaming | `--stream` keeps expert blobs on disk and fetches on demand (LRU + rollover in RAM), offset-sorted reads, direct I/O auto-detected: O_DIRECT on Linux, F_NOCACHE on macOS (`MICROKIMI_NO_ODIRECT=1` to A/B) |
-| Markov prefetch | `--stream-predict N` pre-fetches the experts the router is likely to pick next; `microkimi cachereplay <trace>` replays a recorded request trace offline under LRU / Belady / Markov policies (record with `MICROKIMI_TRACE=trace.bin`) |
+| Markov prefetch | `--stream-predict N` pre-fetches the experts the router is likely to pick next; `microkimi cachereplay <trace>` replays a recorded request trace offline under LRU / LFU / ARC / Belady / Markov policies (record with `MICROKIMI_TRACE=trace.bin`); the live eviction policy is selected with `MICROKIMI_CACHE=arc|lru|lfu` (default lfu) |
 | mmap demand-paging | models are mapped, not loaded: the kernel pages weights on demand, so a model larger than RAM still runs (`MICROKIMI_NO_MMAP=1` for the old full-load path) |
 | microquant | `microkimi slice --cold-vq N` keeps all experts but requantizes the coldest to 0.5-bit VQ - measured better than deleting them (30.6% vs 19.1% top-1 parity with the full model) |
 | structural slicing | `microkimi slice` prunes layers / hidden channels / experts (`--layers --hidden --experts`) and vocabulary (`--vocab-top`) from a .bin or straight from remote safetensors; crash-safe resume (`.sliceckpt`) and a persistent expert-score cache |

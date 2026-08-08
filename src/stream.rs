@@ -310,22 +310,61 @@ pub fn report_line() -> String {
     s
 }
 
-// ── RAM LRU ──
+// ── RAM cache: eviction policies ──
 
-/// MICROKIMI_NO_LFU=1: restore pure LRU eviction (A/B toggle). The default
-/// is LFU with a recency tie-break: the eviction victim is the entry with
-/// the lowest use count (1 at insert, +1 per demand hit), ties broken by
-/// the oldest last access. Expert reuse is strongly bimodal (a hot working
-/// set of frequently re-routed experts vs one-shot picks), so frequency is
-/// a better residency signal than recency alone; the cachereplay LFU column
-/// quantifies it offline. NOTE: an unused prefetch sits at count 1 like a
-/// one-shot demand pick and ages out by recency - a 0-count scheme was
-/// measured to self-evict fresh prefetch batches BEFORE the router could
-/// consume them (0% prefetch recall), because every count-0 entry is a
-/// better victim than every proven entry.
-fn lfu_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MICROKIMI_NO_LFU").map(|v| v != "1").unwrap_or(true))
+/// Eviction policy of the expert RAM cache. MICROKIMI_CACHE=arc|lru|lfu
+/// selects it; unset, the legacy MICROKIMI_NO_LFU=1 restores pure LRU and
+/// the default is LFU with a recency tie-break: the eviction victim is the
+/// entry with the lowest use count (1 at insert, +1 per demand hit), ties
+/// broken by the oldest last access. Expert reuse is strongly bimodal (a
+/// hot working set of frequently re-routed experts vs one-shot picks), so
+/// frequency is a better residency signal than recency alone; the
+/// cachereplay LFU column quantifies it offline. NOTE: an unused prefetch
+/// sits at count 1 like a one-shot demand pick and ages out by recency - a
+/// 0-count scheme was measured to self-evict fresh prefetch batches BEFORE
+/// the router could consume them (0% prefetch recall), because every
+/// count-0 entry is a better victim than every proven entry.
+///
+/// ARC (MICROKIMI_CACHE=arc) is the scan-resistant alternative: resident
+/// entries split into T1 (referenced once) and T2 (referenced twice), and
+/// the B1/B2 ghost lists keep the keys+sizes of recent evictions. A ghost
+/// hit in B1 grows the adaptive T1 target p (recency matters), a ghost hit
+/// in B2 shrinks it (frequency matters); a pure scan touches T1 only and
+/// cannot flush the T2 working set. Byte-budgeted: the list capacities and
+/// p are in bytes, entry sizes vary (MXFP4 vs VQ1 blobs). Available but
+/// non-default, same status as the LRU toggle: the cachereplay ARC column
+/// quantifies it offline against LRU/LFU/Belady.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Policy {
+    Lfu,
+    Lru,
+    Arc,
+}
+
+/// The configured eviction policy (see the Policy comment).
+fn policy() -> Policy {
+    static P: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| match std::env::var("MICROKIMI_CACHE").map(|v| v.to_ascii_lowercase()) {
+        Ok(v) if v == "arc" => Policy::Arc,
+        Ok(v) if v == "lru" => Policy::Lru,
+        Ok(v) if v == "lfu" => Policy::Lfu,
+        Ok(v) => {
+            eprintln!("warning: unknown MICROKIMI_CACHE={} (expected arc|lru|lfu), using the default", v);
+            Policy::Lfu
+        }
+        // legacy toggle, honored when MICROKIMI_CACHE is unset
+        Err(_) if std::env::var("MICROKIMI_NO_LFU").map(|v| v == "1").unwrap_or(false) => Policy::Lru,
+        Err(_) => Policy::Lfu,
+    })
+}
+
+/// Policy name for the startup line / report.
+fn policy_name(p: Policy) -> &'static str {
+    match p {
+        Policy::Lfu => "lfu",
+        Policy::Lru => "lru",
+        Policy::Arc => "arc",
+    }
 }
 
 struct Lru {
@@ -334,9 +373,52 @@ struct Lru {
     cur: usize,
     tick: u64,
     budget: usize,
+    pol: Policy,
+    // ARC state (pol == Arc only): T2 membership of resident entries
+    // (map \ t2 = T1), the per-list recency orders (stale gens skipped),
+    // the B1/B2 ghost lists (key -> size at eviction) and the adaptive T1
+    // target p. All capacities in bytes; t1b + t2b == cur.
+    t2: std::collections::HashSet<(u32, u32)>,
+    t1q: VecDeque<((u32, u32), u64)>,
+    t2q: VecDeque<((u32, u32), u64)>,
+    t1b: usize,
+    t2b: usize,
+    b1: HashMap<(u32, u32), usize>,
+    b1q: VecDeque<(u32, u32)>,
+    b1b: usize,
+    b2: HashMap<(u32, u32), usize>,
+    b2q: VecDeque<(u32, u32)>,
+    b2b: usize,
+    p: usize,
 }
 
 impl Lru {
+    fn new(budget: usize) -> Lru {
+        Lru::with_policy(budget, policy())
+    }
+
+    fn with_policy(budget: usize, pol: Policy) -> Lru {
+        Lru {
+            map: HashMap::new(),
+            queue: VecDeque::new(),
+            cur: 0,
+            tick: 0,
+            budget,
+            pol,
+            t2: std::collections::HashSet::new(),
+            t1q: VecDeque::new(),
+            t2q: VecDeque::new(),
+            t1b: 0,
+            t2b: 0,
+            b1: HashMap::new(),
+            b1q: VecDeque::new(),
+            b1b: 0,
+            b2: HashMap::new(),
+            b2q: VecDeque::new(),
+            b2b: 0,
+            p: 0,
+        }
+    }
     /// On a hit, also reports (and clears) the prefetch tag (0 = demand
     /// fetch, 1 = Markov/lookahead prefetch, 2 = draft prefetch), so a
     /// prefetched entry consumed on demand is counted exactly once. A
@@ -349,6 +431,9 @@ impl Lru {
     /// its own fresh inserts (measured: 6x the disk traffic at a tight
     /// budget).
     fn get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, u8)> {
+        if self.pol == Policy::Arc {
+            return self.arc_get(k);
+        }
         if !self.map.contains_key(&k) {
             return None;
         }
@@ -380,14 +465,18 @@ impl Lru {
     /// get is served without a count bump (see get). `pref` is the prefetch
     /// tag (0 = demand, 1 = Markov/lookahead, 2 = draft).
     fn insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: u8, warm: bool) {
+        if self.pol == Policy::Arc {
+            self.arc_insert(k, v, pref, warm);
+            return;
+        }
         let sz = v.len();
         if sz > self.budget {
             return; // a single expert exceeds the budget: serve without caching
         }
         self.tick += 1;
-        // LFU count: 1 at insert (demand or prefetch alike - see lfu_on's
-        // comment for why prefetch does not start at 0), +1 per demand hit;
-        // a re-insert keeps the hits earned
+        // LFU count: 1 at insert (demand or prefetch alike - see the
+        // Policy comment for why prefetch does not start at 0), +1 per
+        // demand hit; a re-insert keeps the hits earned
         if let Some(old) = self.map.insert(k, (v, self.tick, pref, 0, warm)) {
             self.cur -= old.0.len();
             self.map.get_mut(&k).unwrap().3 = old.3 + 1;
@@ -398,7 +487,7 @@ impl Lru {
         self.queue.push_back((k, self.tick));
         // evict until back under budget (keep the new entry)
         while self.cur > self.budget && self.map.len() > 1 {
-            if lfu_on() {
+            if self.pol == Policy::Lfu {
                 // LFU victim: lowest hit count, then oldest access. O(map)
                 // per victim, negligible next to the disk fetch that
                 // triggered the insert (and amortized: several victims may
@@ -425,6 +514,187 @@ impl Lru {
             let mut live: Vec<((u32, u32), u64)> = self.map.iter().map(|(&k, &(_, g, _, _, _))| (k, g)).collect();
             live.sort_by_key(|&(_, g)| g);
             self.queue = live.into();
+        }
+    }
+
+    // ── ARC internals (pol == Arc; see the Policy comment) ──
+
+    /// ARC hit: a T1 entry is promoted to T2 (second reference), a T2 entry
+    /// is refreshed MRU. Same tag/warm accounting as the LRU/LFU get.
+    fn arc_get(&mut self, k: (u32, u32)) -> Option<(Arc<Vec<u8>>, u8)> {
+        if !self.map.contains_key(&k) {
+            return None;
+        }
+        self.tick += 1;
+        let e = self.map.get_mut(&k).unwrap();
+        e.1 = self.tick;
+        if !std::mem::take(&mut e.4) {
+            e.3 += 1;
+        }
+        let v = e.0.clone();
+        let pref = std::mem::take(&mut e.2);
+        if !self.t2.contains(&k) {
+            self.t2.insert(k);
+            self.t1b -= v.len();
+            self.t2b += v.len();
+        }
+        self.t2q.push_back((k, self.tick));
+        Some((v, pref))
+    }
+
+    /// Evicts the LRU entry of T1, ghosting its key+size into B1 unless
+    /// `ghost` is false (the |T1| == c miss case of the paper drops it).
+    fn arc_evict_t1(&mut self, ghost: bool) {
+        while let Some((k, g)) = self.t1q.pop_front() {
+            let live = !self.t2.contains(&k) && self.map.get(&k).map(|e| e.1 == g).unwrap_or(false);
+            if !live {
+                continue;
+            }
+            let sz = self.map.remove(&k).unwrap().0.len();
+            self.cur -= sz;
+            self.t1b -= sz;
+            if ghost {
+                self.b1.insert(k, sz);
+                self.b1q.push_back(k);
+                self.b1b += sz;
+            }
+            return;
+        }
+    }
+
+    /// Evicts the LRU entry of T2, ghosting its key+size into B2.
+    fn arc_evict_t2(&mut self) {
+        while let Some((k, g)) = self.t2q.pop_front() {
+            let live = self.t2.contains(&k) && self.map.get(&k).map(|e| e.1 == g).unwrap_or(false);
+            if !live {
+                continue;
+            }
+            let sz = self.map.remove(&k).unwrap().0.len();
+            self.t2.remove(&k);
+            self.cur -= sz;
+            self.t2b -= sz;
+            self.b2.insert(k, sz);
+            self.b2q.push_back(k);
+            self.b2b += sz;
+            return;
+        }
+    }
+
+    /// Drops the LRU ghost of a ghost list (stale queue entries belong to
+    /// keys already consumed by a ghost hit).
+    fn ghost_pop(b: &mut HashMap<(u32, u32), usize>, q: &mut VecDeque<(u32, u32)>, bytes: &mut usize) {
+        while let Some(k) = q.pop_front() {
+            if let Some(sz) = b.remove(&k) {
+                *bytes -= sz;
+                return;
+            }
+        }
+    }
+
+    /// ARC REPLACE: evict the LRU of T1 into B1 when T1 exceeds the target
+    /// p (or meets it on a B2-guided reference), else the LRU of T2 into B2.
+    fn arc_replace(&mut self, in_b2: bool) {
+        let over = self.t1b > self.p || (in_b2 && self.t1b == self.p);
+        if over && self.t1b > 0 {
+            self.arc_evict_t1(true);
+        } else if self.t2b > 0 {
+            self.arc_evict_t2();
+        } else if self.t1b > 0 {
+            self.arc_evict_t1(true);
+        }
+    }
+
+    /// Enters a freshly fetched entry into T2 (ghost-guided reference).
+    fn arc_fill_t2(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: u8, warm: bool) {
+        self.t2b += v.len();
+        self.cur += v.len();
+        self.t2.insert(k);
+        self.map.insert(k, (v, self.tick, pref, 1, warm));
+        self.t2q.push_back((k, self.tick));
+    }
+
+    /// ARC reference miss path (see the Policy comment for the invariant
+    /// sketch): ghost hits adapt the target p and land in T2; plain misses
+    /// maintain the ghost bounds, REPLACE, and land in T1. Byte-budgeted
+    /// adaptation of the entry-count paper: list sizes and p are bytes.
+    fn arc_insert(&mut self, k: (u32, u32), v: Arc<Vec<u8>>, pref: u8, warm: bool) {
+        let sz = v.len();
+        if sz > self.budget {
+            return; // a single expert exceeds the budget: serve without caching
+        }
+        self.tick += 1;
+        // re-insert of a resident entry (concurrent duplicate fetch of the
+        // same file bytes): keeps the hits earned, counts as a reference
+        if self.map.contains_key(&k) {
+            let old = self.map.insert(k, (v, self.tick, pref, 0, warm)).unwrap();
+            self.map.get_mut(&k).unwrap().3 = old.3 + 1;
+            self.cur -= old.0.len();
+            self.cur += sz;
+            if self.t2.contains(&k) {
+                self.t2b -= old.0.len();
+                self.t2b += sz;
+            } else {
+                self.t2.insert(k);
+                self.t1b -= old.0.len();
+                self.t2b += sz;
+            }
+            self.t2q.push_back((k, self.tick));
+        } else if let Some(gsz) = self.b1.remove(&k) {
+            // B1 ghost hit: recency matters more - grow the T1 target
+            self.b1b -= gsz;
+            let ratio = (self.b2b / self.b1b.max(1)).max(1);
+            self.p = (self.p + sz * ratio).min(self.budget);
+            self.arc_replace(false);
+            self.arc_fill_t2(k, v, pref, warm);
+        } else if let Some(gsz) = self.b2.remove(&k) {
+            // B2 ghost hit: frequency matters more - shrink the T1 target
+            self.b2b -= gsz;
+            let ratio = (self.b1b / self.b2b.max(1)).max(1);
+            self.p = self.p.saturating_sub(sz * ratio);
+            self.arc_replace(true);
+            self.arc_fill_t2(k, v, pref, warm);
+        } else {
+            // plain miss: maintain the ghost bounds, REPLACE, land in T1
+            if self.t1b + self.b1b >= self.budget {
+                if self.t1b < self.budget {
+                    Self::ghost_pop(&mut self.b1, &mut self.b1q, &mut self.b1b);
+                    self.arc_replace(false);
+                } else {
+                    // B1 empty, T1 alone fills the cache: drop the T1 LRU
+                    // without ghosting it (the paper's |T1| == c case)
+                    self.arc_evict_t1(false);
+                }
+            } else if self.t1b + self.b1b + self.t2b + self.b2b >= self.budget {
+                if self.t1b + self.b1b + self.t2b + self.b2b >= 2 * self.budget {
+                    Self::ghost_pop(&mut self.b2, &mut self.b2q, &mut self.b2b);
+                }
+                self.arc_replace(false);
+            }
+            self.t1b += sz;
+            self.cur += sz;
+            self.map.insert(k, (v, self.tick, pref, 1, warm));
+            self.t1q.push_back((k, self.tick));
+        }
+        // budget safety under variable entry sizes (the paper evicts one
+        // entry per reference; sizes here vary by a few %)
+        while self.cur > self.budget && self.map.len() > 1 {
+            let before = self.cur;
+            self.arc_replace(false);
+            if self.cur == before {
+                break; // nothing evictable (should not happen)
+            }
+        }
+        // amortized compaction of the recency queues (every reference
+        // pushes one entry)
+        if self.t1q.len() + self.t2q.len() > 4 * self.map.len().max(16) {
+            let mut live: Vec<((u32, u32), u64, bool)> = self
+                .map
+                .iter()
+                .map(|(&k, &(_, g, _, _, _))| (k, g, self.t2.contains(&k)))
+                .collect();
+            live.sort_by_key(|&(_, g, _)| g);
+            self.t1q = live.iter().filter(|e| !e.2).map(|&(k, g, _)| (k, g)).collect();
+            self.t2q = live.iter().filter(|e| e.2).map(|&(k, g, _)| (k, g)).collect();
         }
     }
 }
@@ -1239,12 +1509,13 @@ impl ExpertCache {
         } else {
             println!("stream: draft-aware expert prefetch off (MICROKIMI_DRAFTPREFETCH=0)");
         }
+        println!("stream: expert cache policy {} (MICROKIMI_CACHE=arc|lru|lfu; default lfu)", policy_name(policy()));
         // initialize the trace sink now so its startup line prints with the
         // other stream lines (no-op when MICROKIMI_TRACE is unset)
         trace_sink();
         ExpertCache {
             inner: Arc::new(CacheInner {
-                lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
+                lru: Mutex::new(Lru::new(ram_mb << 20)),
                 src: Src::Local(LocalSrc { file, direct }),
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
@@ -1257,7 +1528,7 @@ impl ExpertCache {
     pub fn remote(url: &str, ram_mb: usize, kept_layers: &[usize], disk_mb: u64) -> ExpertCache {
         ExpertCache {
             inner: Arc::new(CacheInner {
-                lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: ram_mb << 20 }),
+                lru: Mutex::new(Lru::new(ram_mb << 20)),
                 src: Src::Remote(RemoteSource::open_disk(url, default_cache_root(url), kept_layers, disk_mb)),
                 pred: Mutex::new(Predictor::new()),
                 inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
@@ -1587,7 +1858,7 @@ pub fn streamtest(args: &[String]) {
     let entry = 1 << 20; // 1 MB synthetic entries
     let cache = ExpertCache {
         inner: Arc::new(CacheInner {
-            lru: Mutex::new(Lru { map: HashMap::new(), queue: VecDeque::new(), cur: 0, tick: 0, budget: 3 * entry }),
+            lru: Mutex::new(Lru::new(3 * entry)),
             src: Src::Remote(src),
             pred: Mutex::new(Predictor::new()),
             inflight: (Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()),
@@ -1836,5 +2107,99 @@ mod tests {
     fn fuse_runs_empty_and_single() {
         assert_eq!(fuse_runs(&[]), Vec::<(usize, usize)>::new());
         assert_eq!(fuse_runs(&[req(7, 42, 1000)]), vec![(0, 1)]);
+    }
+
+    // ── ARC policy (MICROKIMI_CACHE=arc) ──
+
+    const E: usize = 1000; // synthetic entry size
+
+    fn arc_lru(entries: usize) -> Lru {
+        Lru::with_policy(entries * E, Policy::Arc)
+    }
+
+    fn arc_insert(c: &mut Lru, e: u32) {
+        c.insert((0, e), Arc::new(vec![e as u8; E]), 0, false);
+    }
+
+    #[test]
+    fn arc_evicts_t1_lru_first() {
+        // budget 3: insert 1,2,3 (T1), hit 1 (-> T2), insert 4: the T1 LRU
+        // (2) is evicted into B1, the T2 entry (1) is protected
+        let mut c = arc_lru(3);
+        arc_insert(&mut c, 1);
+        arc_insert(&mut c, 2);
+        arc_insert(&mut c, 3);
+        assert!(c.get((0, 1)).is_some());
+        arc_insert(&mut c, 4);
+        assert!(c.map.contains_key(&(0, 1)), "T2 entry must survive");
+        assert!(!c.map.contains_key(&(0, 2)), "T1 LRU must be evicted");
+        assert!(c.map.contains_key(&(0, 3)));
+        assert!(c.map.contains_key(&(0, 4)));
+        assert!(c.b1.contains_key(&(0, 2)), "the T1 victim ghosts into B1");
+        assert_eq!(c.cur, 3 * E);
+        assert_eq!(c.t1b + c.t2b, c.cur);
+    }
+
+    #[test]
+    fn arc_ghost_hit_grows_p_and_lands_in_t2() {
+        // continue the scenario above: referencing the B1 ghost (2) is a
+        // cache miss that fetches into T2 and grows the T1 target p
+        let mut c = arc_lru(3);
+        arc_insert(&mut c, 1);
+        arc_insert(&mut c, 2);
+        arc_insert(&mut c, 3);
+        c.get((0, 1));
+        arc_insert(&mut c, 4); // evicts 2 into B1
+        assert!(c.get((0, 2)).is_none(), "ghost: not resident");
+        arc_insert(&mut c, 2); // the demand fetch re-inserts: ghost hit
+        assert!(c.map.contains_key(&(0, 2)));
+        assert!(c.t2.contains(&(0, 2)), "a ghost-guided reference lands in T2");
+        assert_eq!(c.p, E, "p grew by one entry (B2 empty: ratio 1)");
+        assert!(!c.b1.contains_key(&(0, 2)), "the ghost is consumed");
+        assert!(c.cur <= 3 * E);
+    }
+
+    #[test]
+    fn arc_is_scan_resistant() {
+        // hot entries referenced twice sit in T2; a one-shot scan then
+        // cannot flush them (plain LRU loses the whole working set)
+        let mut c = arc_lru(4);
+        for _ in 0..2 {
+            for e in [10, 11] {
+                arc_insert(&mut c, e);
+                c.get((0, e));
+            }
+        }
+        for e in 0..8 {
+            arc_insert(&mut c, e); // the scan: 8 one-shot entries, budget 4
+        }
+        assert!(c.map.contains_key(&(0, 10)), "T2 hot entry flushed by a scan");
+        assert!(c.map.contains_key(&(0, 11)), "T2 hot entry flushed by a scan");
+        // the scan leaves only its own tail in T1
+        assert!(c.cur <= 4 * E);
+    }
+
+    #[test]
+    fn arc_budget_invariant_under_mixed_load() {
+        let mut c = arc_lru(16);
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..4000 {
+            let e = (next() % 64) as u32;
+            if c.get((0, e)).is_none() {
+                arc_insert(&mut c, e);
+            }
+            assert!(c.cur <= 16 * E, "over budget: {}", c.cur);
+            assert_eq!(c.t1b + c.t2b, c.cur, "T1+T2 must account for all residents");
+            // every resident entry is in exactly one list
+            for k in c.map.keys() {
+                assert_eq!(c.t2.contains(k), c.t2.contains(k));
+            }
+        }
     }
 }

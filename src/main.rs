@@ -283,6 +283,8 @@ fn main() {
             println!("                        (--spec/--spec-rosa + --stream: experts predicted from the drafted");
             println!("                        tokens are prefetched before the verification pass; output-preserving)");
             println!("                    env MICROKIMI_TRACE=trace.bin records the expert request stream (see cachereplay)");
+            println!("                    env MICROKIMI_CACHE=arc|lru|lfu selects the expert cache eviction policy");
+            println!("                        (default lfu; arc = T1/T2 + ghost lists, scan-resistant, non-default)");
             println!("                    env MICROKIMI_ROUTECMS=sketch.bin records a count-min sketch of the routing");
             println!("                        decisions of the run (4 x 4096 u32, saved on exit; see routestats/cmsinfo)");
             println!("  microkimi routestats \"prompt\" [--model X.bin] [--max-new N] [--out routecms.bin]");
@@ -306,7 +308,7 @@ fn main() {
             println!("  microkimi cache --clean [--repo X] delete cached tensors (one repo or all), prints freed bytes");
             println!("  microkimi cachereplay trace.bin [--top-k K] [--predict N]");
             println!("                                         replay a MICROKIMI_TRACE expert-request trace offline:");
-            println!("                                         hit-rate vs capacity under LRU, Markov prefetch, Belady");
+            println!("                                         hit-rate vs capacity under LRU, LFU, ARC, Markov prefetch, Belady");
             println!("  microkimi metaltest | metaltest-packed | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
         }
     }

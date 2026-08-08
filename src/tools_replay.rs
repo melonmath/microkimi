@@ -17,6 +17,8 @@
 //   - LRU:    plain least-recently-used eviction
 //   - LFU:    lowest demand-hit count evicted first, recency tie-break (the
 //             engine Lru's default eviction, stream.rs)
+//   - ARC:    T1/T2 resident split + B1/B2 ghost lists, adaptive T1 target
+//             (the engine's MICROKIMI_CACHE=arc policy, stream.rs)
 //   - Markov: LRU + the engine's Markov prefetcher (stream.rs Predictor,
 //             driven as-is with N predicted experts per MoE layer)
 //   - Belady: optimal OFFLINE eviction (evict the entry reused farthest in
@@ -110,6 +112,85 @@ fn replay_lfu(trace: &[Key], cap: usize) -> u64 {
                 }
                 map.insert(k, (1, tick));
             }
+        }
+    }
+    hits
+}
+
+/// ARC hit count over the trace at capacity `cap` (entries): the classic
+/// T1/T2 resident split + B1/B2 ghost lists with the adaptive T1 target p -
+/// the same scheme the engine runs under MICROKIMI_CACHE=arc (stream.rs),
+/// in entry counts rather than bytes (uniform entry size per model).
+fn replay_arc(trace: &[Key], cap: usize) -> u64 {
+    if cap == 0 {
+        return 0;
+    }
+    let mut t1: HashMap<Key, u64> = HashMap::new(); // key -> recency tick
+    let mut t2: HashMap<Key, u64> = HashMap::new();
+    let mut b1: HashMap<Key, u64> = HashMap::new();
+    let mut b2: HashMap<Key, u64> = HashMap::new();
+    let mut p = 0usize; // adaptive T1 target
+    let mut tick = 0u64;
+    let mut hits = 0u64;
+    // LRU victim of a tick-stamped list
+    fn lru_of(m: &HashMap<Key, u64>) -> Key {
+        *m.iter().min_by_key(|p| *p.1).unwrap().0
+    }
+    // REPLACE(x, in_b2): evict the T1 LRU into B1 when T1 exceeds p (or
+    // meets it on a B2-guided reference), else the T2 LRU into B2
+    macro_rules! replace {
+        ($in_b2:expr) => {
+            if !t1.is_empty() && (t1.len() > p || ($in_b2 && t1.len() == p)) {
+                let v = lru_of(&t1);
+                t1.remove(&v);
+                b1.insert(v, tick);
+            } else if !t2.is_empty() {
+                let v = lru_of(&t2);
+                t2.remove(&v);
+                b2.insert(v, tick);
+            } else if !t1.is_empty() {
+                let v = lru_of(&t1);
+                t1.remove(&v);
+                b1.insert(v, tick);
+            }
+        };
+    }
+    for &k in trace {
+        tick += 1;
+        if t1.remove(&k).is_some() {
+            hits += 1;
+            t2.insert(k, tick); // second reference: T1 -> T2
+        } else if t2.contains_key(&k) {
+            hits += 1;
+            t2.insert(k, tick);
+        } else if b1.remove(&k).is_some() {
+            p = (p + (b2.len() / b1.len().max(1)).max(1)).min(cap);
+            replace!(false);
+            t2.insert(k, tick);
+        } else if b2.remove(&k).is_some() {
+            p = p.saturating_sub((b1.len() / b2.len().max(1)).max(1));
+            replace!(true);
+            t2.insert(k, tick);
+        } else {
+            if t1.len() + b1.len() >= cap {
+                if t1.len() < cap {
+                    let v = lru_of(&b1);
+                    b1.remove(&v);
+                    replace!(false);
+                } else {
+                    // B1 empty, T1 alone fills the cache: drop the T1 LRU
+                    // without ghosting it
+                    let v = lru_of(&t1);
+                    t1.remove(&v);
+                }
+            } else if t1.len() + b1.len() + t2.len() + b2.len() >= cap {
+                if t1.len() + b1.len() + t2.len() + b2.len() >= 2 * cap {
+                    let v = lru_of(&b2);
+                    b2.remove(&v);
+                }
+                replace!(false);
+            }
+            t1.insert(k, tick);
         }
     }
     hits
@@ -226,23 +307,26 @@ pub fn run(args: &[String]) {
         n_pred
     );
     println!();
-    println!("{:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>12} {:>12}", "capacity", "LRU", "LFU", "Markov", "Belady", "gap B-LRU", "LRU fetches", "Markov fetches");
+    println!("{:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>12} {:>12}", "capacity", "LRU", "LFU", "ARC", "Markov", "Belady", "gap B-LRU", "LRU fetches", "Markov fetches");
     let total = trace.len() as f64;
     let n_req = trace.len() as u64;
     for &cap in &CAPS {
         let lru_h = replay_lru(&trace, cap);
         let lfu_h = replay_lfu(&trace, cap);
+        let arc_h = replay_arc(&trace, cap);
         let (mkv_h, mkv_pref) = replay_markov(&trace, cap, top_k, n_pred);
         let bel_h = replay_belady(&trace, cap);
         let lru = lru_h as f64 / total;
         let lfu = lfu_h as f64 / total;
+        let arc = arc_h as f64 / total;
         let mkv = mkv_h as f64 / total;
         let bel = bel_h as f64 / total;
         println!(
-            "{:>8} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>+9.1}% {:>12} {:>12}",
+            "{:>8} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>+9.1}% {:>12} {:>12}",
             cap,
             100.0 * lru,
             100.0 * lfu,
+            100.0 * arc,
             100.0 * mkv,
             100.0 * bel,
             100.0 * (bel - lru),
@@ -253,6 +337,7 @@ pub fn run(args: &[String]) {
     println!();
     println!("hit rates over {} requests; Belady is the offline optimum for DEMAND-ONLY policies.", trace.len());
     println!("LFU = lowest demand-hit count evicted first, recency tie-break (the engine's default policy).");
+    println!("ARC = T1/T2 + B1/B2 ghosts with the adaptive T1 target (MICROKIMI_CACHE=arc in the engine).");
     println!("Markov is a prefetch policy: its demand hit-rate can exceed Belady at tight capacities;");
     println!("the fetch columns show the bandwidth spent for it (demand misses + prefetches vs misses).");
     println!("capacity unit: cache entries (uniform expert size per model, so entries == byte budget).");
