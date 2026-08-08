@@ -275,6 +275,67 @@ pub fn decay(path: &str, half_life: f64, units: f64, out: &str) -> Result<f64, S
     Ok(factor as f64)
 }
 
+// ── merge_states (experimental): linear interpolation between two states ──
+//
+// `microkimi merge a.mkmem b.mkmem --alpha A --out m.mkmem` writes
+// alpha*A + (1-alpha)*B element-wise over the KDA recurrent states s AND
+// the KDA short conv windows (conv_q/conv_k/conv_v), with the same alpha.
+// The MLA k/v caches are per-position sequences whose lengths generally
+// differ between the two files, and the stored logits belong to one specific
+// continuation: both are taken from file A unchanged.
+//
+// WARNING (honest framing): the KDA recurrence S += (beta k) x delta is not
+// linear in its inputs, so a linear blend of two states is NOT a semantic
+// merge of the two conversations. It is an exploratory hack: alpha=0 and
+// alpha=1 are exact (pure B / pure A), anything in between is an
+// off-distribution state whose behavior is an open experiment.
+
+/// Interpolates two .mkmem files. Refuses to mix states of different models
+/// (fingerprint or layer layout mismatch).
+pub fn merge_interp(a_path: &str, b_path: &str, alpha: f32, out: &str) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err("merge: --alpha must be in [0, 1]".to_string());
+    }
+    let a = parse(a_path)?;
+    let b = parse(b_path)?;
+    if a.header != b.header {
+        return Err(format!(
+            "{}: fingerprint differs from {} - cannot merge states of different models or dims",
+            b_path, a_path
+        ));
+    }
+    let mut layers: Vec<LayerMem> = Vec::with_capacity(a.layers.len());
+    for (i, (la, lb)) in a.layers.into_iter().zip(b.layers.into_iter()).enumerate() {
+        match (la, lb) {
+            (
+                LayerMem::Kda { conv_q: aq, conv_k: ak, conv_v: av, s: as_ },
+                LayerMem::Kda { conv_q: bq, conv_k: bk, conv_v: bv, s: bs },
+            ) => {
+                for (x, y, name) in [(&as_, &bs, "s"), (&aq, &bq, "conv_q"), (&ak, &bk, "conv_k"), (&av, &bv, "conv_v")] {
+                    if x.len() != y.len() {
+                        return Err(format!("merge: KDA layer {} {} length mismatch ({} vs {})", i, name, x.len(), y.len()));
+                    }
+                }
+                let lerp = |x: Vec<f32>, y: &[f32]| -> Vec<f32> {
+                    x.into_iter().zip(y).map(|(u, &v)| alpha * u + (1.0 - alpha) * v).collect()
+                };
+                layers.push(LayerMem::Kda {
+                    conv_q: lerp(aq, &bq),
+                    conv_k: lerp(ak, &bk),
+                    conv_v: lerp(av, &bv),
+                    s: lerp(as_, &bs),
+                });
+            }
+            // MLA caches: sequence state, not interpolable in general; keep A.
+            (m @ LayerMem::Mla { .. }, LayerMem::Mla { .. }) => layers.push(m),
+            _ => return Err(format!("merge: layer {} kind mismatch between the two files", i)),
+        }
+    }
+    let m = MemFile { header: a.header, layers, logits: a.logits };
+    write_mem(&m, out).map_err(|e| format!("cannot write {}: {}", out, e))?;
+    Ok(())
+}
+
 fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
     for x in v {
@@ -409,6 +470,60 @@ mod tests {
         std::fs::remove_file(&src).ok();
     }
 
+    #[test]
+    fn merge_alpha_endpoints_and_midpoint() {
+        let pa = write(&mem(4.0, 16), "merge_a");
+        let pb = write(&mem(2.0, 16), "merge_b");
+        let out = tmp("merge_out");
 
+        // alpha = 1 -> pure A
+        merge_interp(&pa, &pb, 1.0, &out).unwrap();
+        let m = parse(&out).unwrap();
+        assert!(kda_s(&m).iter().all(|&x| (x - 4.0).abs() < 1e-6));
 
+        // alpha = 0 -> pure B
+        merge_interp(&pa, &pb, 0.0, &out).unwrap();
+        let m = parse(&out).unwrap();
+        assert!(kda_s(&m).iter().all(|&x| (x - 2.0).abs() < 1e-6));
+
+        // alpha = 0.5 -> element-wise midpoint, norms included
+        merge_interp(&pa, &pb, 0.5, &out).unwrap();
+        let m = parse(&out).unwrap();
+        let s = kda_s(&m);
+        assert!(s.iter().all(|&x| (x - 3.0).abs() < 1e-6));
+        let (na, nb, nm) = (norm(&vec![4.0f32; 16]), norm(&vec![2.0f32; 16]), norm(s));
+        assert!((nm - (na + nb) / 2.0).abs() < 1e-4);
+        // conv windows are blended with the same alpha
+        match &m.layers[0] {
+            LayerMem::Kda { conv_k, .. } => assert!(conv_k.iter().all(|&x| (x - 3.0).abs() < 1e-6)),
+            _ => unreachable!(),
+        }
+        // MLA caches come from A
+        match &m.layers[1] {
+            LayerMem::Mla { k, .. } => assert_eq!(k, &vec![1.0, 2.0]),
+            _ => unreachable!(),
+        }
+        for p in [&pa, &pb, &out] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn merge_refuses_different_models() {
+        let pa = write(&mem(1.0, 16), "merge_c");
+        let mut other = mem(1.0, 16);
+        other.header[8] = 3; // n_layers 2 -> 3: different fingerprint
+        let pb = write(&other, "merge_d");
+        assert!(merge_interp(&pa, &pb, 0.5, &tmp("merge_bad")).is_err());
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
+    }
+
+    #[test]
+    fn merge_refuses_alpha_out_of_range() {
+        let pa = write(&mem(1.0, 16), "merge_e");
+        assert!(merge_interp(&pa, &pa, 1.5, &tmp("merge_bad2")).is_err());
+        assert!(merge_interp(&pa, &pa, -0.1, &tmp("merge_bad3")).is_err());
+        std::fs::remove_file(&pa).ok();
+    }
 }
