@@ -218,16 +218,18 @@ impl std::ops::Deref for Backing {
 
 // Direct libc FFI (no crate). Constant values verified against the system
 // headers: Linux glibc asm-generic/mman-common.h (PROT_READ 0x1,
-// MADV_RANDOM 1) and bits/mman-linux.h (MAP_PRIVATE 0x02); Apple XNU
-// bsd/sys/mman.h (PROT_READ 0x01, MAP_PRIVATE 0x0002, MADV_RANDOM 1 =
-// POSIX_MADV_RANDOM). Identical values on Linux and macOS. off_t is 64-bit
-// on both x86_64/aarch64 Linux and macOS.
+// MADV_RANDOM 1, MADV_WILLNEED 3) and bits/mman-linux.h (MAP_PRIVATE 0x02);
+// Apple XNU bsd/sys/mman.h (PROT_READ 0x01, MAP_PRIVATE 0x0002, MADV_RANDOM
+// 1 = POSIX_MADV_RANDOM, MADV_WILLNEED 3 = POSIX_MADV_WILLNEED). Identical
+// values on Linux and macOS. off_t is 64-bit on both x86_64/aarch64 Linux
+// and macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mman {
     use std::ffi::c_void;
     pub const PROT_READ: i32 = 0x1;
     pub const MAP_PRIVATE: i32 = 0x2;
     pub const MADV_RANDOM: i32 = 1;
+    pub const MADV_WILLNEED: i32 = 3;
     unsafe extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
@@ -241,13 +243,14 @@ fn no_mmap() -> bool {
     std::env::var("MICROKIMI_NO_MMAP").map(|v| v == "1").unwrap_or(false)
 }
 
-/// Whole-file read-only mapping with a MADV_RANDOM hint (per-token expert
-/// access is sparse over the file; speculative readahead would only pollute
-/// the page cache - the madvise is best-effort). None when mmap is disabled,
-/// unsupported, the file is empty, or the call fails (caller falls back to
-/// reading into a Vec). Alignment: the mapping base is page-aligned and the
-/// format's tensor offsets are 64-aligned, so f32 slices keep at least the
-/// alignment the Vec path had.
+/// Whole-file read-only mapping. None when mmap is disabled, unsupported,
+/// the file is empty, or the call fails (caller falls back to reading into
+/// a Vec). No madvise hint is applied here: the right advice depends on the
+/// access pattern, which only the caller knows (full load reads the routed
+/// experts through the mapping, the streaming load never does - see
+/// advise_random / advise_willneed below). Alignment: the mapping base is
+/// page-aligned and the format's tensor offsets are 64-aligned, so f32
+/// slices keep at least the alignment the Vec path had.
 fn mmap_file(f: &std::fs::File, len: u64) -> Option<Mmap> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -259,7 +262,6 @@ fn mmap_file(f: &std::fs::File, len: u64) -> Option<Mmap> {
         if p.is_null() || p as isize == -1 {
             return None; // MAP_FAILED: Vec fallback
         }
-        unsafe { mman::madvise(p, len as usize, mman::MADV_RANDOM) };
         return Some(Mmap { ptr: p as *mut u8, len: len as usize });
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -267,6 +269,60 @@ fn mmap_file(f: &std::fs::File, len: u64) -> Option<Mmap> {
         let _ = (f, len);
         None
     }
+}
+
+// madvise operates on whole pages and requires a page-aligned address, and
+// the mapping base is page-aligned, so a file range [off, off+len) maps to
+// address range base+off .. base+off+len. The two helpers below differ in
+// how they treat the partial edge pages:
+// - RANDOM on expert spans rounds OUTWARD: the edge pages are almost all
+//   format padding (expert blobs start 4096-aligned, their tails pad to the
+//   next page), so covering the full span costs at most one shared page per
+//   expert.
+// - WILLNEED on spine gaps rounds INWARD: pulling an edge page would fault
+//   in the tail of a neighbor expert blob the stream engine will never read
+//   through the mapping, so the edge pages are left to demand paging.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const PAGE: u64 = 4096;
+
+/// Best-effort madvise over the file range [off, off+len) of the mapping.
+/// `outward` rounds the range to the enclosing pages, `!outward` to the
+/// covered pages only (an empty result advises nothing).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn advise(m: &Mmap, off: u64, len: u64, hint: i32, outward: bool) {
+    let file_end = m.len as u64;
+    let (s, e) = if outward {
+        (off & !(PAGE - 1), (off + len).next_multiple_of(PAGE).min(file_end))
+    } else {
+        (off.next_multiple_of(PAGE), (off + len).min(file_end) & !(PAGE - 1))
+    };
+    if e <= s {
+        return;
+    }
+    unsafe { mman::madvise(m.ptr.add(s as usize) as *mut std::ffi::c_void, (e - s) as usize, hint) };
+}
+
+/// Sorted, merged byte ranges of the routed expert blobs (span ends padded
+/// to the 64-byte format alignment, capped at the file length). Used by the
+/// streaming Vec compaction (open_spine) and by the mmap advice logic.
+fn expert_spans(entries: &HashMap<String, Entry>, file_len: u64) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = entries
+        .iter()
+        .filter(|(n, _)| is_expert_tensor(n))
+        .map(|(_, e)| {
+            let end = (e.offset + e.size).div_ceil(64) * 64;
+            (e.offset, end.min(file_len))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
 }
 
 /// Available RAM in bytes, from /proc/meminfo MemAvailable (Linux). None on
@@ -404,6 +460,18 @@ impl BinFile {
         let (f, config, entries) = read_directory(path);
         let file_len = f.metadata().unwrap().len();
         if let Some(m) = mmap_file(&f, file_len) {
+            // Full load: the routed experts ARE read through this mapping
+            // (sparse per-token picks, so RANDOM on their spans kills the
+            // useless speculative readahead), while the spine (attention,
+            // embeddings, norms, lm_head) is swept sequentially once per
+            // token and keeps the kernel default: sequential readahead.
+            // A whole-file RANDOM here would cap the spine at single-page
+            // faults (measured: a few MB/s instead of 100-200 MB/s of
+            // sequential demand paging). Best-effort, advice only.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            for &(s, e) in &expert_spans(&entries, file_len) {
+                advise(&m, s, e - s, mman::MADV_RANDOM, true);
+            }
             mem_report(file_len, file_len, true);
             return BinFile { data: Backing::Mmap(m), entries, config };
         }
@@ -442,27 +510,35 @@ impl BinFile {
         let expert_bytes: u64 = entries.iter().filter(|(n, _)| is_expert_tensor(n)).map(|(_, e)| e.size).sum();
         let spine_bytes = file_len - expert_bytes;
         if let Some(m) = mmap_file(&f, file_len) {
+            // Streaming load: the experts are pread through the stream
+            // engine's own fd (O_DIRECT/F_NOCACHE when available), so this
+            // mapping serves ONLY the spine, swept sequentially once per
+            // token. No MADV_RANDOM here: it would cap the spine at
+            // single-page faults (measured: a few MB/s instead of 100-200
+            // MB/s of sequential demand paging). Instead, when the RAM
+            // clearly fits the spine, MADV_WILLNEED on the spine gaps asks
+            // the kernel for a background sequential read-in at load time,
+            // replacing the manual warm-up pass. Best-effort, advice only.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let warm = matches!(mem_available(), Some(a) if a > spine_bytes);
+                if warm {
+                    let mut cursor = 0u64;
+                    let gaps = expert_spans(&entries, file_len);
+                    for &(s, e) in &gaps {
+                        advise(&m, cursor, s - cursor, mman::MADV_WILLNEED, false);
+                        cursor = e;
+                    }
+                    advise(&m, cursor, file_len - cursor, mman::MADV_WILLNEED, false);
+                    println!("memory: spine warm-up on (MADV_WILLNEED, background sequential read-in)");
+                }
+            }
             mem_report(file_len, spine_bytes, true);
             return BinFile { data: Backing::Mmap(m), entries, config };
         }
         mem_report(file_len, spine_bytes, false);
         // expert byte ranges held back from RAM (end padded to 64, see above)
-        let mut spans: Vec<(u64, u64)> = entries
-            .iter()
-            .filter(|(n, _)| is_expert_tensor(n))
-            .map(|(_, e)| {
-                let end = (e.offset + e.size).div_ceil(64) * 64;
-                (e.offset, end.min(file_len))
-            })
-            .collect();
-        spans.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
-        for (s, e) in spans {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
-            }
-        }
+        let merged = expert_spans(&entries, file_len);
         // skipped[i] = total expert bytes in merged[0..=i]
         let mut skipped: Vec<u64> = Vec::with_capacity(merged.len());
         let mut acc = 0u64;
