@@ -1,5 +1,7 @@
 // safetensors reading (JSON header + data ranges), for local files
-// (Qwen in the HF cache) and remote shard headers (K3, via range requests).
+// (a model repo in the local HF cache) and remote shard headers (K3,
+// via range requests). Read-only: tensors are located and sliced out,
+// never converted here (conversion lives in quant/weights.rs).
 
 use crate::json::{self, Json};
 use std::collections::HashMap;

@@ -1,5 +1,7 @@
-// Generic mini JSON parser (taken from rustgpt): null, bool, number, string,
-// array, object. Sufficient for safetensors headers, index.json and golden.json.
+// Generic mini JSON parser: null, bool, number, string, array, object.
+// Sufficient for safetensors headers, index.json and golden.json.
+// Not a general JSON library: whole document parsed in memory, no
+// streaming, no validation beyond the grammar.
 
 #[derive(Debug, Clone)]
 pub enum Json {

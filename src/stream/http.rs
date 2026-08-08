@@ -1,5 +1,7 @@
 // HTTP via curl as a subprocess (no TLS in std, so curl is shelled out).
 // Range requests against HuggingFace with redirect following (-L) and retries.
+// Byte-exact pass-through: the response body is delivered untouched, the
+// fetched byte/request counters are observability only.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
