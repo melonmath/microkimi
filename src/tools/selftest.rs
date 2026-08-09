@@ -217,7 +217,7 @@ pub fn run_ds() {
         println!(
             "  {:<28} {}  (packed byte diffs: {}, scale byte diffs: {})",
             "DS fp8 quantize (vs torch)",
-            if n_diff == 0 && n_sdiff == 0 { "OK   " } else { "ÉCHEC" },
+            if n_diff == 0 && n_sdiff == 0 { "OK   " } else { "FAIL " },
             n_diff,
             n_sdiff
         );
@@ -282,9 +282,9 @@ pub fn run_ds2() {
             }
         }
         println!(
-            "  {:<28} {}  (ids exacts: {})",
+            "  {:<28} {}  (exact ids: {})",
             "DS gate top-6 (sqrtsoftplus)",
-            if ids_ok { "OK   " } else { "ÉCHEC" },
+            if ids_ok { "OK   " } else { "FAIL " },
             ids_ok
         );
         ok &= ids_ok;
@@ -301,9 +301,9 @@ pub fn run_ds2() {
             }
             let lok = bad == 0;
             println!(
-                "  {:<28} {}  ({} val. hors tol 1e-5+1e-3·scale)",
+                "  {:<28} {}  ({} values outside 1e-5+1e-3·scale tolerance)",
                 "DS gate weights (renorm ×1.5)",
-                if lok { "OK   " } else { "ÉCHEC" },
+                if lok { "OK   " } else { "FAIL " },
                 bad
             );
             ok &= lok;
@@ -467,9 +467,9 @@ pub fn run_ds3() {
         }
         let lok = bad == 0;
         println!(
-            "  {:<34} {}  max_abs={:.3e} ({} val. hors tol QAT 2e-3+1e-3·scale)",
+            "  {:<34} {}  max_abs={:.3e} ({} values outside QAT 2e-3+1e-3·scale tolerance)",
             label,
-            if lok { "OK   " } else { "ÉCHEC" },
+            if lok { "OK   " } else { "FAIL " },
             worst,
             bad
         );
