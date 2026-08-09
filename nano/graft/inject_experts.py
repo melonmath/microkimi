@@ -125,6 +125,10 @@ def inject(src, dst, pack_path, birth_bias, gate_scale):
 
     cfg = dict(config)
     cfg["n_experts"] = e0 + bands
+    # first injection records the pre-graft bank size; later tools (heal)
+    # use it to tell grafted experts from the original bank. The engine
+    # ignores unknown config keys.
+    cfg.setdefault("graft_base_experts", e0)
     cfg_bytes = json.dumps(cfg).encode()
     dir_size = sum(2 + len(n.encode()) + 1 + 1 + 4 * len(dims) + 8 + 8
                    for n, _, dims, _ in out)
@@ -240,7 +244,8 @@ def selftest():
 
         cfg2, entries2, f2 = read_bin(dst)
         assert cfg2["n_experts"] == 6
-        print("claim 1: config n_experts bumped 4 -> 6")
+        assert cfg2["graft_base_experts"] == 4
+        print("claim 1: config n_experts bumped 4 -> 6, base bank recorded")
 
         e2 = {n: (dt, dims, off, size) for n, dt, dims, off, size in entries2}
         for name, w in ref.items():

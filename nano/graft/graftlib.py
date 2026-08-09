@@ -256,7 +256,7 @@ def neuron_scores(w1_full, w3_full, w_down, h_sample, chunk=2048):
 
 def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
                 rel_lambda=1e-4, holdout=4096, score_sample=16384,
-                chunk=8192, ih=None, idz=None):
+                chunk=8192, ih=None, idz=None, gate_sigma=1.0):
     """Solves host-shaped expert tensors from aligned activations.
 
     h_lat [n, rh]   host latent stream (routed_expert_down_proj output)
@@ -327,10 +327,18 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
         w2, res_w2 = g_w2.solve(rel_lambda)     # [rh, moe_inter]
         # 4) router row: predict the (standardized) size of the projected
         # donor contribution from the router's own input stream
-        mu_t = g_gate.sum_y[0] / g_gate.n
-        sd_t = np.sqrt(max(g_gate.gyy[0, 0] / g_gate.n - mu_t ** 2, 1e-12))
         gate_row, _ = g_gate.solve(rel_lambda)
-        gate_row = (gate_row[0] / sd_t).astype(np.float32)  # zero-mean-ish
+        gate_row = gate_row[0]
+        # normalize the row so its logits sit in a router-typical range:
+        # solved against an arbitrary-scale target, the raw row can put
+        # every logit far outside the host distribution (a sigmoid score
+        # saturated at 1.0 on every token routes the expert everywhere).
+        # exact logit second moment from the grams: E[(g.h)^2] = g Gxx g / n
+        ex2 = float(gate_row @ g_gate.gxx @ gate_row) / g_gate.n
+        mu = float(gate_row @ g_gate.sum_x) / g_gate.n
+        sd = np.sqrt(max(ex2 - mu * mu, 1e-12))
+        gate_row = (gate_row * (gate_sigma / sd)).astype(np.float32)
+        logit_mu = mu * gate_sigma / sd
 
         # 5) holdout: relative error of the final expert vs the target
         hh = np.asarray(h_lat[ih_hold], np.float64)
@@ -341,7 +349,9 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
         rel_hold = float(((pred - yy) ** 2).sum() / denom) if denom > 0 else 0.0
         experts.append((w1.astype(np.float32), w3.astype(np.float32),
                         w2.astype(np.float32), gate_row))
-        diag_bands.append({"res_w2": res_w2, "rel_holdout": rel_hold})
+        diag_bands.append({"res_w2": res_w2, "rel_holdout": rel_hold,
+                           "gate_logit_mu": logit_mu,
+                           "gate_logit_sd": gate_sigma})
 
     diag = {"cka": cka, "res_s_in": res_in, "res_m_out": res_out,
             "n_pairs": n, "holdout": holdout, "bands": diag_bands}
@@ -399,6 +409,10 @@ def selftest():
         and w2.shape == (rh, mi) and gate_row.shape == (d,)
     print("claim 4: host-native shapes "
           f"w1 {w1.shape} w2 {w2.shape} gate {gate_row.shape}")
+
+    sd_log = float(np.std(h_pln[1000:] @ gate_row))
+    print(f"claim 4b: gate logits normalized (std {sd_log:.3f})")
+    assert 0.7 < sd_log < 1.4, sd_log
 
     # anchors: two tokenizations of the same byte stream must pair exactly
     ends_a = np.concatenate([pack_ends(0, [2, 5, 9]), pack_ends(1, [4, 8])])
