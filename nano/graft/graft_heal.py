@@ -145,7 +145,7 @@ def train(model, xs, ms, vocab, device, steps, lr, warmup, clip, batch,
             g["lr"] = lr * min(1.0, s)
         opt.step()
         if step % log_every == 0 or step == steps - 1:
-            log(f"  step {step}: loss {float(loss.detach()):.4f}")
+            log(f"  step {step}: loss {float(loss.detach()):.4f}", flush=True)
     return model
 
 
