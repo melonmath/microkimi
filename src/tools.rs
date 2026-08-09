@@ -5,6 +5,8 @@
 pub mod build;
 pub mod build_ds;
 pub mod eval;
+pub mod parity;
 pub mod replay;
+pub mod selftest;
 pub mod slice;
 pub mod slice_st;

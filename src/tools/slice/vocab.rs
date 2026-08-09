@@ -1,9 +1,9 @@
-// Vocabulary pruning (--vocab-top): keep-set selection and runtime remap (moved from slice.rs).
+// Vocabulary pruning (--vocab-top / --vocab-list): keep-set selection and runtime remap (moved from slice.rs).
 
 use super::score::top_n;
 use crate::config::Config;
 
-// ── vocabulary pruning (--vocab-top) ──
+// ── vocabulary pruning (--vocab-top / --vocab-list) ──
 
 /// Special tokens the runtime remap must carry (NanoTokenizer::load unwraps
 /// all of them but pad).
@@ -126,15 +126,15 @@ pub(super) fn base_vocab_map(model: &str, base_flag: Option<String>, vocab: usiz
     }
     assert!(
         vocab > crate::tokenizer::NUM_BASE as usize,
-        "--vocab-top on an already remapped vocab ({} ids) needs --vocab-base <remap.json> \
+        "vocab pruning on an already remapped vocab ({} ids) needs --vocab-base <remap.json> \
 (or a vocab_nano.json with a matching vocab_size next to the source model) to map rows back to kimi ids",
         vocab
     );
     None
 }
 
-/// Result of the --vocab-top selection: the kept rows plus the runtime remap
-/// file (engine --vocab compatible) to write next to the .bin.
+/// Result of the --vocab-top / --vocab-list selection: the kept rows plus
+/// the runtime remap file (engine --vocab compatible) to write next to the .bin.
 pub(super) struct VocabPlan {
     pub(super) keep: Vec<usize>,                 // old row ids kept, ascending
     pub(super) specials_new: Vec<(String, u32)>, // name -> NEW id (ascending old order)
@@ -142,13 +142,63 @@ pub(super) struct VocabPlan {
     pub(super) remap_json: String,
 }
 
-/// Top-N by frequency + all specials/reserved ids, and the remap JSON.
-pub(super) fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json::Json, cfg: &Config, n_top: usize, freq_path: &str, base_flag: Option<String>) -> VocabPlan {
-    let counts = parse_freqfile(freq_path, cfg.vocab);
+/// Where the vocab keep-set comes from: the N most frequent ids of a
+/// freqfile (--vocab-top), or an explicit id list file (--vocab-list, one
+/// subject token id per line, '#' comments allowed - nano/vocab_cross.py
+/// writes these). Either way the specials/reserved rows are force-kept on
+/// top (in doubt, keep).
+#[derive(Debug, PartialEq)]
+pub(super) enum VocabSelect {
+    TopN(usize, String), // N rows + freqfile path
+    List(String),        // id list file path
+}
+
+/// Parses an id list file (--vocab-list): one token id per line, '#'
+/// comments and blank lines ignored. Ids index the model's CURRENT
+/// vocabulary, same contract as the freqfile.
+pub(super) fn parse_id_list(path: &str, vocab: usize) -> Vec<usize> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("vocab list {} unreadable: {}", path, e));
+    let mut ids = Vec::new();
+    for (ln, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id: usize = line.parse().unwrap_or_else(|_| panic!("vocab list {}:{}: expected one token id per line, got '{}'", path, ln + 1, line));
+        assert!(
+            id < vocab,
+            "vocab list {}: token id {} out of range (model vocab is {}) - the list must index the model's CURRENT vocabulary",
+            path, id, vocab
+        );
+        ids.push(id);
+    }
+    assert!(!ids.is_empty(), "vocab list {}: no token ids", path);
+    ids
+}
+
+/// Top-N by frequency OR an explicit id list, + all specials/reserved ids,
+/// and the remap JSON.
+pub(super) fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json::Json, cfg: &Config, select: &VocabSelect, base_flag: Option<String>) -> VocabPlan {
+    let (mut keep, sel_desc) = match select {
+        VocabSelect::TopN(n_top, freq_path) => {
+            let counts = parse_freqfile(freq_path, cfg.vocab);
+            let scores: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+            let keep = top_n(&scores, (*n_top).min(cfg.vocab));
+            let total: u64 = counts.iter().sum();
+            let covered: u64 = keep.iter().map(|&j| counts[j]).sum();
+            let desc = format!("top-{} by frequency ({:.2}% of the counted token mass)", keep.len(), covered as f64 / total.max(1) as f64 * 100.0);
+            (keep, desc)
+        }
+        VocabSelect::List(list_path) => {
+            let ids = parse_id_list(list_path, cfg.vocab);
+            let desc = format!("{} ids from {}", ids.len(), list_path);
+            (ids, desc)
+        }
+    };
+    keep.sort_unstable();
+    keep.dedup();
+    let n_sel = keep.len();
     let specials_old = known_specials(source_json, cfg);
-    let scores: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
-    let mut keep = top_n(&scores, n_top.min(cfg.vocab));
-    let n_freq = keep.len();
     // specials are never ranked: force-keep them all (in doubt, keep)
     for &(_, id) in &specials_old {
         keep.push(id as usize);
@@ -159,15 +209,12 @@ pub(super) fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json
     }
     keep.sort_unstable();
     keep.dedup();
-    let total: u64 = counts.iter().sum();
-    let covered: u64 = keep.iter().map(|&j| counts[j]).sum();
     println!(
-        "vocab: keeping {}/{} rows (top-{} by frequency + {} special/reserved), {:.2}% of the counted token mass",
+        "vocab: keeping {}/{} rows ({} + {} special/reserved)",
         keep.len(),
         cfg.vocab,
-        n_freq,
-        keep.len() - n_freq,
-        covered as f64 / total.max(1) as f64 * 100.0
+        sel_desc,
+        keep.len() - n_sel,
     );
 
     // old row -> kimi id (through the base remap when the source is remapped)
@@ -199,7 +246,7 @@ pub(super) fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json
     for req in ["bos", "eos", "open", "close", "sep", "end_of_msg", "unk"] {
         assert!(
             specials_new.iter().any(|(n, _)| n == req),
-            "--vocab-top: no '{}' id found (source config specials + kimi constants) - the runtime remap would be unloadable",
+            "vocab pruning: no '{}' id found (source config specials + kimi constants) - the runtime remap would be unloadable",
             req
         );
     }
@@ -222,4 +269,109 @@ pub(super) fn build_vocab_plan(model: &str, out: &str, source_json: &crate::json
     );
     let remap_path = format!("{}.vocab.json", out.strip_suffix(".bin").unwrap_or(out));
     VocabPlan { keep, specials_new, remap_path, remap_json }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique temp dir per test (no crates: process id + name).
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mkim-vocab-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// --vocab-list with exactly the top-N ids must produce the SAME kept set
+    /// as --vocab-top N, with a contiguous new-id remap.
+    #[test]
+    fn vocab_list_matches_top_n() {
+        let cfg = Config::microkimi(); // full Kimi vocab: 163840
+        let dir = tmpdir("list-vs-topn");
+        let model = dir.join("m.bin");
+        let out = dir.join("o.bin");
+        let source_json = crate::json::parse(b"{}");
+        // 1000 ids with distinct deterministic counts
+        let n_ids = 1000usize;
+        let count_of = |i: usize| (i * 7919) % n_ids + 1; // 7919 coprime with 1000: a permutation
+        let freq_path = dir.join("freq.txt");
+        let mut freq = String::from("# synthetic freqfile\n");
+        for i in 0..n_ids {
+            freq.push_str(&format!("{} {}\n", i, count_of(i)));
+        }
+        std::fs::write(&freq_path, &freq).unwrap();
+        // the top-100 ids by frequency, computed independently
+        let n_top = 100usize;
+        let mut ranked: Vec<usize> = (0..n_ids).collect();
+        ranked.sort_by(|&a, &b| count_of(b).cmp(&count_of(a)).then(a.cmp(&b)));
+        let top: Vec<usize> = ranked[..n_top].to_vec();
+        // the list file: same ids, shuffled order, with comments/blanks/dups
+        let list_path = dir.join("keep.txt");
+        let mut list = String::from("# vocab_cross.py keep-list (synthetic)\n\n");
+        for &i in top.iter().rev() {
+            list.push_str(&format!("{}\n", i));
+        }
+        list.push_str(&format!("{} # duplicate\n{}\n", top[0], top[1]));
+        std::fs::write(&list_path, &list).unwrap();
+
+        let m = model.to_str().unwrap();
+        let o = out.to_str().unwrap();
+        let plan_top = build_vocab_plan(m, o, &source_json, &cfg, &VocabSelect::TopN(n_top, freq_path.to_str().unwrap().to_string()), None);
+        let plan_list = build_vocab_plan(m, o, &source_json, &cfg, &VocabSelect::List(list_path.to_str().unwrap().to_string()), None);
+        assert_eq!(plan_top.keep, plan_list.keep, "list of the top-N ids == --vocab-top N keep-set");
+
+        // keep-set content: the top-100 + all specials + the reserved block
+        let keep = &plan_list.keep;
+        assert!(keep.windows(2).all(|w| w[0] < w[1]), "keep-set strictly ascending (contiguous remap)");
+        for &i in &top {
+            assert!(keep.binary_search(&i).is_ok(), "top-N id {} kept", i);
+        }
+        assert!(keep.len() > n_top + 200, "specials + reserved block force-kept on top: {}", keep.len());
+
+        // remap contiguity: every special has a distinct dense new id, and the
+        // remap table has exactly one entry per kept row
+        let remap = crate::json::parse(plan_list.remap_json.as_bytes());
+        let vocab_size = remap.get("vocab_size").and_then(|v| v.as_num()).unwrap() as usize;
+        assert_eq!(vocab_size, keep.len());
+        let n2k = remap.get("nano_to_kimi").and_then(|v| v.as_arr()).unwrap();
+        assert_eq!(n2k.len(), keep.len(), "one remap entry per kept row");
+        let mut new_ids: Vec<u32> = plan_list.specials_new.iter().map(|&(_, id)| id).collect();
+        new_ids.sort_unstable();
+        new_ids.dedup();
+        assert_eq!(new_ids.len(), plan_list.specials_new.len(), "special new ids distinct");
+        assert!(*new_ids.last().unwrap() < keep.len() as u32, "special new ids dense within the new vocab");
+        for (name, old) in [("bos", crate::tokenizer::BOS), ("end_of_msg", crate::tokenizer::END_OF_MSG)] {
+            let new = plan_list.specials_new.iter().find(|(n, _)| n == name).map(|&(_, id)| id).unwrap();
+            assert_eq!(new as usize, keep.binary_search(&(old as usize)).unwrap(), "{} remapped to its dense position", name);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_id_list_basics() {
+        let dir = tmpdir("idlist");
+        let p = dir.join("l.txt");
+        std::fs::write(&p, "# comment\n\n5\n7  \n3\n").unwrap();
+        assert_eq!(parse_id_list(p.to_str().unwrap(), 10), vec![5, 7, 3]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn parse_id_list_rejects_out_of_range() {
+        let dir = tmpdir("idlist-oor");
+        let p = dir.join("l.txt");
+        std::fs::write(&p, "5\n10\n").unwrap();
+        parse_id_list(p.to_str().unwrap(), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected one token id per line")]
+    fn parse_id_list_rejects_garbage() {
+        let dir = tmpdir("idlist-bad");
+        let p = dir.join("l.txt");
+        std::fs::write(&p, "5\nabc\n").unwrap();
+        parse_id_list(p.to_str().unwrap(), 10);
+    }
 }

@@ -6,6 +6,7 @@
 //   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
 //                                                [--merge-experts N]
 //                                                [--vocab-top N <freqfile> [--vocab-base <remap.json>]]
+//                                                [--vocab-list <ids.txt> [--vocab-base <remap.json>]]
 //                                                [--imatrix imatrix.bin [--imatrix-score-only]]
 //                                                [--expert-order=frequency --route-cms sketch.bin]
 //
@@ -41,8 +42,13 @@
 // (they have near-zero corpus frequency but are structural: <|open|>, <|sep|>,
 // <|close|>, <|end_of_msg|>, UNK, PAD...). Detection is conservative: every id
 // of the source config "specials" block is kept, and on a full Kimi vocab
-// (vocab > 163584) the whole reserved block [163584, vocab) is kept. The
-// freqfile ids index the model's CURRENT vocabulary: text format is
+// (vocab > 163584) the whole reserved block [163584, vocab) is kept.
+// --vocab-list FILE is the explicit-set alternative (mutually exclusive with
+// --vocab-top): the kept rows are the subject token ids listed in the file
+// (one per line, '#' comments allowed; nano/vocab_cross.py produces them
+// from cross-model rarity), remapped contiguously exactly like --vocab-top,
+// with the same specials/reserved force-keep on top. The freqfile/list ids
+// index the model's CURRENT vocabulary: freqfile text format is
 // "<token_id> <count>" per line ('#' comments, blank lines ok); a JSON object
 // {"<id>": <count>, ...} is also accepted. nano/count_freq.py builds one from
 // a tokenized corpus (u32/u16 binary + .meta.json sidecar). The output config
@@ -106,7 +112,7 @@ use plan::{expert_plan_key, slice_f32, slice_f32_rows, slice_vocab_rows, Plan};
 use score::{channel_scores, expert_keep_sets, expert_score_map, top_n, ScoreCache};
 use source::{n_rows, role_of, row_chunks, row_width, Role, Source};
 use vq::{vq_quantize_tensor, vq_reservoir};
-use vocab::{build_vocab_plan, VocabPlan};
+use vocab::{build_vocab_plan, VocabPlan, VocabSelect};
 
 use crate::quant::weights::{blob_size, f32_to_bytes, BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_VQ1};
 use std::rc::Rc;
@@ -137,6 +143,31 @@ fn parse_layer_spec(spec: &str, n_layers: usize) -> Vec<usize> {
     keep
 }
 
+/// Parses --vocab-top N <freqfile> / --vocab-list FILE (mutually exclusive).
+fn parse_vocab_select(args: &[String]) -> Result<Option<VocabSelect>, String> {
+    let top = args.iter().position(|a| a == "--vocab-top");
+    let list = args.iter().position(|a| a == "--vocab-list");
+    if top.is_some() && list.is_some() {
+        return Err("--vocab-top and --vocab-list are mutually exclusive (the keep-set comes from a frequency ranking OR an explicit id list)".to_string());
+    }
+    if let Some(i) = top {
+        let n: usize = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .ok_or("--vocab-top needs N (rows to keep) and a freqfile path")?;
+        if n == 0 {
+            return Err("--vocab-top must be >= 1".to_string());
+        }
+        let f = args.get(i + 2).cloned().ok_or("--vocab-top needs a freqfile path after N")?;
+        return Ok(Some(VocabSelect::TopN(n, f)));
+    }
+    if let Some(i) = list {
+        let f = args.get(i + 1).cloned().ok_or("--vocab-list needs a file path (one token id per line)")?;
+        return Ok(Some(VocabSelect::List(f)));
+    }
+    Ok(None)
+}
+
 pub fn run(args: &[String]) {
     let t0 = std::time::Instant::now();
     let Some(model) = value_flag(args, "--model") else {
@@ -163,11 +194,16 @@ pub fn run(args: &[String]) {
     // --vocab-top N <freqfile>: vocabulary pruning (see the header comment).
     // N rows by frequency + every special token; the remap rides next to the
     // .bin as <stem>.vocab.json (engine --vocab compatible).
-    let vocab_top: Option<(usize, String)> = args.iter().position(|a| a == "--vocab-top").map(|i| {
-        let n: usize = args.get(i + 1).and_then(|s| s.parse().ok()).expect("--vocab-top needs N (rows to keep) and a freqfile path");
-        let f = args.get(i + 2).cloned().expect("--vocab-top needs a freqfile path after N");
-        (n, f)
-    });
+    // --vocab-list FILE: same machinery, but the kept id set comes from an
+    // explicit list file (one subject token id per line, '#' comments
+    // allowed; nano/vocab_cross.py writes these). Mutually exclusive.
+    let vocab_select = match parse_vocab_select(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {}", msg);
+            std::process::exit(1);
+        }
+    };
     let vocab_base = value_flag(args, "--vocab-base");
     // --expert-order=frequency --route-cms SKETCH: physical reorder of the
     // expert blobs of every MoE layer by descending routing frequency (the
@@ -200,8 +236,8 @@ pub fn run(args: &[String]) {
         eprintln!("error: {}", msg);
         std::process::exit(1);
     }
-    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() && expert_order_flag.is_none() && merge_experts.is_none() {
-        eprintln!("error: slice needs at least one of --hidden / --experts / --merge-experts / --layers / --cold-vq / --vocab-top / --expert-order");
+    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_select.is_none() && expert_order_flag.is_none() && merge_experts.is_none() {
+        eprintln!("error: slice needs at least one of --hidden / --experts / --merge-experts / --layers / --cold-vq / --vocab-top / --vocab-list / --expert-order");
         std::process::exit(1);
     }
     if let (Some(m), Some(n)) = (experts, cold_vq) {
@@ -306,12 +342,16 @@ pub fn run(args: &[String]) {
     });
 
     // crash-safe resume checkpoint: model + kept layers + pruning params
-    // (vocab-top is part of the key: N and the freqfile content hash)
-    let vocabtop_key = vocab_top
+    // (vocab selection is part of the key: N/list marker + the file content hash)
+    let vocabtop_key = vocab_select
         .as_ref()
-        .map(|(n, f)| {
-            let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("freqfile {} unreadable: {}", f, e));
-            format!("{}:{:016x}", n, fnv1a(&text))
+        .map(|sel| {
+            let (tag, f) = match sel {
+                VocabSelect::TopN(n, f) => (n.to_string(), f),
+                VocabSelect::List(f) => ("list".to_string(), f),
+            };
+            let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("vocab file {} unreadable: {}", f, e));
+            format!("{}:{:016x}", tag, fnv1a(&text))
         })
         .unwrap_or_default();
     let ckpt_key = format!(
@@ -470,11 +510,10 @@ pub fn run(args: &[String]) {
             }
         };
 
-    // ── 3c. vocabulary selection (--vocab-top): cheap, not checkpointed ──
-    let vocab_plan: Option<VocabPlan> = vocab_top.as_ref().map(|(n, freq)| {
-        assert!(*n > 0, "--vocab-top must be >= 1");
-        build_vocab_plan(&model, &out, &source.source_json(), cfg, *n, freq, vocab_base.clone())
-    });
+    // ── 3c. vocabulary selection (--vocab-top / --vocab-list): cheap, not checkpointed ──
+    let vocab_plan: Option<VocabPlan> = vocab_select
+        .as_ref()
+        .map(|sel| build_vocab_plan(&model, &out, &source.source_json(), cfg, sel, vocab_base.clone()));
 
     // ── 4. plan: output tensors in input directory order ──
     let mut plans: Vec<Plan> = Vec::new();
@@ -627,7 +666,7 @@ pub fn run(args: &[String]) {
     let new_n_experts = experts.or(merge_experts).unwrap_or(cfg.n_experts);
     let new_top_k = cfg.top_k.min(new_n_experts);
     let new_vocab = vocab_plan.as_ref().map(|v| v.keep.len()).unwrap_or(cfg.vocab);
-    // specials: with --vocab-top every known special is recorded at its NEW
+    // specials: with vocab pruning every known special is recorded at its NEW
     // id (a re-slice can then find them all again); otherwise the historical
     // bos/end_of_msg pair, unchanged.
     let specials_kv = match &vocab_plan {
@@ -681,7 +720,13 @@ pub fn run(args: &[String]) {
         specials_kv,
         new_d, new_n_experts, kept_layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(","),
         cold_vq.map(|n| format!(", \"cold_vq\": {}", n)).unwrap_or_default(),
-        vocab_top.as_ref().map(|(n, _)| format!(", \"vocab_top\": {}", n)).unwrap_or_default(),
+        vocab_select
+            .as_ref()
+            .map(|sel| match sel {
+                VocabSelect::TopN(n, _) => format!(", \"vocab_top\": {}", n),
+                VocabSelect::List(_) => format!(", \"vocab_list\": {}", vocab_plan.as_ref().unwrap().keep.len()),
+            })
+            .unwrap_or_default(),
         merge_experts.map(|n| format!(", \"merge_experts\": {}", n)).unwrap_or_default(),
     );
     // the expert_order audit table goes in as a top-level key (inserted
@@ -865,4 +910,41 @@ pub fn run(args: &[String]) {
         println!("         run with: microkimi run \"...\" --model {} --vocab {}", out, v.remap_path);
     }
     ckpt.finish();
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn vocab_select_arg_validation() {
+        // neither flag: no vocab pruning
+        assert_eq!(parse_vocab_select(&args(&[])).unwrap(), None);
+        // --vocab-top alone
+        assert_eq!(
+            parse_vocab_select(&args(&["--vocab-top", "100", "freq.txt"])).unwrap(),
+            Some(VocabSelect::TopN(100, "freq.txt".to_string()))
+        );
+        // --vocab-list alone
+        assert_eq!(
+            parse_vocab_select(&args(&["--vocab-list", "keep.txt"])).unwrap(),
+            Some(VocabSelect::List("keep.txt".to_string()))
+        );
+        // mutually exclusive
+        let both = parse_vocab_select(&args(&["--vocab-top", "100", "f.txt", "--vocab-list", "k.txt"]));
+        assert!(both.unwrap_err().contains("mutually exclusive"));
+        let both_rev = parse_vocab_select(&args(&["--vocab-list", "k.txt", "--vocab-top", "100", "f.txt"]));
+        assert!(both_rev.unwrap_err().contains("mutually exclusive"));
+        // missing arguments
+        assert!(parse_vocab_select(&args(&["--vocab-top"])).is_err());
+        assert!(parse_vocab_select(&args(&["--vocab-top", "100"])).is_err());
+        assert!(parse_vocab_select(&args(&["--vocab-top", "NaN", "f.txt"])).is_err());
+        assert!(parse_vocab_select(&args(&["--vocab-top", "0", "f.txt"])).is_err());
+        assert!(parse_vocab_select(&args(&["--vocab-list"])).is_err());
+    }
 }

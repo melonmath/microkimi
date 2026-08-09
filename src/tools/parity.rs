@@ -381,16 +381,16 @@ pub fn run_ds() {
     } else {
         "models/microdeepseek.bin".to_string() // legacy name from older builds
     };
-    let mut model = crate::deepseek::DsModel::load(&bin);
+    let mut model = crate::model::deepseek::DsModel::load(&bin);
     model.reset();
-    crate::deepseek::DS_PARITY.with(|p| *p.borrow_mut() = Some(crate::deepseek::DsParityDump::default()));
+    crate::model::deepseek::DS_PARITY.with(|p| *p.borrow_mut() = Some(crate::model::deepseek::DsParityDump::default()));
     let mut logits = Vec::new();
     let mut logits_all: Vec<Vec<f32>> = Vec::new();
     for (pos, &id) in ids.iter().enumerate() {
         logits = model.forward(id, pos);
         logits_all.push(logits.clone());
     }
-    let dump = crate::deepseek::DS_PARITY.with(|p| p.borrow_mut().take()).expect("dump missing");
+    let dump = crate::model::deepseek::DS_PARITY.with(|p| p.borrow_mut().take()).expect("dump missing");
 
     let mut ok = true;
 
@@ -446,7 +446,7 @@ pub fn run_ds() {
     {
         let gr = golden.get("router").unwrap();
         let mut exact = true;
-        for &l in &crate::deepseek::DS_ROUTER_LAYERS {
+        for &l in &crate::model::deepseek::DS_ROUTER_LAYERS {
             for pos in 0..t_max {
                 let key = format!("{},{}", pos, l);
                 let want: Vec<u32> = arr(gr, &key).iter().map(|&x| x as u32).collect();
@@ -459,7 +459,7 @@ pub fn run_ds() {
         }
         println!(
             "  {:<46} {}",
-            format!("router top-{} (layers {:?}, all pos)", model.cfg.n_activated_experts, crate::deepseek::DS_ROUTER_LAYERS),
+            format!("router top-{} (layers {:?}, all pos)", model.cfg.n_activated_experts, crate::model::deepseek::DS_ROUTER_LAYERS),
             if exact { "OK    (exact match)" } else { "FAIL " }
         );
         ok &= exact;

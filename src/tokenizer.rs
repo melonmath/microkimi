@@ -468,7 +468,7 @@ impl NanoTokenizer {
 pub enum AnyTokenizer {
     Full(Tokenizer),
     Nano(NanoTokenizer),
-    Ds(crate::dstok::DsTokenizer),
+    Ds(crate::model::dstok::DsTokenizer),
     DsNano(DsNanoTokenizer),
 }
 
@@ -476,7 +476,7 @@ pub enum AnyTokenizer {
 /// of the training corpus + contiguous specials), loaded from
 /// vocab_ds_nano.json produced by nano_ds/prepare.py.
 pub struct DsNanoTokenizer {
-    pub full: crate::dstok::DsTokenizer,
+    pub full: crate::model::dstok::DsTokenizer,
     pub vocab_size: usize,
     pub nano_to_ds: Vec<u32>,
     pub ds_to_nano: Vec<u32>, // 129280, out-of-vocab → unk
@@ -486,7 +486,7 @@ pub struct DsNanoTokenizer {
 }
 
 impl DsNanoTokenizer {
-    pub fn load(vocab_path: &str, full: crate::dstok::DsTokenizer) -> Self {
+    pub fn load(vocab_path: &str, full: crate::model::dstok::DsTokenizer) -> Self {
         let bytes = std::fs::read(vocab_path).expect("vocab_ds_nano.json unreadable");
         let j = crate::json::parse(&bytes);
         let nano_to_ds: Vec<u32> = j
@@ -549,8 +549,8 @@ impl DsNanoTokenizer {
                     self.nano_to_ds[id as usize]
                 } else {
                     match id {
-                        x if x == self.bos => crate::dstok::DS_BOS,
-                        x if x == self.eos => crate::dstok::DS_EOS,
+                        x if x == self.bos => crate::model::dstok::DS_BOS,
+                        x if x == self.eos => crate::model::dstok::DS_EOS,
                         _ => 2, // <｜▁pad▁｜> (unused slot)
                     }
                 }
@@ -567,7 +567,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.markers.end_of_msg,
-            AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
+            AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
         }
     }
@@ -597,7 +597,7 @@ impl AnyTokenizer {
                 ids
             }
             AnyTokenizer::Ds(t) => {
-                let mut ids = vec![crate::dstok::DS_BOS];
+                let mut ids = vec![crate::model::dstok::DS_BOS];
                 ids.extend(t.encode(text));
                 ids
             }
@@ -610,7 +610,7 @@ impl AnyTokenizer {
         match self {
             AnyTokenizer::Full(_) => END_OF_MSG,
             AnyTokenizer::Nano(n) => n.eos,
-            AnyTokenizer::Ds(_) => crate::dstok::DS_EOS,
+            AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
         }
     }

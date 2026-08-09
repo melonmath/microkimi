@@ -7,7 +7,7 @@
 // This path is NOT bit-identical to the f32 reference (int32-exact block
 // sums vs f32 accumulation, plus the q8 rounding of x itself): that is the
 // deal. The error is bounded by dx/2 per element and measured in
-// selftest::run_q8 (max rel << 1e-3). MICROKIMI_NO_Q8=1 restores the exact
+// tools::selftest::run_q8 (max rel << 1e-3). MICROKIMI_NO_Q8=1 restores the exact
 // f32 path.
 //
 // Scale convention for mxfp4: the e2m1 LUT contains half-integers (0.5,

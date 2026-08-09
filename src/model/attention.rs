@@ -186,7 +186,7 @@ pub(crate) fn mla_attn_flash_mqa(cfg: &Config, k: &[f32], v: &[f32], q: &[f32], 
 // cache. MICROKIMI_KV_HADAMARD=1 rotates the latent K and V rows with an
 // unnormalized 64-point Walsh-Hadamard transform before quantization
 // (smearing outliers over the block makes q8 near-lossless; measured in
-// selftest::run_kvq8) and inverts the rotation at read: H = H^T with
+// tools::selftest::run_kvq8) and inverts the rotation at read: H = H^T with
 // H.H = 64 I, so one butterfly routine serves both directions.
 
 /// True when the MLA KV cache quantizes to q8_0 (default).
@@ -198,7 +198,7 @@ fn kvq8_on() -> bool {
 
 /// True when MICROKIMI_KV_HADAMARD=1 (Hadamard rotation before KV
 /// quantization; default off - the measured gain on nanokimi is marginal,
-/// see selftest::run_kvq8).
+/// see tools::selftest::run_kvq8).
 fn kv_hadamard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MICROKIMI_KV_HADAMARD").map(|v| v == "1").unwrap_or(false))
@@ -372,7 +372,7 @@ impl MlaCache {
 /// is de-rotated once at the end (linearity: sum of p.V in the Hadamard
 /// domain, then H./64). `oh` must be zeroed. NOT bit-identical to the f32
 /// path: the q8 rounding of K, V and the query is the deal (measured in
-/// selftest::run_kvq8, max rel << 1e-3).
+/// tools::selftest::run_kvq8, max rel << 1e-3).
 pub(crate) fn mla_attn_flash_q8(cfg: &Config, c: &MlaCache, qh: &[f32], h: usize, pos: usize, scale: f32, oh: &mut [f32]) {
     let (nh, nope, rope, vd) = (cfg.mla_heads, cfg.mla_nope, cfg.mla_rope, cfg.mla_v);
     let had = c.had && nope % 64 == 0 && vd % 64 == 0;
