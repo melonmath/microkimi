@@ -11,7 +11,7 @@ float64 sufficient statistics X.T X, X.T Y, the first moments, and the target
 squared norm remain resident. Ridge strength is relative to the mean diagonal
 of X.T X, so it follows both sample count and activation scale.
 
-The output is a NumPy ``.npz`` file containing a balanced truncated-SVD split:
+The output is a NumPy ``.npz`` file containing a balanced low-rank split:
 
     hidden = torch.nn.functional.linear(source, input_weight)
     target = torch.nn.functional.linear(hidden, output_weight, bias)
@@ -21,6 +21,12 @@ shape ``[target_width, rank]``. These are already in PyTorch Linear weight
 orientation. With ``--affine``, the bias is fitted without regularization and
 is recomputed after rank truncation so the factorized map preserves the target
 mean as closely as possible.
+
+By default, rank reduction is performed after whitening with the regularized
+source Gram. This minimizes the same ridge objective as the dense solve under
+the requested rank constraint. ``--rank-metric coefficient`` retains ordinary
+Euclidean SVD truncation of the dense coefficient matrix when that is the
+desired notion of approximation.
 
 Examples:
 
@@ -157,11 +163,16 @@ def ridge_solve(stats, rel_lambda=1e-4, affine=False):
         raise ValueError("source Gram has an invalid diagonal scale")
     ridge_lambda = rel_lambda * (scale if scale > 0 else 1.0)
     system = gxx + ridge_lambda * np.eye(stats.input_width, dtype=np.float64)
-    try:
-        weight_t = np.linalg.solve(system, gxy)
-    except np.linalg.LinAlgError:
-        # rel_lambda=0 intentionally permits an ordinary least-squares fit.
+    if ridge_lambda == 0:
+        # An exactly singular Gram can still pass a numerical solve or
+        # Cholesky with a tiny artificial pivot. Use the minimum-norm path
+        # deliberately for unregularized least squares.
         weight_t = np.linalg.lstsq(system, gxy, rcond=None)[0]
+    else:
+        try:
+            weight_t = np.linalg.solve(system, gxy)
+        except np.linalg.LinAlgError:
+            weight_t = np.linalg.lstsq(system, gxy, rcond=None)[0]
     weight = weight_t.T
     if affine:
         bias = stats.sum_y / stats.n - weight @ (stats.sum_x / stats.n)
@@ -182,6 +193,80 @@ def svd_factors(weight, rank):
     roots = np.sqrt(singular_values[:effective_rank])
     input_weight = roots[:, None] * vt[:effective_rank, :]
     output_weight = u[:, :effective_rank] * roots[None, :]
+    return input_weight, output_weight, singular_values
+
+
+def ridge_metric_factors(stats, rank, ridge_lambda, affine):
+    """Return reduced-rank factors optimal in regularized source geometry.
+
+    Let ``B`` be the source-by-target coefficient and
+    ``G = X.T X + ridge_lambda I`` (using centered X for an affine fit). The
+    ridge objective around its dense optimum is the Frobenius distance between
+    ``G**0.5 B`` and ``G**0.5 B_dense``. Truncating in that whitened space and
+    mapping back through ``G**-0.5`` solves the rank-constrained objective.
+    """
+    if rank <= 0:
+        raise ValueError("rank must be positive")
+    if not np.isfinite(ridge_lambda) or ridge_lambda < 0:
+        raise ValueError("ridge_lambda must be finite and non-negative")
+    gxx, gxy = centered_grams(stats, affine)
+    system = gxx + ridge_lambda * np.eye(
+        stats.input_width, dtype=np.float64
+    )
+    lower = None
+    if ridge_lambda > 0:
+        try:
+            lower = np.linalg.cholesky(system)
+        except np.linalg.LinAlgError:
+            pass
+    if lower is None:
+        # rel_lambda=0 intentionally permits a singular ordinary least-squares
+        # problem. The symmetric pseudoinverse square root keeps only the
+        # source-supported subspace instead of inventing null-space weights.
+        eigenvalues, eigenvectors = np.linalg.eigh(
+            0.5 * (system + system.T)
+        )
+        largest = max(float(eigenvalues[-1]), 0.0)
+        tolerance = (
+            stats.input_width * np.finfo(np.float64).eps * largest
+        )
+        keep = eigenvalues > tolerance
+        if not keep.any():
+            effective_rank = min(
+                int(rank), stats.input_width, stats.output_width
+            )
+            return (
+                np.zeros((effective_rank, stats.input_width), dtype=np.float64),
+                np.zeros((stats.output_width, effective_rank), dtype=np.float64),
+                np.zeros(min(stats.input_width, stats.output_width),
+                         dtype=np.float64),
+            )
+        inverse_sqrt = (
+            (eigenvectors[:, keep] / np.sqrt(eigenvalues[keep]))
+            @ eigenvectors[:, keep].T
+        )
+        whitened = inverse_sqrt @ gxy
+        u, singular_values, vt = np.linalg.svd(
+            whitened, full_matrices=False
+        )
+        effective_rank = min(int(rank), singular_values.size)
+        roots = np.sqrt(singular_values[:effective_rank])
+        source_columns = (
+            inverse_sqrt @ u[:, :effective_rank]
+        ) * roots[None, :]
+    else:
+        # If G = L L.T, then L.T B_dense = solve(L, X.T Y).
+        whitened = np.linalg.solve(lower, gxy)
+        u, singular_values, vt = np.linalg.svd(
+            whitened, full_matrices=False
+        )
+        effective_rank = min(int(rank), singular_values.size)
+        roots = np.sqrt(singular_values[:effective_rank])
+        source_columns = np.linalg.solve(
+            lower.T, u[:, :effective_rank] * roots[None, :]
+        )
+    input_weight = source_columns.T
+    output_weight = vt[:effective_rank, :].T * roots[None, :]
     return input_weight, output_weight, singular_values
 
 
@@ -221,14 +306,22 @@ def relative_residual(stats, weight, bias):
     return max(squared_error, 0.0) / stats.sum_sq_y
 
 
-def solve_bridge(stats, rank=64, rel_lambda=1e-4, affine=False):
+def solve_bridge(stats, rank=64, rel_lambda=1e-4, affine=False,
+                 rank_metric="ridge"):
     """Solve, truncate, and return arrays and scalar metadata for an .npz."""
+    if rank_metric not in ("ridge", "coefficient"):
+        raise ValueError("rank_metric must be 'ridge' or 'coefficient'")
     dense_weight, dense_bias, ridge_lambda = ridge_solve(
         stats, rel_lambda=rel_lambda, affine=affine
     )
-    input_weight, output_weight, singular_values = svd_factors(
-        dense_weight, rank
-    )
+    if rank_metric == "ridge":
+        input_weight, output_weight, singular_values = ridge_metric_factors(
+            stats, rank, ridge_lambda, affine
+        )
+    else:
+        input_weight, output_weight, singular_values = svd_factors(
+            dense_weight, rank
+        )
     # Residual metadata describes the stored float32 factors, not an
     # unattainable float64 intermediate.
     input_weight = input_weight.astype(np.float32)
@@ -245,12 +338,13 @@ def solve_bridge(stats, rank=64, rel_lambda=1e-4, affine=False):
         "output_weight": output_weight,
         "bias": bias,
         "singular_values": singular_values.astype(np.float64),
-        "format_version": np.int64(1),
+        "format_version": np.int64(2),
         "input_width": np.int64(stats.input_width),
         "output_width": np.int64(stats.output_width),
         "rank": np.int64(input_weight.shape[0]),
         "n": np.int64(stats.n),
         "affine": np.bool_(affine),
+        "rank_metric": np.asarray(rank_metric),
         "rel_lambda": np.float64(rel_lambda),
         "ridge_lambda": np.float64(ridge_lambda),
         "dense_relative_residual": np.float64(
@@ -320,11 +414,13 @@ def selftest():
         )
         save_bridge(output_path, archived)
         with np.load(output_path, allow_pickle=False) as loaded:
+            assert int(loaded["format_version"]) == 2
             assert loaded["input_weight"].shape == (true_rank, input_width)
             assert loaded["output_weight"].shape == (output_width, true_rank)
             assert loaded["bias"].shape == (output_width,)
             assert int(loaded["n"]) == rows
             assert bool(loaded["affine"])
+            assert str(loaded["rank_metric"]) == "ridge"
 
     print("activation_bridge selftest OK")
 
@@ -359,6 +455,11 @@ def main():
         help="fit an unregularized output bias",
     )
     parser.add_argument(
+        "--rank-metric", choices=("ridge", "coefficient"), default="ridge",
+        help=("rank reduction geometry: covariance-aware ridge objective "
+              "(default) or Euclidean coefficient SVD"),
+    )
+    parser.add_argument(
         "--chunk-rows", type=int, default=4096,
         help="rows loaded from each input array per block (default: 4096)",
     )
@@ -376,7 +477,7 @@ def main():
         )
         solution = solve_bridge(
             stats, rank=args.rank, rel_lambda=args.rel_lambda,
-            affine=args.affine,
+            affine=args.affine, rank_metric=args.rank_metric,
         )
         output_path = save_bridge(args.out, solution)
     except ValueError as exc:
@@ -385,6 +486,7 @@ def main():
     print(f"paired rows          : {stats.n}")
     print(f"source -> target     : {stats.input_width} -> {stats.output_width}")
     print(f"effective rank       : {int(solution['rank'])}")
+    print(f"rank metric          : {str(solution['rank_metric'])}")
     print(f"absolute ridge       : {float(solution['ridge_lambda']):.6g}")
     print(
         "relative residual   : "
