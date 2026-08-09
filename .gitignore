@@ -28,3 +28,7 @@ vocabs/*.json
 vocabs/*.model
 vocabs/*.txt
 !vocabs/README.md
+
+# agent instructions are local-only, never published
+AGENTS.md
+vocabs/*.tiktoken

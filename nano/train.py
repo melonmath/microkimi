@@ -157,6 +157,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None, help="override n_layers (smoke)")
     ap.add_argument("--experts", type=int, default=None, help="override n_experts (smoke)")
+    ap.add_argument("--vocab", type=int, default=None,
+                    help="override vocabulary size; token bins must match")
+    ap.add_argument("--hidden", type=int, default=None,
+                    help="override hidden size")
+    ap.add_argument("--kda-heads", type=int, default=None,
+                    help="override KDA head count (keep kda_heads*kda_dim ~ hidden)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--steps", type=int, default=8000)
@@ -227,7 +233,9 @@ def main():
     print(f"device: {dev}", flush=True)
     if args.amp and dev != "cuda":
         print("--amp requested but device is not cuda: amp is a no-op (bf16 autocast is cuda-only here)", flush=True)
-    cfg = {k: v for k, v in (("n_layers", args.layers), ("n_experts", args.experts)) if v}
+    cfg = {k: v for k, v in (("n_layers", args.layers), ("n_experts", args.experts),
+                             ("vocab", args.vocab), ("hidden", args.hidden),
+                             ("kda_heads", args.kda_heads)) if v}
     cfg = cfg or None
     # --resume: the model config comes from the checkpoint itself (a ckpt
     # converted from a .bin by bin2pt.py carries the .bin config, possibly
