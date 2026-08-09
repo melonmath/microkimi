@@ -5,14 +5,10 @@
 // reduced dims. std only.
 
 mod config;
-mod deepseek;
-mod dstok;
 mod json;
 mod memory;
 mod model;
-mod parity;
 mod quant;
-mod selftest;
 mod stream;
 mod tokenizer;
 mod tools;
@@ -45,20 +41,21 @@ fn main() {
         "slice" => tools::slice::run(&args),
         // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
         "shadow" => stream::shadow::cmd(&args),
-        "selftest" => { selftest::run(); selftest::run_ds(); selftest::run_ds2(); selftest::run_ds3(); selftest::run_ds4(); selftest::run_packed_emul(); selftest::run_q8(); selftest::run_flash(); selftest::run_kvq8(); },
+        "selftest" => { tools::selftest::run(); tools::selftest::run_ds(); tools::selftest::run_ds2(); tools::selftest::run_ds3(); tools::selftest::run_ds4(); tools::selftest::run_packed_emul(); tools::selftest::run_q8(); tools::selftest::run_flash(); tools::selftest::run_kvq8(); },
         "metaltest" => metaltest_cmd(),
         "metaltest-packed" => metaltest_packed_cmd(),
         "gputest" => gputest_cmd(),
         "dstest" => dstest_cmd(),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" | "parity" => {
-            if arch == "dsv4" { parity::run_ds() } else { parity::run(args.iter().any(|a| a == "--show")) }
+            if arch == "dsv4" { tools::parity::run_ds() } else { tools::parity::run(args.iter().any(|a| a == "--show")) }
         }
-        "dsparity" => parity::run_ds(), // alias for `parity --arch dsv4`
+        "dsparity" => tools::parity::run_ds(), // alias for `parity --arch dsv4`
         "run" => {
             // microkimi run "prompt" [--max-new N] [--model X.bin] [--vocab V.json]
             //                        [--memory mem.mkmem] [--save mem.mkmem]
             //                        [--temp T] [--top-p P] [--seed N]
+            //                        [--exit-layer N] [--logit-lens [--lens-probe "TOKEN"]]
             let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
             let prompt = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "Hello".to_string());
             let max_new = args
@@ -73,11 +70,15 @@ fn main() {
                 args.iter().any(|a| a == "--logit-lens" || a == "--logit-lens-all"),
                 args.iter().any(|a| a == "--logit-lens-all"),
             );
-            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args));
+            run_inference(&prompt, max_new, true, &model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), &value_flag(&args, "--memory"), &value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args), exit_layer_flag(&args), &lens_probe_strings(&args));
         }
         "chat" => {
             model::set_gpu(args.iter().any(|a| a == "--gpu"));
-            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), value_flag(&args, "--memory"), value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args));
+            model::set_logit_lens(
+                args.iter().any(|a| a == "--logit-lens" || a == "--logit-lens-all"),
+                args.iter().any(|a| a == "--logit-lens-all"),
+            );
+            chat_loop(&model_flag(&args), vocab_flag(&args), args.iter().any(|a| a == "--debug-routing"), args.iter().any(|a| a == "--raw"), value_flag(&args, "--memory"), value_flag(&args, "--save"), &mut sampler_flag(&args), stream_ram_flag(&args), exit_layer_flag(&args), &lens_probe_strings(&args));
         }
         // microkimi prefill "text" --save mem.mkmem [--model X.bin] [--vocab V.json] [--chat]
         "prefill" => {
@@ -235,7 +236,10 @@ fn main() {
             println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
-            println!("                                         structural pruning (channels / experts / layers)");            println!("      --merge-experts N                  merge instead of delete: usage-weighted k-means clusters");
+            println!("                                         structural pruning (channels / experts / layers)");            println!("      --vocab-top N freqfile             vocabulary pruning: top-N frequent rows + all specials");
+            println!("      --vocab-list ids.txt               same, but the kept rows come from an explicit id list");
+            println!("                                         (one per line, '#' comments; nano/vocab_cross.py output);");
+            println!("                                         mutually exclusive with --vocab-top");            println!("      --merge-experts N                  merge instead of delete: usage-weighted k-means clusters");
             println!("                                         the experts of every MoE layer into N averaged experts");
             println!("                                         (router rows merged by logsumexp, routing mass conserved)");            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
             println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
@@ -269,6 +273,13 @@ fn main() {
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --logit-lens (top-5 tokens of every layer through final norm + lm_head,");
             println!("                        last prefill position; --logit-lens-all: also on each generated token)");
+            println!("                    --exit-layer N (early exit: run decoder layers 0..=N only, then read the");
+            println!("                        residual stream through the lens projection - final norm + lm_head,");
+            println!("                        no output attn-res mix: greedy output == logit-lens row N top-1;");
+            println!("                        N < n_layers-1 required; layers past N are never allocated/fetched)");
+            println!("                    --lens-probe \"TOKEN\" (repeatable, with --logit-lens: adds the per-layer");
+            println!("                        probability and 1-based logit rank of each probe token; the string");
+            println!("                        must be exactly one vocab entry, leading space included)");
             println!("                    a .bin with an embedded seam adapter (apply_lora_bin.py --write-seam) is");
             println!("                        applied exactly after layer seam_after, in prefill and decode alike;");
             println!("                        the load line shows 'seam: adapter rank R after layer N'");
@@ -747,6 +758,64 @@ fn value_flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// --exit-layer N (0-based, inclusive): early exit after decoder layer N.
+/// Validated against the model's layer count later (exit_layer_apply), once
+/// the config is read.
+fn exit_layer_flag(args: &[String]) -> Option<usize> {
+    value_flag(args, "--exit-layer").map(|s| {
+        s.parse().unwrap_or_else(|_| {
+            eprintln!("error: --exit-layer expects a non-negative integer, got {:?}", s);
+            std::process::exit(1);
+        })
+    })
+}
+
+/// --lens-probe "TOKEN" (repeatable): the raw strings, resolved against the
+/// vocab later (lens_probes_resolve), once the tokenizer is loaded.
+fn lens_probe_strings(args: &[String]) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == "--lens-probe")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
+}
+
+/// Validates --exit-layer against the model config and arms the load-time
+/// preset, so from_bin never allocates the KDA/MLA states of layers past the
+/// exit (and a --stream run never fetches their experts).
+fn exit_layer_apply(exit: Option<usize>, n_layers: usize, memory: bool, save: bool) {
+    let Some(n) = exit else { return };
+    if let Err(e) = model::check_exit_layer(n, n_layers) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+    if memory || save {
+        eprintln!("error: --exit-layer cannot be combined with --memory/--save (a .mkmem pack spans all layers)");
+        std::process::exit(1);
+    }
+    model::preset_exit_layer(Some(n));
+    println!("exit-layer: running layers 0..={} of {}", n, n_layers);
+}
+
+/// Resolves every --lens-probe string to a token id (exact vocab match) and
+/// arms the probe columns of the logit-lens report.
+fn lens_probes_resolve(probes: &[String], tok: &tokenizer::AnyTokenizer) {
+    if probes.is_empty() {
+        return;
+    }
+    let mut ids = Vec::with_capacity(probes.len());
+    for p in probes {
+        match model::resolve_lens_probe(tok, p) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    model::set_lens_probes(ids);
+}
+
 /// --stream / --stream-ram N: MoE expert streaming with a RAM LRU budget of
 /// N MB (default 512). Some(mb) when streaming is requested (--stream-ram
 /// implies --stream), None for the historical full load.
@@ -880,12 +949,16 @@ fn check_tok_compat(tok: &tokenizer::AnyTokenizer, model: &model::Model) {
 }
 
 /// Loads tokenizer + weights, runs one inference turn with detailed output.
-fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>) -> String {
+fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>, exit: Option<usize>, probes: &[String]) -> String {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
     let mp_cfg = crate::quant::weights::read_config(&mp);
     if mp_cfg.ds.is_some() {
+        if exit.is_some() {
+            eprintln!("error: --exit-layer is only supported for K3 models (not DeepSeek-V4)");
+            std::process::exit(1);
+        }
         if stream_mb.is_some() {
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
@@ -894,7 +967,7 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
             eprintln!("warning: --spec/--spec-rosa are only supported for K3 models, ignoring them (DeepSeek-V4)");
         }
         let tok = load_ds_any_tokenizer(&mp, vocab, mp_cfg.vocab);
-        let mut model = deepseek::DsModel::load(&mp);
+        let mut model = model::deepseek::DsModel::load(&mp);
         println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
         println!("cores used for matvecs: {}", model::n_threads());
         let (ids, stop) = if raw {
@@ -902,9 +975,11 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         } else {
             (tok.encode_chat_user(question), tok.end_of_msg())
         };
-        return deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
+        return model::deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
     }
-    let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
+    exit_layer_apply(exit, mp_cfg.n_layers, memory.is_some(), save.is_some());
+    let tok = load_any_tokenizer(&mp, vocab, mp_cfg.vocab);
+    lens_probes_resolve(probes, &tok);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -1007,7 +1082,7 @@ fn routestats_cmd(args: &[String]) {
         std::process::exit(1);
     }
     stream::route_sketch::start(&out);
-    run_inference(&prompt, max_new, false, &mp, vocab_flag(args), false, args.iter().any(|a| a == "--raw"), &None, &None, &mut sampler_flag(args), stream_ram_flag(args));
+    run_inference(&prompt, max_new, false, &mp, vocab_flag(args), false, args.iter().any(|a| a == "--raw"), &None, &None, &mut sampler_flag(args), stream_ram_flag(args), exit_layer_flag(args), &[]);
     stream::route_sketch::finish();
 }
 
@@ -1044,18 +1119,24 @@ fn absorb_cmd(args: &[String]) {
     prefill_cmd(&text, &out, &model_flag(args), vocab_flag(args), args.iter().any(|a| a == "--chat"), stream_ram_flag(args));
 }
 
-fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>) {
+fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: Option<String>, save: Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>, exit: Option<usize>, probes: &[String]) {
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     if crate::quant::weights::read_config(&mp).ds.is_some() {
+        if exit.is_some() {
+            eprintln!("error: --exit-layer is only supported for K3 models (not DeepSeek-V4)");
+            std::process::exit(1);
+        }
         if stream_mb.is_some() {
             eprintln!("error: --stream is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
         }
         return chat_loop_ds(&mp, vocab, debug_routing, raw);
     }
+    exit_layer_apply(exit, crate::quant::weights::read_config(&mp).n_layers, memory.is_some(), save.is_some());
     let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
+    lens_probes_resolve(probes, &tok);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
@@ -1082,9 +1163,10 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     // from the snapshot instead of re-prefilling. Bit-identity with a full
     // prefill requires the sequential KDA loop (the chunked form reassociates
     // per 64-token chunk, so a moved chunk boundary would break it). Off in
-    // raw mode, with --memory (state comes from elsewhere) and with an active
-    // speculative proposer.
-    let pck = if raw || resumed || sampler.spec > 0 || sampler.spec_rosa > 0 {
+    // raw mode, with --memory (state comes from elsewhere), with an active
+    // speculative proposer, and with --exit-layer (the mkmem payload spans
+    // all layers, the truncated model holds only N+1 caches).
+    let pck = if raw || resumed || sampler.spec > 0 || sampler.spec_rosa > 0 || exit.is_some() {
         None
     } else {
         let p = memory::prefix_cache::open(&mp);
@@ -1147,7 +1229,7 @@ fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool)
     use std::io::Write;
     let tl = Instant::now();
     let tok = load_ds_any_tokenizer(mp, vocab, crate::quant::weights::read_config(mp).vocab);
-    let mut model = deepseek::DsModel::load(mp);
+    let mut model = model::deepseek::DsModel::load(mp);
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     if raw {
         println!("\nRAW interactive mode - each line is a story beginning to continue (type 'quit' to exit)");
@@ -1173,10 +1255,10 @@ fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool)
         if raw {
             let ids = tok.encode_raw(q);
             let stop = tok.raw_stop();
-            deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, stop);
+            model::deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, stop);
         } else {
             let ids = tok.encode_chat(&history, q);
-            let answer = deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg());
+            let answer = model::deepseek::ds_run_turn(&ids, 200, &tok, &mut model, false, debug_routing, tok.end_of_msg());
             history.push((q.to_string(), answer));
         }
     }
@@ -1187,7 +1269,7 @@ fn chat_loop_ds(mp: &str, vocab: Option<String>, debug_routing: bool, raw: bool)
 /// to the bin when its vocab size matches the model's, otherwise the full V4
 /// tokenizer (tokenizer.json next to the bin / cache / HF download).
 fn load_ds_any_tokenizer(mp: &str, vocab: Option<String>, model_vocab: usize) -> tokenizer::AnyTokenizer {
-    let full = || dstok::DsTokenizer::load(&ds_tokenizer_path(mp, None));
+    let full = || model::dstok::DsTokenizer::load(&ds_tokenizer_path(mp, None));
     let try_nano = |p: &str| -> Option<tokenizer::AnyTokenizer> {
         let bytes = std::fs::read(p).ok()?;
         let j = crate::json::parse(&bytes);
@@ -1210,7 +1292,7 @@ fn load_ds_any_tokenizer(mp: &str, vocab: Option<String>, model_vocab: usize) ->
         if let Some(t) = try_nano(p) {
             return t;
         }
-        return tokenizer::AnyTokenizer::Ds(dstok::DsTokenizer::load(p));
+        return tokenizer::AnyTokenizer::Ds(model::dstok::DsTokenizer::load(p));
     }
     let dir = std::path::Path::new(mp).parent().unwrap_or(std::path::Path::new("."));
     let cand = dir.join("vocab_ds_nano.json");

@@ -11,6 +11,8 @@
 // lens (diagnostics), generate (sampler + decode loop).
 
 mod attention;
+pub mod deepseek;
+pub mod dstok;
 mod generate;
 mod kda;
 mod lens;
@@ -48,10 +50,10 @@ use kda::{kda_forward, kda_prefill};
 use moe::{dense_forward, dense_prefill, moe_forward, moe_lookahead, moe_prefill};
 use seam::{seam_apply, seam_load, SeamW};
 pub use lens::{
-    logit_lens_print_maybe, set_dump_hidden, set_logit_lens, ParityDump, RoutingDebug, DUMP_LAYERS,
+    logit_lens_print_maybe, resolve_lens_probe, set_dump_hidden, set_lens_probes, set_logit_lens, ParityDump, RoutingDebug, DUMP_LAYERS,
     PARITY, ROUTER_LAYERS, ROUTING,
 };
-use lens::{dump_hidden_on, dump_hidden_print, logit_lens_compute, logit_lens_on, parity_rec, vec_rms};
+use lens::{dump_hidden_on, dump_hidden_print, lens_project, logit_lens_compute, logit_lens_on, parity_rec, vec_rms};
 pub use generate::{run_turn, run_turn_core, run_turn_core_batch, run_turn_resume, Sampler};
 pub(crate) use generate::{apply_dry, py_repr, top_k_probs};
 
@@ -129,6 +131,40 @@ pub fn set_gpu(on: bool) {
 
 pub fn gpu_on() -> bool {
     GPU_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ── --exit-layer N: early exit after decoder layer N (0-based, inclusive) ──
+//
+// The forward runs layers 0..=N only, then reads the residual stream through
+// the LENS readout (lens::lens_project: final norm + f32 lm_head, no output
+// attn-res mix) instead of the full-depth tail, so `--exit-layer K` greedy
+// output is exactly the lens row K top-1. main presets the value BEFORE load
+// and from_bin sizes the caches from it: the KDA/MLA states of layers past
+// the exit are never allocated, and a --stream run never fetches their
+// experts. The Model::set_exit_layer setter (tests) truncates the caches of
+// an already-loaded model instead.
+static EXIT_LAYER_PRESET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Arms the early exit for the NEXT loaded model (main, before Model::load).
+pub fn preset_exit_layer(n: Option<usize>) {
+    EXIT_LAYER_PRESET.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// CLI validation of --exit-layer N (0-based, inclusive): N must leave the
+/// last layer out - exiting at n_layers - 1 is the plain full forward, so
+/// the flag is rejected there (and beyond).
+pub fn check_exit_layer(n: usize, n_layers: usize) -> Result<(), String> {
+    if n + 1 >= n_layers {
+        Err(format!(
+            "--exit-layer {} out of range: the model has {} layers, valid range is 0..={} ({} is the normal full forward)",
+            n,
+            n_layers,
+            n_layers.saturating_sub(2),
+            n_layers - 1
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +364,11 @@ pub struct Model {
     /// --stream: RAM LRU of packed expert bytes over the disk/HTTP tiers
     /// (stream.rs). None = historical full-load path, byte-identical behavior.
     stream: Option<crate::stream::ExpertCache>,
+    /// --exit-layer: run decoder layers 0..=N only and read the result
+    /// through the lens projection (see the EXIT_LAYER_PRESET section). When
+    /// set, `caches` holds exactly N+1 entries: layers past the exit have no
+    /// state at all.
+    exit_layer: Option<usize>,
 }
 
 impl Model {
@@ -379,6 +420,15 @@ impl Model {
 
     fn from_bin(bin: BinFile, stream: Option<crate::stream::ExpertCache>) -> Self {
         let cfg = bin.config.clone();
+        // --exit-layer preset (armed by main before the load): layers past
+        // the exit get no cache at all (see the EXIT_LAYER_PRESET section).
+        let exit_layer = match EXIT_LAYER_PRESET.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => None,
+            n => {
+                assert!(n < cfg.n_layers, "--exit-layer {} out of range ({} layers)", n, cfg.n_layers);
+                Some(n)
+            }
+        };
         let get = |name: &str| -> T {
             T::from(bin.entries.get(name).unwrap_or_else(|| panic!("missing tensor: {}", name)))
         };
@@ -413,8 +463,20 @@ impl Model {
                 &get(&format!("{}mlp_res_norm.weight", p)),
                 &get(&format!("{}mlp_res_proj.weight", p)),
             );
+            // KDA/MLA states of layers past the exit layer are never allocated
+            if exit_layer.map_or(true, |e| l <= e) {
+                caches.push(if cfg.is_mla(l) {
+                    Cache::Mla(MlaCache::new())
+                } else {
+                    Cache::Kda(KdaCache {
+                        conv_q: vec![0.0; 3 * cfg.kda_proj()],
+                        conv_k: vec![0.0; 3 * cfg.kda_proj()],
+                        conv_v: vec![0.0; 3 * cfg.kda_proj()],
+                        s: vec![0.0; cfg.kda_heads * cfg.kda_dim * cfg.kda_dim],
+                    })
+                });
+            }
             let attn = if cfg.is_mla(l) {
-                caches.push(Cache::Mla(MlaCache::new()));
                 AttnW::Mla(MlaW {
                     q_a: get(&format!("{}self_attn.q_a_proj.weight", p)),
                     q_a_ln: get(&format!("{}self_attn.q_a_layernorm.weight", p)),
@@ -426,12 +488,6 @@ impl Model {
                     o_proj: get(&format!("{}self_attn.o_proj.weight", p)),
                 })
             } else {
-                caches.push(Cache::Kda(KdaCache {
-                    conv_q: vec![0.0; 3 * cfg.kda_proj()],
-                    conv_k: vec![0.0; 3 * cfg.kda_proj()],
-                    conv_v: vec![0.0; 3 * cfg.kda_proj()],
-                    s: vec![0.0; cfg.kda_heads * cfg.kda_dim * cfg.kda_dim],
-                }));
                 AttnW::Kda(KdaW {
                     q_proj: get(&format!("{}self_attn.q_proj.weight", p)),
                     k_proj: get(&format!("{}self_attn.k_proj.weight", p)),
@@ -500,7 +556,18 @@ impl Model {
         if let Some(s) = &seam {
             println!("seam: adapter rank {} after layer {}", s.rank, s.after);
         }
-        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), seam, stream }
+        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), seam, stream, exit_layer }
+    }
+
+    /// Post-load early exit (the CLI presets before load, see
+    /// preset_exit_layer): N == n_layers - 1 is accepted here and behaves
+    /// exactly like the full forward. The caches of layers > N are dropped,
+    /// the forward never touches them again.
+    #[cfg(test)]
+    pub fn set_exit_layer(&mut self, n: usize) {
+        assert!(n < self.cfg.n_layers, "exit-layer {} out of range ({} layers)", n, self.cfg.n_layers);
+        self.exit_layer = Some(n);
+        self.caches.truncate(n + 1);
     }
 
     /// Number of tokens already represented in the caches (from the first MLA
@@ -547,8 +614,9 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream, exit_layer } = self;
         let cfg = &*cfg;
+        let last = exit_layer.unwrap_or(cfg.n_layers - 1); // --exit-layer truncation
         let data = &bin.data[..];
         let embed = Self::t(data, embed);
         let mut hidden = embed[token as usize * cfg.d..(token as usize + 1) * cfg.d].to_vec();
@@ -560,7 +628,7 @@ impl Model {
         let lens_on = logit_lens_on();
         let mut lens: Vec<(usize, &'static str, Vec<f32>)> = Vec::new();
 
-        for l in 0..cfg.n_layers {
+        for l in 0..=last {
             let prefix: Option<Vec<f32>> = Some(hidden.clone());
             let layer = &layers[l];
             let tm = Instant::now();
@@ -632,7 +700,9 @@ impl Model {
                     if let Some(cache) = stream.as_ref() {
                         let n = crate::stream::predict_n();
                         if n > 0 && crate::stream::lookahead_on() {
-                            let next = (l + 1..cfg.n_layers).find_map(|l2| match &layers[l2].ffn {
+                            // never look past the exit layer: a truncated run
+                            // must not fetch experts it will never compute
+                            let next = (l + 1..=last).find_map(|l2| match &layers[l2].ffn {
                                 FfnW::Moe(w2) => Some((l2, w2)),
                                 _ => None,
                             });
@@ -677,15 +747,24 @@ impl Model {
         }
 
         let tm = Instant::now();
-        attn_res(cfg, &hidden, &blocks, &out_res_w, &mut buf_res);
-        hidden.copy_from_slice(&buf_res);
-        let mut xf = vec![0f32; cfg.d];
-        rmsnorm(cfg, &hidden, Self::t(data, &norm_f), &mut xf);
-        prof.t_norm_res += tm.elapsed().as_secs_f64();
-        let tm = Instant::now();
         let mut logits = vec![0f32; cfg.vocab];
-        Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
-        prof.t_lm_head += tm.elapsed().as_secs_f64();
+        if last + 1 < cfg.n_layers {
+            // --exit-layer: the lens readout - the post-layer hidden goes
+            // straight through norm_f + lm_head, skipping the output attn-res
+            // mix exactly like the lens rows of intermediate layers, so
+            // --exit-layer K greedy == lens row K top-1
+            lens_project(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), &hidden, &mut logits);
+            prof.t_lm_head += tm.elapsed().as_secs_f64();
+        } else {
+            attn_res(cfg, &hidden, &blocks, &out_res_w, &mut buf_res);
+            hidden.copy_from_slice(&buf_res);
+            let mut xf = vec![0f32; cfg.d];
+            rmsnorm(cfg, &hidden, Self::t(data, &norm_f), &mut xf);
+            prof.t_norm_res += tm.elapsed().as_secs_f64();
+            let tm = Instant::now();
+            Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
+            prof.t_lm_head += tm.elapsed().as_secs_f64();
+        }
         if hd_on {
             dump_hidden_print(&hd, vec_rms(&hidden), &logits);
         }
@@ -764,8 +843,9 @@ impl Model {
         if ids.len() == 1 {
             return vec![self.forward(ids[0], pos0)];
         }
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream, exit_layer } = self;
         let cfg = &*cfg;
+        let last = exit_layer.unwrap_or(cfg.n_layers - 1); // --exit-layer truncation
         let data = &bin.data[..];
         let n = ids.len();
         let d = cfg.d;
@@ -782,7 +862,7 @@ impl Model {
         let lens_on = logit_lens_on();
         let mut lens: Vec<(usize, &'static str, Vec<f32>)> = Vec::new();
 
-        for l in 0..cfg.n_layers {
+        for l in 0..=last {
             let layer = &layers[l];
             let tm = Instant::now();
             let mut prefix: Option<Vec<f32>> = Some(hidden.clone());
@@ -897,22 +977,33 @@ impl Model {
         }
 
         let tm = Instant::now();
-        for t in 0..n {
-            let brefs: Vec<&[f32]> = blocks.iter().map(|b| &b[t * d..(t + 1) * d]).collect();
-            attn_res_refs(cfg, &hidden[t * d..(t + 1) * d], &brefs, &out_res_w, &mut buf_res[t * d..(t + 1) * d]);
+        // --exit-layer: the output attn-res mix is part of the full-depth
+        // tail only; the truncated readout skips it, like the lens rows
+        let truncated = last + 1 < cfg.n_layers;
+        if !truncated {
+            for t in 0..n {
+                let brefs: Vec<&[f32]> = blocks.iter().map(|b| &b[t * d..(t + 1) * d]).collect();
+                attn_res_refs(cfg, &hidden[t * d..(t + 1) * d], &brefs, &out_res_w, &mut buf_res[t * d..(t + 1) * d]);
+            }
+            hidden.copy_from_slice(&buf_res);
         }
-        hidden.copy_from_slice(&buf_res);
         if all_logits {
             // --spec verification: rmsnorm + lm_head on EVERY position (the
             // same matvec as the single-token forward, so per-position
-            // logits are bit-identical to a sequential run)
+            // logits are bit-identical to a sequential run); the lens
+            // readout on every position when the run is truncated
             let tm = Instant::now();
             let mut out = Vec::with_capacity(n);
             for t in 0..n {
-                let mut xf = vec![0f32; d];
-                rmsnorm(cfg, &hidden[t * d..(t + 1) * d], Self::t(data, &norm_f), &mut xf);
+                let h = &hidden[t * d..(t + 1) * d];
                 let mut logits = vec![0f32; cfg.vocab];
-                Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
+                if truncated {
+                    lens_project(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), h, &mut logits);
+                } else {
+                    let mut xf = vec![0f32; d];
+                    rmsnorm(cfg, h, Self::t(data, &norm_f), &mut xf);
+                    Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
+                }
                 out.push(logits);
             }
             prof.t_norm_res += tm.elapsed().as_secs_f64();
@@ -922,13 +1013,18 @@ impl Model {
             *last_logits = out.last().unwrap().clone();
             return out;
         }
-        let mut xf = vec![0f32; d];
-        rmsnorm(cfg, &hidden[(n - 1) * d..n * d], Self::t(data, &norm_f), &mut xf);
-        prof.t_norm_res += tm.elapsed().as_secs_f64();
-        let tm = Instant::now();
         let mut logits = vec![0f32; cfg.vocab];
-        Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
-        prof.t_lm_head += tm.elapsed().as_secs_f64();
+        if truncated {
+            lens_project(cfg, Self::t(data, &lm_head), Self::t(data, &norm_f), &hidden[(n - 1) * d..n * d], &mut logits);
+            prof.t_lm_head += tm.elapsed().as_secs_f64();
+        } else {
+            let mut xf = vec![0f32; d];
+            rmsnorm(cfg, &hidden[(n - 1) * d..n * d], Self::t(data, &norm_f), &mut xf);
+            prof.t_norm_res += tm.elapsed().as_secs_f64();
+            let tm = Instant::now();
+            Self::logits_project(data, &lm_head, lm_head_q8.as_ref(), cfg, &xf, &mut logits);
+            prof.t_lm_head += tm.elapsed().as_secs_f64();
+        }
         if hd_on {
             // per-layer rms was taken on the LAST position (the one the
             // logits are computed from)
@@ -1256,5 +1352,290 @@ mod seam_tests {
             let err = (h[j] as f64 - want[j]).abs();
             assert!(err < 1e-6, "h[{}]: got {} want {}", j, h[j], want[j]);
         }
+    }
+}
+
+
+#[cfg(test)]
+pub(crate) mod testbin {
+    //! Tiny synthetic MKIM0002 model for the exit-layer / logit-lens
+    //! integration tests: 8 layers (KDA everywhere but 3 and 7, which are
+    //! MLA), dense FFN at layer 0, a 16-expert MoE at layers 1..=7, and a
+    //! rank-4 seam adapter after layer 2 (so the exit-vs-seam interplay is
+    //! exercised). Weights are deterministic splitmix draws.
+    use crate::config::Config;
+    use crate::quant::weights::{f32_to_bytes, BinWriter, DTYPE_F32, DTYPE_MXFP4};
+
+    pub(crate) const N_LAYERS: usize = 8;
+
+    pub(crate) fn config() -> Config {
+        let mut c = Config::microkimi();
+        c.n_layers = N_LAYERS;
+        c.d = 64;
+        c.vocab = 512;
+        c.n_experts = 16;
+        c.top_k = 4;
+        c.kda_heads = 2;
+        c.kda_dim = 32;
+        c.kda_conv = 4;
+        c.kda_fa = 32;
+        c.mla_heads = 2;
+        c.mla_qa = 32;
+        c.mla_kva = 32;
+        c.mla_nope = 32;
+        c.mla_rope = 32;
+        c.mla_v = 32;
+        c.routed_hidden = 32;
+        c.moe_inter = 32;
+        c.shared_inter = 64;
+        c.dense_inter = 128;
+        c.attn_res_block = 4;
+        c.first_k_dense = 1;
+        c.eos_id = 510;
+        c.bos_id = 509;
+        c.seam_after = Some(2);
+        c
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) as f64 / u64::MAX as f64 - 0.5) as f32
+        }
+    }
+
+    type Tensors = Vec<(String, u8, Vec<u32>, Vec<f32>)>;
+
+    fn push(t: &mut Tensors, rng: &mut Rng, name: String, dims: &[u32], scale: f32) {
+        let n: usize = dims.iter().map(|&x| x as usize).product();
+        t.push((name, DTYPE_F32, dims.to_vec(), (0..n).map(|_| rng.f32() * scale).collect()));
+    }
+
+    fn push_mxfp4(t: &mut Tensors, rng: &mut Rng, name: String, dims: &[u32], scale: f32) {
+        let n: usize = dims.iter().map(|&x| x as usize).product();
+        t.push((name, DTYPE_MXFP4, dims.to_vec(), (0..n).map(|_| rng.f32() * scale).collect()));
+    }
+
+    fn push_const(t: &mut Tensors, name: String, n: usize, v: f32) {
+        t.push((name, DTYPE_F32, vec![n as u32], vec![v; n]));
+    }
+
+    fn config_json(cfg: &Config) -> String {
+        format!(
+            "{{\"n_layers\":{},\"hidden\":{},\"vocab\":{},\"n_experts\":{},\"top_k\":{},\"n_shared\":{},\"kda_heads\":{},\"kda_dim\":{},\"kda_conv\":{},\"kda_fa_rank\":{},\"mla_heads\":{},\"mla_q_lora\":{},\"mla_kv_lora\":{},\"mla_nope\":{},\"mla_rope\":{},\"mla_v\":{},\"routed_hidden\":{},\"moe_inter\":{},\"shared_inter\":{},\"dense_inter\":{},\"attn_res_block\":{},\"first_k_dense\":{},\"seam_after\":{},\"specials\":{{\"end_of_msg\":{},\"bos\":{}}}}}",
+            cfg.n_layers,
+            cfg.d,
+            cfg.vocab,
+            cfg.n_experts,
+            cfg.top_k,
+            cfg.n_shared,
+            cfg.kda_heads,
+            cfg.kda_dim,
+            cfg.kda_conv,
+            cfg.kda_fa,
+            cfg.mla_heads,
+            cfg.mla_qa,
+            cfg.mla_kva,
+            cfg.mla_nope,
+            cfg.mla_rope,
+            cfg.mla_v,
+            cfg.routed_hidden,
+            cfg.moe_inter,
+            cfg.shared_inter,
+            cfg.dense_inter,
+            cfg.attn_res_block,
+            cfg.first_k_dense,
+            cfg.seam_after.unwrap(),
+            cfg.eos_id,
+            cfg.bos_id
+        )
+    }
+
+    /// Writes the tiny model to `path`.
+    pub(crate) fn write(path: &str) {
+        let cfg = config();
+        let (d, kp) = (cfg.d as u32, cfg.kda_proj() as u32);
+        let mut t: Tensors = Vec::new();
+        let mut rng = Rng(0x5EED_5EED_5EED_5EED);
+        push(&mut t, &mut rng, "embed_tokens.weight".to_string(), &[cfg.vocab as u32, d], 0.05);
+        push(&mut t, &mut rng, "lm_head.weight".to_string(), &[cfg.vocab as u32, d], 0.05);
+        push_const(&mut t, "norm.weight".to_string(), d as usize, 1.0);
+        push_const(&mut t, "output_attn_res_norm.weight".to_string(), d as usize, 1.0);
+        push(&mut t, &mut rng, "output_attn_res_proj.weight".to_string(), &[d], 0.1);
+        push(&mut t, &mut rng, "seam.A".to_string(), &[4, d], 0.05);
+        push(&mut t, &mut rng, "seam.B".to_string(), &[d, 4], 0.05);
+        for l in 0..cfg.n_layers {
+            let p = format!("layers.{}.", l);
+            push_const(&mut t, format!("{}input_layernorm.weight", p), d as usize, 1.0);
+            push_const(&mut t, format!("{}post_attention_layernorm.weight", p), d as usize, 1.0);
+            push_const(&mut t, format!("{}self_attention_res_norm.weight", p), d as usize, 1.0);
+            push(&mut t, &mut rng, format!("{}self_attention_res_proj.weight", p), &[d], 0.1);
+            push_const(&mut t, format!("{}mlp_res_norm.weight", p), d as usize, 1.0);
+            push(&mut t, &mut rng, format!("{}mlp_res_proj.weight", p), &[d], 0.1);
+            if cfg.is_mla(l) {
+                push(&mut t, &mut rng, format!("{}self_attn.q_a_proj.weight", p), &[cfg.mla_qa as u32, d], 0.05);
+                push_const(&mut t, format!("{}self_attn.q_a_layernorm.weight", p), cfg.mla_qa, 1.0);
+                push(&mut t, &mut rng, format!("{}self_attn.q_b_proj.weight", p), &[cfg.mla_qb() as u32, cfg.mla_qa as u32], 0.05);
+                push(&mut t, &mut rng, format!("{}self_attn.kv_a_proj_with_mqa.weight", p), &[cfg.mla_c_dim() as u32, d], 0.05);
+                push_const(&mut t, format!("{}self_attn.kv_a_layernorm.weight", p), cfg.mla_kva, 1.0);
+                push(&mut t, &mut rng, format!("{}self_attn.kv_b_proj.weight", p), &[cfg.mla_kvb() as u32, cfg.mla_kva as u32], 0.05);
+                push(&mut t, &mut rng, format!("{}self_attn.g_proj.weight", p), &[cfg.mla_hv() as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}self_attn.o_proj.weight", p), &[d, cfg.mla_hv() as u32], 0.05);
+            } else {
+                for x in ["q_proj", "k_proj", "v_proj", "g_proj"] {
+                    push(&mut t, &mut rng, format!("{}self_attn.{}.weight", p, x), &[kp, d], 0.05);
+                }
+                push(&mut t, &mut rng, format!("{}self_attn.o_proj.weight", p), &[d, kp], 0.05);
+                for x in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                    push(&mut t, &mut rng, format!("{}self_attn.{}.weight", p, x), &[kp, cfg.kda_conv as u32], 0.1);
+                }
+                push(&mut t, &mut rng, format!("{}self_attn.f_a_proj.weight", p), &[cfg.kda_fa as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}self_attn.f_b_proj.weight", p), &[kp, cfg.kda_fa as u32], 0.05);
+                // realistic init: log(uniform(1, 16))
+                let a_log: Vec<f32> = (0..cfg.kda_dim).map(|_| (1.0 + (rng.f32() + 0.5) * 15.0).ln()).collect();
+                t.push((format!("{}self_attn.A_log", p), DTYPE_F32, vec![cfg.kda_dim as u32], a_log));
+                push_const(&mut t, format!("{}self_attn.dt_bias", p), kp as usize, 0.0);
+                push(&mut t, &mut rng, format!("{}self_attn.b_proj.weight", p), &[cfg.kda_heads as u32, d], 0.1);
+                push_const(&mut t, format!("{}self_attn.o_norm.weight", p), cfg.kda_dim, 1.0);
+            }
+            if cfg.is_moe(l) {
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.gate.weight", p), &[cfg.n_experts as u32, d], 0.05);
+                push_const(&mut t, format!("{}block_sparse_moe.gate.e_score_correction_bias", p), cfg.n_experts, 0.0);
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.routed_expert_down_proj.weight", p), &[cfg.routed_hidden as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.routed_expert_up_proj.weight", p), &[d, cfg.routed_hidden as u32], 0.05);
+                push_const(&mut t, format!("{}block_sparse_moe.routed_expert_norm.weight", p), cfg.routed_hidden, 1.0);
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.shared_experts.gate_proj.weight", p), &[cfg.shared_inter as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.shared_experts.up_proj.weight", p), &[cfg.shared_inter as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}block_sparse_moe.shared_experts.down_proj.weight", p), &[d, cfg.shared_inter as u32], 0.05);
+                for e in 0..cfg.n_experts {
+                    let pfx = format!("{}block_sparse_moe.experts.{}.", p, e);
+                    push_mxfp4(&mut t, &mut rng, format!("{}w1", pfx), &[cfg.moe_inter as u32, cfg.routed_hidden as u32], 0.1);
+                    push_mxfp4(&mut t, &mut rng, format!("{}w2", pfx), &[cfg.routed_hidden as u32, cfg.moe_inter as u32], 0.1);
+                    push_mxfp4(&mut t, &mut rng, format!("{}w3", pfx), &[cfg.moe_inter as u32, cfg.routed_hidden as u32], 0.1);
+                }
+            } else {
+                push(&mut t, &mut rng, format!("{}mlp.gate_proj.weight", p), &[cfg.dense_inter as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}mlp.up_proj.weight", p), &[cfg.dense_inter as u32, d], 0.05);
+                push(&mut t, &mut rng, format!("{}mlp.down_proj.weight", p), &[d, cfg.dense_inter as u32], 0.05);
+            }
+        }
+        let mut w = BinWriter::new();
+        for (name, dtype, dims, _) in &t {
+            w.add(name, *dtype, dims.clone());
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        let offsets = w.write_header_v2(&mut f, &config_json(&cfg));
+        for ((_, dtype, dims, vals), &off) in t.iter().zip(&offsets) {
+            let blob = if *dtype == DTYPE_MXFP4 {
+                let (mut packed, scales) = crate::quant::mxfp4::quantize(vals, dims[0] as usize, dims[1] as usize);
+                packed.extend_from_slice(&scales);
+                packed
+            } else {
+                f32_to_bytes(vals)
+            };
+            w.write_blob_at(&mut f, off, &blob);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exit_lens_tests {
+    use super::lens::lens_rows_take;
+    use super::{check_exit_layer, set_lens_probes, set_logit_lens, testbin, Model};
+
+    fn argmax(logits: &[f32]) -> usize {
+        logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0
+    }
+
+    fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{}: length mismatch", what);
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{}: first divergence at index {}", what, i);
+        }
+    }
+
+    /// --exit-layer CLI validation: N must leave the last layer out.
+    #[test]
+    fn exit_layer_validation() {
+        assert!(check_exit_layer(0, 8).is_ok());
+        assert!(check_exit_layer(6, 8).is_ok());
+        let err = check_exit_layer(7, 8).unwrap_err(); // last layer = full forward
+        assert!(err.contains("out of range"), "{}", err);
+        assert!(check_exit_layer(8, 8).is_err());
+        assert!(check_exit_layer(0, 1).is_err());
+    }
+
+    /// The two exit-layer invariants on the tiny synthetic model:
+    ///  - exit at the LAST layer is bit-identical to the normal full forward
+    ///    (batched prefill and single-token decode);
+    ///  - exit at layer K greedy next-token == logit-lens row K top-1 (the
+    ///    lens readout is shared; the fixture's seam after layer 2 applies on
+    ///    both sides);
+    /// plus the probe column: a probe on a row's top-1 token reports rank 1.
+    #[test]
+    fn exit_layer_bit_identity_and_lens_invariant() {
+        let path = format!("{}/microkimi-exitlens-{}.bin", std::env::temp_dir().display(), std::process::id());
+        testbin::write(&path);
+        let prompt: Vec<u32> = vec![3, 17, 42, 128, 200, 77];
+        let n = prompt.len();
+
+        // full-depth reference (batched prefill + one decode step)
+        let mut full = Model::load(&path);
+        let full_pre = full.prefill(&prompt, 0);
+        let full_dec = full.forward(argmax(&full_pre) as u32, n);
+
+        // exit at the last layer: the plain full forward, bit-identical
+        let mut last = Model::load(&path);
+        last.set_exit_layer(last.cfg.n_layers - 1);
+        let last_pre = last.prefill(&prompt, 0);
+        assert_bit_identical(&full_pre, &last_pre, "exit(last) prefill");
+        let last_dec = last.forward(argmax(&last_pre) as u32, n);
+        assert_bit_identical(&full_dec, &last_dec, "exit(last) decode");
+
+        // lens rows of the full model (last prefill position)
+        set_logit_lens(true, false);
+        let mut lm = Model::load(&path);
+        lm.prefill(&prompt, 0);
+        let rows = lens_rows_take().expect("lens rows");
+        set_logit_lens(false, false);
+        assert_eq!(rows.len(), testbin::N_LAYERS);
+
+        // core invariant: --exit-layer K greedy == lens row K top-1
+        for k in [0usize, 1, 2, 4, 5, 6] {
+            let mut m = Model::load(&path);
+            m.set_exit_layer(k);
+            assert_eq!(m.caches.len(), k + 1, "layers past the exit must have no state");
+            let lg = m.prefill(&prompt, 0);
+            let (l, _, top, _) = &rows[k];
+            assert_eq!(*l, k);
+            assert_eq!(argmax(&lg), top[0].0, "exit-layer {} greedy != lens row top-1", k);
+        }
+
+        // probe on the top-1 token of lens row 5: rank 1, and the probe prob
+        // is exactly the top-1 softmax prob of the row
+        let probe = rows[5].2[0].0 as u32;
+        set_logit_lens(true, false);
+        set_lens_probes(vec![probe]);
+        let mut pm = Model::load(&path);
+        pm.prefill(&prompt, 0);
+        let prows = lens_rows_take().expect("lens rows with probes");
+        set_logit_lens(false, false);
+        set_lens_probes(Vec::new());
+        for (l, _, top, stats) in &prows {
+            assert_eq!(stats.len(), 1);
+            assert_eq!(stats[0].0, probe);
+            assert!(stats[0].1 >= 1 && stats[0].1 <= 512);
+            assert!(stats[0].2 > 0.0 && stats[0].2 <= 1.0);
+            if *l == 5 {
+                assert_eq!(stats[0].1, 1, "the row top-1 token must probe at rank 1");
+                assert_eq!(stats[0].2.to_bits(), top[0].1.to_bits(), "probe prob must match the top-1 softmax prob");
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 }
