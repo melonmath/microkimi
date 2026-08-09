@@ -121,7 +121,7 @@ def check_fold_tensors(orig, merged, after, a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/workspace/chat_smoke/nanokimi_chat_smoke.bin")
+    ap.add_argument("--model", default="/workspace/references/chat_smoke/nanokimi_chat_smoke.bin")
     ap.add_argument("--data", default=os.path.join(HERE, "..", "..", "nano_chat", "out_smoke", "tokens_chat.bin"))
     ap.add_argument("--skip-training", action="store_true", help="only (a) and the fabricated parts of (d)")
     args = ap.parse_args()

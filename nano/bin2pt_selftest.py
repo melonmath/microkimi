@@ -2,11 +2,11 @@
 """nanokimi - bin2pt_selftest: numerical proof of the .bin -> .pt bridge.
 
   A) round trip pt -> bin -> pt on a real nano checkpoint (default
-     /workspace/chat_smoke/ckpt_base.pt): every tensor must survive,
+     /workspace/references/chat_smoke/ckpt_base.pt): every tensor must survive,
      f32 tensors EXACTLY (1e-6), experts mxfp4 too (compared against
      dequant(quantize(orig)), the exact reference; the quantization
      error vs the original is reported for information only);
-  B) the real /workspace/nanokimi-0.2b-chat.bin converts with names and
+  B) the real /workspace/references/nanokimi-0.2b-chat.bin converts with names and
      shapes matching its source checkpoint (values differ: it went
      through chat SFT);
   C) config-driven construction proof for the future 1b: a NanoModel
@@ -106,7 +106,7 @@ def roundtrip(ckpt_path, tag, expert_sample=None):
 
 
 def test_real_bin(ref_ckpt):
-    src = "/workspace/nanokimi-0.2b-chat.bin"
+    src = "/workspace/references/nanokimi-0.2b-chat.bin"
     if not os.path.exists(src):
         print(f"-- [real-bin] {src} absent, skipped")
         return
@@ -159,7 +159,7 @@ def test_1b_structure():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/workspace/chat_smoke/ckpt_base.pt")
+    ap.add_argument("--ckpt", default="/workspace/references/chat_smoke/ckpt_base.pt")
     args = ap.parse_args()
     ckpt = args.ckpt
     if not os.path.exists(ckpt):
