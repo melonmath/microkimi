@@ -252,6 +252,24 @@ def neuron_scores(w1_full, w3_full, w_down, h_sample, chunk=2048):
     return mean_act * np.linalg.norm(w_down, axis=0)
 
 
+# ------------------------------------------------------------------ cka scan
+
+def cka_scan(h_lat, donor_planes, ih, idz, sample=30000, chunk=8192):
+    """Centered linear CKA of one host latent stream against each donor
+    plane, over at most `sample` anchor pairs. Cheap closed-form
+    pre-filter to choose the donor layer for a port before any solve.
+    donor_planes: {key: [n, d_D] row source}. Returns {key: cka}."""
+    m = min(sample, len(ih))
+    out = {}
+    for name, z in donor_planes.items():
+        g = RectGram(h_lat.shape[1], z.shape[1])
+        for t0 in range(0, m, chunk):
+            g.add(np.asarray(h_lat[ih[t0:t0 + chunk]], np.float64),
+                  np.asarray(z[idz[t0:t0 + chunk]], np.float64))
+        out[name] = g.cka()
+    return out
+
+
 # ---------------------------------------------------------------- core solve
 
 def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
@@ -371,7 +389,8 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
 
     diag = {"cka": cka, "res_s_in": res_in, "res_m_out": res_out,
             "n_pairs": n, "holdout": holdout, "bands": diag_bands}
-    return {"experts": experts, "diag": diag}
+    return {"experts": experts, "diag": diag,
+            "m_out": m_out.astype(np.float32)}
 
 
 # ------------------------------------------------------------------ selftest

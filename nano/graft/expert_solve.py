@@ -40,8 +40,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from graftlib import (match_anchors, open_capture, read_safetensors_dir,
-                      solve_graft)  # noqa: E402
+from graftlib import (cka_scan, match_anchors, open_capture,
+                      read_safetensors_dir, solve_graft)  # noqa: E402
 
 
 def parse_map(s):
@@ -52,9 +52,26 @@ def parse_map(s):
     return out
 
 
+def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print):
+    """Chooses one donor layer per host port by centered linear CKA over a
+    subsample of anchor pairs (closed form, no solve). Returns the
+    host->donor map, best-first ties broken by donor depth."""
+    donor_layers = sorted(dmeta["layers"])
+    donor_in = {dl: dplanes[f"L{dl}.in"] for dl in donor_layers}
+    layer_map = []
+    for hl in hmeta["layers"]:
+        scores = cka_scan(hplanes[f"L{hl}.lat"], donor_in, ih, idz, sample)
+        best = max(scores, key=scores.get)
+        row = " ".join(f"L{dl}:{scores[dl]:.3f}" for dl in donor_layers)
+        log(f"scan L{hl}: {row} -> donor L{best}")
+        layer_map.append((hl, best))
+    return layer_map
+
+
 def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
               bands=1, rel_lambda=1e-4, holdout=4096, max_pairs=0,
-              moe_inter=None, log=print, target="donor"):
+              moe_inter=None, log=print, target="donor",
+              scan_sample=30000):
     hmeta, hends, hmask, hplanes = open_capture(host_prefix)
     dmeta, dends, dmask, dplanes = open_capture(donor_prefix)
     mi = moe_inter or hmeta["moe_inter"]
@@ -67,6 +84,10 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
         f"({hmeta['n_tokens']} host / {dmeta['n_tokens']} donor tokens)")
     if len(ih) < 10 * holdout:
         log(f"  note: few pairs for holdout {holdout}")
+
+    if layer_map == "scan":
+        layer_map = scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz,
+                             scan_sample, log)
 
     pack = {}
     report = {}
@@ -93,6 +114,10 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
             pack[f"L{hl}.g{g}.w3"] = w3
             pack[f"L{hl}.g{g}.w2"] = w2
             pack[f"L{hl}.g{g}.gate"] = gate_row
+            # donor-to-latent stitch: lets later closed-form passes rebuild
+            # the target (e.g. a re-solve restricted to routed positions)
+            pack[f"L{hl}.g{g}.m_out"] = out["m_out"]
+            pack[f"L{hl}.g{g}.donor_layer"] = np.int64(dl)
         g_next[hl] = g0 + len(out["experts"])
         d = out["diag"]
         report[f"{hl}:{dl}"] = {**{k: d[k] for k in
@@ -124,7 +149,9 @@ def main():
                     help="hostLayer:donorLayer,... A host layer may appear "
                     "several times (one expert per occurrence); an "
                     "injectable pack needs every MoE layer with the same "
-                    "expert count")
+                    "expert count. 'scan' picks the best donor layer per "
+                    "port by CKA over the captured donor layers")
+    ap.add_argument("--scan-sample", type=int, default=30000)
     ap.add_argument("--bands", type=int, default=1,
                     help="experts per layer, successive neuron bands")
     ap.add_argument("--rel-lambda", type=float, default=1e-4)
@@ -137,11 +164,12 @@ def main():
                     "expert only encodes what the host lacks)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    lm = "scan" if args.map == "scan" else parse_map(args.map)
     pack, meta = solve_all(args.host_capture, args.donor_capture,
-                           args.donor_weights, parse_map(args.map),
+                           args.donor_weights, lm,
                            args.bands, args.rel_lambda, args.holdout,
                            args.max_pairs, args.moe_inter,
-                           target=args.target)
+                           target=args.target, scan_sample=args.scan_sample)
     np.savez(args.out, **pack)
     print(f"-> {args.out}: {len(pack) - 1} tensors, bands {meta['bands']}")
 
@@ -211,14 +239,19 @@ def selftest():
                 d_in.append(rng.normal(size=d_d))
                 d_dz.append(rng.normal(size=d_d))
                 d_mask.append(True)
+        # layer 4 carries the real stream; layer 9 is pure noise, so a CKA
+        # scan must prefer 4
         dw = CaptureWriter(
-            dp, {"L4.in": d_d, "L4.dz": d_d},
-            {"kind": "donor", "model": "toy",
+            dp, {"L4.in": d_d, "L4.dz": d_d, "L9.in": d_d, "L9.dz": d_d},
+            {"kind": "donor", "model": "toy", "layers": [4, 9],
              "weights": {"gate": "l{l}.gate", "up": "l{l}.up",
                          "down": "l{l}.down"}})
+        nz = len(d_in)
         dw.add(np.asarray(d_ends, np.uint64) | np.uint64(0),
                d_mask, {"L4.in": np.asarray(d_in),
-                        "L4.dz": np.asarray(d_dz)})
+                        "L4.dz": np.asarray(d_dz),
+                        "L9.in": rng.normal(size=(nz, d_d)),
+                        "L9.dz": rng.normal(size=(nz, d_d))})
         dw.close()
 
         st = os.path.join(td, "donor.safetensors")
@@ -254,6 +287,23 @@ def selftest():
         assert "L1.g1.w1" in pack3
         assert np.array_equal(pack3["L1.g0.w1"], pack3["L1.g1.w1"])
         print("claim 5: repeated host layer stacks experts (bands 2)")
+
+        assert pack["L1.g0.m_out"].shape == (rh, d_d)
+        assert int(pack["L1.g0.donor_layer"]) == 4
+        print("claim 6: pack carries the donor-to-latent stitch and the "
+              "donor layer")
+
+        # host meta needs its layer list for the scan entry point
+        with open(hp + ".meta.json") as f:
+            hm = json.load(f)
+        hm["layers"] = [1]
+        with open(hp + ".meta.json", "w") as f:
+            json.dump(hm, f)
+        pack4, meta4 = solve_all(hp, dp, st, "scan", bands=1, holdout=800,
+                                 scan_sample=2000, log=lambda *a: None)
+        assert meta4["map"] == [(1, 4)], meta4["map"]
+        print("claim 7: CKA scan picks the informative donor layer "
+              "(4, not the noise layer 9)")
 
     print("expert_solve selftest OK")
 

@@ -237,6 +237,10 @@ def main():
     ap.add_argument("--sweep", default="global", choices=["global", "layer"],
                     help="global: one (bias, gain) for all grafts; layer: "
                     "greedy per-layer bias, gain fixed at 1")
+    ap.add_argument("--rows", default="solve", choices=["solve", "keep"],
+                    help="keep: leave the router rows already in the .bin "
+                    "and only run the calibration sweep (e.g. after an "
+                    "offline w2 refit)")
     args = ap.parse_args()
 
     import torch
@@ -270,10 +274,11 @@ def main():
     print(f"{probe} probe windows, {hold} holdout windows, "
           f"{cfg['n_experts'] - e0} grafted expert(s) x {len(moe)} layers")
 
-    rows, _rep = solve_rows(model, moe, e0, xs_p, ms_p, cfg["vocab"],
-                            args.device, args.batch, args.gate_sigma,
-                            args.rel_lambda)
-    install_rows(model, rows)
+    if args.rows == "solve":
+        rows, _rep = solve_rows(model, moe, e0, xs_p, ms_p, cfg["vocab"],
+                                args.device, args.batch, args.gate_sigma,
+                                args.rel_lambda)
+        install_rows(model, rows)
     bias_grid = [float(x) for x in args.bias_grid.split(",")]
     if args.sweep == "layer":
         chosen, ce, base_ce = layer_sweep(model, moe, e0, xs_h, ms_h,
