@@ -108,6 +108,23 @@ def make_batch(tokens, rng, batch, seq):
     return torch.from_numpy(x), torch.from_numpy(y)
 
 
+def depth_bounds(n_layers, min_frac):
+    """Sampled-depth interval: [ceil(min_frac * n_layers), n_layers] (min 1)."""
+    lo = min(n_layers, max(1, int(math.ceil(min_frac * n_layers))))
+    return lo, n_layers
+
+
+def sample_depth(rng, n_layers, min_frac, full_p):
+    """Stochastic-depth sampler (nested-model training): the FULL depth with
+    probability `full_p`, else a uniform depth over the shallower prefix range.
+    Draws from the training rng (the same stream as the batches), so --seed
+    and --resume fully determine the sampled sequence."""
+    lo, hi = depth_bounds(n_layers, min_frac)
+    if lo >= hi or rng.random() < full_p:
+        return hi
+    return int(rng.integers(lo, hi))
+
+
 def lr_at(step, args):
     if step < args.warmup:
         return args.lr * (step + 1) / args.warmup
@@ -139,6 +156,7 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None, help="override n_layers (smoke)")
+    ap.add_argument("--experts", type=int, default=None, help="override n_experts (smoke)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--steps", type=int, default=8000)
@@ -180,6 +198,17 @@ def main():
                     help="comma list from q,k,v,o,attn (default attn: q/k/v/o projections)")
     ap.add_argument("--lora-norms", action="store_true",
                     help="also train the norm gains (everything else stays frozen)")
+    ap.add_argument("--stochastic-depth", action="store_true",
+                    help="nested-model training: each optimizer step samples a depth d in "
+                         "[--stochastic-depth-min x n_layers, n_layers], forwards only that "
+                         "layer prefix and reads the logits off it with the logit-lens path "
+                         "(final norm + lm_head). One run yields a model whose every prefix "
+                         "is a valid smaller model. Default OFF (pure opt-in)")
+    ap.add_argument("--stochastic-depth-min", type=float, default=0.25,
+                    help="smallest sampled depth, as a fraction of n_layers (default 0.25)")
+    ap.add_argument("--stochastic-depth-full-p", type=float, default=0.5,
+                    help="probability of sampling the FULL depth on a step (default 0.5; "
+                         "the remaining mass is uniform over the shallower depths)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -198,7 +227,8 @@ def main():
     print(f"device: {dev}", flush=True)
     if args.amp and dev != "cuda":
         print("--amp requested but device is not cuda: amp is a no-op (bf16 autocast is cuda-only here)", flush=True)
-    cfg = {"n_layers": args.layers} if args.layers else None
+    cfg = {k: v for k, v in (("n_layers", args.layers), ("n_experts", args.experts)) if v}
+    cfg = cfg or None
     # --resume: the model config comes from the checkpoint itself (a ckpt
     # converted from a .bin by bin2pt.py carries the .bin config, possibly
     # with explicit mla_layers/dense_layers lists); peek before building.
@@ -207,6 +237,20 @@ def main():
     if args.resume and os.path.exists(ckpt_latest):
         pre_ck = torch.load(ckpt_latest, map_location="cpu", weights_only=False)
         cfg = pre_ck.get("cfg", cfg)
+        # a resumed run keeps the stochastic-depth behavior it was started
+        # with (the flag state lives in the saved run config)
+        saved_args = pre_ck.get("args") or {}
+        if saved_args.get("stochastic_depth"):
+            args.stochastic_depth = True
+            args.stochastic_depth_min = saved_args.get("stochastic_depth_min", args.stochastic_depth_min)
+            args.stochastic_depth_full_p = saved_args.get("stochastic_depth_full_p", args.stochastic_depth_full_p)
+            print("stochastic depth: behavior inherited from the checkpoint args", flush=True)
+    # seed BEFORE model construction: the init draws from the torch global
+    # generator, which otherwise starts from per-process entropy and --seed
+    # would not reproduce a run. The manual_seed after the build (below) keeps
+    # the post-init stream exactly as it was; a --resume overrides both with
+    # the checkpoint states.
+    torch.manual_seed(args.seed)
     model = NanoModel(cfg, grad_ckpt=True).float().to(dev)
     model.eval()  # required by the MoE gate assert; no dropout/BN in the arch
     total, experts = count_params(model)
@@ -240,6 +284,12 @@ def main():
     print(f"corpus: {len(tokens) / 1e6:.1f} M tokens", flush=True)
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
+    n_layers = model.c["n_layers"]
+    if args.stochastic_depth:
+        lo, _ = depth_bounds(n_layers, args.stochastic_depth_min)
+        print(f"stochastic depth: sampling d in [{lo}, {n_layers}] per step, "
+              f"P(full)={args.stochastic_depth_full_p} "
+              f"(prefix readout = final norm + lm_head)", flush=True)
 
     if args.bench is not None:
         # bench mode: cap the run at N steps, summary printed at the end
@@ -318,11 +368,15 @@ def main():
         x, y = make_batch(tokens, rng, args.batch, args.seq)
         x = x.to(dev)
         y = y.to(dev)
+        depth = n_layers
+        if args.stochastic_depth:
+            depth = sample_depth(rng, n_layers, args.stochastic_depth_min,
+                                 args.stochastic_depth_full_p)
         if args.amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
-                logits = model(x)
+                logits = model(x) if depth == n_layers else model.forward_prefix(x, depth)
         else:
-            logits = model(x)
+            logits = model(x) if depth == n_layers else model.forward_prefix(x, depth)
         loss = torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
             ignore_index=8198 if args.ignore_unk else -100,
@@ -339,9 +393,10 @@ def main():
         if (step + 1) % args.log_every == 0 or step == step0:
             dt = time.time() - t0
             eta = dt / max(1, step + 1 - step0) * (args.steps - step - 1)
+            depth_str = f" | depth {depth}/{n_layers}" if args.stochastic_depth else ""
             print(
                 f"step {step + 1:6d}/{args.steps} | loss {loss_ema:.4f} "
-                f"(ema {loss_ema:.4f}) | lr {lr:.2e} | {toks / dt:.0f} tok/s | "
+                f"(ema {loss_ema:.4f}){depth_str} | lr {lr:.2e} | {toks / dt:.0f} tok/s | "
                 f"rss {rss_gb():.1f} GB | {dt / 60:.1f} min, eta {eta / 60:.1f} min",
                 flush=True,
             )

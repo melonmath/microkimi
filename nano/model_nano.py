@@ -392,8 +392,13 @@ class NanoModel(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-    def forward(self, ids):
-        """ids [B, T] → logits [B, T, V]. Same flow as KimiLinearModel.forward."""
+    def _stack(self, ids, depth):
+        """embed + the first `depth` decoder layers → (residual [B, T, D], blocks).
+
+        The layer loop of KimiLinearModel.forward, truncated at `depth`. KDA
+        layers allocate their recurrent state inside each call (no cache is
+        threaded through), so a truncated stack is exactly a full forward
+        stopped early - no state carries across calls or sequences."""
         c = self.c
         B, T = ids.shape
         D = c["hidden"]
@@ -406,7 +411,8 @@ class NanoModel(nn.Module):
         blocks = hidden.new_zeros(B * T, 0, D)
         seam = getattr(self, "seam_adapter", None)
         seam_after = getattr(self, "seam_after", -1)
-        for l, layer in enumerate(self.layers):
+        for l in range(depth):
+            layer = self.layers[l]
             mask = causal if l in self._mla else None
             if self.grad_ckpt and torch.is_grad_enabled():
                 # gradient checkpointing: the graph keeps only the layer
@@ -427,11 +433,33 @@ class NanoModel(nn.Module):
                 )
             if l == seam_after:
                 hidden = seam(hidden)
+        return hidden, blocks
+
+    def forward(self, ids):
+        """ids [B, T] → logits [B, T, V]. Same flow as KimiLinearModel.forward."""
+        c = self.c
+        B, T = ids.shape
+        D = c["hidden"]
+        hidden, blocks = self._stack(ids, c["n_layers"])
         hidden = _apply_attn_res(
             hidden.view(-1, D), blocks, self.output_attn_res_proj, self.output_attn_res_norm
         ).view(B, T, D)
         hidden = self.norm(hidden)
         return self.lm_head(hidden)
+
+    def forward_prefix(self, ids, depth):
+        """ids [B, T] → logits [B, T, V] from the first `depth` layers only.
+
+        Logit-lens readout used as a training exit (stochastic-depth /
+        nested-model training): the FINAL norm + lm_head are applied directly
+        to the prefix residual stream, exactly like the engine's per-layer
+        logit lens. The output attn-res mix is NOT applied on this path - it
+        is trained by the full-depth steps, which go through forward().
+        """
+        n = self.c["n_layers"]
+        assert 1 <= depth <= n, f"depth {depth} out of range [1, {n}]"
+        hidden, _ = self._stack(ids, depth)
+        return self.lm_head(self.norm(hidden))
 
 
 def count_params(model):
