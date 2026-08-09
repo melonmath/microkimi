@@ -104,10 +104,23 @@ class TrainableSparseMoe(KimiSparseMoeBlock):
     the architecture has neither dropout nor batchnorm, so eval() changes nothing else.
     """
 
+    # Routing-frequency accumulator (int64 [E], plain attribute: never in the
+    # state_dict). While not None, every forward adds the top-k selection
+    # counts of the batch. Used to build the importance ordering of the
+    # experts (see train.py --nest-experts and tools/nesting_eval.py). Note:
+    # with gradient checkpointing the forward is recomputed during backward,
+    # which counts each step's routing exactly twice (the recompute is
+    # deterministic) - a uniform scaling that does not change the ordering.
+    route_count_acc = None
+
     def forward(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
+        if self.route_count_acc is not None:
+            with torch.no_grad():
+                self.route_count_acc += torch.bincount(
+                    topk_idx.reshape(-1), minlength=len(self.experts))
         hidden = hidden_states.view(-1, hidden_states.shape[-1])
         if self.use_latent_moe:
             hidden = self.routed_expert_down_proj(hidden)
@@ -283,6 +296,41 @@ class TrainableSparseMoe(KimiSparseMoeBlock):
         unsorted = torch.empty_like(out_sorted)
         unsorted[order] = out_sorted
         return (unsorted * flat_w).view(n, k, -1).sum(1)
+
+    def restrict_experts(self, keep_idx):
+        """Restrict the router to the experts listed in keep_idx (LongTensor).
+
+        Excluded experts receive a large negative offset on the gate's score
+        correction bias, so the top-k selection never picks them and the gate
+        renormalization runs over the kept experts only (equivalent to zeroing
+        the other experts out and renormalizing). The bias carries no gradient
+        here (the selection is discrete and the combination weights come from
+        the bias-free scores), so backup/restore is exact. keep_idx must hold
+        at least top_k entries. The restriction must stay active across the
+        backward pass (gradient checkpointing recomputes the forward); call
+        clear_expert_restriction() after the optimizer step. Repeated calls
+        without a clear in between simply replace the subset (the backup is
+        taken once).
+        """
+        gate = self.gate
+        keep_idx = keep_idx.to(gate.e_score_correction_bias.device)
+        assert keep_idx.numel() >= gate.top_k, (
+            f"restrict_experts: {keep_idx.numel()} experts < top_k {gate.top_k}")
+        backup = getattr(gate, "_restrict_backup", None)
+        if backup is None:
+            backup = gate.e_score_correction_bias.detach().clone()
+            gate._restrict_backup = backup
+        offset = torch.ones_like(backup)
+        offset[keep_idx] = 0.0
+        gate.e_score_correction_bias.data = backup - 1e4 * offset
+
+    def clear_expert_restriction(self):
+        """Restore the gate bias saved by restrict_experts (exact: the bias
+        receives no gradient, so the optimizer never touches it)."""
+        backup = getattr(self.gate, "_restrict_backup", None)
+        if backup is not None:
+            self.gate.e_score_correction_bias.data.copy_(backup)
+            del self.gate._restrict_backup
 
 # ── nano config (see mission SPEC) ──
 NANO = dict(

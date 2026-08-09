@@ -29,6 +29,23 @@ GPU (NVIDIA, torch CUDA backend):
   expert stacks (NANO_MOE_CHUNK, NANO_MOE_FAST_DEVICES) and time-segment
   gradient checkpointing of the KDA recurrence (NANO_KDA_SEG,
   NANO_KDA_SEG_DEVICES). The cpu/mps paths are unchanged.
+
+Opt-in training features (all default OFF, combinable, inherited on --resume):
+  --stochastic-depth   nested-model training over the DEPTH axis (each step
+                       samples a layer-prefix depth, logit-lens readout)
+  --nest-experts KMIN  nested-model training over the EXPERT-COUNT axis (each
+                       step samples a routed-expert pool size k in
+                       [max(KMIN, top_k), n_experts] and restricts every MoE
+                       router to the top-k experts of its importance ordering:
+                       an EMA of the routing frequency, refreshed every
+                       --nest-experts-ema-every steps)
+  --ortho-loss W       auxiliary loss pushing the down-projection (w2) weight
+                       matrices of distinct experts of a layer apart (mean
+                       squared absolute cosine similarity over --ortho-pairs
+                       random pairs per layer per step), added with weight W
+  --head-vocab N       restricted output head: logits only for the first N
+                       token ids, targets >= N excluded from the loss (the
+                       skipped fraction is logged); input embedding full-size
 """
 import argparse
 import ctypes
@@ -125,6 +142,47 @@ def sample_depth(rng, n_layers, min_frac, full_p):
     return int(rng.integers(lo, hi))
 
 
+def nest_order(ema, acc):
+    """Importance ordering of the experts of one MoE layer: indices sorted by
+    decreasing routing-frequency score. The score is the EMA once it holds
+    data, else the raw accumulator (before the first EMA refresh); while both
+    are zero the natural index order applies. Ties break on the lower index
+    (stable sort)."""
+    score = ema if float(ema.sum()) > 0 else acc.to(ema.dtype)
+    if float(score.sum()) == 0:
+        return torch.arange(ema.numel(), device=ema.device)
+    return torch.argsort(score, descending=True, stable=True)
+
+
+def expert_ortho_loss(blocks, n_pairs):
+    """Mean squared absolute cosine similarity between the down-projection
+    (w2) weight matrices of distinct experts, averaged over the given MoE
+    blocks. n_pairs random pairs (i, j) with i != j are sampled per block
+    (the full O(E^2) pairing is pointless at hundreds of experts)."""
+    total = None
+    for blk in blocks:
+        w = torch.stack([e.w2.weight for e in blk.experts])
+        e_total = w.shape[0]
+        flat = w.reshape(e_total, -1).float()
+        i = torch.randint(0, e_total, (n_pairs,), device=flat.device)
+        j = (i + 1 + torch.randint(0, e_total - 1, (n_pairs,), device=flat.device)) % e_total
+        wi, wj = flat[i], flat[j]
+        cos = (wi * wj).sum(-1) / (wi.norm(dim=1) * wj.norm(dim=1)).clamp_min(1e-12)
+        loss = cos.pow(2).mean()
+        total = loss if total is None else total + loss
+    return total / len(blocks)
+
+
+def restrict_head(logits, y, head_vocab):
+    """Restricted output head: keep the logits of the first `head_vocab` token
+    ids and mask the targets >= head_vocab out of the loss (ignore_index
+    -100). Returns (logits, flat_targets, n_skipped)."""
+    logits = logits[..., :head_vocab]
+    y_flat = y.reshape(-1)
+    skip = y_flat >= head_vocab
+    return logits, y_flat.masked_fill(skip, -100), int(skip.sum())
+
+
 def lr_at(step, args):
     if step < args.warmup:
         return args.lr * (step + 1) / args.warmup
@@ -215,6 +273,30 @@ def main():
     ap.add_argument("--stochastic-depth-full-p", type=float, default=0.5,
                     help="probability of sampling the FULL depth on a step (default 0.5; "
                          "the remaining mass is uniform over the shallower depths)")
+    ap.add_argument("--nest-experts", type=int, default=0,
+                    help="expert-count nesting: each optimizer step samples a routed-expert "
+                         "pool size k uniformly in [max(KMIN, top_k), n_experts] and restricts "
+                         "every MoE router to the top-k experts of its importance ordering "
+                         "(EMA of the routing frequency, refreshed every "
+                         "--nest-experts-ema-every steps), so every pool size stays a usable "
+                         "model. Default 0 = OFF (pure opt-in)")
+    ap.add_argument("--nest-experts-ema-every", type=int, default=50,
+                    help="steps between routing-frequency EMA refreshes (default 50; "
+                         "EMA decay 0.9 per refresh)")
+    ap.add_argument("--ortho-loss", type=float, default=0.0,
+                    help="weight of the expert-orthogonality auxiliary loss: mean squared "
+                         "absolute cosine similarity between the down-projection (w2) weight "
+                         "matrices of distinct experts of a layer, averaged over the MoE "
+                         "layers (--ortho-pairs random pairs per layer per step). "
+                         "Default 0.0 = OFF")
+    ap.add_argument("--ortho-pairs", type=int, default=256,
+                    help="random expert pairs sampled per MoE layer per step for "
+                         "--ortho-loss (default 256)")
+    ap.add_argument("--head-vocab", type=int, default=0,
+                    help="restricted output head: the lm_head emits logits for the first N "
+                         "token ids only and training targets >= N are excluded from the "
+                         "loss (like --ignore-unk; the skipped fraction is logged). The "
+                         "input embedding stays full-size. Default 0 = full vocab")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -253,6 +335,19 @@ def main():
             args.stochastic_depth_min = saved_args.get("stochastic_depth_min", args.stochastic_depth_min)
             args.stochastic_depth_full_p = saved_args.get("stochastic_depth_full_p", args.stochastic_depth_full_p)
             print("stochastic depth: behavior inherited from the checkpoint args", flush=True)
+        # same inheritance for the other opt-in features: a resumed run keeps
+        # the behavior it was started with (flag state lives in the run config)
+        inherited = []
+        for key, default in (("nest_experts", 0), ("ortho_loss", 0.0), ("head_vocab", 0)):
+            val = saved_args.get(key, default)
+            if val != default:
+                setattr(args, key, val)
+                inherited.append(f"{key}={val}")
+        if inherited:
+            args.nest_experts_ema_every = saved_args.get("nest_experts_ema_every", 50)
+            args.ortho_pairs = saved_args.get("ortho_pairs", 256)
+            print(f"opt-in features inherited from the checkpoint args: {', '.join(inherited)}",
+                  flush=True)
     # seed BEFORE model construction: the init draws from the torch global
     # generator, which otherwise starts from per-process entropy and --seed
     # would not reproduce a run. The manual_seed after the build (below) keeps
@@ -298,6 +393,35 @@ def main():
         print(f"stochastic depth: sampling d in [{lo}, {n_layers}] per step, "
               f"P(full)={args.stochastic_depth_full_p} "
               f"(prefix readout = final norm + lm_head)", flush=True)
+
+    moe_blocks = [l.block_sparse_moe for l in model.layers if hasattr(l, "block_sparse_moe")]
+    nest_ema = None
+    if args.nest_experts > 0:
+        n_exp, top_k = model.c["n_experts"], model.c["top_k"]
+        nest_kmin = max(args.nest_experts, top_k)  # the router picks top_k per token
+        if nest_kmin > n_exp:
+            raise SystemExit(f"--nest-experts {args.nest_experts}: effective minimum "
+                             f"{nest_kmin} > n_experts {n_exp}")
+        assert moe_blocks, "--nest-experts: the model has no MoE layers"
+        for blk in moe_blocks:
+            blk.route_count_acc = torch.zeros(len(blk.experts), dtype=torch.int64, device=dev)
+        nest_ema = [torch.zeros(len(blk.experts), device=dev) for blk in moe_blocks]
+        nest_orders = [nest_order(ema, blk.route_count_acc)
+                       for ema, blk in zip(nest_ema, moe_blocks)]
+        print(f"expert nesting: sampling pool k in [{nest_kmin}, {n_exp}] per step "
+              f"(top-k of the routing-frequency EMA, refresh every "
+              f"{args.nest_experts_ema_every} steps)", flush=True)
+    if args.ortho_loss > 0:
+        assert moe_blocks, "--ortho-loss: the model has no MoE layers"
+        print(f"expert orthogonality loss: weight {args.ortho_loss}, {args.ortho_pairs} "
+              f"random w2 pairs per MoE layer per step", flush=True)
+    if args.head_vocab > 0:
+        if not 0 < args.head_vocab <= model.c["vocab"]:
+            raise SystemExit(f"--head-vocab {args.head_vocab} out of range "
+                             f"(1, {model.c['vocab']})")
+        print(f"restricted output head: logits over the first {args.head_vocab} ids "
+              f"(of {model.c['vocab']}), targets >= {args.head_vocab} excluded from the loss",
+              flush=True)
 
     if args.bench is not None:
         # bench mode: cap the run at N steps, summary printed at the end
@@ -359,6 +483,9 @@ def main():
     t0 = time.time()
     t_ckpt = t0
     loss_ema = None
+    ortho_ema = None
+    head_skipped = 0
+    head_total = 0
     toks = 0
     stop_reason = "steps reached"
     for step in range(step0, args.steps):
@@ -380,19 +507,55 @@ def main():
         if args.stochastic_depth:
             depth = sample_depth(rng, n_layers, args.stochastic_depth_min,
                                  args.stochastic_depth_full_p)
+        k_pool = None
+        if nest_ema is not None:
+            # one pool size per optimizer step (same draw stream as the batches:
+            # --seed / --resume fully determine the sequence). The restriction
+            # stays active across backward (gradient checkpointing recomputes
+            # the forward) and is cleared right after opt.step().
+            k_pool = int(rng.integers(nest_kmin, n_exp + 1))
+            for blk, order in zip(moe_blocks, nest_orders):
+                blk.restrict_experts(order[:k_pool])
         if args.amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
                 logits = model(x) if depth == n_layers else model.forward_prefix(x, depth)
         else:
             logits = model(x) if depth == n_layers else model.forward_prefix(x, depth)
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
-            ignore_index=8198 if args.ignore_unk else -100,
-        )
+        if args.head_vocab > 0:
+            logits, y_flat, n_skip = restrict_head(logits, y, args.head_vocab)
+            head_skipped += n_skip
+            head_total += y.numel()
+            if args.ignore_unk:
+                y_flat = y_flat.masked_fill(y_flat == 8198, -100)
+            if bool((y_flat != -100).any()):
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]).float(), y_flat, ignore_index=-100)
+            else:
+                # every target of the step was skipped: no signal, keep the graph
+                loss = logits.float().sum() * 0.0
+        else:
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1),
+                ignore_index=8198 if args.ignore_unk else -100,
+            )
+        if args.ortho_loss > 0:
+            o_loss = expert_ortho_loss(moe_blocks, args.ortho_pairs)
+            loss = loss + args.ortho_loss * o_loss
+            o_val = o_loss.item()
+            ortho_ema = o_val if ortho_ema is None else 0.98 * ortho_ema + 0.02 * o_val
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         opt.step()
+        if nest_ema is not None:
+            for blk in moe_blocks:
+                blk.clear_expert_restriction()
+            if (step + 1) % args.nest_experts_ema_every == 0:
+                for ema, blk in zip(nest_ema, moe_blocks):
+                    ema.mul_(0.9).add_(blk.route_count_acc.to(ema.dtype), alpha=0.1)
+                    blk.route_count_acc.zero_()
+                nest_orders = [nest_order(ema, blk.route_count_acc)
+                               for ema, blk in zip(nest_ema, moe_blocks)]
         toks += args.batch * args.seq
         loss_ema = loss.item() if loss_ema is None else 0.98 * loss_ema + 0.02 * loss.item()
         # explicitly release the step tensors (reduces malloc churn)
@@ -402,9 +565,13 @@ def main():
             dt = time.time() - t0
             eta = dt / max(1, step + 1 - step0) * (args.steps - step - 1)
             depth_str = f" | depth {depth}/{n_layers}" if args.stochastic_depth else ""
+            nest_str = f" | pool {k_pool}/{n_exp}" if nest_ema is not None else ""
+            ortho_str = f" | ortho {ortho_ema:.4f}" if args.ortho_loss > 0 else ""
+            head_str = (f" | head-skip {100 * head_skipped / max(1, head_total):.1f}%"
+                        if args.head_vocab > 0 else "")
             print(
                 f"step {step + 1:6d}/{args.steps} | loss {loss_ema:.4f} "
-                f"(ema {loss_ema:.4f}){depth_str} | lr {lr:.2e} | {toks / dt:.0f} tok/s | "
+                f"(ema {loss_ema:.4f}){depth_str}{nest_str}{ortho_str}{head_str} | lr {lr:.2e} | {toks / dt:.0f} tok/s | "
                 f"rss {rss_gb():.1f} GB | {dt / 60:.1f} min, eta {eta / 60:.1f} min",
                 flush=True,
             )
