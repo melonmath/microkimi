@@ -22,3 +22,9 @@ nano/vendor/moonshot/
 vocab_nano.json
 ds_parity_golden.json
 microdeepseek.tokenizer.json
+
+# third-party vocab data (downloaded on demand)
+vocabs/*.json
+vocabs/*.model
+vocabs/*.txt
+!vocabs/README.md
