@@ -309,7 +309,7 @@ def selftest():
     ce_a, _ = ce_eval(model, xs[:8], ms[:8], cfg["vocab"], "cpu", batch=4)
     train(model, xs[8:], ms[8:], cfg["vocab"], "cpu", steps=60, lr=1e-2,
           warmup=5, clip=1.0, batch=4, trainable=trainable,
-          log=lambda *a: None)
+          log=lambda *a, **k: None)
     ce_b, _ = ce_eval(model, xs[:8], ms[:8], cfg["vocab"], "cpu", batch=4)
     print(f"claim 1: heal reduces holdout CE on learnable data "
           f"({ce_a:.3f} -> {ce_b:.3f})")
