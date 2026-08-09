@@ -70,6 +70,7 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
 
     pack = {}
     report = {}
+    g_next = {}
     for hl, dl in layer_map:
         names = {k: wtmpl[k].format(l=dl) for k in ("gate", "up", "down")}
         w = read_safetensors_dir(donor_weights_path, list(names.values()))
@@ -79,20 +80,27 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
             dplanes[f"L{dl}.in"], dplanes[f"L{dl}.dz"], donor_w, mi,
             bands=bands, rel_lambda=rel_lambda, holdout=holdout,
             ih=ih, idz=idz)
-        for g, (w1, w3, w2, gate_row) in enumerate(out["experts"]):
+        g0 = g_next.get(hl, 0)
+        for g, (w1, w3, w2, gate_row) in enumerate(out["experts"], g0):
             pack[f"L{hl}.g{g}.w1"] = w1
             pack[f"L{hl}.g{g}.w3"] = w3
             pack[f"L{hl}.g{g}.w2"] = w2
             pack[f"L{hl}.g{g}.gate"] = gate_row
+        g_next[hl] = g0 + len(out["experts"])
         d = out["diag"]
-        report[str(hl)] = {"donor_layer": dl, **{k: d[k] for k in
-                           ("cka", "res_s_in", "res_m_out", "bands")}}
+        report[f"{hl}:{dl}"] = {**{k: d[k] for k in
+                                ("cka", "res_s_in", "res_m_out", "bands")}}
         band_txt = " ".join(f"g{g}:hold={b['rel_holdout']:.3f}"
-                            for g, b in enumerate(d["bands"]))
+                            for g, b in enumerate(d["bands"], g0))
         log(f"L{hl} <- donor L{dl}: cka {d['cka']:.3f}, "
             f"stitch res in/out {d['res_s_in']:.3f}/{d['res_m_out']:.3f}, "
             f"{band_txt}")
-    meta = {"bands": bands, "rel_lambda": rel_lambda,
+    counts = set(g_next.values())
+    if len(counts) != 1:
+        raise SystemExit(f"uneven experts per layer {g_next}: n_experts is "
+                         "global, every mapped layer needs the same count")
+    total_bands = counts.pop()
+    meta = {"bands": total_bands, "rel_lambda": rel_lambda,
             "host": hmeta.get("bin"), "donor": dmeta.get("model"),
             "map": layer_map, "report": report}
     pack["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
@@ -106,8 +114,10 @@ def main():
     ap.add_argument("--donor-weights", required=True,
                     help="safetensors file or checkpoint directory")
     ap.add_argument("--map", required=True,
-                    help="hostLayer:donorLayer,... (one per MoE layer for "
-                    "an injectable pack)")
+                    help="hostLayer:donorLayer,... A host layer may appear "
+                    "several times (one expert per occurrence); an "
+                    "injectable pack needs every MoE layer with the same "
+                    "expert count")
     ap.add_argument("--bands", type=int, default=1,
                     help="experts per layer, successive neuron bands")
     ap.add_argument("--rel-lambda", type=float, default=1e-4)
@@ -204,7 +214,7 @@ def selftest():
 
         pack, meta = solve_all(hp, dp, st, [(1, 4)], bands=1,
                                holdout=800, log=lambda *a: None)
-        rep = meta["report"]["1"]
+        rep = meta["report"]["1:4"]
         print(f"claim 1: anchors filtered the unmatched donor tokens, solve "
               f"ran (cka {rep['cka']:.3f})")
         assert rep["cka"] > 0.4
@@ -224,6 +234,14 @@ def selftest():
                              log=lambda *a: None)
         assert np.array_equal(pack["L1.g0.w2"], pack2["L1.g0.w2"])
         print("claim 4: solve is deterministic")
+
+        # a repeated host layer stacks experts g0, g1
+        pack3, meta3 = solve_all(hp, dp, st, [(1, 4), (1, 4)], bands=1,
+                                 holdout=800, log=lambda *a: None)
+        assert meta3["bands"] == 2
+        assert "L1.g1.w1" in pack3
+        assert np.array_equal(pack3["L1.g0.w1"], pack3["L1.g1.w1"])
+        print("claim 5: repeated host layer stacks experts (bands 2)")
 
     print("expert_solve selftest OK")
 
