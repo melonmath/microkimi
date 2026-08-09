@@ -166,6 +166,39 @@ def sweep(model, moe, e0, xs, ms, vocab, device, bias_grid, gamma_grid,
     return best[0], best[1], best[2], base_ce
 
 
+def set_layer_bias(model, l, e0, value):
+    import torch
+    with torch.no_grad():
+        model.layers[l].block_sparse_moe.gate \
+             .e_score_correction_bias[e0:] = value
+
+
+def layer_sweep(model, moe, e0, xs, ms, vocab, device, bias_grid,
+                batch=4, log=print):
+    """Greedy per-layer calibration: starting all-silent, each layer keeps
+    the bias (from the grid) that most improves holdout CE, or stays
+    silent. Monotone by construction: every accepted change lowered the
+    measured CE. Returns ({layer: bias}, final_ce, base_ce)."""
+    set_graft_bias(model, moe, e0, SILENT)
+    best_ce, _ = ce_eval(model, xs, ms, vocab, device, batch)
+    base_ce = best_ce
+    log(f"holdout CE, grafts silent: {base_ce:.4f}")
+    chosen = {}
+    for l in moe:
+        keep = SILENT
+        for b in bias_grid:
+            set_layer_bias(model, l, e0, b)
+            ce, _ = ce_eval(model, xs, ms, vocab, device, batch)
+            log(f"  L{l} bias {b:+.2f}: CE {ce:.4f}")
+            if ce < best_ce:
+                best_ce, keep = ce, b
+        set_layer_bias(model, l, e0, keep)
+        if keep != SILENT:
+            chosen[l] = keep
+            log(f"  L{l}: kept bias {keep:+.2f} (CE {best_ce:.4f})")
+    return chosen, best_ce, base_ce
+
+
 def collect_updates(model, moe, e0, gamma):
     import torch
     upd = {}
@@ -201,6 +234,9 @@ def main():
     ap.add_argument("--rel-lambda", type=float, default=1e-4)
     ap.add_argument("--bias-grid", default="-1,-0.5,0,0.5")
     ap.add_argument("--gamma-grid", default="0.5,1,1.5")
+    ap.add_argument("--sweep", default="global", choices=["global", "layer"],
+                    help="global: one (bias, gain) for all grafts; layer: "
+                    "greedy per-layer bias, gain fixed at 1")
     args = ap.parse_args()
 
     import torch
@@ -239,12 +275,20 @@ def main():
                             args.rel_lambda)
     install_rows(model, rows)
     bias_grid = [float(x) for x in args.bias_grid.split(",")]
-    gamma_grid = [float(x) for x in args.gamma_grid.split(",")]
-    b, gamma, ce, base_ce = sweep(model, moe, e0, xs_h, ms_h, cfg["vocab"],
-                                  args.device, bias_grid, gamma_grid,
-                                  args.batch)
-    print(f"best: bias {b:+.2f} gamma {gamma:.2f} -> holdout CE {ce:.4f} "
-          f"(silent {base_ce:.4f})")
+    if args.sweep == "layer":
+        chosen, ce, base_ce = layer_sweep(model, moe, e0, xs_h, ms_h,
+                                          cfg["vocab"], args.device,
+                                          bias_grid, args.batch)
+        gamma = 1.0
+        print(f"best: per-layer {chosen or 'all silent'} -> holdout CE "
+              f"{ce:.4f} (silent {base_ce:.4f})")
+    else:
+        gamma_grid = [float(x) for x in args.gamma_grid.split(",")]
+        b, gamma, ce, base_ce = sweep(model, moe, e0, xs_h, ms_h,
+                                      cfg["vocab"], args.device, bias_grid,
+                                      gamma_grid, args.batch)
+        print(f"best: bias {b:+.2f} gamma {gamma:.2f} -> holdout CE "
+              f"{ce:.4f} (silent {base_ce:.4f})")
     n = patch_bin(args.bin, args.out, collect_updates(model, moe, e0, gamma))
     print(f"-> {args.out}: {n} tensors rewritten, zero training steps",
           flush=True)
@@ -309,6 +353,17 @@ def selftest():
                    ".e_score_correction_bias"]
         assert float(bias[e0]) == b
     print("claim 5: update set carries solved rows and chosen bias")
+
+    chosen, ce_l, base_l = layer_sweep(model, moe, e0, xs[:6], ms[:6], v,
+                                       "cpu", [0.0], 4,
+                                       log=lambda *a, **k: None)
+    assert ce_l <= base_l + 1e-9
+    for l in moe:
+        bias = model.layers[l].block_sparse_moe.gate.e_score_correction_bias
+        want = chosen.get(l, SILENT)
+        assert float(bias[e0].detach()) == want
+    print(f"claim 6: greedy layer sweep monotone and consistent "
+          f"({len(chosen)} layer(s) kept, CE {ce_l:.4f} <= {base_l:.4f})")
 
     print("route_solve selftest OK")
 
