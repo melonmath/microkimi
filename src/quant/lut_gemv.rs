@@ -157,6 +157,7 @@ pub fn gemv_lut4(cb16: &[f32], idx: &[u8], rows: usize, cols: usize, x: &[f32], 
 
 /// Transposed codebook [VQ_DIM][VQ_K]: for a fixed j the 256 entry values
 // are contiguous, so the precompute vectorizes across entries.
+#[allow(dead_code)] // only the aarch64-dispatched precompute uses this
 fn transpose_cb(codebook: &[f32], cb_t: &mut [f32]) {
     debug_assert_eq!(codebook.len(), VQ_K * VQ_DIM);
     for k in 0..VQ_K {
