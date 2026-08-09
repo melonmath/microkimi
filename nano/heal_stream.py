@@ -33,7 +33,11 @@ and a full fp32 forward+backward that fits in no GPU. This trainer instead:
     it into the input projections of layer N+1 - exactly at zero-init, but
     only approximately once trained (the residual pass-through part of the
     correction is not foldable; trained adapters are refused by default
-    there, see its docstring).
+    there, see its docstring). The adapter can start from the closed-form
+    ridge solution instead of zero: --init-seam stitch.pt loads the A/B
+    written by stitch_solve.py (shapes checked, tensors stay trainable), so
+    gradient training only polishes the nonlinear residual. A resumed
+    checkpoint that already carries a seam adapter always wins over the init.
 
 Two opt-in accelerations (env, default OFF, safe to combine):
   - NANO_ACT_OFFLOAD=1: the KDA time-segment checkpointing (NANO_KDA_SEG)
@@ -575,6 +579,86 @@ def parse_layers(spec):
     return sorted(out)
 
 
+# a lens row: "  layer 20 (MLA): ' France' 46.6%  ' of' 5.8%  ..." - only the
+# top-1 token (the first 'tok' pct% segment) is captured
+_LENS_LINE = re.compile(
+    r"^\s*layer\s+(\d+)\s+\([^)]*\)\s*:\s*(?:'[^']*'|\"[^\"]*\")\s+([0-9]+(?:\.[0-9]+)?)%")
+
+
+def lens_top1(path):
+    """Parse a logit-lens log into {layer index: top-1 percentage}. Lines that
+    do not match the lens format (headers, prompts, other diagnostics) are
+    skipped, so a full generation log can be fed directly."""
+    top1 = {}
+    with open(path) as f:
+        for line in f:
+            m = _LENS_LINE.match(line)
+            if m:
+                top1[int(m.group(1))] = float(m.group(2))
+    return top1
+
+
+def lora_layers_from_lens(path, n_layers=None, collapse_pct=10.0):
+    """Pick the LoRA layer range from a logit-lens log. A layer's top-1 token
+    has "collapsed" when its share drops below collapse_pct AFTER some earlier
+    layer exceeded it (a confident signal exists upstream and dies here). The
+    wound is the deepest contiguous tail of collapsed layers; the adapters
+    cover one layer above the first collapsed one through the last collapsed
+    layer. Returns the sorted layer list, or None when the log has no parsable
+    collapse (the caller falls back to training every layer)."""
+    top1 = lens_top1(path)
+    if not top1:
+        return None
+    seen_live = False
+    runs, run = [], []  # maximal runs of consecutive collapsed layer indices
+    for l in sorted(top1):
+        live = top1[l] >= collapse_pct
+        seen_live = seen_live or live
+        collapsed = seen_live and not live
+        if collapsed and (not run or l == run[-1] + 1):
+            run.append(l)
+        else:
+            if run:
+                runs.append(run)
+            run = [l] if collapsed else []
+    if run:
+        runs.append(run)
+    if not runs:
+        return None
+    tail = runs[-1]  # deepest contiguous collapsed tail
+    first, last = tail[0], tail[-1]
+    if n_layers is not None:
+        last = min(last, n_layers - 1)
+    lo = max(0, first - 1)
+    print(f"lora-auto: {path}: top-1 collapsed below {collapse_pct:.0f}% in layers "
+          f"{first}..{tail[-1]} (deepest contiguous tail); adapting layers "
+          f"{lo}..{last} (one above the wound through its end)", flush=True)
+    return list(range(lo, last + 1))
+
+
+def init_seam_from_stitch(sm, path):
+    """Load a stitch_solve.py result (keys seam_adapter.A / seam_adapter.B)
+    into the attached seam adapter as the optimization START: only the values
+    change, the tensors stay the same trainable parameters (their optimizer
+    state is untouched). Callers apply this only on the fresh zero-init path -
+    a resumed checkpoint that carries a seam adapter always wins."""
+    sd = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        a, b = sd["seam_adapter.A"], sd["seam_adapter.B"]
+    except (KeyError, TypeError):
+        raise SystemExit(f"{path}: not a stitch file (needs seam_adapter.A / seam_adapter.B)")
+    ad = sm.model.seam_adapter
+    if tuple(a.shape) != tuple(ad.A.shape) or tuple(b.shape) != tuple(ad.B.shape):
+        raise SystemExit(
+            f"{path}: stitch shapes A {tuple(a.shape)} / B {tuple(b.shape)} do not "
+            f"match the adapter (rank {ad.rank}, hidden {ad.A.shape[1]})")
+    with torch.no_grad():
+        ad.A.copy_(a.to(device=ad.A.device, dtype=ad.A.dtype))
+        ad.B.copy_(b.to(device=ad.B.device, dtype=ad.B.dtype))
+    print(f"init-seam: {path} loaded into the adapter (rank {a.shape[0]}): "
+          f"|B| {ad.B.norm():.4e} (vs exactly 0 at the default zero-init)", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="microkimi .bin (MKIM0002), read via mmap")
@@ -602,6 +686,20 @@ def main():
                     help="0-based index of the layer after which the seam adapter is "
                          "inserted (default 11: the v3 slice '0-11,83-92' has its seam "
                          "between the renumbered layers 11 and 12)")
+    ap.add_argument("--init-seam", default=None, metavar="STITCH.pt",
+                    help="initialize the seam adapter from a stitch_solve.py result "
+                         "(keys seam_adapter.A / seam_adapter.B) instead of zero: the "
+                         "ridge-solved stitch sits near the linear optimum, gradient "
+                         "training only polishes the nonlinear residual. Requires "
+                         "--seam-adapter; ignored when the resumed checkpoint already "
+                         "carries a seam adapter")
+    ap.add_argument("--lora-auto", default=None, metavar="LENSLOG",
+                    help="choose --lora-layers from a logit-lens log: the deepest "
+                         "contiguous tail of layers whose top-1 token collapsed below "
+                         "10%% (after exceeding 10%% earlier) localizes the wound, the "
+                         "adapter range starts one layer above it. Explicit "
+                         "--lora-layers wins; no parsable collapse falls back to "
+                         "every layer with a warning")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--accum", type=int, default=1, help="micro-batches per optimizer step")
@@ -628,6 +726,10 @@ def main():
                     help="logits parity vs the bin2pt reference model, then exit")
     args = ap.parse_args()
 
+    if args.init_seam and not args.seam_adapter:
+        raise SystemExit("--init-seam requires --seam-adapter (the init targets the "
+                         "seam adapter)")
+
     os.makedirs(args.out, exist_ok=True)
     torch.set_num_threads(args.threads)
     dev = args.device
@@ -646,12 +748,21 @@ def main():
         pre_ck = torch.load(ckpt_latest, map_location="cpu", weights_only=False)
     lora_cfg = (pre_ck or {}).get("lora")
     if lora_cfg is None:
+        # layer scope: explicit --lora-layers always wins over --lora-auto
+        layers = None
+        if args.lora_layers:
+            layers = parse_layers(args.lora_layers)
+        elif args.lora_auto:
+            layers = lora_layers_from_lens(args.lora_auto)
+            if layers is None:
+                print(f"lora-auto: no collapsed top-1 tail found in {args.lora_auto} - "
+                      "falling back to every layer", flush=True)
         lora_cfg = {
             "rank": args.lora,
             "alpha": args.lora_alpha if args.lora_alpha is not None else args.lora,
             "targets": [t.strip() for t in args.lora_targets.split(",") if t.strip()],
             "norms": args.lora_norms,
-            "layers": parse_layers(args.lora_layers) if args.lora_layers else None,
+            "layers": layers,
             "final_norm": args.lora_final_norm,
         }
     # seam adapter: from the checkpoint being resumed when it has one, else the
@@ -683,9 +794,10 @@ def main():
     torch.manual_seed(args.seed)
 
     step0 = 0
+    fresh_seam = seam_cfg is not None  # no resume: the adapter is fresh zero-init
     if pre_ck is not None:
         print(f"resuming from {ckpt_latest} ...", flush=True)
-        sm.load_trainable(pre_ck["model"])
+        fresh_seam = sm.load_trainable(pre_ck["model"])
         try:
             opt.load_state_dict(pre_ck["opt"])
         except ValueError:
@@ -716,6 +828,14 @@ def main():
         rng.bit_generator.state = pre_ck["rng_np"]
         torch.set_rng_state(pre_ck["rng_torch"])
         print(f"  -> step {step0}", flush=True)
+
+    # --init-seam: only on the fresh zero-init path - checkpoint state wins
+    if args.init_seam:
+        if fresh_seam:
+            init_seam_from_stitch(sm, args.init_seam)
+        else:
+            print("init-seam: the resumed checkpoint already carries a seam "
+                  "adapter - checkpoint state wins, init ignored", flush=True)
 
     if args.bench is not None:
         args.steps = step0 + args.bench
