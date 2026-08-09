@@ -4,9 +4,22 @@
 // top_k, n_layers, mla_layers, dense_layers).
 //
 //   microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "spec"] [--cold-vq N]
+//                                                [--merge-experts N]
 //                                                [--vocab-top N <freqfile> [--vocab-base <remap.json>]]
 //                                                [--imatrix imatrix.bin [--imatrix-score-only]]
 //                                                [--expert-order=frequency --route-cms sketch.bin]
+//
+// Expert merging (--merge-experts N): the alternative to --experts deletion
+// (the two are mutually exclusive, as are --cold-vq and --expert-order
+// combinations). Per MoE layer the N output experts are CLUSTERS of the old
+// ones: deterministic usage-weighted k-means over the dequantized
+// w1|w2|w3 vectors (k-means++ seeding, fixed xorshift seed, 25 iterations),
+// each merged expert is the usage-weighted average of its members
+// requantized to mxfp4, and its router row is the logsumexp of the member
+// rows (routing mass conserved). Close experts merge their knowledge
+// instead of dropping the tail; hot experts tend to survive as singletons.
+// Shared experts are never merged. Details in tools/slice/merge.rs. Local
+// .bin sources only (the merge reads and requantizes every expert).
 //
 // Expert reordering (--expert-order=frequency --route-cms SKETCH): no
 // pruning, ALL experts stay; per MoE layer the expert blobs are physically
@@ -80,6 +93,7 @@
 // them). Zero requantization loss. All sliced tensors are f32 and stay f32.
 
 mod ckpt;
+mod merge;
 mod plan;
 mod score;
 mod source;
@@ -94,7 +108,8 @@ use source::{n_rows, role_of, row_chunks, row_width, Role, Source};
 use vq::{vq_quantize_tensor, vq_reservoir};
 use vocab::{build_vocab_plan, VocabPlan};
 
-use crate::quant::weights::{blob_size, f32_to_bytes, BinWriter, DTYPE_F32, DTYPE_VQ1};
+use crate::quant::weights::{blob_size, f32_to_bytes, BinWriter, DTYPE_F32, DTYPE_MXFP4, DTYPE_VQ1};
+use std::rc::Rc;
 
 fn value_flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -134,6 +149,10 @@ pub fn run(args: &[String]) {
     };
     let hidden: Option<usize> = value_flag(args, "--hidden").map(|s| s.parse().expect("bad --hidden"));
     let experts: Option<usize> = value_flag(args, "--experts").map(|s| s.parse().expect("bad --experts"));
+    // --merge-experts N: merge instead of delete (see the header comment and
+    // tools/slice/merge.rs). Mutually exclusive with --experts / --cold-vq /
+    // --expert-order; local .bin sources only.
+    let merge_experts: Option<usize> = value_flag(args, "--merge-experts").map(|s| s.parse().expect("bad --merge-experts"));
     let layers_spec = value_flag(args, "--layers");
     // --cold-vq N: precision-tiered expert storage. ALL experts stay in the
     // file (the router is untouched); per MoE layer the top-N experts by
@@ -177,8 +196,12 @@ pub fn run(args: &[String]) {
             std::process::exit(1);
         }
     }
-    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() && expert_order_flag.is_none() {
-        eprintln!("error: slice needs at least one of --hidden / --experts / --layers / --cold-vq / --vocab-top / --expert-order");
+    if let Err(msg) = merge::check_compatible(experts, merge_experts, cold_vq, expert_order_flag.as_ref()) {
+        eprintln!("error: {}", msg);
+        std::process::exit(1);
+    }
+    if hidden.is_none() && experts.is_none() && layers_spec.is_none() && cold_vq.is_none() && vocab_top.is_none() && expert_order_flag.is_none() && merge_experts.is_none() {
+        eprintln!("error: slice needs at least one of --hidden / --experts / --merge-experts / --layers / --cold-vq / --vocab-top / --expert-order");
         std::process::exit(1);
     }
     if let (Some(m), Some(n)) = (experts, cold_vq) {
@@ -190,10 +213,19 @@ pub fn run(args: &[String]) {
             "--cold-vq requires a local .bin source (mxfp4 expert blobs)"
         );
     }
+    if merge_experts.is_some() {
+        assert!(
+            !model.starts_with("http://") && !model.starts_with("https://"),
+            "--merge-experts requires a local .bin source (mxfp4 expert blobs)"
+        );
+    }
 
     let mut source = Source::open(&model, &out);
     if cold_vq.is_some() {
         assert!(matches!(source, Source::Bin(_)), "--cold-vq requires a .bin source (mxfp4 expert blobs)");
+    }
+    if merge_experts.is_some() {
+        assert!(matches!(source, Source::Bin(_)), "--merge-experts requires a .bin source (mxfp4 expert blobs)");
     }
     // --imatrix FILE: activation importance stats (microkimi calibrate) used
     // to weight the VQ codebook training + assignment of the cold experts.
@@ -283,13 +315,14 @@ pub fn run(args: &[String]) {
         })
         .unwrap_or_default();
     let ckpt_key = format!(
-        "model={}|layers={}|hidden={}|experts={}|vocabtop={}|eorder={}",
+        "model={}|layers={}|hidden={}|experts={}|vocabtop={}|eorder={}|merge={}",
         model,
         join_csv(&kept_layers),
         hidden.map(|h| h.to_string()).unwrap_or_default(),
         experts.map(|e| e.to_string()).unwrap_or_default(),
         vocabtop_key,
-        eorder_key
+        eorder_key,
+        merge_experts.map(|e| e.to_string()).unwrap_or_default()
     );
     let ckpt = SliceCkpt::open(&out, &ckpt_key);
 
@@ -319,13 +352,16 @@ pub fn run(args: &[String]) {
     });
 
     // ── 3. expert selection (per kept MoE layer) ──
+    // persistent full-score cache (config-independent, one level below the
+    // per-run .sliceckpt): saves the whole scoring on reruns. --experts reads
+    // AND writes it; --merge-experts only READS it (usage weights), so a merge
+    // rerun on the same model + cache state is bit-identical.
+    let score_cache =
+        (experts.is_some() || merge_experts.is_some()).then(|| ScoreCache::open(&out, &model, cfg.n_layers, cfg.n_experts));
     let expert_sets = experts.map(|n| {
         assert!(n > 0, "--experts must be >= 1");
         let t = std::time::Instant::now();
-        // persistent full-score cache (config-independent, one level below
-        // the per-run .sliceckpt): saves the whole scoring on reruns
-        let score_cache = ScoreCache::open(&out, &model, cfg.n_layers, cfg.n_experts);
-        let sets = expert_keep_sets(&source, &kept_layers, n, &ckpt, &score_cache);
+        let sets = expert_keep_sets(&source, &kept_layers, n, &ckpt, score_cache.as_ref().unwrap());
         let how = if matches!(source, Source::Bin(_)) {
             "Frobenius of dequantized w1+w2+w3"
         } else {
@@ -333,6 +369,24 @@ pub fn run(args: &[String]) {
         };
         println!("experts: keeping {}/{} per MoE layer ({}), scored in {:.1?}", n, cfg.n_experts, how, t.elapsed());
         sets
+    });
+
+    // ── 3a. expert merging (--merge-experts): per kept MoE layer the old
+    // experts clustered into N (new expert id = cluster index). Checkpointed
+    // per layer (crash-safe resume), threaded one layer per thread.
+    let merge_plan: Option<std::collections::HashMap<usize, merge::LayerMerge>> = merge_experts.map(|n| {
+        assert!(n >= 1 && n < cfg.n_experts, "--merge-experts N must be in 1..={} (model has {} experts)", cfg.n_experts - 1, cfg.n_experts);
+        let t = std::time::Instant::now();
+        let m = merge::cluster_layers(&source, &kept_layers, n, &ckpt, score_cache.as_ref().unwrap());
+        println!("merge: {} MoE layers clustered {} -> {} experts in {:.1?}", m.len(), cfg.n_experts, n, t.elapsed());
+        m
+    });
+    // Rc-shared per layer: the 3N merged expert plans and the 2 router plans
+    // of a layer all point at the same cluster table / weight vector.
+    let merge_rc: Option<std::collections::HashMap<usize, (Rc<Vec<Vec<usize>>>, Rc<Vec<f64>>)>> = merge_plan.as_ref().map(|m| {
+        m.iter()
+            .map(|(&l, lm)| (l, (Rc::new(lm.clusters.clone()), Rc::new(lm.weights.clone()))))
+            .collect()
     });
 
     // fold --expert-order into the per-layer expert lists the plan builder
@@ -424,8 +478,38 @@ pub fn run(args: &[String]) {
 
     // ── 4. plan: output tensors in input directory order ──
     let mut plans: Vec<Plan> = Vec::new();
+    let mut merge_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for e in source.entries() {
         let role = role_of(&e.name, cfg, arch);
+        // merged experts (--merge-experts): the output experts of a layer are
+        // cluster averages, not source tensors - emit the layer's 3N merged
+        // plans once, on the first expert blob met, and skip every source
+        // expert tensor of the layer.
+        if role == Role::Expert && merge_rc.is_some() {
+            let (l, _) = split_layer(&e.name).unwrap();
+            let Some(nl) = new_layer_of(l) else { continue }; // pruned layer
+            if merge_emitted.insert(l) {
+                let (clusters, wts) = merge_rc.as_ref().unwrap()[&l].clone();
+                for (k, members) in clusters.iter().enumerate() {
+                    for wn in ["w1", "w2", "w3"] {
+                        let src_name = format!("layers.{}.block_sparse_moe.experts.{}.{}", l, members[0], wn);
+                        plans.push(Plan {
+                            out_name: format!("layers.{}.block_sparse_moe.experts.{}.{}", nl, k, wn),
+                            dtype: DTYPE_MXFP4, // requantized output (also for mxfp4sq sources)
+                            dims: source.entry(&src_name).dims.clone(),
+                            src_name,
+                            role,
+                            channels: Vec::new(),
+                            experts: None,
+                            vocab: None,
+                            merge_members: Some((Rc::new(members.clone()), wts.clone())),
+                            merge_clusters: None,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         let (out_name, experts_for_tensor, dtype_override): (String, Option<Vec<usize>>, Option<u8>) = match split_layer(&e.name) {
             None => (e.name.clone(), None, None),
             Some((l, rest)) => {
@@ -461,6 +545,15 @@ pub fn run(args: &[String]) {
             (Some(v), "embed_tokens.weight" | "lm_head.weight") => Some(v.keep.clone()),
             _ => None,
         };
+        // merged routers keep no old row gather: their rows are the
+        // logsumexp of each cluster's member rows (merge_clusters), and the
+        // row count is the cluster count.
+        let merge_clusters: Option<Rc<Vec<Vec<usize>>>> = if matches!(role, Role::RouterW | Role::RouterB) {
+            split_layer(&e.name).and_then(|(l, _)| merge_rc.as_ref().and_then(|m| m.get(&l).map(|(c, _)| c.clone())))
+        } else {
+            None
+        };
+        let mrows = merge_clusters.as_ref().map(|c| c.len());
         let dims = if matches!(role, Role::Copy | Role::Expert) {
             e.dims.clone()
         } else {
@@ -472,8 +565,8 @@ pub fn run(args: &[String]) {
                 Role::ColsD => vec![out_rows, ch.len() as u32],
                 Role::RowsD => vec![ch.len() as u32, e.dims[1]],
                 Role::BothD => vec![ch.len() as u32, ch.len() as u32],
-                Role::RouterW => vec![experts_for_tensor.as_ref().map(|k| k.len()).unwrap_or(r) as u32, ch.len() as u32],
-                Role::RouterB => vec![experts_for_tensor.as_ref().map(|k| k.len()).unwrap_or(r) as u32],
+                Role::RouterW => vec![mrows.or(experts_for_tensor.as_ref().map(|k| k.len())).unwrap_or(r) as u32, ch.len() as u32],
+                Role::RouterB => vec![mrows.or(experts_for_tensor.as_ref().map(|k| k.len())).unwrap_or(r) as u32],
                 _ => unreachable!(),
             }
         };
@@ -486,6 +579,8 @@ pub fn run(args: &[String]) {
             channels: ch,
             experts: experts_for_tensor,
             vocab: vrows,
+            merge_members: None,
+            merge_clusters,
         });
     }
     // physical write order with --expert-order: the plan list follows the
@@ -521,13 +616,15 @@ pub fn run(args: &[String]) {
             channels: Vec::new(),
             experts: None,
             vocab: None,
+            merge_members: None,
+            merge_clusters: None,
         });
     }
 
     // ── 5. MKIM0002 config ──
     let new_n_layers = kept_layers.len();
     let new_d = channels.as_ref().map(|c| c.len()).unwrap_or(d);
-    let new_n_experts = experts.unwrap_or(cfg.n_experts);
+    let new_n_experts = experts.or(merge_experts).unwrap_or(cfg.n_experts);
     let new_top_k = cfg.top_k.min(new_n_experts);
     let new_vocab = vocab_plan.as_ref().map(|v| v.keep.len()).unwrap_or(cfg.vocab);
     // specials: with --vocab-top every known special is recorded at its NEW
@@ -573,7 +670,7 @@ pub fn run(args: &[String]) {
 \"attn_res_block\": {}, \"first_k_dense\": {}, \"rms_eps\": {}{}, \
 \"mla_layers\": [{}], \"dense_layers\": [{}], \
 \"specials\": {{{}}}, \
-\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"{}{}}}}}",
+\"pruning\": {{\"method\": \"weight-magnitude-v1\", \"hidden\": {}, \"experts\": {}, \"layers\": \"{}\"{}{}{}}}}}",
         arch_kv,
         new_n_layers, new_d, new_vocab, new_n_experts, new_top_k, cfg.n_shared,
         cfg.kda_heads, cfg.kda_dim, cfg.kda_conv, cfg.kda_fa, cfg.gate_lb,
@@ -585,6 +682,7 @@ pub fn run(args: &[String]) {
         new_d, new_n_experts, kept_layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(","),
         cold_vq.map(|n| format!(", \"cold_vq\": {}", n)).unwrap_or_default(),
         vocab_top.as_ref().map(|(n, _)| format!(", \"vocab_top\": {}", n)).unwrap_or_default(),
+        merge_experts.map(|n| format!(", \"merge_experts\": {}", n)).unwrap_or_default(),
     );
     // the expert_order audit table goes in as a top-level key (inserted
     // post-hoc: one less placeholder in an already dense format string)
@@ -621,6 +719,16 @@ pub fn run(args: &[String]) {
         }
         let se = source.entry(&p.src_name);
         match p.role {
+            Role::Expert if p.merge_members.is_some() => {
+                // merged expert: dequantize the cluster members (SOURCE layer
+                // numbering from src_name), weighted average, requantize
+                let (members, wts) = p.merge_members.as_ref().unwrap();
+                let (l, rest) = split_layer(&p.src_name).unwrap();
+                let wname = rest.rsplit('.').next().unwrap();
+                let blob = merge::merge_expert_blob(&source, l, members, wts, wname, p.dims[0] as usize, p.dims[1] as usize);
+                assert_eq!(blob_size(p.dtype, &p.dims), blob.len() as u64, "{}: merged size mismatch", p.out_name);
+                w.write_blob_at(&mut f, off, &blob);
+            }
             Role::Expert if p.dtype == DTYPE_VQ1 => {
                 // imatrix column weights for this expert matrix (original
                 // layer numbering: src_name), w1/w3 -> hidden, w2 -> inter
@@ -671,7 +779,14 @@ pub fn run(args: &[String]) {
                 assert_eq!(written, blob_size(DTYPE_F32, &p.dims), "{}: planned dims mismatch", p.src_name);
             }
             _ => {
-                let (vals, dims) = slice_f32(se, &source.f32_rows(se, 0, n_rows(se)), p.role, &p.channels, p.experts.as_ref());
+                let full = source.f32_rows(se, 0, n_rows(se));
+                let (vals, dims) = match (&p.merge_clusters, p.role) {
+                    // merged router: logsumexp over each cluster's member
+                    // rows (routing mass conserved), then the channel gather
+                    (Some(cl), Role::RouterW) => (merge::router_merge_w(&full, n_rows(se), row_width(se), cl, &p.channels), p.dims.clone()),
+                    (Some(cl), Role::RouterB) => (merge::router_merge_b(&full, cl), p.dims.clone()),
+                    _ => slice_f32(se, &full, p.role, &p.channels, p.experts.as_ref()),
+                };
                 assert_eq!(dims, p.dims, "{}: planned dims mismatch", p.src_name);
                 w.write_blob_at(&mut f, off, &f32_to_bytes(&vals));
             }
@@ -718,7 +833,13 @@ pub fn run(args: &[String]) {
     println!("  config: {} layers (MLA {:?}, dense {:?}), hidden {}, {} experts top-{}", 
         new_n_layers, mla_layers, dense_layers, new_d, new_n_experts, new_top_k);
     println!("  AttnRes: block={} re-applied on the renumbered layers", cfg.attn_res_block);
-    println!("  experts: mxfp4 blobs copied verbatim (no requantization)");
+    match merge_experts {
+        Some(n) => println!(
+            "  merge: {} -> {} experts per MoE layer (usage-weighted k-means, weighted-average experts requantized to mxfp4, router rows merged by logsumexp)",
+            cfg.n_experts, n
+        ),
+        None => println!("  experts: mxfp4 blobs copied verbatim (no requantization)"),
+    }
     if expert_order.is_some() {
         println!("  expert-order: frequency (route-cms) - router rows and expert blobs relabeled, hot experts file-adjacent, dense packing");
     }

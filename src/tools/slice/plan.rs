@@ -12,6 +12,11 @@ pub(super) struct Plan {
     pub(super) channels: Vec<usize>,          // hidden keep-set (identity when no --hidden)
     pub(super) experts: Option<Vec<usize>>,  // expert keep-set for RouterW/RouterB rows
     pub(super) vocab: Option<Vec<usize>>,    // vocab keep-set (old row ids, ascending) for embed/lm_head
+    // --merge-experts: merged expert tensors carry their cluster (source
+    // expert ids + the layer's per-old-expert merge weights); RouterW/RouterB
+    // carry the layer's cluster table (rows merged by logsumexp).
+    pub(super) merge_members: Option<(std::rc::Rc<Vec<usize>>, std::rc::Rc<Vec<f64>>)>,
+    pub(super) merge_clusters: Option<std::rc::Rc<Vec<Vec<usize>>>>,
 }
 
 /// Slices an f32 tensor according to its role. Returns (values, new_dims).

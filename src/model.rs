@@ -36,7 +36,7 @@ pub use ops::matvec_cpu;
 pub(crate) use ops::matvec_packed_nt;
 use ops::{attn_res_refs, q8head_enabled, sigmoid, silu};
 #[cfg(test)]
-use ops::{dot8t, dot_scalar};
+use ops::dot_scalar;
 pub(crate) use attention::{
     hadamard64, mla_attn_flash, mla_attn_flash_mqa, mla_attn_flash_q8, mla_attn_flash_q8_mqa,
     mla_attn_ref, mla_attn_ref_q8,

@@ -235,7 +235,9 @@ fn main() {
             println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
-            println!("                                         structural pruning (channels / experts / layers)");            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
+            println!("                                         structural pruning (channels / experts / layers)");            println!("      --merge-experts N                  merge instead of delete: usage-weighted k-means clusters");
+            println!("                                         the experts of every MoE layer into N averaged experts");
+            println!("                                         (router rows merged by logsumexp, routing mass conserved)");            println!("      --cold-vq N                        precision tiering: top-N experts stay mxfp4, the");
             println!("                                         cold tail becomes VQ1 (0.5 bit, shared codebook)");
             println!("      --imatrix FILE (with --cold-vq)      activation-weighted VQ codebook (see calibrate);");
             println!("                                         --imatrix-score-only: report only, blind codebook");

@@ -53,7 +53,7 @@ use fetch::{
     FUSE_NS, FUSE_READS,
 };
 #[cfg(test)]
-use fetch::{compact, FUSE_GAP_MAX, O_DIRECT};
+use fetch::FUSE_GAP_MAX;
 use prefetch::{
     pref_used, trace_record, trace_sink, TraceSim, DPREF_CACHED, DPREF_COOL, DPREF_ISSUED,
     DPREF_USED, DPREF_WIN_I, DPREF_WIN_U, PREDICT_N, PRED_HIT, PRED_TOT, PREF_CACHED, PREF_ISSUED,
