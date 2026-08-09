@@ -48,20 +48,34 @@ def moe_layers_of(cfg):
 
 
 class HostTaps:
-    """Hooks on each MoE layer's routed_expert_down_proj: its input is the
-    router/post-attention-layernorm stream, its output the latent stream."""
+    """Hooks on each MoE layer: routed_expert_down_proj's input is the
+    router/post-attention-layernorm stream and its output the latent
+    stream; routed_expert_norm's input is the latent output of the routed
+    expert mix (what the bank already produces, before norm + up_proj)."""
 
     def __init__(self, model, layers):
         self.rec = {}
         self.handles = []
         for l in layers:
-            mod = model.layers[l].block_sparse_moe.routed_expert_down_proj
-            self.handles.append(mod.register_forward_hook(self._mk(l)))
+            blk = model.layers[l].block_sparse_moe
+            self.handles.append(
+                blk.routed_expert_down_proj.register_forward_hook(
+                    self._mk(l)))
+            norm = getattr(blk, "routed_expert_norm", None)
+            if norm is not None:
+                self.handles.append(
+                    norm.register_forward_hook(self._mk_moe(l)))
 
     def _mk(self, l):
         def hook(_mod, inp, out):
             self.rec[f"L{l}.pln"] = inp[0].detach().float().cpu()
             self.rec[f"L{l}.lat"] = out.detach().float().cpu()
+        return hook
+
+    def _mk_moe(self, l):
+        def hook(_mod, inp, _out):
+            self.rec[f"L{l}.moe"] = inp[0].detach().float().cpu() \
+                .reshape(-1, inp[0].shape[-1])
         return hook
 
     def close(self):
@@ -223,12 +237,13 @@ def selftest():
 
         _m, ends, mask, planes = open_capture(p)
         assert set(planes) == {f"L{l}.{k}" for l in layers
-                               for k in ("pln", "lat")}
+                               for k in ("pln", "lat", "moe")}
         assert planes["L1.pln"].shape == (17, 64)
         assert planes["L1.lat"].shape == (17, 32)
+        assert planes["L1.moe"].shape == (17, 32)
         assert not mask[0] and mask[1]  # BOS masked
-        print("claim 2: planes have router-input and latent widths, "
-              "BOS masked")
+        print("claim 2: planes have router-input, latent and MoE-mix "
+              "widths, BOS masked")
 
         # latent plane must equal down_proj(router plane) exactly
         w = model.layers[1].block_sparse_moe.routed_expert_down_proj

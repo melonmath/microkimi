@@ -16,6 +16,7 @@ TOOLS = [
     ("expert_solve.py", "expert_solve selftest OK"),
     ("inject_experts.py", "inject_experts selftest OK"),
     ("graft_heal.py", "graft_heal selftest OK"),
+    ("route_solve.py", "route_solve selftest OK"),
     ("tokens_to_text.py", "tokens_to_text selftest OK"),
 ]
 

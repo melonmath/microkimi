@@ -54,7 +54,7 @@ def parse_map(s):
 
 def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
               bands=1, rel_lambda=1e-4, holdout=4096, max_pairs=0,
-              moe_inter=None, log=print):
+              moe_inter=None, log=print, target="donor"):
     hmeta, hends, hmask, hplanes = open_capture(host_prefix)
     dmeta, dends, dmask, dplanes = open_capture(donor_prefix)
     mi = moe_inter or hmeta["moe_inter"]
@@ -75,11 +75,18 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
         names = {k: wtmpl[k].format(l=dl) for k in ("gate", "up", "down")}
         w = read_safetensors_dir(donor_weights_path, list(names.values()))
         donor_w = {k: w[names[k]] for k in names}
+        y_moe = None
+        if target == "diff":
+            if f"L{hl}.moe" not in hplanes:
+                raise SystemExit(f"--target diff needs the L{hl}.moe plane "
+                                 "(re-capture the host with a tool version "
+                                 "that records the MoE mix output)")
+            y_moe = hplanes[f"L{hl}.moe"]
         out = solve_graft(
             hplanes[f"L{hl}.lat"], hplanes[f"L{hl}.pln"],
             dplanes[f"L{dl}.in"], dplanes[f"L{dl}.dz"], donor_w, mi,
             bands=bands, rel_lambda=rel_lambda, holdout=holdout,
-            ih=ih, idz=idz)
+            ih=ih, idz=idz, y_moe=y_moe)
         g0 = g_next.get(hl, 0)
         for g, (w1, w3, w2, gate_row) in enumerate(out["experts"], g0):
             pack[f"L{hl}.g{g}.w1"] = w1
@@ -102,7 +109,7 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
     total_bands = counts.pop()
     meta = {"bands": total_bands, "rel_lambda": rel_lambda,
             "host": hmeta.get("bin"), "donor": dmeta.get("model"),
-            "map": layer_map, "report": report}
+            "map": layer_map, "target": target, "report": report}
     pack["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     return pack, meta
 
@@ -124,12 +131,17 @@ def main():
     ap.add_argument("--holdout", type=int, default=4096)
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--moe-inter", type=int, default=None)
+    ap.add_argument("--target", default="donor", choices=["donor", "diff"],
+                    help="donor: projected donor FFN delta; diff: that "
+                    "delta MINUS the host bank's own mix output (the "
+                    "expert only encodes what the host lacks)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     pack, meta = solve_all(args.host_capture, args.donor_capture,
                            args.donor_weights, parse_map(args.map),
                            args.bands, args.rel_lambda, args.holdout,
-                           args.max_pairs, args.moe_inter)
+                           args.max_pairs, args.moe_inter,
+                           target=args.target)
     np.savez(args.out, **pack)
     print(f"-> {args.out}: {len(pack) - 1} tensors, bands {meta['bands']}")
 

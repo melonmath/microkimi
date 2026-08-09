@@ -256,7 +256,8 @@ def neuron_scores(w1_full, w3_full, w_down, h_sample, chunk=2048):
 
 def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
                 rel_lambda=1e-4, holdout=4096, score_sample=16384,
-                chunk=8192, ih=None, idz=None, gate_sigma=1.0):
+                chunk=8192, ih=None, idz=None, gate_sigma=1.0,
+                y_moe=None):
     """Solves host-shaped expert tensors from aligned activations.
 
     h_lat [n, rh]   host latent stream (routed_expert_down_proj output)
@@ -267,6 +268,13 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
                      "down": [d_D, d_ff]}
     ih, idz         optional anchor index arrays pairing host rows with
                     donor rows (from match_anchors)
+    y_moe [n, rh]   optional: the host expert bank's own latent mix
+                    output. When given, the target becomes DIFFERENTIAL:
+                    Y = projected donor delta - y_moe, i.e. only the part
+                    of the donor's contribution the host does not already
+                    produce. Where the host already agrees, the expert
+                    output vanishes, which makes a mis-routed expert
+                    nearly harmless (the low-heal / no-heal target).
 
     Returns {"experts": [(w1, w3, w2, gate_row) x bands], "diag": {...}}
     with w1/w3 [moe_inter, rh], w2 [rh, moe_inter], gate_row [d].
@@ -316,11 +324,17 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
         # 3) w2 re-solve: SiTU response -> projected donor delta
         g_w2 = RectGram(moe_inter, rh)
         g_gate = RectGram(h_pln.shape[1], 1)
-        for (h, d), (p, _) in zip(
-                chunked_pairs(h_lat, dz, ih_fit, idz_fit, chunk),
-                chunked_pairs(h_pln, dz, ih_fit, idz_fit, chunk)):
+        n_fit = len(ih_fit)
+        for t0 in range(0, n_fit, chunk):
+            hi = ih_fit[t0:t0 + chunk]
+            di = idz_fit[t0:t0 + chunk]
+            h = np.asarray(h_lat[hi], np.float64)
+            d = np.asarray(dz[di], np.float64)
+            p = np.asarray(h_pln[hi], np.float64)
             a = situ(h @ w1.T.astype(np.float64), h @ w3.T.astype(np.float64))
             y = d @ m_out.T
+            if y_moe is not None:
+                y = y - np.asarray(y_moe[hi], np.float64)
             g_w2.add(a, y)
             t = np.linalg.norm(y, axis=1, keepdims=True)
             g_gate.add(p, t)
@@ -344,6 +358,8 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
         hh = np.asarray(h_lat[ih_hold], np.float64)
         dd = np.asarray(dz[idz_hold], np.float64)
         yy = dd @ m_out.T
+        if y_moe is not None:
+            yy = yy - np.asarray(y_moe[ih_hold], np.float64)
         pred = situ(hh @ w1.T, hh @ w3.T) @ w2.T
         denom = float((yy ** 2).sum())
         rel_hold = float(((pred - yy) ** 2).sum() / denom) if denom > 0 else 0.0
@@ -413,6 +429,22 @@ def selftest():
     sd_log = float(np.std(h_pln[1000:] @ gate_row))
     print(f"claim 4b: gate logits normalized (std {sd_log:.3f})")
     assert 0.7 < sd_log < 1.4, sd_log
+
+    # differential target: if the host bank already produces most of the
+    # projected donor delta, the solved expert must output much less
+    m_ref = np.linalg.lstsq(z_in, h_lat, rcond=None)[0]  # [d_d, rh]
+    y_moe = 0.9 * (dz @ m_ref)
+    out_d = solve_graft(h_lat, h_pln, z_in, dz, donor_w, mi, bands=1,
+                        rel_lambda=1e-4, holdout=1000, score_sample=2000,
+                        y_moe=y_moe)
+    def pred_norm(o):
+        w1_, w3_, w2_, _ = o["experts"][0]
+        p = situ(h_lat[:1000] @ w1_.T, h_lat[:1000] @ w3_.T) @ w2_.T
+        return float(np.linalg.norm(p, axis=1).mean())
+    n_plain, n_diff = pred_norm(out), pred_norm(out_d)
+    print(f"claim 4c: differential expert stays quiet where the host "
+          f"already agrees (|out| {n_diff:.3f} vs {n_plain:.3f} plain)")
+    assert n_diff < 0.5 * n_plain, (n_diff, n_plain)
 
     # anchors: two tokenizations of the same byte stream must pair exactly
     ends_a = np.concatenate([pack_ends(0, [2, 5, 9]), pack_ends(1, [4, 8])])
