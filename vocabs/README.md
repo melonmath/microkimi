@@ -4,7 +4,8 @@ Vocabulary data lives here. Conventions:
 
 - third-party tokenizer files (`tokenizer.json`, `vocab.json`+`merges.txt`,
   SentencePiece models) are DATA: gitignored, downloaded on demand with
-  `sh nano/fetch_vocabs.sh` (qwen3, gemma3, llama32, deepseek_v3);
+  `sh nano/fetch_vocabs.sh` (qwen3, gemma3, llama32, deepseek_v3, glm4,
+  mistral_v3, o200k);
   `nano/vocab_cross.py` points at them by path;
 - our own small vocabs that ship in releases (e.g. `vocab_nano.json`) stay
   with their model artifacts and remain gitignored as well;
