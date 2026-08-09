@@ -9,7 +9,8 @@ usage:
   python3 vocab_cross.py --subject /path/to/tiktoken.model \
       --refs qwen3/tokenizer.json llama32/tokenizer.json gemma3/tokenizer.json \
       [--report] [--keep-list OUT] [--freq freq.txt] [--freq-top F] \
-      [--min-refs 2] [--max-keep N] [--reserved A-B] [--kimi-vocab PATH]
+      [--min-refs 2] [--max-keep N] [--reserved A-B] [--kimi-vocab PATH] \
+      [--recompose]   # report the re-segmentation cost of the cut tokens
   python3 vocab_cross.py --selftest        # offline synthetic check
 
 Supported input formats (auto-detected per file):
@@ -343,6 +344,68 @@ def build_keep_list(subject, presence, counts, freq_top, min_refs, max_keep):
     return sorted(keep)
 
 
+# ── recomposition cost ──
+
+def recompose_costs(subject, keep):
+    """For every CUT subject token: into how many KEPT tokens does its byte
+    surface re-segment? Greedy longest-match over the kept surfaces (the 256
+    byte fallbacks are structural, so this always terminates). Greedy is an
+    approximation of a real BPE re-tokenization, but it is the same order of
+    cost. Returns {subject_id: n_pieces}; cost per occurrence is n_pieces-1.
+    """
+    keep_set = set(keep)
+    kept_surfaces = {subject.keys[i] for i in keep_set if i in subject.keys}
+    maxlen = max((len(s) for s in kept_surfaces), default=1)
+    costs = {}
+    for i, key in subject.keys.items():
+        if i in keep_set:
+            continue
+        n, p = 0, 0
+        while p < len(key):
+            for ln in range(min(maxlen, len(key) - p), 0, -1):
+                if key[p:p + ln] in kept_surfaces:
+                    p += ln
+                    n += 1
+                    break
+            else:  # no kept surface matches, not even a single byte
+                p += 1
+                n += 1
+        costs[i] = n
+    return costs
+
+
+def recompose_report(subject, keep, costs, counts):
+    cut = len(costs)
+    tot_extra = sum(n - 1 for n in costs.values())
+    print(f"\n== recomposition cost of the {cut} cut tokens ==")
+    if cut == 0:
+        print("  nothing cut")
+        return
+    hist = {}
+    for n in costs.values():
+        hist[n] = hist.get(n, 0) + 1
+    print("  pieces per cut token: " + ", ".join(
+        f"{n} pcs x {c}" for n, c in sorted(hist.items())[:10]))
+    print(f"  mean extra tokens per occurrence: {tot_extra / cut:.2f}")
+    if counts:
+        weighted = sum((costs[i] - 1) * counts.get(i, 0) for i in costs)
+        total = sum(counts.values()) or 1
+        print(f"  corpus inflation if cut: {weighted} extra tokens over {total} observed "
+              f"({weighted / total * 100:.3f}%)")
+        worst = sorted(costs, key=lambda i: (-(costs[i] - 1) * counts.get(i, 0), i))[:20]
+        print("  most expensive cuts (freq x extra):")
+        for i in worst:
+            if counts.get(i, 0) == 0:
+                break
+            print(f"  id {i:>7}: {render(subject.keys[i])}  freq={counts[i]} "
+                  f"-> {costs[i]} pcs (+{(costs[i] - 1) * counts[i]})")
+    else:
+        worst = sorted(costs, key=lambda i: (-costs[i], i))[:20]
+        print("  hardest to recompose (no --freq: unweighted):")
+        for i in worst:
+            print(f"  id {i:>7}: {render(subject.keys[i])}  -> {costs[i]} pcs")
+
+
 # ── selftest (offline, synthetic vocabs in a temp dir) ──
 
 def selftest():
@@ -412,6 +475,16 @@ def selftest():
     assert len(capped) == 260 and 259 in capped and 261 in capped, "cap keeps freq priority"
     assert 256 not in capped and 258 not in capped, "cap drops lower-priority selected"
     assert set(range(256)) | {300, 301} <= set(capped), "cap never drops structural"
+
+    # recomposition: cut tokens re-segment greedily into kept surfaces
+    subject.reserved = set()
+    costs = recompose_costs(subject, set(range(256)) | {258})
+    assert 258 not in costs and 0 not in costs, "kept tokens have no recomposition cost"
+    assert costs[256] == 4, f"b' the' -> 4 single bytes, got {costs[256]}"
+    assert costs[259] == 7, f"b' banana' -> 7 single bytes, got {costs[259]}"
+    assert costs[261] == 3, f"b'zzz' -> 3 single bytes, got {costs[261]}"
+    costs2 = recompose_costs(subject, set(range(256)) | {256, 258})
+    assert costs2[261] == 3 and 256 not in costs2, "keeping b' the' removes its cost"
     print(f"selftest OK (synthetic vocabs in {tmp})")
 
 
@@ -437,6 +510,8 @@ def main():
     ap.add_argument("--freq-top", type=int, default=0, help="keep the top-F most frequent tokens (needs --freq)")
     ap.add_argument("--min-refs", type=int, default=2, help="keep tokens present in >= this many reference vocabs")
     ap.add_argument("--max-keep", type=int, default=None, help="cap the keep-list (structural tokens never dropped)")
+    ap.add_argument("--recompose", action="store_true",
+                    help="with --keep-list: report the re-segmentation cost of every cut token")
     ap.add_argument("--selftest", action="store_true", help="offline synthetic check of all formats and rules")
     args = ap.parse_args()
 
@@ -465,6 +540,8 @@ def main():
             if i >= subject.size:
                 sys.exit(f"error: {args.freq}: token id {i} out of range (subject vocab is {subject.size})")
         keep = build_keep_list(subject, presence, counts, args.freq_top, args.min_refs, args.max_keep)
+        if args.recompose:
+            recompose_report(subject, set(keep), recompose_costs(subject, set(keep)), counts)
         with open(args.keep_list, "w", encoding="utf-8") as f:
             f.write(f"# vocab_cross.py keep-list: subject={args.subject} min_refs={args.min_refs} "
                     f"freq_top={args.freq_top} max_keep={args.max_keep}\n")
