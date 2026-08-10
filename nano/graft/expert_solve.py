@@ -40,7 +40,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from graftlib import (cka_scan, match_anchors, open_capture,
+from graftlib import (RectGram, match_anchors, open_capture,
                       read_safetensors_dir, solve_graft)  # noqa: E402
 
 
@@ -52,22 +52,34 @@ def parse_map(s):
     return out
 
 
-def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print):
-    """Chooses one donor layer per host port by centered linear CKA of the
-    host latent stream against each donor FFN DELTA, over a subsample of
-    anchor pairs (closed form, no solve). The delta is the quantity the
-    grafted expert must reproduce, so its predictability from the host
-    stream is the binding constraint; state streams are misleading here
-    (early-layer states align with everything while their deltas carry
-    nothing transferable). Returns the host->donor map."""
+def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
+             rel_lambda=1e-4, chunk=8192):
+    """Chooses one donor layer per host port by the ridge R^2 of
+    predicting the donor FFN DELTA from the host latent stream, over a
+    subsample of anchor pairs (closed form, no expert solve). The delta
+    is what the grafted expert must reproduce, so its DIRECTIONAL
+    predictability from the host stream is the binding constraint.
+    Symmetric alignability scores (CKA) mislead twice over: early donor
+    states align with everything, and a high mutual-subspace overlap
+    does not mean the delta is predictable. Returns the host->donor
+    map."""
     donor_layers = sorted(dmeta["layers"])
-    donor_dz = {dl: dplanes[f"L{dl}.dz"] for dl in donor_layers}
+    m = min(sample, len(ih))
     layer_map = []
     for hl in hmeta["layers"]:
-        scores = cka_scan(hplanes[f"L{hl}.lat"], donor_dz, ih, idz, sample)
+        lat = hplanes[f"L{hl}.lat"]
+        scores = {}
+        for dl in donor_layers:
+            dz = dplanes[f"L{dl}.dz"]
+            g = RectGram(lat.shape[1], dz.shape[1])
+            for t0 in range(0, m, chunk):
+                g.add(np.asarray(lat[ih[t0:t0 + chunk]], np.float64),
+                      np.asarray(dz[idz[t0:t0 + chunk]], np.float64))
+            _w, res = g.solve(rel_lambda)
+            scores[dl] = 1.0 - res
         best = max(scores, key=scores.get)
         row = " ".join(f"L{dl}:{scores[dl]:.3f}" for dl in donor_layers)
-        log(f"scan L{hl} (delta cka): {row} -> donor L{best}")
+        log(f"scan L{hl} (delta ridge R2): {row} -> donor L{best}")
         layer_map.append((hl, best))
     return layer_map
 
