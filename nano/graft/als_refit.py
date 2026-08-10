@@ -160,8 +160,11 @@ def refit_all(bin_path, pack_path, host_prefix, donor_prefix, out_path,
             log(f"L{l} e{e_idx}: fired {n_f} ({100 * frac:.2f}%), "
                 f"slice holdout rel {rel:.3f}, w2 refit")
     if not updates:
-        raise SystemExit("nothing refit: no expert fires enough "
-                         "(try --assume-bias or lower --min-fired)")
+        import shutil
+        shutil.copyfile(bin_path, out_path)
+        log(f"-> {out_path}: unchanged copy (no expert fires enough; "
+            "try --assume-bias or a lower --min-fired)")
+        return report
     n = patch_bin(bin_path, out_path, updates)
     log(f"-> {out_path}: {n} w2 tensor(s) refit on the routed slice, "
         f"zero training steps")
