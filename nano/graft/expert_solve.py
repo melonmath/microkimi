@@ -53,17 +53,21 @@ def parse_map(s):
 
 
 def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print):
-    """Chooses one donor layer per host port by centered linear CKA over a
-    subsample of anchor pairs (closed form, no solve). Returns the
-    host->donor map, best-first ties broken by donor depth."""
+    """Chooses one donor layer per host port by centered linear CKA of the
+    host latent stream against each donor FFN DELTA, over a subsample of
+    anchor pairs (closed form, no solve). The delta is the quantity the
+    grafted expert must reproduce, so its predictability from the host
+    stream is the binding constraint; state streams are misleading here
+    (early-layer states align with everything while their deltas carry
+    nothing transferable). Returns the host->donor map."""
     donor_layers = sorted(dmeta["layers"])
-    donor_in = {dl: dplanes[f"L{dl}.in"] for dl in donor_layers}
+    donor_dz = {dl: dplanes[f"L{dl}.dz"] for dl in donor_layers}
     layer_map = []
     for hl in hmeta["layers"]:
-        scores = cka_scan(hplanes[f"L{hl}.lat"], donor_in, ih, idz, sample)
+        scores = cka_scan(hplanes[f"L{hl}.lat"], donor_dz, ih, idz, sample)
         best = max(scores, key=scores.get)
         row = " ".join(f"L{dl}:{scores[dl]:.3f}" for dl in donor_layers)
-        log(f"scan L{hl}: {row} -> donor L{best}")
+        log(f"scan L{hl} (delta cka): {row} -> donor L{best}")
         layer_map.append((hl, best))
     return layer_map
 
