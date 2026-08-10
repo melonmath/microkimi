@@ -46,10 +46,11 @@ from capture_host import moe_layers_of  # noqa: E402
 
 # ------------------------------------------------------------- param surgery
 
-def freeze_except_grafts(model, moe, e0):
-    """Freezes every parameter, then re-enables the grafted expert weights
-    and the grafted rows of each gate (via a row-masking gradient hook).
-    Returns the list of trainable parameters."""
+def freeze_except_grafts(model, moe, e0, train="all"):
+    """Freezes every parameter, then re-enables the selected grafted
+    parameters: "all" = router rows + expert w1/w2/w3, "w2" = the down
+    matrices only, "gate" = the router rows only (grafted rows via a
+    row-masking gradient hook). Returns the trainable parameters."""
     import torch
     for p in model.parameters():
         p.requires_grad_(False)
@@ -57,15 +58,19 @@ def freeze_except_grafts(model, moe, e0):
     for l in moe:
         blk = model.layers[l].block_sparse_moe
         n_e = len(blk.experts)
-        gw = blk.gate.weight
-        gw.requires_grad_(True)
-        mask = torch.zeros(n_e, 1, device=gw.device, dtype=gw.dtype)
-        mask[e0:] = 1.0
-        gw.register_hook(lambda g, m=mask: g * m)
-        trainable.append(gw)
+        if train in ("all", "gate"):
+            gw = blk.gate.weight
+            gw.requires_grad_(True)
+            mask = torch.zeros(n_e, 1, device=gw.device, dtype=gw.dtype)
+            mask[e0:] = 1.0
+            gw.register_hook(lambda g, m=mask: g * m)
+            trainable.append(gw)
+        if train == "gate":
+            continue
+        mods = ("w1", "w2", "w3") if train == "all" else ("w2",)
         for e in range(e0, n_e):
-            for mod in (blk.experts[e].w1, blk.experts[e].w2,
-                        blk.experts[e].w3):
+            for nm in mods:
+                mod = getattr(blk.experts[e], nm)
                 mod.weight.requires_grad_(True)
                 trainable.append(mod.weight)
     return trainable
@@ -219,14 +224,18 @@ def main():
     ap.add_argument("--holdout-windows", type=int, default=32)
     ap.add_argument("--heal-bias", type=float, default=0.0)
     ap.add_argument("--final-bias", type=float, default=0.0)
+    ap.add_argument("--train", default="all", choices=["all", "w2", "gate"],
+                    help="which grafted parameters to train")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
+    import time
     import torch
     from model_nano import NanoModel
     from capture_host import make_host_encoder
     from capture_donor import iter_docs
 
+    t_start = time.time()
     sd, cfg = convert(args.bin)
     config, _entries, f = read_bin(args.bin)
     f.close()
@@ -259,9 +268,10 @@ def main():
     print(f"holdout CE before heal: {ce0:.4f} nats ({cnt} tokens, "
           f"heal bias {args.heal_bias})")
 
-    trainable = freeze_except_grafts(model, moe, e0)
+    trainable = freeze_except_grafts(model, moe, e0, args.train)
     n_par = sum(p.numel() for p in trainable)
-    print(f"training {len(trainable)} tensors, {n_par} params")
+    print(f"training {len(trainable)} tensors, {n_par} params "
+          f"(--train {args.train})")
     train(model, xs_t, ms_t, cfg["vocab"], args.device, args.steps,
           args.lr, args.warmup, args.clip, args.batch, trainable,
           args.seed)
@@ -273,7 +283,8 @@ def main():
     n = patch_bin(args.bin, args.out, collect_updates(model, config, moe,
                                                       e0, args.final_bias))
     print(f"-> {args.out}: {n} tensors rewritten in place, final bias "
-          f"{args.final_bias}")
+          f"{args.final_bias}, total {time.time() - t_start:.0f}s",
+          flush=True)
 
 
 # ------------------------------------------------------------------ selftest

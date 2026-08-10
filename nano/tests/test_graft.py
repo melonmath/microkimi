@@ -18,6 +18,7 @@ TOOLS = [
     ("graft_heal.py", "graft_heal selftest OK"),
     ("route_solve.py", "route_solve selftest OK"),
     ("als_refit.py", "als_refit selftest OK"),
+    ("grad_refit.py", "grad_refit selftest OK"),
     ("eval_compare.py", "eval_compare selftest OK"),
     ("tokens_to_text.py", "tokens_to_text selftest OK"),
 ]
