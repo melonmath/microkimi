@@ -148,6 +148,20 @@ def extend_bank(model, pack_path, bias_by_layer):
     return n_graft
 
 
+def scale_grafts(model, n_graft, factor):
+    """Multiplies every grafted down matrix by `factor`. Softmax routing
+    renormalizes among the selected experts, so a graft that wins a slot
+    also claims a large share of the mixture: attenuating its output is
+    the direct lever on the eviction damage that lever cannot reach."""
+    import torch
+    if factor == 1.0:
+        return
+    with torch.no_grad():
+        for li, mlp in moe_blocks(model):
+            if li in n_graft:
+                mlp.experts.down_proj[-n_graft[li]:] *= factor
+
+
 def set_graft_bias(model, bias_by_layer, n_graft):
     import torch
     for li, mlp in moe_blocks(model):
@@ -155,6 +169,103 @@ def set_graft_bias(model, bias_by_layer, n_graft):
             with torch.no_grad():
                 mlp.gate.expert_bias[-n_graft[li]:] = float(
                     bias_by_layer.get(li, -1e9))
+
+
+# --------------------------------------------------------- utility routing
+
+SILENT = -1e9
+
+
+def utility_rows(model, tok, text_path, d0, d1, seq, device, n_graft,
+                 batch=1, rel_lambda=1e-4, gate_sigma=1.0, log=print):
+    """Solves each grafted router row against MEASURED per-token utility.
+
+    Baseline pass (grafts silent) and one forced pass per grafted expert
+    give a per-position loss difference; a ridge solve maps the router
+    input stream to that utility, and the row is normalized to a
+    router-typical logit scale. This replaces the activation-derived
+    proxy row, which cannot tell where a graft HELPS from where it merely
+    has something to say."""
+    import torch
+    import torch.nn.functional as F
+    from graftlib import RectGram
+
+    wins, pln = [], {li: [] for li in n_graft}
+    handles = []
+    rec = {}
+
+    def mk(li):
+        def hook(_m, inp, _o):
+            rec[li] = inp[0].detach().float()
+        return hook
+
+    for li, mlp in moe_blocks(model):
+        if li in n_graft:
+            handles.append(mlp.gate.register_forward_hook(mk(li)))
+
+    with open(text_path) as f:
+        for i, line in enumerate(f):
+            if i >= d1:
+                break
+            if i < d0:
+                continue
+            t = json.loads(line).get("text")
+            if t:
+                wins.extend(doc_windows(t, tok, seq)[:2])
+
+    def pass_losses(collect_pln):
+        out = []
+        for w in wins:
+            x = torch.tensor(w[None, :-1], device=device)
+            y = torch.tensor(w[None, 1:], device=device)
+            with torch.no_grad():
+                logits = model(input_ids=x).logits
+            ce = F.cross_entropy(logits[0].float(), y[0], reduction="none")
+            out.append(ce.cpu().numpy())
+            if collect_pln:
+                for li in n_graft:
+                    pln[li].append(rec[li].reshape(-1, rec[li].shape[-1])
+                                   .cpu().numpy().astype(np.float16))
+        return np.concatenate(out)
+
+    set_graft_bias(model, {}, n_graft)
+    base = pass_losses(True)
+    for h in handles:
+        h.remove()
+    log(f"utility baseline: {len(wins)} windows, {len(base)} positions")
+
+    rows = {}
+    for li in n_graft:
+        stream = np.concatenate(pln[li])[:len(base)]
+        for g in range(n_graft[li]):
+            set_graft_bias(model, {li: 0.0}, {li: n_graft[li]})
+            forced = pass_losses(False)
+            set_graft_bias(model, {}, n_graft)
+            util = base - forced[:len(base)]
+            gram = RectGram(stream.shape[1], 1)
+            for t0 in range(0, len(util), 8192):
+                gram.add(stream[t0:t0 + 8192], util[t0:t0 + 8192, None])
+            row, _ = gram.solve(rel_lambda)
+            row = row[0]
+            ex2 = float(row @ gram.gxx @ row) / gram.n
+            mu = float(row @ gram.sum_x) / gram.n
+            sd = np.sqrt(max(ex2 - mu * mu, 1e-12))
+            rows[(li, g)] = (row * (gate_sigma / sd)).astype(np.float32)
+            log(f"L{li}.g{g}: mean util {util.mean():+.4f}, helps on "
+                f"{100 * (util > 0).mean():.1f}% of positions", flush=True)
+    return rows
+
+
+def install_rows(model, rows, n_graft):
+    import torch
+    with torch.no_grad():
+        for (li, g), row in rows.items():
+            for l2, mlp in moe_blocks(model):
+                if l2 == li:
+                    idx = mlp.gate.weight.shape[0] - n_graft[li] + g
+                    mlp.gate.weight[idx] = torch.tensor(
+                        row, dtype=mlp.gate.weight.dtype,
+                        device=mlp.gate.weight.device)
 
 
 # ------------------------------------------------------------------- eval
@@ -232,6 +343,12 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--max-new", type=int, default=40)
+    ap.add_argument("--utility-rows", default=None,
+                    help="doc range A:B used to solve router rows from "
+                    "measured per-token utility before calibrating")
+    ap.add_argument("--gamma-grid", default="1.0",
+                    help="output-scale factors tried for the grafted "
+                    "down matrices during calibration")
     ap.add_argument("--bias-grid", default=None,
                     help="global selection-bias sweep on the cal range "
                     "(replaces the greedy per-layer pass)")
@@ -276,6 +393,12 @@ def main():
             gcfg = json.load(f)
         n_graft = extend_bank(model, gcfg["pack"],
                               {int(k): v for k, v in gcfg["bias"].items()})
+        if gcfg.get("rows"):
+            install_rows(model, {(int(k.split(".")[0]), int(k.split(".")[1])):
+                                 np.asarray(v, np.float32)
+                                 for k, v in gcfg["rows"].items()}, n_graft)
+        if gcfg.get("gamma", 1.0) != 1.0:
+            scale_grafts(model, n_graft, gcfg["gamma"])
         print(f"applied graft: {len(n_graft)} layers, "
               f"biases from {args.graft_cfg}")
 
@@ -294,25 +417,41 @@ def main():
     if gcfg and args.cal_range:
         c0, c1 = (int(x) for x in args.cal_range.split(":"))
         n_g = {int(k): 1 for k in gcfg["bias"]}
+        if args.utility_rows:
+            u0, u1 = (int(x) for x in args.utility_rows.split(":"))
+            rows = utility_rows(model, tok, args.text, u0, u1, args.seq,
+                                args.device, n_g, args.batch)
+            install_rows(model, rows, n_g)
+            print(f"installed {len(rows)} measured-utility router rows")
         if args.bias_grid:
-            # global sweep: one bias for every graft, silence included
+            # 2D sweep over (output scale, selection bias); silence is
+            # always in the grid, so the result is never worse
             set_graft_bias(model, {}, n_g)
             docs = eval_range(model, tok, args.text, c0, c1, args.seq,
                               args.device, args.batch)
             best = sum(n for n, _c in docs) / sum(c for _n, c in docs)
             print(f"sweep: silent CE {best:.4f}")
-            keep = None
-            for b in (float(x) for x in args.bias_grid.split(",")):
-                set_graft_bias(model, {li: b for li in n_g}, n_g)
-                docs = eval_range(model, tok, args.text, c0, c1, args.seq,
-                                  args.device, args.batch)
-                ce = sum(n for n, _c in docs) / sum(c for _n, c in docs)
-                print(f"sweep: bias {b:+.1f} CE {ce:.4f}", flush=True)
-                if ce < best:
-                    best, keep = ce, b
+            keep, keep_g, cur_g = None, 1.0, 1.0
+            for gam in (float(x) for x in args.gamma_grid.split(",")):
+                scale_grafts(model, n_g, gam / cur_g)
+                cur_g = gam
+                for b in (float(x) for x in args.bias_grid.split(",")):
+                    set_graft_bias(model, {li: b for li in n_g}, n_g)
+                    docs = eval_range(model, tok, args.text, c0, c1,
+                                      args.seq, args.device, args.batch)
+                    ce = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+                    print(f"sweep: gamma {gam:g} bias {b:+.1f} CE {ce:.4f}",
+                          flush=True)
+                    if ce < best:
+                        best, keep, keep_g = ce, b, gam
+            scale_grafts(model, n_g, keep_g / cur_g)
             chosen = {li: keep for li in n_g} if keep is not None else {}
             set_graft_bias(model, chosen, n_g)
             gcfg["bias"] = {str(k): chosen.get(k, -1e9) for k in n_g}
+            gcfg["gamma"] = keep_g
+            gcfg["rows"] = {f"{li}.{g}": r.tolist()
+                            for (li, g), r in
+                            (rows.items() if args.utility_rows else {}.items())}
             with open(args.graft_cfg, "w") as f:
                 json.dump(gcfg, f)
             print(f"sweep kept bias {keep} -> {args.graft_cfg}")
