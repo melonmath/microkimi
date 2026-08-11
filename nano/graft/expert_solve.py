@@ -84,6 +84,22 @@ def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
     return layer_map
 
 
+def _read_donor(path, names):
+    """Reads donor tensors tolerating wrapper-prefix drift between module
+    tree and checkpoint file names (model. vs model.language_model.)."""
+    variants = [lambda n: n,
+                lambda n: n.replace("model.", "model.language_model.", 1),
+                lambda n: n.replace("model.language_model.", "model.", 1)]
+    last = None
+    for v in variants:
+        try:
+            got = read_safetensors_dir(path, [v(n) for n in names])
+            return {n: got[v(n)] for n in names}
+        except KeyError as e:
+            last = e
+    raise last
+
+
 def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
               bands=1, rel_lambda=1e-4, holdout=4096, max_pairs=0,
               moe_inter=None, log=print, target="donor",
@@ -130,8 +146,7 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
             # fused MoE donor bank [E, 2i, d] / [E, d, i]: one expert of
             # the donor becomes the imported FFN (--donor-expert)
             names = {k: wtmpl[k].format(l=dl) for k in ("gate_up", "down")}
-            w = read_safetensors_dir(donor_weights_path,
-                                     list(names.values()))
+            w = _read_donor(donor_weights_path, list(names.values()))
             gu = w[names["gate_up"]][donor_expert]
             half = gu.shape[0] // 2
             donor_w = {"gate": gu[:half], "up": gu[half:],
@@ -139,8 +154,7 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
         else:
             names = {k: wtmpl[k].format(l=dl)
                      for k in ("gate", "up", "down")}
-            w = read_safetensors_dir(donor_weights_path,
-                                     list(names.values()))
+            w = _read_donor(donor_weights_path, list(names.values()))
             donor_w = {k: w[names[k]] for k in names}
         y_moe = None
         if target == "diff":
