@@ -222,11 +222,6 @@ def main():
 
     style_name = (detect_style(args.model) if args.style == "auto"
                   else args.style)
-    style = {
-        "in": _reroot(STYLES[style_name]["in"], args.module_root),
-        "dz": _reroot(STYLES[style_name]["dz"], args.module_root),
-        "weights": STYLES[style_name]["weights"],
-    }
     layers = [int(x) for x in args.layers.split(",")]
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -250,6 +245,23 @@ def main():
     if not args.load_4bit and args.device != "auto":
         model.to(args.device)
     model.eval()
+
+    # resolve the decoder root by probing (wrapper layouts vary with the
+    # loading path); --module-root is tried first
+    style = None
+    for root in (args.module_root, "model", "model.language_model"):
+        cand = {"in": _reroot(STYLES[style_name]["in"], root),
+                "dz": _reroot(STYLES[style_name]["dz"], root),
+                "weights": STYLES[style_name]["weights"]}
+        try:
+            get_module(model, cand["in"].format(l=0))
+            style = cand
+            print(f"decoder root: {root}")
+            break
+        except AttributeError:
+            continue
+    if style is None:
+        raise SystemExit("no decoder root matched this checkpoint")
 
     special_ids = set(tok.all_special_ids)
 
