@@ -87,7 +87,8 @@ def _patched_router_forward(self, hidden_states):
     import torch
     import torch.nn.functional as F
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-    router_logits = F.linear(hidden_states, self.weight) + self.expert_bias
+    router_logits = F.linear(hidden_states, self.weight)
+    router_logits = router_logits + self.expert_bias.to(router_logits.dtype)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
     top_val, top_idx = torch.topk(router_probs, self.top_k, dim=-1)
     top_val /= top_val.sum(dim=-1, keepdim=True)
