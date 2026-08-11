@@ -235,6 +235,10 @@ def main():
         kw["dtype"] = getattr(torch, args.dtype)
         if args.device == "auto":
             kw["device_map"] = "auto"
+            n = torch.cuda.device_count()
+            mm = {i: "21GiB" for i in range(n)}
+            mm["cpu"] = "150GiB"  # spill to RAM, never to disk
+            kw["max_memory"] = mm
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, **kw)
     except ValueError:
