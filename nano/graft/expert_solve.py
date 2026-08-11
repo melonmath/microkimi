@@ -143,8 +143,8 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
     if layer_map == "scan":
         layer_map = scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz,
                              scan_sample, log,
-                             host_key=("in" if host_planes == "classic"
-                                       else "lat"))
+                             host_key=("lat" if host_planes == "k3"
+                                       else "in"))
 
     pack = {}
     report = {}
