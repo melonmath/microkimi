@@ -238,6 +238,8 @@ def main():
         kw["device_map"] = "auto" if args.device == "auto" else args.device
     else:
         kw["dtype"] = getattr(torch, args.dtype)
+        if args.device == "auto":
+            kw["device_map"] = "auto"
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, **kw)
     except ValueError:
@@ -245,7 +247,7 @@ def main():
         with open(os.path.join(args.model, "config.json")) as f:
             arch = _json.load(f)["architectures"][0]
         model = getattr(transformers, arch).from_pretrained(args.model, **kw)
-    if not args.load_4bit:
+    if not args.load_4bit and args.device != "auto":
         model.to(args.device)
     model.eval()
 
