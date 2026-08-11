@@ -72,6 +72,17 @@ STYLES = {
             "down": "model.layers.{l}.mlp.experts.down_proj",
         },
     },
+    # dense always-on shared expert of a qwen3_5_moe checkpoint as the
+    # donor FFN (same in/dz planes as the block)
+    "qwen3_5_moe_shared": {
+        "in": "model.layers.{l}.post_attention_layernorm",
+        "dz": "model.layers.{l}.mlp",
+        "weights": {
+            "gate": "model.layers.{l}.mlp.shared_expert.gate_proj.weight",
+            "up": "model.layers.{l}.mlp.shared_expert.up_proj.weight",
+            "down": "model.layers.{l}.mlp.shared_expert.down_proj.weight",
+        },
+    },
     "deepseek_v4": {
         "in": "model.layers.{l}.post_attention_layernorm",
         "dz": "model.layers.{l}.mlp",
@@ -224,7 +235,7 @@ def main():
         from transformers import BitsAndBytesConfig
         kw["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        kw["device_map"] = args.device
+        kw["device_map"] = "auto" if args.device == "auto" else args.device
     else:
         kw["dtype"] = getattr(torch, args.dtype)
     try:
