@@ -60,10 +60,23 @@ STYLES = {
             "down": "model.layers.{l}.mlp.down_proj.weight",
         },
     },
+    # MoE decoders (qwen3_5_moe family): "in" is the expert/router input
+    # stream, "dz" the whole MoE block output (routed mix + shared).
+    # Wrapped multimodal checkpoints expose the text stack under
+    # model.language_model (handled by --module-prefix).
+    "qwen3_5_moe": {
+        "in": "model.layers.{l}.post_attention_layernorm",
+        "dz": "model.layers.{l}.mlp",
+        "weights": {
+            "gate_up": "model.layers.{l}.mlp.experts.gate_up_proj",
+            "down": "model.layers.{l}.mlp.experts.down_proj",
+        },
+    },
 }
 _MODEL_TYPE_STYLE = {
     "llama": "llama", "qwen2": "llama", "qwen3": "llama", "mistral": "llama",
     "gemma3": "gemma3", "gemma3_text": "gemma3",
+    "qwen3_5_moe": "qwen3_5_moe", "qwen3_5_moe_text": "qwen3_5_moe",
 }
 
 
@@ -74,6 +87,11 @@ def detect_style(model_dir):
     if mt not in _MODEL_TYPE_STYLE:
         raise SystemExit(f"unknown model_type {mt!r}: pass --style explicitly")
     return _MODEL_TYPE_STYLE[mt]
+
+
+def _reroot(tmpl, root):
+    """Points a 'model.layers.{l}...' template at another decoder root."""
+    return tmpl.replace("model.", root + ".", 1) if root != "model" else tmpl
 
 
 def get_module(model, path):
@@ -170,21 +188,46 @@ def main():
     ap.add_argument("--style", default="auto", choices=["auto", *STYLES])
     ap.add_argument("--max-tokens", type=int, default=0)
     ap.add_argument("--max-docs", type=int, default=None)
+    ap.add_argument("--module-root", default="model",
+                    help="root of the decoder stack in the module tree "
+                    "(wrapped multimodal checkpoints: model.language_model)")
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="quantized load (bitsandbytes); activations stay "
+                    "full precision")
     args = ap.parse_args()
 
     import torch
+    import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     style_name = (detect_style(args.model) if args.style == "auto"
                   else args.style)
-    style = STYLES[style_name]
+    style = {
+        "in": _reroot(STYLES[style_name]["in"], args.module_root),
+        "dz": _reroot(STYLES[style_name]["dz"], args.module_root),
+        "weights": STYLES[style_name]["weights"],
+    }
     layers = [int(x) for x in args.layers.split(",")]
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=getattr(torch, args.dtype),
-        attn_implementation="eager")
-    model.to(args.device).eval()
+    kw = {"attn_implementation": "eager"}
+    if args.load_4bit:
+        from transformers import BitsAndBytesConfig
+        kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        kw["device_map"] = args.device
+    else:
+        kw["dtype"] = getattr(torch, args.dtype)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, **kw)
+    except ValueError:
+        import json as _json
+        with open(os.path.join(args.model, "config.json")) as f:
+            arch = _json.load(f)["architectures"][0]
+        model = getattr(transformers, arch).from_pretrained(args.model, **kw)
+    if not args.load_4bit:
+        model.to(args.device)
+    model.eval()
 
     special_ids = set(tok.all_special_ids)
 

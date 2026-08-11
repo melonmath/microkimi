@@ -53,7 +53,7 @@ def parse_map(s):
 
 
 def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
-             rel_lambda=1e-4, chunk=8192):
+             rel_lambda=1e-4, chunk=8192, host_key="lat"):
     """Chooses one donor layer per host port by the ridge R^2 of
     predicting the donor FFN DELTA from the host latent stream, over a
     subsample of anchor pairs (closed form, no expert solve). The delta
@@ -67,7 +67,7 @@ def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
     m = min(sample, len(ih))
     layer_map = []
     for hl in hmeta["layers"]:
-        lat = hplanes[f"L{hl}.lat"]
+        lat = hplanes[f"L{hl}.{host_key}"]
         scores = {}
         for dl in donor_layers:
             dz = dplanes[f"L{dl}.dz"]
@@ -87,10 +87,24 @@ def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
 def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
               bands=1, rel_lambda=1e-4, holdout=4096, max_pairs=0,
               moe_inter=None, log=print, target="donor",
-              scan_sample=30000):
+              scan_sample=30000, act="situ", host_planes="k3"):
+    """host_planes selects the host capture layout: "k3" (lat/pln/moe
+    planes from capture_host) or "classic" (in/dz planes from a
+    capture_donor-style capture of a residual-expert MoE host: the port
+    and router stream are the same plane, the block output is the
+    differential reference)."""
     hmeta, hends, hmask, hplanes = open_capture(host_prefix)
     dmeta, dends, dmask, dplanes = open_capture(donor_prefix)
-    mi = moe_inter or hmeta["moe_inter"]
+    mi = moe_inter or hmeta.get("moe_inter")
+    if not mi:
+        raise SystemExit("--moe-inter required (host capture carries none)")
+    if host_planes == "classic":
+        lat_of = pln_of = (lambda hl: hplanes[f"L{hl}.in"])
+        moe_of = lambda hl: hplanes.get(f"L{hl}.dz")
+    else:
+        lat_of = lambda hl: hplanes[f"L{hl}.lat"]
+        pln_of = lambda hl: hplanes[f"L{hl}.pln"]
+        moe_of = lambda hl: hplanes.get(f"L{hl}.moe")
     wtmpl = dmeta["weights"]
 
     ih, idz = match_anchors(hends, hmask, dends, dmask)
@@ -103,7 +117,9 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
 
     if layer_map == "scan":
         layer_map = scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz,
-                             scan_sample, log)
+                             scan_sample, log,
+                             host_key=("in" if host_planes == "classic"
+                                       else "lat"))
 
     pack = {}
     report = {}
@@ -114,16 +130,15 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
         donor_w = {k: w[names[k]] for k in names}
         y_moe = None
         if target == "diff":
-            if f"L{hl}.moe" not in hplanes:
-                raise SystemExit(f"--target diff needs the L{hl}.moe plane "
-                                 "(re-capture the host with a tool version "
-                                 "that records the MoE mix output)")
-            y_moe = hplanes[f"L{hl}.moe"]
+            y_moe = moe_of(hl)
+            if y_moe is None:
+                raise SystemExit(f"--target diff needs the host block-output "
+                                 f"plane for L{hl}")
         out = solve_graft(
-            hplanes[f"L{hl}.lat"], hplanes[f"L{hl}.pln"],
+            lat_of(hl), pln_of(hl),
             dplanes[f"L{dl}.in"], dplanes[f"L{dl}.dz"], donor_w, mi,
             bands=bands, rel_lambda=rel_lambda, holdout=holdout,
-            ih=ih, idz=idz, y_moe=y_moe)
+            ih=ih, idz=idz, y_moe=y_moe, act=act)
         g0 = g_next.get(hl, 0)
         for g, (w1, w3, w2, gate_row) in enumerate(out["experts"], g0):
             pack[f"L{hl}.g{g}.w1"] = w1
@@ -174,6 +189,12 @@ def main():
     ap.add_argument("--holdout", type=int, default=4096)
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--moe-inter", type=int, default=None)
+    ap.add_argument("--act", default="situ", choices=["situ", "silu"],
+                    help="the HOST expert activation the down re-solve "
+                    "goes through")
+    ap.add_argument("--host-planes", default="k3", choices=["k3", "classic"],
+                    help="host capture layout: k3 lat/pln/moe planes, or "
+                    "classic in/dz planes (residual-expert MoE hosts)")
     ap.add_argument("--target", default="donor", choices=["donor", "diff"],
                     help="donor: projected donor FFN delta; diff: that "
                     "delta MINUS the host bank's own mix output (the "
@@ -185,7 +206,8 @@ def main():
                            args.donor_weights, lm,
                            args.bands, args.rel_lambda, args.holdout,
                            args.max_pairs, args.moe_inter,
-                           target=args.target, scan_sample=args.scan_sample)
+                           target=args.target, scan_sample=args.scan_sample,
+                           act=args.act, host_planes=args.host_planes)
     np.savez(args.out, **pack)
     print(f"-> {args.out}: {len(pack) - 1} tensors, bands {meta['bands']}")
 

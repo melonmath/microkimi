@@ -35,6 +35,16 @@ def situ(g, u):
     return (4.0 * np.tanh(g / 4.0) * sig) * (25.0 * np.tanh(u / 25.0))
 
 
+def silu_gate(g, u):
+    """Standard SiLU-gated MLP activation: silu(g) * u (llama/qwen FFNs)."""
+    g = np.asarray(g)
+    u = np.asarray(u)
+    return (g / (1.0 + np.exp(-g))) * u
+
+
+GATED_ACTS = {"situ": situ, "silu": silu_gate}
+
+
 # ---------------------------------------------------------------- gram solve
 
 class RectGram:
@@ -235,17 +245,19 @@ def _read_st_file(path, names):
 
 # ------------------------------------------------------------- neuron slice
 
-def neuron_scores(w1_full, w3_full, w_down, h_sample, chunk=2048):
+def neuron_scores(w1_full, w3_full, w_down, h_sample, chunk=2048,
+                  act="situ"):
     """Importance of each donor FFN neuron seen from the host latent stream:
     mean |activation| on the sample times the norm of the neuron's output
     column. w1_full/w3_full: [d_ff, rh] (input-folded), w_down: [d_D, d_ff],
     h_sample: [m, rh]."""
+    af = GATED_ACTS[act]
     d_ff = w1_full.shape[0]
     acc = np.zeros(d_ff, np.float64)
     n = 0
     for t0 in range(0, h_sample.shape[0], chunk):
         h = np.asarray(h_sample[t0:t0 + chunk], np.float32)
-        a = situ(h @ w1_full.T, h @ w3_full.T)
+        a = af(h @ w1_full.T, h @ w3_full.T)
         acc += np.abs(a).sum(axis=0)
         n += h.shape[0]
     mean_act = acc / max(n, 1)
@@ -275,7 +287,7 @@ def cka_scan(h_lat, donor_planes, ih, idz, sample=30000, chunk=8192):
 def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
                 rel_lambda=1e-4, holdout=4096, score_sample=16384,
                 chunk=8192, ih=None, idz=None, gate_sigma=1.0,
-                y_moe=None):
+                y_moe=None, act="situ"):
     """Solves host-shaped expert tensors from aligned activations.
 
     h_lat [n, rh]   host latent stream (routed_expert_down_proj output)
@@ -301,6 +313,7 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
     w2 ridge against the projected donor delta, per-band router row ridge.
     The w2 re-solve absorbs the output map, the activation mismatch and
     the slice error in one regression."""
+    af = GATED_ACTS[act]
     n = len(ih) if ih is not None else h_lat.shape[0]
     if n <= holdout:
         holdout = n // 4
@@ -328,7 +341,8 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
     w3_full = (donor_w["up"].astype(np.float64) @ s_in).astype(np.float32)
     m = min(score_sample, n - holdout)
     h_sample = np.asarray(h_lat[ih_fit[:m]], np.float32)
-    scores = neuron_scores(w1_full, w3_full, donor_w["down"], h_sample)
+    scores = neuron_scores(w1_full, w3_full, donor_w["down"], h_sample,
+                           act=act)
     order = np.argsort(-scores)
     need = moe_inter * bands
     assert d_ff >= need, f"donor d_ff {d_ff} < moe_inter*bands {need}"
@@ -349,7 +363,7 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
             h = np.asarray(h_lat[hi], np.float64)
             d = np.asarray(dz[di], np.float64)
             p = np.asarray(h_pln[hi], np.float64)
-            a = situ(h @ w1.T.astype(np.float64), h @ w3.T.astype(np.float64))
+            a = af(h @ w1.T.astype(np.float64), h @ w3.T.astype(np.float64))
             y = d @ m_out.T
             if y_moe is not None:
                 y = y - np.asarray(y_moe[hi], np.float64)
@@ -378,7 +392,7 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
         yy = dd @ m_out.T
         if y_moe is not None:
             yy = yy - np.asarray(y_moe[ih_hold], np.float64)
-        pred = situ(hh @ w1.T, hh @ w3.T) @ w2.T
+        pred = af(hh @ w1.T, hh @ w3.T) @ w2.T
         denom = float((yy ** 2).sum())
         rel_hold = float(((pred - yy) ** 2).sum() / denom) if denom > 0 else 0.0
         experts.append((w1.astype(np.float32), w3.astype(np.float32),
