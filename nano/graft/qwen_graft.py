@@ -189,8 +189,9 @@ class SideBranch:
 
     def __init__(self, mlp, w1, w3, w2, row, bias=-1e9, gamma=1.0):
         import torch
-        dev = mlp.experts.down_proj.device
-        dt = mlp.experts.down_proj.dtype
+        ref = (mlp.experts.down_proj if hasattr(mlp, "experts")
+               else mlp.down_proj.weight)
+        dev, dt = ref.device, ref.dtype
         self.mlp = mlp
         self.w1 = torch.tensor(w1, dtype=dt, device=dev)
         self.w3 = torch.tensor(w3, dtype=dt, device=dev)
@@ -264,13 +265,27 @@ def measure_norm_gain(model, tok, text_path, d0, d1, seq, device, layers,
     return gains
 
 
+def ffn_blocks(model):
+    """[(layer_idx, mlp)] for every layer with a feed-forward block, MoE
+    or dense. A side branch attaches to either: it wraps the block's
+    forward and adds a gated organ to its output, which needs no router
+    and no expert bank."""
+    dec = find_decoder(model)
+    out = []
+    for i, layer in enumerate(dec.layers):
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            out.append((i, mlp))
+    return out
+
+
 def attach_branches(model, pack_path):
-    """Attaches one side branch per MoE layer from a graft pack. Returns
-    {layer: branch}. Every branch starts silent (bias -1e9)."""
+    """Attaches one side branch per feed-forward layer from a graft pack.
+    Returns {layer: branch}. Every branch starts silent (bias -1e9)."""
     z = np.load(pack_path)
     meta = json.loads(bytes(z["meta"]).decode())
     out = {}
-    for li, mlp in moe_blocks(model):
+    for li, mlp in ffn_blocks(model):
         k = f"L{li}.g0"
         if f"{k}.w1" not in z:
             continue
