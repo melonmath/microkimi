@@ -253,19 +253,41 @@ def utility_rows(model, tok, text_path, d0, d1, seq, device, n_graft,
             rows[(li, g)] = (row * (gate_sigma / sd)).astype(np.float32)
             log(f"L{li}.g{g}: mean util {util.mean():+.4f}, helps on "
                 f"{100 * (util > 0).mean():.1f}% of positions", flush=True)
-    return rows
+    return rows, {li: np.concatenate(pln[li])[:len(base)] for li in n_graft}
 
 
-def install_rows(model, rows, n_graft):
+def install_rows(model, rows, n_graft, stream_by_layer=None):
+    """Installs solved router rows. With a sample of the router input
+    stream, each row is rescaled and centered so its logits match the
+    native rows' spread and mean: a solved row carries an arbitrary
+    scale, and under softmax an offset of a few units makes the graft win
+    every slot and claim most of the mixture weight, starving competent
+    native experts. Matching the distribution is what makes the selection
+    bias meaningful in native units."""
     import torch
     with torch.no_grad():
         for (li, g), row in rows.items():
             for l2, mlp in moe_blocks(model):
-                if l2 == li:
-                    idx = mlp.gate.weight.shape[0] - n_graft[li] + g
-                    mlp.gate.weight[idx] = torch.tensor(
-                        row, dtype=mlp.gate.weight.dtype,
-                        device=mlp.gate.weight.device)
+                if l2 != li:
+                    continue
+                w = mlp.gate.weight
+                idx = w.shape[0] - n_graft[li] + g
+                r = torch.tensor(row, dtype=w.dtype, device=w.device)
+                if stream_by_layer is not None and li in stream_by_layer:
+                    x = torch.tensor(stream_by_layer[li][:4096],
+                                     dtype=w.dtype, device=w.device)
+                    nat = x @ w[:w.shape[0] - n_graft[li]].T
+                    got = x @ r
+                    scale = (nat.float().std() /
+                             got.float().std().clamp_min(1e-6))
+                    r = r * scale.to(w.dtype)
+                    off = (x @ r).float().mean() - nat.float().mean()
+                    # fold the offset into a constant direction of the row
+                    r = r - (off / x.float().mean(0).norm().clamp_min(1e-6)
+                             ).to(w.dtype) * (x.float().mean(0)
+                                              / x.float().mean(0).norm()
+                                              .clamp_min(1e-6)).to(w.dtype)
+                w[idx] = r
 
 
 # ------------------------------------------------------------------- eval
@@ -419,9 +441,10 @@ def main():
         n_g = {int(k): 1 for k in gcfg["bias"]}
         if args.utility_rows:
             u0, u1 = (int(x) for x in args.utility_rows.split(":"))
-            rows = utility_rows(model, tok, args.text, u0, u1, args.seq,
-                                args.device, n_g, args.batch)
-            install_rows(model, rows, n_g)
+            rows, streams = utility_rows(model, tok, args.text, u0, u1,
+                                         args.seq, args.device, n_g,
+                                         args.batch)
+            install_rows(model, rows, n_g, streams)
             print(f"installed {len(rows)} measured-utility router rows")
         if args.bias_grid:
             # 2D sweep over (output scale, selection bias); silence is
