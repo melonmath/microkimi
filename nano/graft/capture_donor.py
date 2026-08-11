@@ -266,10 +266,11 @@ def main():
         "style": style_name, "layers": layers, "seq": args.seq,
         "weights": {k: v for k, v in style["weights"].items()},
     }
+    input_dev = "cuda:0" if args.device == "auto" else args.device
     meta = run_capture(model, layers, style,
                        iter_docs(args.text, args.max_docs), encode,
                        args.out, args.seq, args.max_tokens, extra,
-                       args.device)
+                       input_dev)
     print(f"-> {args.out}: {meta['n_tokens']} tokens, planes "
           f"{sorted(meta['planes'])}")
 
