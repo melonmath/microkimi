@@ -58,13 +58,17 @@ def load_model(model_dir, device="cpu", dtype="bfloat16"):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_dir)
     kw = {"attn_implementation": "eager", "dtype": getattr(torch, dtype)}
+    if device == "auto":
+        kw["device_map"] = "auto"
     try:
         model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
     except ValueError:
         with open(os.path.join(model_dir, "config.json")) as f:
             arch = json.load(f)["architectures"][0]
         model = getattr(transformers, arch).from_pretrained(model_dir, **kw)
-    model.to(device).eval()
+    if device != "auto":
+        model.to(device)
+    model.eval()
     return model, tok
 
 
@@ -228,6 +232,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--max-new", type=int, default=40)
+    ap.add_argument("--bias-grid", default=None,
+                    help="global selection-bias sweep on the cal range "
+                    "(replaces the greedy per-layer pass)")
     ap.add_argument("--boot", type=int, default=10000)
     args = ap.parse_args()
 
@@ -235,6 +242,8 @@ def main():
     torch.set_num_threads(os.cpu_count() or 8)
 
     model, tok = load_model(args.model, args.device, args.dtype)
+    if args.device == "auto":
+        args.device = "cuda:0"
 
     if args.cmd == "graft":
         # silent-birth verification: logits before == after at bias -1e9
@@ -285,6 +294,36 @@ def main():
     if gcfg and args.cal_range:
         c0, c1 = (int(x) for x in args.cal_range.split(":"))
         n_g = {int(k): 1 for k in gcfg["bias"]}
+        if args.bias_grid:
+            # global sweep: one bias for every graft, silence included
+            set_graft_bias(model, {}, n_g)
+            docs = eval_range(model, tok, args.text, c0, c1, args.seq,
+                              args.device, args.batch)
+            best = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+            print(f"sweep: silent CE {best:.4f}")
+            keep = None
+            for b in (float(x) for x in args.bias_grid.split(",")):
+                set_graft_bias(model, {li: b for li in n_g}, n_g)
+                docs = eval_range(model, tok, args.text, c0, c1, args.seq,
+                                  args.device, args.batch)
+                ce = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+                print(f"sweep: bias {b:+.1f} CE {ce:.4f}", flush=True)
+                if ce < best:
+                    best, keep = ce, b
+            chosen = {li: keep for li in n_g} if keep is not None else {}
+            set_graft_bias(model, chosen, n_g)
+            gcfg["bias"] = {str(k): chosen.get(k, -1e9) for k in n_g}
+            with open(args.graft_cfg, "w") as f:
+                json.dump(gcfg, f)
+            print(f"sweep kept bias {keep} -> {args.graft_cfg}")
+        if not args.bias_grid:
+            _greedy(model, tok, args, gcfg, n_g, c0, c1)
+
+    t0 = time.time()
+    _run_final_eval(model, tok, args, gcfg)
+
+
+def _greedy(model, tok, args, gcfg, n_g, c0, c1):
         set_graft_bias(model, {}, n_g)  # all silent
         base_docs = eval_range(model, tok, args.text, c0, c1, args.seq,
                                args.device, args.batch)
@@ -309,6 +348,10 @@ def main():
             json.dump(gcfg, f)
         print(f"calibrated: {len(chosen)} layers active -> {args.graft_cfg}")
 
+
+def _run_final_eval(model, tok, args, gcfg):
+    from eval_compare import paired_bootstrap
+    d0, d1 = (int(x) for x in args.doc_range.split(":"))
     t0 = time.time()
     docs = eval_range(model, tok, args.text, d0, d1, args.seq, args.device,
                       args.batch)
