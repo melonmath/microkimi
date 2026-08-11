@@ -201,6 +201,8 @@ class SideBranch:
         self.inner = mlp.forward
         mlp.forward = self._forward
 
+    gamma_base = 1.0
+
     def _forward(self, hidden_states):
         import torch
         import torch.nn.functional as F
@@ -210,8 +212,56 @@ class SideBranch:
         h = hidden_states.reshape(-1, hidden_states.shape[-1])
         gate = torch.sigmoid(h @ self.row + self.bias)
         act = F.silu(h @ self.w1.T) * (h @ self.w3.T)
-        side = (act @ self.w2.T) * gate[:, None] * self.gamma
+        side = (act @ self.w2.T) * gate[:, None] * (self.gamma
+                                                     * self.gamma_base)
         return out + side.reshape(out.shape)
+
+
+def measure_norm_gain(model, tok, text_path, d0, d1, seq, device, layers,
+                      log=print):
+    """Per-layer RMS ratio between a MoE block's OUTPUT and its INPUT.
+
+    Host planes are captured post-norm (block input) but a side branch
+    adds to the block output, which lives in residual scale; the RMSNorm
+    gain between the two is layer dependent, so no single output scale
+    can absorb it. This measures the ratio so it can be folded into each
+    organ's down matrix."""
+    import torch
+    rec, handles = {}, []
+
+    def mk(li):
+        def hook(_m, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            rec.setdefault(li, []).append(
+                (float(inp[0].detach().float().pow(2).mean().sqrt()),
+                 float(o.detach().float().pow(2).mean().sqrt())))
+        return hook
+
+    for li, mlp in moe_blocks(model):
+        if li in layers:
+            handles.append(mlp.register_forward_hook(mk(li)))
+    n = 0
+    with open(text_path) as f:
+        for i, line in enumerate(f):
+            if i >= d1 or n >= 8:
+                break
+            if i < d0:
+                continue
+            t = json.loads(line).get("text")
+            if not t:
+                continue
+            for w in doc_windows(t, tok, seq)[:1]:
+                with torch.no_grad():
+                    model(input_ids=torch.tensor(w[None, :-1],
+                                                 device=device))
+                n += 1
+    for h in handles:
+        h.remove()
+    gains = {li: float(np.mean([o / max(i, 1e-6) for i, o in v]))
+             for li, v in rec.items()}
+    log("norm gains: " + " ".join(f"L{li}:{g:.3f}"
+                                  for li, g in sorted(gains.items())))
+    return gains
 
 
 def attach_branches(model, pack_path):
@@ -431,6 +481,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--max-new", type=int, default=40)
+    ap.add_argument("--norm-gain", action="store_true",
+                    help="fold the measured per-layer block output/input "
+                    "RMS ratio into each side branch")
     ap.add_argument("--additive", action="store_true",
                     help="attach grafts as parallel side branches "
                     "(sigmoid-gated, no top-k competition) instead of "
@@ -485,6 +538,11 @@ def main():
         br = attach_branches(model, gc["pack"])
         print(f"attached {len(br)} side branches")
         c0, c1 = (int(x) for x in args.cal_range.split(":"))
+        if args.norm_gain:
+            g = measure_norm_gain(model, tok, args.text, c0, c1, args.seq,
+                                  args.device, set(br))
+            for li, b in br.items():
+                b.gamma_base = g.get(li, 1.0)
         set_branches(br, -1e9)
         docs = eval_range(model, tok, args.text, c0, c1, args.seq,
                           args.device, args.batch)
