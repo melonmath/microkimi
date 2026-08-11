@@ -87,7 +87,8 @@ def scan_map(hmeta, hplanes, dmeta, dplanes, ih, idz, sample, log=print,
 def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
               bands=1, rel_lambda=1e-4, holdout=4096, max_pairs=0,
               moe_inter=None, log=print, target="donor",
-              scan_sample=30000, act="situ", host_planes="k3"):
+              scan_sample=30000, act="situ", host_planes="k3",
+              donor_expert=0):
     """host_planes selects the host capture layout: "k3" (lat/pln/moe
     planes from capture_host) or "classic" (in/dz planes from a
     capture_donor-style capture of a residual-expert MoE host: the port
@@ -125,9 +126,22 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
     report = {}
     g_next = {}
     for hl, dl in layer_map:
-        names = {k: wtmpl[k].format(l=dl) for k in ("gate", "up", "down")}
-        w = read_safetensors_dir(donor_weights_path, list(names.values()))
-        donor_w = {k: w[names[k]] for k in names}
+        if "gate_up" in wtmpl:
+            # fused MoE donor bank [E, 2i, d] / [E, d, i]: one expert of
+            # the donor becomes the imported FFN (--donor-expert)
+            names = {k: wtmpl[k].format(l=dl) for k in ("gate_up", "down")}
+            w = read_safetensors_dir(donor_weights_path,
+                                     list(names.values()))
+            gu = w[names["gate_up"]][donor_expert]
+            half = gu.shape[0] // 2
+            donor_w = {"gate": gu[:half], "up": gu[half:],
+                       "down": w[names["down"]][donor_expert]}
+        else:
+            names = {k: wtmpl[k].format(l=dl)
+                     for k in ("gate", "up", "down")}
+            w = read_safetensors_dir(donor_weights_path,
+                                     list(names.values()))
+            donor_w = {k: w[names[k]] for k in names}
         y_moe = None
         if target == "diff":
             y_moe = moe_of(hl)
@@ -189,6 +203,8 @@ def main():
     ap.add_argument("--holdout", type=int, default=4096)
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--moe-inter", type=int, default=None)
+    ap.add_argument("--donor-expert", type=int, default=0,
+                    help="expert index for fused MoE donor banks")
     ap.add_argument("--act", default="situ", choices=["situ", "silu"],
                     help="the HOST expert activation the down re-solve "
                     "goes through")
@@ -207,7 +223,8 @@ def main():
                            args.bands, args.rel_lambda, args.holdout,
                            args.max_pairs, args.moe_inter,
                            target=args.target, scan_sample=args.scan_sample,
-                           act=args.act, host_planes=args.host_planes)
+                           act=args.act, host_planes=args.host_planes,
+                           donor_expert=args.donor_expert)
     np.savez(args.out, **pack)
     print(f"-> {args.out}: {len(pack) - 1} tensors, bands {meta['bands']}")
 

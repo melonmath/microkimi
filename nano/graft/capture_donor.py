@@ -72,11 +72,20 @@ STYLES = {
             "down": "model.layers.{l}.mlp.experts.down_proj",
         },
     },
+    "deepseek_v4": {
+        "in": "model.layers.{l}.post_attention_layernorm",
+        "dz": "model.layers.{l}.mlp",
+        "weights": {
+            "gate_up": "model.layers.{l}.mlp.experts.gate_up_proj",
+            "down": "model.layers.{l}.mlp.experts.down_proj",
+        },
+    },
 }
 _MODEL_TYPE_STYLE = {
     "llama": "llama", "qwen2": "llama", "qwen3": "llama", "mistral": "llama",
     "gemma3": "gemma3", "gemma3_text": "gemma3",
     "qwen3_5_moe": "qwen3_5_moe", "qwen3_5_moe_text": "qwen3_5_moe",
+    "deepseek_v4": "deepseek_v4",
 }
 
 
