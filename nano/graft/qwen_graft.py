@@ -171,6 +171,72 @@ def set_graft_bias(model, bias_by_layer, n_graft):
                     bias_by_layer.get(li, -1e9))
 
 
+# ------------------------------------------------------- additive grafting
+
+class SideBranch:
+    """Adds a grafted FFN in PARALLEL to a MoE block instead of entering
+    its top-k. The block output becomes
+
+        y = moe(h) + sigma(h . g + bias) * gamma * organ(h)
+
+    so the organ never displaces a native expert. Measured motivation:
+    on a strong host the organ loses to the expert it would evict
+    (utility -7.6 to -11.1 nats when forced through the router), while
+    the same organ can still contribute where the gate opens, because
+    nothing is taken away. The sigmoid gate keeps the contract soft: no
+    hard selection, no renormalization, and bias -> -inf reproduces the
+    host exactly."""
+
+    def __init__(self, mlp, w1, w3, w2, row, bias=-1e9, gamma=1.0):
+        import torch
+        dev = mlp.experts.down_proj.device
+        dt = mlp.experts.down_proj.dtype
+        self.mlp = mlp
+        self.w1 = torch.tensor(w1, dtype=dt, device=dev)
+        self.w3 = torch.tensor(w3, dtype=dt, device=dev)
+        self.w2 = torch.tensor(w2, dtype=dt, device=dev)
+        self.row = torch.tensor(row, dtype=dt, device=dev)
+        self.bias = bias
+        self.gamma = gamma
+        self.inner = mlp.forward
+        mlp.forward = self._forward
+
+    def _forward(self, hidden_states):
+        import torch
+        import torch.nn.functional as F
+        out = self.inner(hidden_states)
+        if self.bias <= -1e8:
+            return out
+        h = hidden_states.reshape(-1, hidden_states.shape[-1])
+        gate = torch.sigmoid(h @ self.row + self.bias)
+        act = F.silu(h @ self.w1.T) * (h @ self.w3.T)
+        side = (act @ self.w2.T) * gate[:, None] * self.gamma
+        return out + side.reshape(out.shape)
+
+
+def attach_branches(model, pack_path):
+    """Attaches one side branch per MoE layer from a graft pack. Returns
+    {layer: branch}. Every branch starts silent (bias -1e9)."""
+    z = np.load(pack_path)
+    meta = json.loads(bytes(z["meta"]).decode())
+    out = {}
+    for li, mlp in moe_blocks(model):
+        k = f"L{li}.g0"
+        if f"{k}.w1" not in z:
+            continue
+        out[li] = SideBranch(mlp, z[f"{k}.w1"], z[f"{k}.w3"], z[f"{k}.w2"],
+                             z[f"{k}.gate"])
+    if not out:
+        raise SystemExit("pack matched no MoE layer")
+    return out
+
+
+def set_branches(branches, bias, gamma=1.0):
+    for b in branches.values():
+        b.bias = bias
+        b.gamma = gamma
+
+
 # --------------------------------------------------------- utility routing
 
 SILENT = -1e9
@@ -365,6 +431,10 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--max-new", type=int, default=40)
+    ap.add_argument("--additive", action="store_true",
+                    help="attach grafts as parallel side branches "
+                    "(sigmoid-gated, no top-k competition) instead of "
+                    "extending the expert bank")
     ap.add_argument("--utility-rows", default=None,
                     help="doc range A:B used to solve router rows from "
                     "measured per-token utility before calibrating")
@@ -407,6 +477,38 @@ def main():
         with open(args.out_cfg or "graft_cfg.json", "w") as f:
             json.dump(cfg, f)
         print(f"-> {args.out_cfg or 'graft_cfg.json'}")
+        return
+
+    if args.additive:
+        with open(args.graft_cfg) as f:
+            gc = json.load(f)
+        br = attach_branches(model, gc["pack"])
+        print(f"attached {len(br)} side branches")
+        c0, c1 = (int(x) for x in args.cal_range.split(":"))
+        set_branches(br, -1e9)
+        docs = eval_range(model, tok, args.text, c0, c1, args.seq,
+                          args.device, args.batch)
+        best = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+        print(f"additive: silent CE {best:.4f}", flush=True)
+        keep = None
+        for gam in (float(x) for x in args.gamma_grid.split(",")):
+            for b in (float(x) for x in args.bias_grid.split(",")):
+                set_branches(br, b, gam)
+                docs = eval_range(model, tok, args.text, c0, c1, args.seq,
+                                  args.device, args.batch)
+                ce = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+                print(f"additive: gamma {gam:g} bias {b:+.1f} CE {ce:.4f}",
+                      flush=True)
+                if ce < best:
+                    best, keep = ce, (b, gam)
+        set_branches(br, *(keep if keep else (-1e9, 1.0)))
+        print(f"additive kept {keep} (CE {best:.4f})", flush=True)
+        d0, d1 = (int(x) for x in args.doc_range.split(":"))
+        docs = eval_range(model, tok, args.text, d0, d1, args.seq,
+                          args.device, args.batch)
+        ce = sum(n for n, _c in docs) / sum(c for _n, c in docs)
+        print(f"additive final: CE {ce:.4f} over "
+              f"{sum(c for _n, c in docs)} tokens", flush=True)
         return
 
     gcfg = None
