@@ -287,7 +287,7 @@ def cka_scan(h_lat, donor_planes, ih, idz, sample=30000, chunk=8192):
 def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
                 rel_lambda=1e-4, holdout=4096, score_sample=16384,
                 chunk=8192, ih=None, idz=None, gate_sigma=1.0,
-                y_moe=None, act="situ"):
+                y_moe=None, act="situ", out_space=None):
     """Solves host-shaped expert tensors from aligned activations.
 
     h_lat [n, rh]   host latent stream (routed_expert_down_proj output)
@@ -328,10 +328,17 @@ def solve_graft(h_lat, h_pln, z_in, dz, donor_w, moe_inter, bands=1,
     # 1) state stitches, both directions, streamed grams (fit rows only:
     # the leading `holdout` pairs never enter any solve)
     g_in = RectGram(rh, d_d)
-    g_out = RectGram(d_d, rh)
-    for x, y in chunked_pairs(h_lat, z_in, ih_fit, idz_fit, chunk):
+    # the donor-to-host stitch must land in the space the organ output is
+    # added to; out_space provides that stream when it differs from the
+    # port stream (block output vs block input)
+    tgt = out_space if out_space is not None else h_lat
+    g_out = RectGram(d_d, tgt.shape[1])
+    for t0 in range(0, len(ih_fit), chunk):
+        hi, di = ih_fit[t0:t0 + chunk], idz_fit[t0:t0 + chunk]
+        x = np.asarray(h_lat[hi], np.float64)
+        y = np.asarray(z_in[di], np.float64)
         g_in.add(x, y)
-        g_out.add(y, x)
+        g_out.add(y, np.asarray(tgt[hi], np.float64))
     s_in, res_in = g_in.solve(rel_lambda)      # [d_D, rh]
     m_out, res_out = g_out.solve(rel_lambda)   # [rh, d_D]
     cka = g_in.cka()

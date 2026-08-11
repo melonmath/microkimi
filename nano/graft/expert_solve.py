@@ -118,6 +118,14 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
     if host_planes == "classic":
         lat_of = pln_of = (lambda hl: hplanes[f"L{hl}.in"])
         moe_of = lambda hl: hplanes.get(f"L{hl}.dz")
+    elif host_planes == "output":
+        # organs are added to the block OUTPUT, so both the target and the
+        # donor-to-host stitch must be solved in that space: the residual
+        # rescaling between a block's input and its output is not a scalar
+        # per layer, it is a full change of basis, and no post-hoc factor
+        # can rotate a direction solved in the input space
+        lat_of = pln_of = (lambda hl: hplanes[f"L{hl}.in"])
+        moe_of = lambda hl: hplanes[f"L{hl}.dz"]
     else:
         lat_of = lambda hl: hplanes[f"L{hl}.lat"]
         pln_of = lambda hl: hplanes[f"L{hl}.pln"]
@@ -166,7 +174,9 @@ def solve_all(host_prefix, donor_prefix, donor_weights_path, layer_map,
             lat_of(hl), pln_of(hl),
             dplanes[f"L{dl}.in"], dplanes[f"L{dl}.dz"], donor_w, mi,
             bands=bands, rel_lambda=rel_lambda, holdout=holdout,
-            ih=ih, idz=idz, y_moe=y_moe, act=act)
+            ih=ih, idz=idz, y_moe=y_moe, act=act,
+            out_space=(hplanes[f"L{hl}.dz"] if host_planes == "output"
+                       else None))
         g0 = g_next.get(hl, 0)
         for g, (w1, w3, w2, gate_row) in enumerate(out["experts"], g0):
             pack[f"L{hl}.g{g}.w1"] = w1
@@ -222,7 +232,8 @@ def main():
     ap.add_argument("--act", default="situ", choices=["situ", "silu"],
                     help="the HOST expert activation the down re-solve "
                     "goes through")
-    ap.add_argument("--host-planes", default="k3", choices=["k3", "classic"],
+    ap.add_argument("--host-planes", default="k3",
+                    choices=["k3", "classic", "output"],
                     help="host capture layout: k3 lat/pln/moe planes, or "
                     "classic in/dz planes (residual-expert MoE hosts)")
     ap.add_argument("--target", default="donor", choices=["donor", "diff"],
