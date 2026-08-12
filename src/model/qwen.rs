@@ -523,3 +523,250 @@ mod forward_tests {
         }
     }
 }
+
+// ──────────────────────────── assembled model ────────────────────────────
+
+/// Owned weights of one layer, in the order the decode loop needs them.
+/// Linear-attention and full-attention layers carry different sets; the
+/// expert bank and the shared expert are common to both.
+pub struct QwenLayer {
+    pub input_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub router: Vec<f32>,
+    pub experts: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+    pub shared: (Vec<f32>, Vec<f32>, Vec<f32>),
+    pub shared_gate: Vec<f32>,
+    /// linear layers only
+    pub lin: Option<QwenLinWeights>,
+}
+
+pub struct QwenLinWeights {
+    pub in_qkv: Vec<f32>,
+    pub in_z: Vec<f32>,
+    pub in_b: Vec<f32>,
+    pub in_a: Vec<f32>,
+    pub conv: Vec<f32>,
+    pub a_log: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub out_proj: Vec<f32>,
+}
+
+/// A loaded qwen3_5_moe decoder: trunk weights, per-layer weights, and
+/// the recurrent state of every linear-attention layer.
+pub struct QwenModel {
+    pub cfg: QwenConfig,
+    pub embed: Vec<f32>,
+    pub norm_f: Vec<f32>,
+    pub lm_head: Vec<f32>,
+    pub layers: Vec<QwenLayer>,
+    pub caches: Vec<Option<LinCache>>,
+}
+
+impl QwenModel {
+    /// Allocates the per-layer recurrent state. Call before decoding and
+    /// whenever a fresh sequence starts.
+    pub fn reset(&mut self) {
+        self.caches = (0..self.layers.len())
+            .map(|l| {
+                if self.cfg.is_full_attn(l) {
+                    None
+                } else {
+                    Some(LinCache::new(&self.cfg))
+                }
+            })
+            .collect();
+    }
+
+    /// One decode step. Full-attention layers are skipped for now (their
+    /// KV cache is not wired), so this runs the linear-attention path and
+    /// the expert banks: enough to exercise the recurrence and routing on
+    /// real weights.
+    pub fn step(&mut self, token: u32, logits: &mut [f32]) {
+        let c = &self.cfg;
+        let d = c.d;
+        let mut h = self.embed[token as usize * d..(token as usize + 1) * d].to_vec();
+        let mut buf = vec![0.0f32; d];
+        let mut mix = vec![0.0f32; d];
+
+        for l in 0..self.layers.len() {
+            let is_full = c.is_full_attn(l);
+            {
+                let layer = &self.layers[l];
+                rmsnorm(&h, &layer.input_norm, c.norm_eps as f32, &mut buf);
+            }
+            if !is_full {
+                // borrow the layer weights and this layer's cache together
+                let (lin_ok, out) = {
+                    let layer = &self.layers[l];
+                    match (&layer.lin, self.caches[l].as_mut()) {
+                        (Some(w), Some(cache)) => {
+                            let lw = LinAttn {
+                                in_qkv: &w.in_qkv,
+                                in_z: &w.in_z,
+                                in_b: &w.in_b,
+                                in_a: &w.in_a,
+                                conv: &w.conv,
+                                a_log: &w.a_log,
+                                dt_bias: &w.dt_bias,
+                                norm: &w.norm,
+                                out_proj: &w.out_proj,
+                            };
+                            let mut o = vec![0.0f32; d];
+                            lin_attn_step(&lw, c, &buf, cache, &mut o);
+                            (true, o)
+                        }
+                        _ => (false, vec![0.0f32; d]),
+                    }
+                };
+                if lin_ok {
+                    for i in 0..d {
+                        h[i] += out[i];
+                    }
+                }
+            }
+            {
+                let layer = &self.layers[l];
+                rmsnorm(&h, &layer.post_norm, c.norm_eps as f32, &mut buf);
+                let block = MoeBlock {
+                    router: &layer.router,
+                    experts: layer
+                        .experts
+                        .iter()
+                        .map(|(g, u, dn)| (&g[..], &u[..], &dn[..]))
+                        .collect(),
+                    shared: (&layer.shared.0[..], &layer.shared.1[..], &layer.shared.2[..]),
+                    shared_gate: &layer.shared_gate,
+                };
+                moe_forward(&block, &buf, c, &mut mix);
+            }
+            for i in 0..d {
+                h[i] += mix[i];
+            }
+        }
+        rmsnorm(&h, &self.norm_f, c.norm_eps as f32, &mut buf);
+        crate::model::ops::matvec(&self.lm_head, c.vocab, d, &buf, logits);
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn build(c: QwenConfig) -> QwenModel {
+        let d = c.d;
+        let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+        let conv_dim = kt * 2 + vt;
+        let mk_ffn = |inter: usize, s: f32| {
+            (
+                vec![0.05f32; inter * d],
+                vec![0.05f32; inter * d],
+                vec![s; inter * d],
+            )
+        };
+        let layers = (0..c.n_layers)
+            .map(|l| QwenLayer {
+                input_norm: vec![1.0; d],
+                post_norm: vec![1.0; d],
+                router: vec![0.01; c.n_experts * d],
+                experts: (0..c.n_experts)
+                    .map(|e| mk_ffn(c.moe_inter, 0.01 * (e + 1) as f32))
+                    .collect(),
+                shared: mk_ffn(c.shared_inter, 0.01),
+                shared_gate: vec![0.0; d],
+                lin: if c.is_full_attn(l) {
+                    None
+                } else {
+                    Some(QwenLinWeights {
+                        in_qkv: vec![0.02; conv_dim * d],
+                        in_z: vec![0.03; vt * d],
+                        in_b: vec![0.0; c.lin_v_heads * d],
+                        in_a: vec![0.0; c.lin_v_heads * d],
+                        conv: {
+                            let mut v = vec![0.0f32; conv_dim * c.conv_kernel];
+                            for i in 0..conv_dim {
+                                v[i * c.conv_kernel + c.conv_kernel - 1] = 1.0;
+                            }
+                            v
+                        },
+                        a_log: vec![0.0; c.lin_v_heads],
+                        dt_bias: vec![0.0; c.lin_v_heads],
+                        norm: vec![1.0; c.lin_v_dim],
+                        out_proj: vec![0.02; d * vt],
+                    })
+                },
+            })
+            .collect();
+        let mut m = QwenModel {
+            embed: vec![0.1; c.vocab * d],
+            norm_f: vec![1.0; d],
+            lm_head: vec![0.05; c.vocab * d],
+            layers,
+            caches: Vec::new(),
+            cfg: c,
+        };
+        m.reset();
+        m
+    }
+
+    fn tiny() -> QwenConfig {
+        let mut c = QwenConfig::qwen35_moe();
+        c.n_layers = 4;
+        c.d = 8;
+        c.vocab = 16;
+        c.n_experts = 4;
+        c.top_k = 2;
+        c.moe_inter = 6;
+        c.shared_inter = 6;
+        c.lin_k_heads = 1;
+        c.lin_v_heads = 2;
+        c.lin_k_dim = 4;
+        c.lin_v_dim = 4;
+        c
+    }
+
+    #[test]
+    fn full_stack_step_produces_finite_logits() {
+        let c = tiny();
+        let vocab = c.vocab;
+        let mut m = build(c);
+        let mut logits = vec![0.0f32; vocab];
+        m.step(3, &mut logits);
+        assert!(logits.iter().all(|v| v.is_finite()), "{:?}", logits);
+        assert!(logits.iter().any(|v| v.abs() > 1e-9));
+    }
+
+    #[test]
+    fn reset_makes_decoding_reproducible() {
+        // the recurrence itself is covered by forward_tests; here the
+        // contract is that reset() returns the model to its first-token
+        // state, so two runs of the same sequence agree exactly
+        let c = tiny();
+        let vocab = c.vocab;
+        let mut m = build(c);
+        let mut a = vec![0.0f32; vocab];
+        let mut b = vec![0.0f32; vocab];
+        for t in [3u32, 5, 1] {
+            m.step(t, &mut a);
+        }
+        m.reset();
+        for t in [3u32, 5, 1] {
+            m.step(t, &mut b);
+        }
+        for i in 0..vocab {
+            assert!((a[i] - b[i]).abs() < 1e-6, "reset did not clear state");
+        }
+        assert!(a.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn cache_allocation_follows_the_attention_stride() {
+        let c = tiny();
+        let m = build(c);
+        for l in 0..m.layers.len() {
+            let full = m.cfg.is_full_attn(l);
+            assert_eq!(m.caches[l].is_none(), full, "layer {}", l);
+            assert_eq!(m.layers[l].lin.is_none(), full, "layer {}", l);
+        }
+    }
+}
