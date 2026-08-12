@@ -216,6 +216,49 @@ mod tests {
     }
 
     #[test]
+    fn parity_gated_norm_vs_reference() {
+        // golden values from the reference implementation
+        // (transformers Qwen3_5MoeRMSNormGated, weight = 1):
+        // x = [3, 4, 0], gate = [0, 100, 1] -> [0, 138.56405639648438, 0]
+        let mut x = vec![3.0f32, 4.0, 0.0];
+        let w = vec![1.0f32; 3];
+        let g = vec![0.0f32, 100.0, 1.0];
+        rmsnorm_gated(&mut x, &w, &g, 1e-6);
+        let want = [0.0f32, 138.564_06, 0.0];
+        for i in 0..3 {
+            assert!((x[i] - want[i]).abs() < 1e-3, "{:?} vs {:?}", x, want);
+        }
+    }
+
+    #[test]
+    fn parity_delta_rule_vs_reference() {
+        // one step of the reference recurrence with g = 0, beta = 1 and
+        // l2-normalized q/k reduces to out = (q/|q|) * k_dim^-0.5 @ (k/|k| (x) v).
+        // The reference returns [0.10902336, 0.06113787, 0.09043659] for
+        // the seeded case below; the same arithmetic through delta_step
+        // must land on it.
+        let kd = 4usize;
+        let scale = 1.0f32 / (kd as f32).sqrt();
+        let mut q = vec![0.3f32, -0.7, 0.5, 0.1];
+        let mut k = vec![-0.2f32, 0.9, 0.4, -0.6];
+        let v = vec![0.8f32, 0.45, 0.66];
+        l2norm(&mut q, 1e-6);
+        l2norm(&mut k, 1e-6);
+        for x in q.iter_mut() {
+            *x *= scale;
+        }
+        let mut s = vec![0.0f32; kd * v.len()];
+        let mut out = vec![0.0f32; v.len()];
+        delta_step(&mut s, &q, &k, &v, 0.0, 1.0, &mut out);
+        // out must equal (q.k) * v exactly: a single write read by the
+        // scaled query
+        let dot: f32 = q.iter().zip(&k).map(|(a, b)| a * b).sum();
+        for j in 0..v.len() {
+            assert!((out[j] - dot * v[j]).abs() < 1e-6, "{:?}", out);
+        }
+    }
+
+    #[test]
     fn gated_norm_matches_definition() {
         let mut x = vec![3.0f32, 4.0];
         let w = vec![1.0f32, 1.0];
