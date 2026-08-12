@@ -66,6 +66,7 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | microquant | `microkimi slice --cold-vq N` keeps all experts but requantizes the coldest to 0.5-bit VQ - measured better than deleting them (30.6% vs 19.1% top-1 parity with the full model) |
 | structural slicing | `microkimi slice` prunes layers / hidden channels / experts (`--layers --hidden --experts`) and vocabulary (`--vocab-top`) from a .bin or straight from remote safetensors; crash-safe resume (`.sliceckpt`) and a persistent expert-score cache |
 | evaluation | `microkimi eval --model X.bin` - deterministic scorecard: 40 factual QA probes (2 phrasings) + perplexity, `--json` for archiving |
+| model adapter packs | K3 only: `nano/adapter_pack.py` turns a standard same-base PEFT LoRA into a hash-bound `.mkap`; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
 | memory packs | K3 only: `microkimi absorb doc.txt --out pack.mkmem` snapshots the fixed-size KDA state; `run --memory pack.mkmem` resumes it. A video-game save state - details in [KIMI.md](KIMI.md#memory-packs-save-states-for-a-neural-network) |
 
 ## License

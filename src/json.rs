@@ -51,6 +51,16 @@ pub fn parse(bytes: &[u8]) -> Json {
     p.value()
 }
 
+/// Parses one complete JSON value and rejects non-whitespace trailing bytes.
+/// Strict bounded-format readers use this when the exact byte range matters.
+pub fn parse_complete(bytes: &[u8]) -> Json {
+    let mut p = Parser { b: bytes, i: 0 };
+    let value = p.value();
+    p.ws();
+    assert_eq!(p.i, bytes.len(), "JSON: trailing bytes at {}", p.i);
+    value
+}
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,

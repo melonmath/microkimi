@@ -11,6 +11,7 @@
 // lens (diagnostics), generate (sampler + decode loop).
 
 mod attention;
+mod adapter;
 pub mod deepseek;
 pub mod dstok;
 mod generate;
@@ -50,6 +51,7 @@ pub(crate) use kda::kda_recur_step_pub;
 use kda::{kda_forward, kda_prefill};
 use moe::{dense_forward, dense_prefill, moe_forward, moe_lookahead, moe_prefill};
 use seam::{seam_apply, seam_load, SeamW};
+use adapter::AppliedPacks;
 pub use lens::{
     logit_lens_print_maybe, resolve_lens_probe, set_dump_hidden, set_lens_probes, set_logit_lens, ParityDump, RoutingDebug, DUMP_LAYERS,
     PARITY, ROUTER_LAYERS, ROUTING,
@@ -362,6 +364,10 @@ pub struct Model {
     /// Embedded seam adapter (seam.A / seam.B + config seam_after), applied
     /// to the residual stream right after layer seam.after (seam_load).
     seam: Option<SeamW>,
+    /// External low-rank model adapter packs folded into private fp32 pages
+    /// during load. Kept for identity and persistence guards; inference reads
+    /// the already-folded weights and pays no adapter-branch overhead.
+    adapter_packs: AppliedPacks,
     /// --stream: RAM LRU of packed expert bytes over the disk/HTTP tiers
     /// (stream.rs). None = historical full-load path, byte-identical behavior.
     stream: Option<crate::stream::ExpertCache>,
@@ -388,7 +394,16 @@ impl Model {
     }
 
     pub fn load(path: &str) -> Self {
-        Self::from_bin(BinFile::open(path), None)
+        Self::from_bin(BinFile::open(path), None, AppliedPacks::default())
+    }
+
+    /// Loads a model and folds every verified external adapter pack into
+    /// its private mapping. The model file itself remains byte-identical.
+    pub fn load_with_adapters(path: &str, pack_paths: &[String]) -> Self {
+        let mut bin = BinFile::open(path);
+        let packs = adapter::apply_packs(path, &mut bin, pack_paths)
+            .unwrap_or_else(|e| panic!("adapter pack: {}", e));
+        Self::from_bin(bin, None, packs)
     }
 
     /// Streaming load (--stream): the spine is loaded compacted (expert MXFP4
@@ -401,7 +416,19 @@ impl Model {
     /// precision in the background - a DEGRADED latency mode, NOT
     /// bit-identical, off by default.
     pub fn load_streaming(path: &str, ram_mb: usize, fallback: bool) -> Self {
-        let bin = BinFile::open_spine(path);
+        Self::load_streaming_with_adapters(path, ram_mb, fallback, &[])
+    }
+
+    /// Streaming model load with the same verified adapter-pack fold as
+    /// `load_with_adapters`. Only spine tensors may be targeted, so routed
+    /// expert blobs remain outside the resident mapping.
+    pub fn load_streaming_with_adapters(
+        path: &str,
+        ram_mb: usize,
+        fallback: bool,
+        pack_paths: &[String],
+    ) -> Self {
+        let mut bin = BinFile::open_spine(path);
         let shadows = if fallback {
             let cfg = &bin.config;
             let moe_layers: Vec<usize> = (0..cfg.n_layers).filter(|&l| cfg.is_moe(l)).collect();
@@ -416,10 +443,20 @@ impl Model {
         } else {
             None
         };
-        Self::from_bin(bin, Some(crate::stream::ExpertCache::local(path, ram_mb, shadows)))
+        let packs = adapter::apply_packs(path, &mut bin, pack_paths)
+            .unwrap_or_else(|e| panic!("adapter pack: {}", e));
+        Self::from_bin(
+            bin,
+            Some(crate::stream::ExpertCache::local(path, ram_mb, shadows)),
+            packs,
+        )
     }
 
-    fn from_bin(bin: BinFile, stream: Option<crate::stream::ExpertCache>) -> Self {
+    fn from_bin(
+        bin: BinFile,
+        stream: Option<crate::stream::ExpertCache>,
+        adapter_packs: AppliedPacks,
+    ) -> Self {
         let cfg = bin.config.clone();
         // --exit-layer preset (armed by main before the load): layers past
         // the exit get no cache at all (see the EXIT_LAYER_PRESET section).
@@ -557,7 +594,23 @@ impl Model {
         if let Some(s) = &seam {
             println!("seam: adapter rank {} after layer {}", s.rank, s.after);
         }
-        Model { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits: Vec::new(), prof: Prof::default(), seam, stream, exit_layer }
+        Model {
+            cfg,
+            bin,
+            embed,
+            lm_head,
+            lm_head_q8,
+            norm_f,
+            out_res_w,
+            layers,
+            caches,
+            last_logits: Vec::new(),
+            prof: Prof::default(),
+            seam,
+            adapter_packs,
+            stream,
+            exit_layer,
+        }
     }
 
     /// Post-load early exit (the CLI presets before load, see
@@ -581,6 +634,14 @@ impl Model {
             }
         }
         0
+    }
+
+    pub fn has_adapter_packs(&self) -> bool {
+        !self.adapter_packs.is_empty()
+    }
+
+    pub fn adapter_set_sha256(&self) -> Option<&str> {
+        self.adapter_packs.set_sha256.as_deref()
     }
 
     pub fn reset_cache(&mut self) {
@@ -615,7 +676,7 @@ impl Model {
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // destructuring: independent per-field borrows (data immutable,
         // caches/prof mutable) - no raw pointers.
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream, exit_layer } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, adapter_packs: _, stream, exit_layer } = self;
         let cfg = &*cfg;
         let last = exit_layer.unwrap_or(cfg.n_layers - 1); // --exit-layer truncation
         let data = &bin.data[..];
@@ -844,7 +905,7 @@ impl Model {
         if ids.len() == 1 {
             return vec![self.forward(ids[0], pos0)];
         }
-        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, stream, exit_layer } = self;
+        let Self { cfg, bin, embed, lm_head, lm_head_q8, norm_f, out_res_w, layers, caches, last_logits, prof, seam, adapter_packs: _, stream, exit_layer } = self;
         let cfg = &*cfg;
         let last = exit_layer.unwrap_or(cfg.n_layers - 1); // --exit-layer truncation
         let data = &bin.data[..];

@@ -21,6 +21,12 @@ const MAGIC: &[u8; 8] = b"MKMEM001";
 
 /// Serializes the layer caches + the logits after the last ingested token.
 pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
+    if model.has_adapter_packs() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "external adapter packs are not represented in MKMEM001 fingerprints",
+        ));
+    }
     std::fs::write(path, serialize(model, logits))
 }
 
@@ -28,6 +34,10 @@ pub fn save(model: &Model, logits: &[f32], path: &str) -> std::io::Result<()> {
 /// `save` so the prefix cache (src/memory/prefix_cache.rs) can embed the same image in its
 /// own container without a round trip through a file.
 pub fn serialize(model: &Model, logits: &[f32]) -> Vec<u8> {
+    assert!(
+        !model.has_adapter_packs(),
+        "external adapter packs are not represented in MKMEM001 fingerprints"
+    );
     let cfg = &model.cfg;
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -70,6 +80,12 @@ pub fn load(model: &mut Model, path: &str) -> Result<Vec<f32>, String> {
 /// In-memory variant of `load` (prefix cache entries embed a .mkmem image);
 /// `label` only names the source in error messages.
 pub fn load_slice(model: &mut Model, b: &[u8], label: &str) -> Result<Vec<f32>, String> {
+    if model.has_adapter_packs() {
+        return Err(format!(
+            "{}: MKMEM001 cannot prove the external adapter-pack identity",
+            label
+        ));
+    }
     let path = label;
     let mut r = Reader { b, p: 0 };
     if r.take(8)? != MAGIC {

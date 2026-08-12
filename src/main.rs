@@ -9,6 +9,7 @@ mod json;
 mod memory;
 mod model;
 mod quant;
+mod sha256;
 mod stream;
 mod tokenizer;
 mod tools;
@@ -56,7 +57,14 @@ fn main() {
             //                        [--memory mem.mkmem] [--save mem.mkmem]
             //                        [--temp T] [--top-p P] [--seed N]
             //                        [--exit-layer N] [--logit-lens [--lens-probe "TOKEN"]]
-            let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
+            let skip = flag_value_positions(&args, &["--adapter"]);
+            let positional: Vec<&String> = args
+                .iter()
+                .enumerate()
+                .skip(2)
+                .filter(|(i, a)| !a.starts_with("--") && !skip.contains(i))
+                .map(|(_, a)| a)
+                .collect();
             let prompt = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "Hello".to_string());
             let max_new = args
                 .iter()
@@ -266,6 +274,9 @@ fn main() {
             println!("  run/chat options: --model X.bin --vocab vocab_nano.json (auto if next to the .bin)");
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
+            println!("                    --adapter skill.mkap (repeatable; hash-bound low-rank packs folded");
+            println!("                        into private pages at load, base .bin unchanged; K3 only;");
+            println!("                        currently incompatible with --memory/--save and the chat prefix cache)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
             println!("                    --spec-rosa N (suffix-automaton proposer, unbounded context, greedy only)");
@@ -565,7 +576,12 @@ fn gpubench_cmd(args: &[String]) {
     let tl = Instant::now();
     let mp = model_flag(args).unwrap_or_else(bin_path);
     let tok = load_any_tokenizer(&mp, vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
-    let mut model = model::Model::load(&mp);
+    let adapters = adapter_flags(args);
+    let mut model = if adapters.is_empty() {
+        model::Model::load(&mp)
+    } else {
+        model::Model::load_with_adapters(&mp, &adapters)
+    };
     println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
     let question = "Once upon a time";
     let ids = tok.encode_chat_user(question);
@@ -674,6 +690,10 @@ fn flag_value_positions(args: &[String], names: &[&str]) -> Vec<usize> {
 /// against the first one (the reference). Quantifies how much a merged state
 /// diverges from each of its parents.
 fn mkmem_div_cmd(args: &[String]) {
+    if !adapter_flags(args).is_empty() {
+        eprintln!("error: mkmem-div cannot yet be combined with --adapter");
+        std::process::exit(1);
+    }
     let skip = flag_value_positions(args, &["--prompt", "--max-new", "--model", "--vocab"]);
     let paths: Vec<String> = args
         .iter()
@@ -741,6 +761,25 @@ fn model_flag(args: &[String]) -> Option<String> {    args.iter()
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Repeated external model adapter packs (`--adapter skill.mkap`). The packs
+/// are verified and folded into private pages when the K3 model loads.
+fn adapter_flags(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--adapter" {
+            let value = args.get(index + 1).filter(|value| !value.starts_with("--"));
+            match value {
+                Some(path) => out.push(path.clone()),
+                None => {
+                    eprintln!("error: --adapter requires a .mkap path");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn vocab_flag(args: &[String]) -> Option<String> {
@@ -831,13 +870,14 @@ fn stream_ram_flag(args: &[String]) -> Option<usize> {
 /// Loads a K3 model, streaming or full, and prints the fetch report at exit
 /// when streaming was active.
 fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
+    let pargs: Vec<String> = std::env::args().collect();
+    let adapters = adapter_flags(&pargs);
     match stream_mb {
         Some(mb) => {
             // --stream-predict N: Markov expert prefetch (0 = off, default).
             // Parsed here from the process args so every streaming entry
             // point (run / chat / prefill) picks it up. top_k comes from the
             // model config (the expert batch size of one MoE layer).
-            let pargs: Vec<String> = std::env::args().collect();
             let n: usize = value_flag(&pargs, "--stream-predict").and_then(|s| s.parse().ok()).unwrap_or(0);
             if n > 0 {
                 let top_k = crate::quant::weights::read_config(mp).top_k;
@@ -852,9 +892,19 @@ fn load_k3_model(mp: &str, stream_mb: Option<usize>) -> model::Model {
             let fallback = pargs.iter().any(|a| a == "--stream-fallback")
                 || std::env::var("MICROKIMI_STREAM_FALLBACK").map(|v| v == "1").unwrap_or(false);
             crate::stream::set_fallback(fallback);
-            model::Model::load_streaming(mp, mb, fallback)
+            if adapters.is_empty() {
+                model::Model::load_streaming(mp, mb, fallback)
+            } else {
+                model::Model::load_streaming_with_adapters(mp, mb, fallback, &adapters)
+            }
         }
-        None => model::Model::load(mp),
+        None => {
+            if adapters.is_empty() {
+                model::Model::load(mp)
+            } else {
+                model::Model::load_with_adapters(mp, &adapters)
+            }
+        }
     }
 }
 
@@ -955,6 +1005,10 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
     // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
     let mp_cfg = crate::quant::weights::read_config(&mp);
     if mp_cfg.ds.is_some() {
+        if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty() {
+            eprintln!("error: external adapter packs are currently supported only for K3 models");
+            std::process::exit(1);
+        }
         if exit.is_some() {
             eprintln!("error: --exit-layer is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
@@ -976,6 +1030,12 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
             (tok.encode_chat_user(question), tok.end_of_msg())
         };
         return model::deepseek::ds_run_turn(&ids, max_new, &tok, &mut model, debug, debug_routing, stop);
+    }
+    if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty()
+        && (memory.is_some() || save.is_some())
+    {
+        eprintln!("error: --adapter cannot yet be combined with --memory or --save");
+        std::process::exit(1);
     }
     exit_layer_apply(exit, mp_cfg.n_layers, memory.is_some(), save.is_some());
     let tok = load_any_tokenizer(&mp, vocab, mp_cfg.vocab);
@@ -1040,6 +1100,10 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
         eprintln!("error: prefill is only supported for K3 models (not DeepSeek-V4)");
         std::process::exit(1);
     }
+    if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty() {
+        eprintln!("error: prefill/absorb state snapshots cannot yet be combined with --adapter");
+        std::process::exit(1);
+    }
     let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
     let mut model = load_k3_model(&mp, stream_mb);
     check_tok_compat(&tok, &model);
@@ -1064,7 +1128,7 @@ fn prefill_cmd(text: &str, save: &str, model_path: &Option<String>, vocab: Optio
 /// turn with the count-min routing sketch armed and saves the sketch at the
 /// end (same result as MICROKIMI_ROUTECMS on `run`, packaged as a command).
 fn routestats_cmd(args: &[String]) {
-    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--max-new"]);
+    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--max-new", "--adapter"]);
     let positional: Vec<&String> = args
         .iter()
         .enumerate()
@@ -1091,7 +1155,7 @@ fn routestats_cmd(args: &[String]) {
 /// chat template with --chat), then snapshots the resulting KDA/MLA state as
 /// a portable .mkmem pack. Resume it later with `run --memory pack.mkmem`.
 fn absorb_cmd(args: &[String]) {
-    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--stream-ram"]);
+    let skip = flag_value_positions(args, &["--out", "--model", "--vocab", "--stream-ram", "--adapter"]);
     let positional: Vec<&String> = args
         .iter()
         .enumerate()
@@ -1124,6 +1188,10 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
     if crate::quant::weights::read_config(&mp).ds.is_some() {
+        if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty() {
+            eprintln!("error: external adapter packs are currently supported only for K3 models");
+            std::process::exit(1);
+        }
         if exit.is_some() {
             eprintln!("error: --exit-layer is only supported for K3 models (not DeepSeek-V4)");
             std::process::exit(1);
@@ -1133,6 +1201,12 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
             std::process::exit(1);
         }
         return chat_loop_ds(&mp, vocab, debug_routing, raw);
+    }
+    if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty()
+        && (memory.is_some() || save.is_some())
+    {
+        eprintln!("error: --adapter cannot yet be combined with --memory or --save");
+        std::process::exit(1);
     }
     exit_layer_apply(exit, crate::quant::weights::read_config(&mp).n_layers, memory.is_some(), save.is_some());
     let tok = load_any_tokenizer(&mp, vocab, crate::quant::weights::read_config(&mp).vocab);
@@ -1166,7 +1240,16 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     // raw mode, with --memory (state comes from elsewhere), with an active
     // speculative proposer, and with --exit-layer (the mkmem payload spans
     // all layers, the truncated model holds only N+1 caches).
-    let pck = if raw || resumed || sampler.spec > 0 || sampler.spec_rosa > 0 || exit.is_some() {
+    let pck = if raw
+        || resumed
+        || sampler.spec > 0
+        || sampler.spec_rosa > 0
+        || exit.is_some()
+        || model.has_adapter_packs()
+    {
+        if let Some(set) = model.adapter_set_sha256().filter(|_| !raw && !resumed) {
+            println!("pck: disabled with external adapter set {}...", &set[..12]);
+        }
         None
     } else {
         let p = memory::prefix_cache::open(&mp);

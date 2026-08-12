@@ -185,10 +185,11 @@ impl BinWriter {
 // page cache sharing benefits small models too; the Vec path remains as the
 // MICROKIMI_NO_MMAP=1 fallback (and mmap failure fallback).
 
-/// Raw read-only file mapping. `Send` + `Sync` are sound: the mapping is
-/// PROT_READ, so no mutation is possible through it, all access is shared
-/// reads of bytes that never change, and the only deallocation is Drop
-/// (munmap), which runs when no reference into the mapping can exist.
+/// Private file mapping. The mapping is created PROT_READ|PROT_WRITE with
+/// MAP_PRIVATE: adapter packs may patch selected fp32 pages during model
+/// construction, while the file on disk never changes. After construction
+/// the engine only exposes shared reads. Mutations require an exclusive
+/// `&mut Backing`, so `Send` and `Sync` remain sound.
 pub struct Mmap {
     ptr: *mut u8,
     len: usize,
@@ -214,6 +215,19 @@ pub enum Backing {
     Mmap(Mmap),
 }
 
+impl Backing {
+    /// Mutable bytes for load-time copy-on-write patches. No reference into
+    /// the backing may coexist with the exclusive borrow required here.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Backing::Vec(v) => v.as_mut_slice(),
+            Backing::Mmap(m) => unsafe {
+                std::slice::from_raw_parts_mut(m.ptr, m.len)
+            },
+        }
+    }
+}
+
 impl std::ops::Deref for Backing {
     type Target = [u8];
     #[inline]
@@ -222,7 +236,7 @@ impl std::ops::Deref for Backing {
             Backing::Vec(v) => v.as_slice(),
             // sound: `ptr..ptr+len` is a live PROT_READ mapping for the whole
             // lifetime of `self` (munmap only in Drop), u8 has no validity
-            // constraints, and the bytes are never mutated
+            // constraints, and mutation requires an exclusive `&mut Backing`
             Backing::Mmap(m) => unsafe { std::slice::from_raw_parts(m.ptr, m.len) },
         }
     }
@@ -239,6 +253,7 @@ impl std::ops::Deref for Backing {
 mod mman {
     use std::ffi::c_void;
     pub const PROT_READ: i32 = 0x1;
+    pub const PROT_WRITE: i32 = 0x2;
     pub const MAP_PRIVATE: i32 = 0x2;
     pub const MADV_RANDOM: i32 = 1;
     pub const MADV_WILLNEED: i32 = 3;
@@ -255,7 +270,7 @@ fn no_mmap() -> bool {
     std::env::var("MICROKIMI_NO_MMAP").map(|v| v == "1").unwrap_or(false)
 }
 
-/// Whole-file read-only mapping. None when mmap is disabled, unsupported,
+/// Whole-file private copy-on-write mapping. None when mmap is disabled, unsupported,
 /// the file is empty, or the call fails (caller falls back to reading into
 /// a Vec). No madvise hint is applied here: the right advice depends on the
 /// access pattern, which only the caller knows (full load reads the routed
@@ -270,7 +285,16 @@ fn mmap_file(f: &std::fs::File, len: u64) -> Option<Mmap> {
         if no_mmap() || len == 0 {
             return None;
         }
-        let p = unsafe { mman::mmap(std::ptr::null_mut(), len as usize, mman::PROT_READ, mman::MAP_PRIVATE, f.as_raw_fd(), 0) };
+        let p = unsafe {
+            mman::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                mman::PROT_READ | mman::PROT_WRITE,
+                mman::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
         if p.is_null() || p as isize == -1 {
             return None; // MAP_FAILED: Vec fallback
         }
