@@ -1,6 +1,7 @@
 // `microkimi eval`: deterministic, reproducible evaluation harness.
 //
-//   microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]
+//   microkimi eval --model X.bin [--vocab V.json] [--max-new N]
+//       [--ppl-file F] [--ppl-max-tokens N] [--skip-qa] [--json out.json]
 //
 // Two measurements, one scorecard:
 //   - QA probes: 40 general-knowledge questions (geography, literature,
@@ -110,6 +111,50 @@ in a season, and the cost of a book fell to a fraction of its former price.";
 
 // ── helpers ──
 
+enum EvalModel {
+    K3(crate::model::Model),
+    Qwen(crate::model::qwen::QwenModel),
+    DeepSeek(crate::model::deepseek::DsModel),
+}
+
+impl EvalModel {
+    fn reset(&mut self) {
+        match self {
+            EvalModel::K3(model) => model.reset_cache(),
+            EvalModel::Qwen(model) => model.reset(),
+            EvalModel::DeepSeek(model) => model.reset(),
+        }
+    }
+
+    fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        match self {
+            EvalModel::K3(model) => model.forward(token, pos),
+            EvalModel::Qwen(model) => model.forward(token),
+            EvalModel::DeepSeek(model) => model.forward(token, pos),
+        }
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
+        match self {
+            EvalModel::K3(model) => model.prefill(ids, 0),
+            EvalModel::Qwen(model) => {
+                let mut logits = Vec::new();
+                for &token in ids {
+                    logits = model.forward(token);
+                }
+                logits
+            }
+            EvalModel::DeepSeek(model) => {
+                let mut logits = Vec::new();
+                for (pos, &token) in ids.iter().enumerate() {
+                    logits = model.forward(token, pos);
+                }
+                logits
+            }
+        }
+    }
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -140,10 +185,15 @@ fn contains_answer(text: &str, ans: &str) -> bool {
 
 /// Greedy raw completion of `prompt`, at most `max_new` tokens, stop at the
 /// raw-mode stop token. Returns (decoded completion, tokens processed).
-fn greedy_complete(model: &mut crate::model::Model, tok: &crate::tokenizer::AnyTokenizer, prompt: &str, max_new: usize) -> (String, usize) {
-    model.reset_cache();
+fn greedy_complete(
+    model: &mut EvalModel,
+    tok: &crate::tokenizer::AnyTokenizer,
+    prompt: &str,
+    max_new: usize,
+) -> (String, usize) {
+    model.reset();
     let ids = tok.encode_raw(prompt);
-    let mut logits = model.prefill(&ids, 0);
+    let mut logits = model.prefill(&ids);
     let mut pos = ids.len();
     let mut out = Vec::new();
     let stop = tok.raw_stop();
@@ -161,9 +211,17 @@ fn greedy_complete(model: &mut crate::model::Model, tok: &crate::tokenizer::AnyT
 
 /// Mean next-token NLL over the whole text (sequential forward, one window).
 /// Returns (ppl, n_tokens_scored, tokens_processed).
-fn perplexity(model: &mut crate::model::Model, tok: &crate::tokenizer::AnyTokenizer, text: &str) -> (f64, usize, usize) {
-    model.reset_cache();
-    let ids = tok.encode_raw(text);
+fn perplexity(
+    model: &mut EvalModel,
+    tok: &crate::tokenizer::AnyTokenizer,
+    text: &str,
+    max_tokens: Option<usize>,
+) -> (f64, usize, usize) {
+    model.reset();
+    let mut ids = tok.encode_raw(text);
+    if let Some(limit) = max_tokens {
+        ids.truncate(limit);
+    }
     let mut nll = 0f64;
     let mut n = 0usize;
     let mut logits = Vec::new();
@@ -172,7 +230,12 @@ fn perplexity(model: &mut crate::model::Model, tok: &crate::tokenizer::AnyTokeni
         if i + 1 < ids.len() {
             let target = ids[i + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
-            let lse = logits.iter().map(|&x| ((x as f64) - max).exp()).sum::<f64>().ln() + max;
+            let lse = logits
+                .iter()
+                .map(|&x| ((x as f64) - max).exp())
+                .sum::<f64>()
+                .ln()
+                + max;
             nll += lse - logits[target] as f64;
             n += 1;
         }
@@ -182,7 +245,9 @@ fn perplexity(model: &mut crate::model::Model, tok: &crate::tokenizer::AnyTokeni
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 struct Hit {
@@ -196,17 +261,66 @@ struct Hit {
 pub fn run(args: &[String]) {
     let t0 = Instant::now();
     let mp = crate::model_flag(args).unwrap_or_else(crate::bin_path);
-    let max_new: usize = crate::value_flag(args, "--max-new").and_then(|s| s.parse().ok()).unwrap_or(15);
+    let max_new: usize = crate::value_flag(args, "--max-new")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     let ppl_file = crate::value_flag(args, "--ppl-file");
     let json_out = crate::value_flag(args, "--json");
+    let skip_qa = args.iter().any(|arg| arg == "--skip-qa");
+    let ppl_max_tokens = crate::value_flag(args, "--ppl-max-tokens").map(|value| {
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|&count| count >= 2)
+            .expect("--ppl-max-tokens must be an integer of at least two")
+    });
 
-    let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     // --stream / --stream-ram / --stream-fallback are honored (streaming
     // load): bit-identical scores without the fallback, the degraded-mode
     // quality cost with it (MICROKIMI_FORCE_FALLBACK=1 forces 100% shadows)
     let stream_mb = crate::stream_ram_flag(args);
-    let mut model = crate::load_k3_model(&mp, stream_mb);
-    crate::check_tok_compat(&tok, &model);
+    let config = crate::quant::weights::read_config(&mp);
+    let packs = crate::adapter_flags(args);
+    let (tok, mut model) = if config.qwen.is_some() {
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is not supported by Qwen eval");
+            std::process::exit(1);
+        }
+        let tok = crate::load_qwen_any_tokenizer(&mp, crate::vocab_flag(args), config.vocab);
+        let model = if packs.is_empty() {
+            crate::model::qwen::QwenModel::load(&mp)
+        } else {
+            crate::model::qwen::QwenModel::load_with_adapters(&mp, &packs)
+        };
+        (tok, EvalModel::Qwen(model))
+    } else if config.ds.is_some() {
+        if !packs.is_empty() {
+            eprintln!("error: external adapter packs are not supported by DeepSeek eval");
+            std::process::exit(1);
+        }
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is not supported by DeepSeek eval");
+            std::process::exit(1);
+        }
+        let tok = crate::load_ds_any_tokenizer(&mp, crate::vocab_flag(args), config.vocab);
+        (
+            tok,
+            EvalModel::DeepSeek(crate::model::deepseek::DsModel::load(&mp)),
+        )
+    } else {
+        let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), config.vocab);
+        let model = crate::load_k3_model(&mp, stream_mb);
+        crate::check_tok_compat(&tok, &model);
+        (tok, EvalModel::K3(model))
+    };
+    if tok.vocab_size() != config.vocab {
+        eprintln!(
+            "error: tokenizer/model mismatch - model vocab is {}, tokenizer vocab is {}.",
+            config.vocab,
+            tok.vocab_size()
+        );
+        std::process::exit(1);
+    }
     let model_size = std::fs::metadata(&mp).map(|m| m.len()).unwrap_or(0);
 
     // ── QA probes ──
@@ -217,25 +331,27 @@ pub fn run(args: &[String]) {
     let mut hits: Vec<Hit> = Vec::new();
     let mut total = 0usize;
     let mut total_hits = 0usize;
-    for p in PROBES {
-        let ci = CATS.iter().position(|&c| c == p.cat).unwrap();
-        for (fi, prompt) in [p.completion, p.qa].iter().enumerate() {
-            let (text, n) = greedy_complete(&mut model, &tok, prompt, max_new);
-            processed += n;
-            let hit = p.answers.iter().find(|a| contains_answer(&text, a));
-            total += 1;
-            cat_tot[ci] += 1;
-            if let Some(a) = hit {
-                total_hits += 1;
-                cat_hits[ci] += 1;
-                fmt_hits[fi] += 1;
-                hits.push(Hit {
-                    cat: p.cat,
-                    fmt: if fi == 0 { "completion" } else { "qa" },
-                    prompt: prompt.to_string(),
-                    answer: a.to_string(),
-                    completion: text.replace('\n', " "),
-                });
+    if !skip_qa {
+        for p in PROBES {
+            let ci = CATS.iter().position(|&c| c == p.cat).unwrap();
+            for (fi, prompt) in [p.completion, p.qa].iter().enumerate() {
+                let (text, n) = greedy_complete(&mut model, &tok, prompt, max_new);
+                processed += n;
+                let hit = p.answers.iter().find(|a| contains_answer(&text, a));
+                total += 1;
+                cat_tot[ci] += 1;
+                if let Some(a) = hit {
+                    total_hits += 1;
+                    cat_hits[ci] += 1;
+                    fmt_hits[fi] += 1;
+                    hits.push(Hit {
+                        cat: p.cat,
+                        fmt: if fi == 0 { "completion" } else { "qa" },
+                        prompt: prompt.to_string(),
+                        answer: a.to_string(),
+                        completion: text.replace('\n', " "),
+                    });
+                }
             }
         }
     }
@@ -248,50 +364,83 @@ pub fn run(args: &[String]) {
         ),
         None => (PPL_TEXT.to_string(), "embedded eval text".to_string()),
     };
-    let (ppl, ppl_tokens, ppl_processed) = perplexity(&mut model, &tok, &ppl_text);
+    let (ppl, ppl_tokens, ppl_processed) = perplexity(&mut model, &tok, &ppl_text, ppl_max_tokens);
     processed += ppl_processed;
 
     let dt = t0.elapsed().as_secs_f64();
     let tok_s = processed as f64 / dt;
     let tok_name = match &tok {
-        crate::tokenizer::AnyTokenizer::Nano(_) => format!("nano remap (vocab {})", tok.vocab_size()),
+        crate::tokenizer::AnyTokenizer::Nano(_) => {
+            format!("nano remap (vocab {})", tok.vocab_size())
+        }
+        crate::tokenizer::AnyTokenizer::Qwen(_) => format!("Qwen BPE (vocab {})", tok.vocab_size()),
+        crate::tokenizer::AnyTokenizer::Ds(_) | crate::tokenizer::AnyTokenizer::DsNano(_) => {
+            format!("DeepSeek BPE (vocab {})", tok.vocab_size())
+        }
         _ => format!("full Kimi (vocab {})", tok.vocab_size()),
     };
 
     // ── scorecard ──
     let mut card = String::new();
     card.push_str("══ microkimi eval ══\n");
-    card.push_str(&format!("model: {} ({:.1} MB)\n", mp, model_size as f64 / 1e6));
+    card.push_str(&format!(
+        "model: {} ({:.1} MB)\n",
+        mp,
+        model_size as f64 / 1e6
+    ));
     card.push_str(&format!("tokenizer: {}\n", tok_name));
     card.push('\n');
-    card.push_str(&format!("── QA probes (greedy, max-new {}, {} questions x 2 formulations) ──\n", max_new, PROBES.len()));
-    for (i, c) in CATS.iter().enumerate() {
-        card.push_str(&format!("  {:<12} {}/{}\n", c, cat_hits[i], cat_tot[i]));
-    }
-    card.push_str(&format!(
-        "  {:<12} {}/{} (completion {}/{}, qa {}/{})\n",
-        "TOTAL",
-        total_hits,
-        total,
-        fmt_hits[0],
-        PROBES.len(),
-        fmt_hits[1],
-        PROBES.len()
-    ));
-    card.push_str("hits:\n");
-    if hits.is_empty() {
-        card.push_str("  (none)\n");
-    }
-    for h in &hits {
-        card.push_str(&format!("  [{}/{}] \"{}\" -> {} (\"{}\")\n", h.cat, h.fmt, h.prompt, h.answer, h.completion));
+    if skip_qa {
+        card.push_str("── QA probes skipped (--skip-qa) ──\n");
+    } else {
+        card.push_str(&format!(
+            "── QA probes (greedy, max-new {}, {} questions x 2 formulations) ──\n",
+            max_new,
+            PROBES.len()
+        ));
+        for (i, c) in CATS.iter().enumerate() {
+            card.push_str(&format!("  {:<12} {}/{}\n", c, cat_hits[i], cat_tot[i]));
+        }
+        card.push_str(&format!(
+            "  {:<12} {}/{} (completion {}/{}, qa {}/{})\n",
+            "TOTAL",
+            total_hits,
+            total,
+            fmt_hits[0],
+            PROBES.len(),
+            fmt_hits[1],
+            PROBES.len()
+        ));
+        card.push_str("hits:\n");
+        if hits.is_empty() {
+            card.push_str("  (none)\n");
+        }
+        for h in &hits {
+            card.push_str(&format!(
+                "  [{}/{}] \"{}\" -> {} (\"{}\")\n",
+                h.cat, h.fmt, h.prompt, h.answer, h.completion
+            ));
+        }
     }
     card.push('\n');
     card.push_str("── perplexity ──\n");
-    card.push_str(&format!("  text: {} ({} tokens scored)\n", ppl_src, ppl_tokens));
-    card.push_str(&format!("  NLL/token: {:.4}   PPL: {:.2}\n", (ppl.ln()), ppl));
+    card.push_str(&format!(
+        "  text: {} ({} tokens scored)\n",
+        ppl_src, ppl_tokens
+    ));
+    card.push_str(&format!(
+        "  NLL/token: {:.4}   PPL: {:.2}\n",
+        (ppl.ln()),
+        ppl
+    ));
     card.push('\n');
     card.push_str("── meta ──\n");
-    card.push_str(&format!("  {} tokens processed in {:.1?} ({:.0} tok/s)\n", processed, t0.elapsed(), tok_s));
+    card.push_str(&format!(
+        "  {} tokens processed in {:.1?} ({:.0} tok/s)\n",
+        processed,
+        t0.elapsed(),
+        tok_s
+    ));
     print!("{}", card);
 
     // ── JSON archive ──
@@ -299,15 +448,34 @@ pub fn run(args: &[String]) {
         let mut j = String::from("{\n");
         j.push_str(&format!("  \"model\": \"{}\",\n", json_escape(&mp)));
         j.push_str(&format!("  \"model_bytes\": {},\n", model_size));
-        j.push_str(&format!("  \"tokenizer\": \"{}\",\n", json_escape(&tok_name)));
+        j.push_str(&format!(
+            "  \"tokenizer\": \"{}\",\n",
+            json_escape(&tok_name)
+        ));
         j.push_str(&format!("  \"max_new\": {},\n", max_new));
+        j.push_str(&format!("  \"skip_qa\": {},\n", skip_qa));
+        match ppl_max_tokens {
+            Some(limit) => j.push_str(&format!("  \"ppl_max_tokens\": {},\n", limit)),
+            None => j.push_str("  \"ppl_max_tokens\": null,\n"),
+        }
         j.push_str("  \"qa\": {\n");
         for (i, c) in CATS.iter().enumerate() {
-            j.push_str(&format!("    \"{}\": [{}, {}],\n", c, cat_hits[i], cat_tot[i]));
+            j.push_str(&format!(
+                "    \"{}\": [{}, {}],\n",
+                c, cat_hits[i], cat_tot[i]
+            ));
         }
         j.push_str(&format!("    \"total\": [{}, {}],\n", total_hits, total));
-        j.push_str(&format!("    \"completion\": [{}, {}],\n", fmt_hits[0], PROBES.len()));
-        j.push_str(&format!("    \"qa_format\": [{}, {}],\n", fmt_hits[1], PROBES.len()));
+        j.push_str(&format!(
+            "    \"completion\": [{}, {}],\n",
+            fmt_hits[0],
+            PROBES.len()
+        ));
+        j.push_str(&format!(
+            "    \"qa_format\": [{}, {}],\n",
+            fmt_hits[1],
+            PROBES.len()
+        ));
         j.push_str("    \"hits\": [\n");
         for (i, h) in hits.iter().enumerate() {
             j.push_str(&format!(
@@ -328,7 +496,10 @@ pub fn run(args: &[String]) {
             ppl.ln(),
             ppl
         ));
-        j.push_str(&format!("  \"meta\": {{\"tokens_processed\": {}, \"secs\": {:.1}, \"tok_s\": {:.1}}}\n", processed, dt, tok_s));
+        j.push_str(&format!(
+            "  \"meta\": {{\"tokens_processed\": {}, \"secs\": {:.1}, \"tok_s\": {:.1}}}\n",
+            processed, dt, tok_s
+        ));
         j.push_str("}\n");
         std::fs::write(&jp, j).unwrap_or_else(|e| panic!("cannot write {}: {}", jp, e));
         println!("json: {}", jp);

@@ -1,6 +1,6 @@
 # microkimi
 
-A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code.
+A zero-dependency Rust engine for three modern MoE architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5/Qwen3.6-MoE text decoder** - verified against their reference implementations.
 
 The Python side under `nano/graft/` adds architecture-agnostic instruments: compatibility scans between two models, per-expert utility measurement, paired evaluation with bootstrap intervals, and closed-form feed-forward transfer. Those read and write **Qwen3.5-MoE** (`qwen3_5_moe`, routed and shared experts), **Qwen3.5 dense**, **DeepSeek-V4**, **Gemma 3** and llama-style checkpoints in addition to the engine's own format - see `nano/graft/README.md`.
 
@@ -42,20 +42,21 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | **nanokimi-0.2b** | 0.2B Kimi K3 model, trained from scratch | [Releases](https://github.com/microkimi/microkimi/releases) - see [KIMI.md](KIMI.md) |
 | **microkimi-debug** | full 93-layer K3 skeleton, synthetic weights | `microkimi build` - see [KIMI.md](KIMI.md) |
 | **microdeepseek-debug** | DeepSeek-V4 skeleton, synthetic weights | `microkimi build --arch dsv4` - see [DEEPSEEK.md](DEEPSEEK.md) |
+| **converted Qwen3.5/Qwen3.6-MoE** | text checkpoint converted to f32 spine + MXFP4 routed experts | `microkimi convert-qwen` - see [QWEN.md](QWEN.md) |
 
 ## Commands
 
-| task | Kimi K3 | DeepSeek-V4-Flash-0731 |
-|---|---|---|
-| assemble weights | `microkimi build` | `microkimi build --arch dsv4` |
-| verify 1:1 vs official code | `microkimi paritytest` | `microkimi parity --arch dsv4` |
-| all mechanism self-tests | `microkimi selftest` (covers both) | `microkimi selftest` (covers both) |
-| generate | `microkimi run "..." --model microkimi-debug.bin` | `microkimi run "..." --model microdeepseek-debug.bin` |
-| interactive | `microkimi chat --model nanokimi-0.2b.bin --raw` | `microkimi chat --model microdeepseek-debug.bin` |
+| task | Kimi K3 | DeepSeek-V4-Flash-0731 | Qwen3.5/Qwen3.6-MoE |
+|---|---|---|---|
+| assemble or convert weights | `microkimi build` | `microkimi build --arch dsv4` | `microkimi convert-qwen --source DIR --out qwen.bin` |
+| verify vs reference code | `microkimi paritytest` | `microkimi parity --arch dsv4` | `python3 ref/qwen_parity.py --out DIR` + `qwen-dump` |
+| mechanism self-tests | `microkimi selftest` | `microkimi selftest` | `cargo test qwen` |
+| generate | `microkimi run "..." --model microkimi-debug.bin` | `microkimi run "..." --model microdeepseek-debug.bin` | `microkimi run "..." --model qwen.bin` |
+| interactive | `microkimi chat --model nanokimi-0.2b.bin --raw` | `microkimi chat --model microdeepseek-debug.bin` | `microkimi chat --model qwen.bin` |
 
 `build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
 
-## Engine features (both architectures)
+## Engine features
 
 | feature | what it does (measured, not promised) |
 |---|---|
@@ -66,7 +67,8 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | microquant | `microkimi slice --cold-vq N` keeps all experts but requantizes the coldest to 0.5-bit VQ - measured better than deleting them (30.6% vs 19.1% top-1 parity with the full model) |
 | structural slicing | `microkimi slice` prunes layers / hidden channels / experts (`--layers --hidden --experts`) and vocabulary (`--vocab-top`) from a .bin or straight from remote safetensors; crash-safe resume (`.sliceckpt`) and a persistent expert-score cache |
 | evaluation | `microkimi eval --model X.bin` - deterministic scorecard: 40 factual QA probes (2 phrasings) + perplexity, `--json` for archiving |
-| model adapter packs | K3 only: `nano/adapter_pack.py` turns a standard same-base PEFT LoRA into a hash-bound `.mkap`; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
+| batch completion | `microkimi complete-batch` evaluates JSONL prompts with one model and adapter load, resetting caches between prompts and atomically writing JSONL results |
+| model adapter packs | K3 and Qwen f32 spine tensors: `nano/adapter_pack.py` turns a standard exact-same-base PEFT LoRA into a hash-bound `.mkap`; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
 | memory packs | K3 only: `microkimi absorb doc.txt --out pack.mkmem` snapshots the fixed-size KDA state; `run --memory pack.mkmem` resumes it. A video-game save state - details in [KIMI.md](KIMI.md#memory-packs-save-states-for-a-neural-network) |
 
 ## License

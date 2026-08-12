@@ -13,6 +13,7 @@ mod sha256;
 mod stream;
 mod tokenizer;
 mod tools;
+mod unicode_nfc;
 
 use std::time::Instant;
 
@@ -38,6 +39,10 @@ fn main() {
             if arch == "dsv4" { tools::build_ds::run() } else { tools::build::run() }
         }
         "build-ds" => tools::build_ds::run(), // alias for `build --arch dsv4`
+        // Convert a local Qwen3.5-MoE Hugging Face checkpoint to MKIM0002.
+        "convert-qwen" => tools::convert_qwen::run(&args),
+        // Deterministic JSONL completions with one model/adapter load.
+        "complete-batch" => tools::complete_batch::run(&args),
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => tools::slice::run(&args),
         // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
@@ -47,6 +52,8 @@ fn main() {
         "metaltest-packed" => metaltest_packed_cmd(),
         "gputest" => gputest_cmd(),
         "dstest" => dstest_cmd(),
+        "qwen-dump" => model::qwen::dump_cmd(&args),
+        "qwen-tok" => model::qwentok::dump_cmd(&args),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" | "parity" => {
             if arch == "dsv4" { tools::parity::run_ds() } else { tools::parity::run(args.iter().any(|a| a == "--show")) }
@@ -243,6 +250,11 @@ fn main() {
             println!("Build & slice:");
             println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
+            println!("  microkimi convert-qwen --source DIR --out MODEL.bin [--audit-only]");
+            println!("                                         converts a local Qwen3.5-MoE text checkpoint;");
+            println!("                                         f32 spine + per-expert MXFP4, bounded conversion RAM");
+            println!("  microkimi complete-batch --model X.bin --input REQUESTS.jsonl --out RESULTS.jsonl");
+            println!("                        deterministic greedy completions, one model load; --chat optional;");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
             println!("                                         structural pruning (channels / experts / layers)");            println!("      --vocab-top N freqfile             vocabulary pruning: top-N frequent rows + all specials");
             println!("      --vocab-list ids.txt               same, but the kept rows come from an explicit id list");
@@ -275,7 +287,7 @@ fn main() {
             println!("                    --raw (raw completion, for nanokimi)  --debug-routing  --gpu (Metal, macOS)");
             println!("                    --memory mem.mkmem (resume a state)  --save mem.mkmem (snapshot after the run)");
             println!("                    --adapter skill.mkap (repeatable; hash-bound low-rank packs folded");
-            println!("                        into private pages at load, base .bin unchanged; K3 only;");
+            println!("                        into private pages at load, base .bin unchanged; K3 and Qwen;");
             println!("                        currently incompatible with --memory/--save and the chat prefix cache)");
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
@@ -347,6 +359,7 @@ fn main() {
             println!("Diagnostics:");
             println!("  microkimi selftest                   compares against golden values (ref/golden.json)");
             println!("  microkimi eval --model X.bin [--vocab V.json] [--max-new N] [--ppl-file F] [--json out.json]");
+            println!("                        --skip-qa --ppl-max-tokens N (NLL-only bounded window)");
             println!("                                         deterministic QA probes (40 x 2 formulations) + perplexity scorecard");
             println!("  microkimi routestats \"prompt\" [--model X.bin] [--max-new N] [--out routecms.bin]");
             println!("                                         one turn with the routing sketch armed, sketch saved on exit");
@@ -1002,8 +1015,59 @@ fn check_tok_compat(tok: &tokenizer::AnyTokenizer, model: &model::Model) {
 fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Option<String>, vocab: Option<String>, debug_routing: bool, raw: bool, memory: &Option<String>, save: &Option<String>, sampler: &mut model::Sampler, stream_mb: Option<usize>, exit: Option<usize>, probes: &[String]) -> String {
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
-    // DeepSeek-V4 model → dedicated tokenizer + DsModel engine
     let mp_cfg = crate::quant::weights::read_config(&mp);
+    // Qwen3.5-MoE model -> native tokenizer + checkpoint-backed engine.
+    if mp_cfg.qwen.is_some() {
+        if exit.is_some() {
+            eprintln!("error: --exit-layer is only supported for K3 models (not Qwen)");
+            std::process::exit(1);
+        }
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is not yet supported for Qwen models (the default mmap load is demand-paged)");
+            std::process::exit(1);
+        }
+        if memory.is_some() || save.is_some() {
+            eprintln!("error: --memory/--save state snapshots are only supported for K3 models (not Qwen)");
+            std::process::exit(1);
+        }
+        if sampler.spec > 0 || sampler.spec_rosa > 0 {
+            eprintln!("warning: --spec/--spec-rosa are only supported for K3 models, ignoring them (Qwen)");
+            sampler.spec = 0;
+            sampler.spec_rosa = 0;
+        }
+        let tok = load_qwen_any_tokenizer(&mp, vocab, mp_cfg.vocab);
+        let packs = adapter_flags(&std::env::args().collect::<Vec<_>>());
+        let mut qwen = if packs.is_empty() {
+            model::qwen::QwenModel::load(&mp)
+        } else {
+            model::qwen::QwenModel::load_with_adapters(&mp, &packs)
+        };
+        if qwen.has_adapter_packs() {
+            println!(
+                "Qwen adapter set: {}...",
+                &qwen.adapter_set_sha256().unwrap()[..12]
+            );
+        }
+        println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
+        println!("cores used for matvecs: {}", model::n_threads());
+        gpu_status_line();
+        let (ids, stop) = if raw {
+            (tok.encode_raw(question), tok.raw_stop())
+        } else {
+            (tok.encode_chat_user(question), tok.end_of_msg())
+        };
+        return model::qwen::qwen_run_turn(
+            &ids,
+            max_new,
+            &tok,
+            &mut qwen,
+            debug,
+            debug_routing,
+            stop,
+            sampler,
+        );
+    }
+    // DeepSeek-V4 model -> dedicated tokenizer + DsModel engine.
     if mp_cfg.ds.is_some() {
         if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty() {
             eprintln!("error: external adapter packs are currently supported only for K3 models");
@@ -1187,7 +1251,28 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     use std::io::Write;
     let tl = Instant::now();
     let mp = model_path.clone().unwrap_or_else(bin_path);
-    if crate::quant::weights::read_config(&mp).ds.is_some() {
+    let mp_cfg = crate::quant::weights::read_config(&mp);
+    if mp_cfg.qwen.is_some() {
+        if exit.is_some() {
+            eprintln!("error: --exit-layer is only supported for K3 models (not Qwen)");
+            std::process::exit(1);
+        }
+        if stream_mb.is_some() {
+            eprintln!("error: --stream is not yet supported for Qwen models (the default mmap load is demand-paged)");
+            std::process::exit(1);
+        }
+        if memory.is_some() || save.is_some() {
+            eprintln!("error: --memory/--save state snapshots are only supported for K3 models (not Qwen)");
+            std::process::exit(1);
+        }
+        if sampler.spec > 0 || sampler.spec_rosa > 0 {
+            eprintln!("warning: --spec/--spec-rosa are only supported for K3 models, ignoring them (Qwen)");
+            sampler.spec = 0;
+            sampler.spec_rosa = 0;
+        }
+        return chat_loop_qwen(&mp, vocab, debug_routing, raw, sampler);
+    }
+    if mp_cfg.ds.is_some() {
         if !adapter_flags(&std::env::args().collect::<Vec<_>>()).is_empty() {
             eprintln!("error: external adapter packs are currently supported only for K3 models");
             std::process::exit(1);
@@ -1305,6 +1390,106 @@ fn chat_loop(model_path: &Option<String>, vocab: Option<String>, debug_routing: 
     }
     crate::stream::route_sketch::finish();
     stream_report_maybe(stream_mb);
+}
+
+/// Interactive loop for Qwen3.5-MoE text models.
+fn chat_loop_qwen(
+    mp: &str,
+    vocab: Option<String>,
+    debug_routing: bool,
+    raw: bool,
+    sampler: &mut model::Sampler,
+) {
+    use std::io::Write;
+    let tl = Instant::now();
+    let cfg = crate::quant::weights::read_config(mp);
+    let tok = load_qwen_any_tokenizer(mp, vocab, cfg.vocab);
+    let packs = adapter_flags(&std::env::args().collect::<Vec<_>>());
+    let mut qwen = if packs.is_empty() {
+        model::qwen::QwenModel::load(mp)
+    } else {
+        model::qwen::QwenModel::load_with_adapters(mp, &packs)
+    };
+    if qwen.has_adapter_packs() {
+        println!(
+            "Qwen adapter set: {}...",
+            &qwen.adapter_set_sha256().unwrap()[..12]
+        );
+    }
+    println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
+    println!("cores used for matvecs: {}", model::n_threads());
+    gpu_status_line();
+    if raw {
+        println!("\nRAW interactive mode - each line is an independent completion (type 'quit' to exit)");
+    } else {
+        println!("\nInteractive mode - history kept (type 'quit' to exit)");
+    }
+    let stdin = std::io::stdin();
+    let mut history: Vec<(String, String)> = Vec::new();
+    loop {
+        print!("\nYou > ");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        if stdin.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let question = line.trim();
+        if question.eq_ignore_ascii_case("quit") || question.eq_ignore_ascii_case("exit") {
+            break;
+        }
+        if question.is_empty() {
+            continue;
+        }
+        let (ids, stop) = if raw {
+            (tok.encode_raw(question), tok.raw_stop())
+        } else {
+            (tok.encode_chat(&history, question), tok.end_of_msg())
+        };
+        let answer = model::qwen::qwen_run_turn(
+            &ids,
+            200,
+            &tok,
+            &mut qwen,
+            false,
+            debug_routing,
+            stop,
+            sampler,
+        );
+        if !raw {
+            history.push((question.to_string(), answer));
+        }
+    }
+}
+
+/// Loads the Qwen tokenizer copied beside the converted model, or an
+/// explicitly supplied tokenizer.json.
+fn load_qwen_any_tokenizer(
+    model_path: &str,
+    vocab: Option<String>,
+    model_vocab: usize,
+) -> tokenizer::AnyTokenizer {
+    let path = if let Some(path) = vocab {
+        path
+    } else {
+        let dir = std::path::Path::new(model_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        ["qwen.tokenizer.json", "tokenizer.json"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.exists())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                eprintln!("error: no Qwen tokenizer found beside {}", model_path);
+                eprintln!("hint: pass --vocab tokenizer.json or keep qwen.tokenizer.json beside the converted model");
+                std::process::exit(1);
+            })
+    };
+    println!("Qwen tokenizer: {}", path);
+    tokenizer::AnyTokenizer::Qwen(model::qwentok::QwenTokenizer::load(
+        &path,
+        model_vocab,
+    ))
 }
 
 /// Interactive loop for DeepSeek-V4 models (DsTokenizer + DsModel).

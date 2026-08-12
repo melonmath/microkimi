@@ -20,6 +20,7 @@ mod lens;
 mod moe;
 mod ops;
 pub mod qwen;
+pub mod qwentok;
 mod seam;
 pub(crate) mod kda_chunk;
 #[cfg(target_os = "macos")]

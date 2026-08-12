@@ -12,7 +12,9 @@
 //! a full-rank gate, and the output norm is gated by a separate
 //! projection instead of a plain RMS norm.
 
+use super::{as_f32, AppliedPacks, Q8Head, T};
 use crate::config::QwenConfig;
+use crate::quant::weights::{BinFile, DTYPE_F32, DTYPE_MXFP4};
 
 /// Depthwise causal convolution over the qkv stream, width 4, followed
 /// by SiLU. `state` carries the last `k-1` columns across steps.
@@ -34,7 +36,7 @@ pub fn conv_step(x: &[f32], w: &[f32], k: usize, state: &mut [f32], out: &mut [f
 
 /// L2 normalization along a head, as the reference applies to q and k.
 pub fn l2norm(v: &mut [f32], eps: f32) {
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(eps);
+    let n = (v.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
     for x in v.iter_mut() {
         *x /= n;
     }
@@ -45,7 +47,15 @@ pub fn l2norm(v: &mut [f32], eps: f32) {
 /// `s` is the [k_dim, v_dim] state, updated in place:
 ///   S <- S * exp(g);  delta = (v - S^T k) * beta;  S += k (x) delta
 ///   out = S^T q
-pub fn delta_step(s: &mut [f32], q: &[f32], k: &[f32], v: &[f32], g: f32, beta: f32, out: &mut [f32]) {
+pub fn delta_step(
+    s: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+    out: &mut [f32],
+) {
     let kd = k.len();
     let vd = v.len();
     let decay = g.exp();
@@ -140,6 +150,25 @@ impl LinCache {
         LinCache {
             state: vec![0.0; c.lin_v_heads * c.lin_k_dim * c.lin_v_dim],
             conv: vec![0.0; conv_dim * (c.conv_kernel - 1)],
+        }
+    }
+}
+
+/// Key/value history for one full-attention layer. Keys are stored after
+/// Q/K normalization and rotary embedding, in token-major order.
+pub struct FullCache {
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub len: usize,
+}
+
+impl FullCache {
+    pub fn new(c: &QwenConfig) -> FullCache {
+        let width = c.n_kv_heads * c.head_dim;
+        FullCache {
+            k: Vec::with_capacity(width * 256),
+            v: Vec::with_capacity(width * 256),
+            len: 0,
         }
     }
 }
@@ -278,13 +307,23 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let inv = 1.0 / (ms + eps).sqrt();
     for i in 0..x.len() {
-        out[i] = x[i] * inv * w[i];
+        // Qwen3.5 stores an offset from one, unlike the gated recurrent
+        // norm below whose checkpoint weights are direct multipliers.
+        out[i] = x[i] * inv * (1.0 + w[i]);
     }
 }
 
 /// SiLU-gated feed-forward: down(silu(gate(x)) * up(x)). Used for both a
 /// routed expert and the shared expert.
-pub fn ffn(x: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32], inter: usize, d: usize, out: &mut [f32]) {
+pub fn ffn(
+    x: &[f32],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+    inter: usize,
+    d: usize,
+    out: &mut [f32],
+) {
     let mut h = vec![0.0f32; inter];
     for r in 0..inter {
         let (mut g, mut u) = (0.0f32, 0.0f32);
@@ -298,14 +337,11 @@ pub fn ffn(x: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32], inter: usize
     for o in out.iter_mut() {
         *o = 0.0;
     }
-    for r in 0..inter {
-        let hr = h[r];
-        if hr == 0.0 {
-            continue;
-        }
-        let row = &w_down[r * d..(r + 1) * d];
-        for c in 0..d {
-            out[c] += hr * row[c];
+    // down is [d, inter], not [inter, d].
+    for c in 0..d {
+        let row = &w_down[c * inter..(c + 1) * inter];
+        for r in 0..inter {
+            out[c] += row[r] * h[r];
         }
     }
 }
@@ -313,6 +349,7 @@ pub fn ffn(x: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32], inter: usize
 /// Weights of one MoE block: a router, `n_experts` routed experts and
 /// one shared expert gated by a sigmoid. `experts[e]` is
 /// (gate, up, down), each row-major.
+#[cfg(test)]
 pub struct MoeBlock<'a> {
     pub router: &'a [f32],
     pub experts: Vec<(&'a [f32], &'a [f32], &'a [f32])>,
@@ -322,6 +359,7 @@ pub struct MoeBlock<'a> {
 
 /// Runs the block: shared expert always, plus the top-k routed experts
 /// mixed by their renormalized softmax weights.
+#[cfg(test)]
 pub fn moe_forward(b: &MoeBlock, x: &[f32], c: &QwenConfig, out: &mut [f32]) {
     let d = c.d;
     let n_e = b.experts.len();
@@ -344,7 +382,15 @@ pub fn moe_forward(b: &MoeBlock, x: &[f32], c: &QwenConfig, out: &mut [f32]) {
     // shared expert, scaled by sigmoid of its own gate
     let sg: f32 = b.shared_gate.iter().zip(x).map(|(a, y)| a * y).sum();
     let sg = 1.0 / (1.0 + (-sg).exp());
-    ffn(x, b.shared.0, b.shared.1, b.shared.2, c.shared_inter, d, &mut tmp);
+    ffn(
+        x,
+        b.shared.0,
+        b.shared.1,
+        b.shared.2,
+        c.shared_inter,
+        d,
+        &mut tmp,
+    );
     for i in 0..d {
         out[i] += sg * tmp[i];
     }
@@ -363,9 +409,124 @@ pub struct LinAttn<'a> {
     pub out_proj: &'a [f32],
 }
 
+/// Weights of one causal full-attention layer. Qwen's q projection emits a
+/// query and an element-wise output gate for every head.
+pub struct FullAttn<'a> {
+    pub q_proj: &'a [f32],
+    pub k_proj: &'a [f32],
+    pub v_proj: &'a [f32],
+    pub o_proj: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+}
+
+/// One autoregressive full-attention step, including grouped-query
+/// attention, partial RoPE, the KV cache, and Qwen's sigmoid output gate.
+pub fn full_attn_step(
+    w: &FullAttn,
+    c: &QwenConfig,
+    x: &[f32],
+    pos: usize,
+    cache: &mut FullCache,
+    out: &mut [f32],
+) {
+    let hd = c.head_dim;
+    let q_width = c.n_heads * hd;
+    let kv_width = c.n_kv_heads * hd;
+    assert_eq!(cache.len, pos, "full-attention cache position mismatch");
+    assert_eq!(c.n_heads % c.n_kv_heads, 0);
+
+    let mut qg = vec![0.0f32; q_width * 2];
+    let mut k = vec![0.0f32; kv_width];
+    let mut v = vec![0.0f32; kv_width];
+    crate::model::ops::matvec(w.q_proj, q_width * 2, c.d, x, &mut qg);
+    crate::model::ops::matvec(w.k_proj, kv_width, c.d, x, &mut k);
+    crate::model::ops::matvec(w.v_proj, kv_width, c.d, x, &mut v);
+
+    // q_proj is reshaped [heads, 2, head_dim]: each head's query is
+    // immediately followed by that head's gate.
+    let mut q = vec![0.0f32; q_width];
+    let mut gate = vec![0.0f32; q_width];
+    for h in 0..c.n_heads {
+        let src = h * hd * 2;
+        q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
+        gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
+        let old = q[h * hd..(h + 1) * hd].to_vec();
+        rmsnorm(
+            &old,
+            w.q_norm,
+            c.norm_eps as f32,
+            &mut q[h * hd..(h + 1) * hd],
+        );
+        rope_partial(
+            &mut q[h * hd..(h + 1) * hd],
+            pos,
+            c.rope_dim(),
+            c.rope_theta,
+        );
+    }
+    for h in 0..c.n_kv_heads {
+        let old = k[h * hd..(h + 1) * hd].to_vec();
+        rmsnorm(
+            &old,
+            w.k_norm,
+            c.norm_eps as f32,
+            &mut k[h * hd..(h + 1) * hd],
+        );
+        rope_partial(
+            &mut k[h * hd..(h + 1) * hd],
+            pos,
+            c.rope_dim(),
+            c.rope_theta,
+        );
+    }
+    cache.k.extend_from_slice(&k);
+    cache.v.extend_from_slice(&v);
+    cache.len += 1;
+
+    let groups = c.n_heads / c.n_kv_heads;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let mut mixed = vec![0.0f32; q_width];
+    let mut scores = vec![0.0f32; cache.len];
+    for h in 0..c.n_heads {
+        let kh = h / groups;
+        let qh = &q[h * hd..(h + 1) * hd];
+        let mut max_score = f32::NEG_INFINITY;
+        for t in 0..cache.len {
+            let off = t * kv_width + kh * hd;
+            let s = crate::model::ops::dot(qh, &cache.k[off..off + hd]) * scale;
+            scores[t] = s;
+            max_score = max_score.max(s);
+        }
+        let mut denom = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - max_score).exp();
+            denom += *s;
+        }
+        let dst = &mut mixed[h * hd..(h + 1) * hd];
+        for t in 0..cache.len {
+            let off = t * kv_width + kh * hd;
+            let a = scores[t] / denom;
+            for i in 0..hd {
+                dst[i] += a * cache.v[off + i];
+            }
+        }
+    }
+    for i in 0..mixed.len() {
+        mixed[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+    }
+    crate::model::ops::matvec(w.o_proj, c.d, q_width, &mixed, out);
+}
+
 /// One decode step of a linear-attention layer. `cache` carries the conv
 /// history and the per-head states across tokens.
-pub fn lin_attn_step(w: &LinAttn, c: &QwenConfig, x: &[f32], cache: &mut LinCache, out: &mut [f32]) {
+pub fn lin_attn_step(
+    w: &LinAttn,
+    c: &QwenConfig,
+    x: &[f32],
+    cache: &mut LinCache,
+    out: &mut [f32],
+) {
     let d = c.d;
     let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
     let conv_dim = kt * 2 + vt;
@@ -399,7 +560,11 @@ pub fn lin_attn_step(w: &LinAttn, c: &QwenConfig, x: &[f32], cache: &mut LinCach
         let beta = 1.0 / (1.0 + (-b_raw[h]).exp());
         let sp = {
             let t = a_raw[h] + w.dt_bias[h];
-            if t > 20.0 { t } else { (1.0 + t.exp()).ln() }
+            if t > 20.0 {
+                t
+            } else {
+                (1.0 + t.exp()).ln()
+            }
         };
         let g = -w.a_log[h].exp() * sp;
         let st = &mut cache.state[h * kd * vd..(h + 1) * kd * vd];
@@ -454,7 +619,10 @@ mod forward_tests {
         let sh = mk(0.0);
         let b = MoeBlock {
             router: &router,
-            experts: bank.iter().map(|(g, u, dn)| (&g[..], &u[..], &dn[..])).collect(),
+            experts: bank
+                .iter()
+                .map(|(g, u, dn)| (&g[..], &u[..], &dn[..]))
+                .collect(),
             shared: (&sh.0[..], &sh.1[..], &sh.2[..]),
             shared_gate: &vec![0.0f32; d],
         };
@@ -511,262 +679,772 @@ mod forward_tests {
     #[test]
     fn rmsnorm_matches_the_gated_variant_at_unit_gate() {
         let x = vec![3.0f32, 4.0, 0.0];
-        let w = vec![1.0f32; 3];
+        // Plain Qwen RMSNorm stores an offset from one, while the gated
+        // recurrent norm stores a direct multiplier.
+        let w = vec![0.0f32; 3];
         let mut plain = vec![0.0f32; 3];
         rmsnorm(&x, &w, 1e-6, &mut plain);
         let mut gated = x.clone();
         // silu(g) = g/(1+e^-g); pick g so the factor is 1
         let g: Vec<f32> = vec![1.2784645f32; 3];
-        rmsnorm_gated(&mut gated, &w, &g, 1e-6);
+        rmsnorm_gated(&mut gated, &[1.0; 3], &g, 1e-6);
         for i in 0..3 {
-            assert!((plain[i] - gated[i]).abs() < 1e-3, "{:?} {:?}", plain, gated);
+            assert!(
+                (plain[i] - gated[i]).abs() < 1e-3,
+                "{:?} {:?}",
+                plain,
+                gated
+            );
+        }
+    }
+
+    #[test]
+    fn ffn_down_projection_is_d_by_intermediate() {
+        let x = [1.0f32, 0.0];
+        let gate = [1.0f32, 0.0, 2.0, 0.0, 3.0, 0.0];
+        let up = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let down = [1.0f32, 10.0, 100.0, -1.0, -10.0, -100.0];
+        let mut out = [0.0f32; 2];
+        ffn(&x, &gate, &up, &down, 3, 2, &mut out);
+        let h = [
+            1.0 / (1.0 + (-1.0f32).exp()),
+            2.0 / (1.0 + (-2.0f32).exp()),
+            3.0 / (1.0 + (-3.0f32).exp()),
+        ];
+        let expected = [
+            h[0] + 10.0 * h[1] + 100.0 * h[2],
+            -h[0] - 10.0 * h[1] - 100.0 * h[2],
+        ];
+        for i in 0..2 {
+            assert!(
+                (out[i] - expected[i]).abs() < 1e-5,
+                "{:?} vs {:?}",
+                out,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn full_attention_first_token_uses_value_and_sigmoid_gate() {
+        let mut c = tiny();
+        c.d = 4;
+        c.n_heads = 2;
+        c.n_kv_heads = 1;
+        c.head_dim = 2;
+        c.partial_rotary = 1.0;
+        let mut v_proj = vec![0.0f32; 2 * c.d];
+        v_proj[0] = 1.0;
+        v_proj[c.d + 1] = 1.0;
+        let mut o_proj = vec![0.0f32; c.d * 4];
+        for i in 0..4 {
+            o_proj[i * 4 + i] = 1.0;
+        }
+        let q_proj = vec![0.0f32; 8 * c.d];
+        let k_proj = vec![0.0f32; 2 * c.d];
+        let norm = vec![0.0f32; 2];
+        let w = FullAttn {
+            q_proj: &q_proj,
+            k_proj: &k_proj,
+            v_proj: &v_proj,
+            o_proj: &o_proj,
+            q_norm: &norm,
+            k_norm: &norm,
+        };
+        let mut cache = FullCache::new(&c);
+        let mut out = vec![0.0f32; c.d];
+        full_attn_step(&w, &c, &[1.0, 2.0, 3.0, 4.0], 0, &mut cache, &mut out);
+        assert_eq!(cache.len, 1);
+        let expected = [0.5f32, 1.0, 0.5, 1.0];
+        for i in 0..4 {
+            assert!((out[i] - expected[i]).abs() < 1e-6, "{:?}", out);
         }
     }
 }
 
-// ──────────────────────────── assembled model ────────────────────────────
+// ─────────────────────── checkpoint-backed runtime ───────────────────────
 
-/// Owned weights of one layer, in the order the decode loop needs them.
-/// Linear-attention and full-attention layers carry different sets; the
-/// expert bank and the shared expert are common to both.
-pub struct QwenLayer {
-    pub input_norm: Vec<f32>,
-    pub post_norm: Vec<f32>,
-    pub router: Vec<f32>,
-    pub experts: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>,
-    pub shared: (Vec<f32>, Vec<f32>, Vec<f32>),
-    pub shared_gate: Vec<f32>,
-    /// linear layers only
-    pub lin: Option<QwenLinWeights>,
+#[derive(Clone, Copy)]
+struct PackedT {
+    off: usize,
+    rows: usize,
+    cols: usize,
 }
 
-pub struct QwenLinWeights {
-    pub in_qkv: Vec<f32>,
-    pub in_z: Vec<f32>,
-    pub in_b: Vec<f32>,
-    pub in_a: Vec<f32>,
-    pub conv: Vec<f32>,
-    pub a_log: Vec<f32>,
-    pub dt_bias: Vec<f32>,
-    pub norm: Vec<f32>,
-    pub out_proj: Vec<f32>,
+#[derive(Clone, Copy)]
+struct QwenLinW {
+    in_qkv: T,
+    in_z: T,
+    in_b: T,
+    in_a: T,
+    conv: T,
+    a_log: T,
+    dt_bias: T,
+    norm: T,
+    out_proj: T,
 }
 
-/// A loaded qwen3_5_moe decoder: trunk weights, per-layer weights, and
-/// the recurrent state of every linear-attention layer.
+#[derive(Clone, Copy)]
+struct QwenFullW {
+    q_proj: T,
+    k_proj: T,
+    v_proj: T,
+    o_proj: T,
+    q_norm: T,
+    k_norm: T,
+}
+
+enum QwenAttnW {
+    Linear(QwenLinW),
+    Full(QwenFullW),
+}
+
+struct QwenLayerW {
+    input_norm: T,
+    post_norm: T,
+    attn: QwenAttnW,
+    router: T,
+    experts: Vec<[PackedT; 3]>, // w1=gate, w2=down, w3=up
+    shared: [T; 3],             // gate, down, up
+    shared_gate: T,
+}
+
+enum QwenCache {
+    Linear(LinCache),
+    Full(FullCache),
+}
+
+/// A zero-copy Qwen3.5-MoE text decoder backed by an MKIM0002 file.
+/// Float spine tensors remain in private file-backed pages; routed experts
+/// stay MXFP4-packed and are evaluated only when selected by the router.
 pub struct QwenModel {
     pub cfg: QwenConfig,
-    pub embed: Vec<f32>,
-    pub norm_f: Vec<f32>,
-    pub lm_head: Vec<f32>,
-    pub layers: Vec<QwenLayer>,
-    pub caches: Vec<Option<LinCache>>,
+    bin: BinFile,
+    embed: T,
+    norm_f: T,
+    lm_head: T,
+    lm_head_q8: Option<Q8Head>,
+    layers: Vec<QwenLayerW>,
+    caches: Vec<QwenCache>,
+    pos: usize,
+    adapter_packs: AppliedPacks,
+}
+
+fn dims_match(actual: &[u32], expected: &[usize]) -> bool {
+    actual.len() == expected.len() && actual.iter().zip(expected).all(|(&a, &b)| a as usize == b)
+}
+
+fn expect_f32(bin: &BinFile, name: &str, dims: &[usize]) -> T {
+    let e = bin
+        .entries
+        .get(name)
+        .unwrap_or_else(|| panic!("missing Qwen tensor: {}", name));
+    assert_eq!(e.dtype, DTYPE_F32, "{} must be f32", name);
+    assert!(
+        dims_match(&e.dims, dims),
+        "{}: expected shape {:?}, found {:?}",
+        name,
+        dims,
+        e.dims
+    );
+    assert_eq!(
+        e.size as usize,
+        dims.iter().product::<usize>() * 4,
+        "{}: invalid byte size",
+        name
+    );
+    T::from(e)
+}
+
+fn expect_conv(bin: &BinFile, name: &str, channels: usize, kernel: usize) -> T {
+    let e = bin
+        .entries
+        .get(name)
+        .unwrap_or_else(|| panic!("missing Qwen tensor: {}", name));
+    assert_eq!(e.dtype, DTYPE_F32, "{} must be f32", name);
+    let ok =
+        dims_match(&e.dims, &[channels, kernel]) || dims_match(&e.dims, &[channels, 1, kernel]);
+    assert!(
+        ok,
+        "{}: expected [{}, 1, {}], found {:?}",
+        name, channels, kernel, e.dims
+    );
+    assert_eq!(
+        e.size as usize,
+        channels * kernel * 4,
+        "{}: invalid byte size",
+        name
+    );
+    T::from(e)
+}
+
+fn expect_packed(bin: &BinFile, name: &str, rows: usize, cols: usize) -> PackedT {
+    let e = bin
+        .entries
+        .get(name)
+        .unwrap_or_else(|| panic!("missing Qwen expert tensor: {}", name));
+    assert_eq!(e.dtype, DTYPE_MXFP4, "{} must be MXFP4", name);
+    assert!(
+        dims_match(&e.dims, &[rows, cols]),
+        "{}: expected [{}, {}], found {:?}",
+        name,
+        rows,
+        cols,
+        e.dims
+    );
+    let size = rows * cols / 2 + rows * cols / 32;
+    assert_eq!(e.size as usize, size, "{}: invalid MXFP4 byte size", name);
+    PackedT {
+        off: e.offset as usize,
+        rows,
+        cols,
+    }
+}
+
+#[inline]
+fn tensor<'a>(data: &'a [u8], t: &T) -> &'a [f32] {
+    as_f32(&data[t.off..t.off + t.len * 4])
+}
+
+#[inline]
+fn packed_parts<'a>(data: &'a [u8], t: &PackedT) -> (&'a [u8], &'a [u8]) {
+    let np = t.rows * t.cols / 2;
+    let ns = t.rows * t.cols / 32;
+    (&data[t.off..t.off + np], &data[t.off + np..t.off + np + ns])
+}
+
+fn packed_moe(data: &[u8], layer: &QwenLayerW, c: &QwenConfig, x: &[f32]) -> Vec<f32> {
+    let mut logits = vec![0.0f32; c.n_experts];
+    crate::model::ops::matvec(
+        tensor(data, &layer.router),
+        c.n_experts,
+        c.d,
+        x,
+        &mut logits,
+    );
+    let selected = route_topk(&logits, c.top_k);
+    let mut routed = vec![0.0f32; selected.len() * c.d];
+
+    // Selected experts are independent. Each job keeps packed GEMVs
+    // single-threaded so the outer pool supplies the parallelism once.
+    {
+        let dp = crate::model::pool::SPtrU8(data.as_ptr());
+        let dlen = data.len();
+        let xp = crate::model::pool::SPtr(x.as_ptr());
+        let op = crate::model::pool::MPtr(routed.as_mut_ptr());
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::with_capacity(selected.len());
+        for (slot, &(expert, _)) in selected.iter().enumerate() {
+            let weights = layer.experts[expert];
+            let d = c.d;
+            let inter = c.moe_inter;
+            jobs.push(Box::new(move || {
+                // Rebind the wrappers so the closure captures their Send
+                // newtypes, not the raw pointer fields directly.
+                let (dp, xp, op) = (dp, xp, op);
+                unsafe {
+                    let data = std::slice::from_raw_parts(dp.0, dlen);
+                    let x = std::slice::from_raw_parts(xp.0, d);
+                    let mut gate = vec![0.0f32; inter];
+                    let mut up = vec![0.0f32; inter];
+                    let (p1, s1) = packed_parts(data, &weights[0]);
+                    let (p3, s3) = packed_parts(data, &weights[2]);
+                    crate::quant::mxfp4::matvec_packed(p1, s1, inter, d, x, &mut gate, 1);
+                    crate::quant::mxfp4::matvec_packed(p3, s3, inter, d, x, &mut up, 1);
+                    for i in 0..inter {
+                        gate[i] = (gate[i] / (1.0 + (-gate[i]).exp())) * up[i];
+                    }
+                    let out = std::slice::from_raw_parts_mut(op.0.add(slot * d), d);
+                    let (p2, s2) = packed_parts(data, &weights[1]);
+                    crate::quant::mxfp4::matvec_packed(p2, s2, d, inter, &gate, out, 1);
+                }
+            }));
+        }
+        crate::model::pool::pool().run(jobs);
+    }
+
+    let mut out = vec![0.0f32; c.d];
+    for (slot, &(_, weight)) in selected.iter().enumerate() {
+        for i in 0..c.d {
+            out[i] += weight * routed[slot * c.d + i];
+        }
+    }
+
+    let shared_gate = crate::model::ops::dot(tensor(data, &layer.shared_gate), x);
+    let shared_scale = 1.0 / (1.0 + (-shared_gate).exp());
+    let mut shared = vec![0.0f32; c.d];
+    ffn(
+        x,
+        tensor(data, &layer.shared[0]),
+        tensor(data, &layer.shared[2]),
+        tensor(data, &layer.shared[1]),
+        c.shared_inter,
+        c.d,
+        &mut shared,
+    );
+    for i in 0..c.d {
+        out[i] += shared_scale * shared[i];
+    }
+    out
 }
 
 impl QwenModel {
-    /// Allocates the per-layer recurrent state. Call before decoding and
-    /// whenever a fresh sequence starts.
-    pub fn reset(&mut self) {
-        self.caches = (0..self.layers.len())
+    pub fn load(path: &str) -> QwenModel {
+        Self::load_with_adapters(path, &[])
+    }
+
+    /// Applies hash-bound low-rank packs to private f32 spine pages before
+    /// tensor handles are created. Packed routed experts remain immutable.
+    pub fn load_with_adapters(path: &str, pack_paths: &[String]) -> QwenModel {
+        let mut bin = BinFile::open(path);
+        let adapter_packs = super::adapter::apply_packs(path, &mut bin, pack_paths)
+            .unwrap_or_else(|e| panic!("adapter pack: {}", e));
+        Self::from_bin(bin, adapter_packs)
+    }
+
+    fn from_bin(bin: BinFile, adapter_packs: AppliedPacks) -> QwenModel {
+        let c = bin
+            .config
+            .qwen
+            .clone()
+            .expect("model is not a qwen3_5_moe MKIM0002 file");
+        assert!(c.n_kv_heads > 0 && c.n_heads % c.n_kv_heads == 0);
+        assert!(c.lin_k_heads > 0 && c.lin_v_heads % c.lin_k_heads == 0);
+        assert!(c.top_k > 0 && c.top_k <= c.n_experts);
+        assert!(c.d % 32 == 0 && c.moe_inter % 32 == 0 && c.shared_inter > 0);
+
+        let embed = expect_f32(
+            &bin,
+            "model.language_model.embed_tokens.weight",
+            &[c.vocab, c.d],
+        );
+        let norm_f = expect_f32(&bin, "model.language_model.norm.weight", &[c.d]);
+        let lm_head = expect_f32(&bin, "lm_head.weight", &[c.vocab, c.d]);
+        let mut layers = Vec::with_capacity(c.n_layers);
+        let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
+        let full_width = c.n_heads * c.head_dim;
+        let kv_width = c.n_kv_heads * c.head_dim;
+
+        for l in 0..c.n_layers {
+            let p = format!("model.language_model.layers.{}", l);
+            let input_norm = expect_f32(&bin, &format!("{}.input_layernorm.weight", p), &[c.d]);
+            let post_norm = expect_f32(
+                &bin,
+                &format!("{}.post_attention_layernorm.weight", p),
+                &[c.d],
+            );
+            let attn = if c.is_full_attn(l) {
+                QwenAttnW::Full(QwenFullW {
+                    q_proj: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.q_proj.weight", p),
+                        &[full_width * 2, c.d],
+                    ),
+                    k_proj: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.k_proj.weight", p),
+                        &[kv_width, c.d],
+                    ),
+                    v_proj: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.v_proj.weight", p),
+                        &[kv_width, c.d],
+                    ),
+                    o_proj: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.o_proj.weight", p),
+                        &[c.d, full_width],
+                    ),
+                    q_norm: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.q_norm.weight", p),
+                        &[c.head_dim],
+                    ),
+                    k_norm: expect_f32(
+                        &bin,
+                        &format!("{}.self_attn.k_norm.weight", p),
+                        &[c.head_dim],
+                    ),
+                })
+            } else {
+                QwenAttnW::Linear(QwenLinW {
+                    in_qkv: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.in_proj_qkv.weight", p),
+                        &[conv_dim, c.d],
+                    ),
+                    in_z: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.in_proj_z.weight", p),
+                        &[c.lin_value_total(), c.d],
+                    ),
+                    in_b: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.in_proj_b.weight", p),
+                        &[c.lin_v_heads, c.d],
+                    ),
+                    in_a: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.in_proj_a.weight", p),
+                        &[c.lin_v_heads, c.d],
+                    ),
+                    conv: expect_conv(
+                        &bin,
+                        &format!("{}.linear_attn.conv1d.weight", p),
+                        conv_dim,
+                        c.conv_kernel,
+                    ),
+                    a_log: expect_f32(&bin, &format!("{}.linear_attn.A_log", p), &[c.lin_v_heads]),
+                    dt_bias: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.dt_bias", p),
+                        &[c.lin_v_heads],
+                    ),
+                    norm: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.norm.weight", p),
+                        &[c.lin_v_dim],
+                    ),
+                    out_proj: expect_f32(
+                        &bin,
+                        &format!("{}.linear_attn.out_proj.weight", p),
+                        &[c.d, c.lin_value_total()],
+                    ),
+                })
+            };
+            let router = expect_f32(&bin, &format!("{}.mlp.gate.weight", p), &[c.n_experts, c.d]);
+            let shared = [
+                expect_f32(
+                    &bin,
+                    &format!("{}.mlp.shared_expert.gate_proj.weight", p),
+                    &[c.shared_inter, c.d],
+                ),
+                expect_f32(
+                    &bin,
+                    &format!("{}.mlp.shared_expert.down_proj.weight", p),
+                    &[c.d, c.shared_inter],
+                ),
+                expect_f32(
+                    &bin,
+                    &format!("{}.mlp.shared_expert.up_proj.weight", p),
+                    &[c.shared_inter, c.d],
+                ),
+            ];
+            let shared_gate = expect_f32(
+                &bin,
+                &format!("{}.mlp.shared_expert_gate.weight", p),
+                &[1, c.d],
+            );
+            let experts = (0..c.n_experts)
+                .map(|e| {
+                    let ep = format!("layers.{}.block_sparse_moe.experts.{}", l, e);
+                    [
+                        expect_packed(&bin, &format!("{}.w1", ep), c.moe_inter, c.d),
+                        expect_packed(&bin, &format!("{}.w2", ep), c.d, c.moe_inter),
+                        expect_packed(&bin, &format!("{}.w3", ep), c.moe_inter, c.d),
+                    ]
+                })
+                .collect();
+            layers.push(QwenLayerW {
+                input_norm,
+                post_norm,
+                attn,
+                router,
+                experts,
+                shared,
+                shared_gate,
+            });
+        }
+
+        let lm_head_q8 = if super::ops::q8head_enabled() && !super::gpu_on() && c.d % 32 == 0 {
+            Some(Q8Head::from_f32(tensor(&bin.data, &lm_head), c.vocab, c.d))
+        } else {
+            None
+        };
+        let caches = (0..c.n_layers)
             .map(|l| {
-                if self.cfg.is_full_attn(l) {
-                    None
+                if c.is_full_attn(l) {
+                    QwenCache::Full(FullCache::new(&c))
                 } else {
-                    Some(LinCache::new(&self.cfg))
+                    QwenCache::Linear(LinCache::new(&c))
                 }
             })
             .collect();
+        QwenModel {
+            cfg: c,
+            bin,
+            embed,
+            norm_f,
+            lm_head,
+            lm_head_q8,
+            layers,
+            caches,
+            pos: 0,
+            adapter_packs,
+        }
     }
 
-    /// One decode step. Full-attention layers are skipped for now (their
-    /// KV cache is not wired), so this runs the linear-attention path and
-    /// the expert banks: enough to exercise the recurrence and routing on
-    /// real weights.
-    pub fn step(&mut self, token: u32, logits: &mut [f32]) {
-        let c = &self.cfg;
-        let d = c.d;
-        let mut h = self.embed[token as usize * d..(token as usize + 1) * d].to_vec();
-        let mut buf = vec![0.0f32; d];
-        let mut mix = vec![0.0f32; d];
-
-        for l in 0..self.layers.len() {
-            let is_full = c.is_full_attn(l);
-            {
-                let layer = &self.layers[l];
-                rmsnorm(&h, &layer.input_norm, c.norm_eps as f32, &mut buf);
-            }
-            if !is_full {
-                // borrow the layer weights and this layer's cache together
-                let (lin_ok, out) = {
-                    let layer = &self.layers[l];
-                    match (&layer.lin, self.caches[l].as_mut()) {
-                        (Some(w), Some(cache)) => {
-                            let lw = LinAttn {
-                                in_qkv: &w.in_qkv,
-                                in_z: &w.in_z,
-                                in_b: &w.in_b,
-                                in_a: &w.in_a,
-                                conv: &w.conv,
-                                a_log: &w.a_log,
-                                dt_bias: &w.dt_bias,
-                                norm: &w.norm,
-                                out_proj: &w.out_proj,
-                            };
-                            let mut o = vec![0.0f32; d];
-                            lin_attn_step(&lw, c, &buf, cache, &mut o);
-                            (true, o)
-                        }
-                        _ => (false, vec![0.0f32; d]),
-                    }
-                };
-                if lin_ok {
-                    for i in 0..d {
-                        h[i] += out[i];
-                    }
+    pub fn reset(&mut self) {
+        self.caches = (0..self.cfg.n_layers)
+            .map(|l| {
+                if self.cfg.is_full_attn(l) {
+                    QwenCache::Full(FullCache::new(&self.cfg))
+                } else {
+                    QwenCache::Linear(LinCache::new(&self.cfg))
                 }
-            }
-            {
-                let layer = &self.layers[l];
-                rmsnorm(&h, &layer.post_norm, c.norm_eps as f32, &mut buf);
-                let block = MoeBlock {
-                    router: &layer.router,
-                    experts: layer
-                        .experts
-                        .iter()
-                        .map(|(g, u, dn)| (&g[..], &u[..], &dn[..]))
-                        .collect(),
-                    shared: (&layer.shared.0[..], &layer.shared.1[..], &layer.shared.2[..]),
-                    shared_gate: &layer.shared_gate,
-                };
-                moe_forward(&block, &buf, c, &mut mix);
+            })
+            .collect();
+        self.pos = 0;
+    }
+
+    pub fn has_adapter_packs(&self) -> bool {
+        !self.adapter_packs.is_empty()
+    }
+
+    pub fn adapter_set_sha256(&self) -> Option<&str> {
+        self.adapter_packs.set_sha256.as_deref()
+    }
+
+    /// Advances the autoregressive decoder by one token and returns logits.
+    pub fn forward(&mut self, token: u32) -> Vec<f32> {
+        assert!(
+            (token as usize) < self.cfg.vocab,
+            "token {} is outside the Qwen vocabulary",
+            token
+        );
+        let c = &self.cfg;
+        let data = &self.bin.data;
+        let d = c.d;
+        let mut hidden =
+            tensor(data, &self.embed)[token as usize * d..(token as usize + 1) * d].to_vec();
+        let mut normed = vec![0.0f32; d];
+        let mut attn_out = vec![0.0f32; d];
+
+        for l in 0..c.n_layers {
+            let layer = &self.layers[l];
+            rmsnorm(
+                &hidden,
+                tensor(data, &layer.input_norm),
+                c.norm_eps as f32,
+                &mut normed,
+            );
+            match (&layer.attn, &mut self.caches[l]) {
+                (QwenAttnW::Linear(w), QwenCache::Linear(cache)) => {
+                    let weights = LinAttn {
+                        in_qkv: tensor(data, &w.in_qkv),
+                        in_z: tensor(data, &w.in_z),
+                        in_b: tensor(data, &w.in_b),
+                        in_a: tensor(data, &w.in_a),
+                        conv: tensor(data, &w.conv),
+                        a_log: tensor(data, &w.a_log),
+                        dt_bias: tensor(data, &w.dt_bias),
+                        norm: tensor(data, &w.norm),
+                        out_proj: tensor(data, &w.out_proj),
+                    };
+                    lin_attn_step(&weights, c, &normed, cache, &mut attn_out);
+                }
+                (QwenAttnW::Full(w), QwenCache::Full(cache)) => {
+                    let weights = FullAttn {
+                        q_proj: tensor(data, &w.q_proj),
+                        k_proj: tensor(data, &w.k_proj),
+                        v_proj: tensor(data, &w.v_proj),
+                        o_proj: tensor(data, &w.o_proj),
+                        q_norm: tensor(data, &w.q_norm),
+                        k_norm: tensor(data, &w.k_norm),
+                    };
+                    full_attn_step(&weights, c, &normed, self.pos, cache, &mut attn_out);
+                }
+                _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
             }
             for i in 0..d {
-                h[i] += mix[i];
+                hidden[i] += attn_out[i];
+            }
+            rmsnorm(
+                &hidden,
+                tensor(data, &layer.post_norm),
+                c.norm_eps as f32,
+                &mut normed,
+            );
+            let moe = packed_moe(data, layer, c, &normed);
+            for i in 0..d {
+                hidden[i] += moe[i];
             }
         }
-        rmsnorm(&h, &self.norm_f, c.norm_eps as f32, &mut buf);
-        crate::model::ops::matvec(&self.lm_head, c.vocab, d, &buf, logits);
+
+        rmsnorm(
+            &hidden,
+            tensor(data, &self.norm_f),
+            c.norm_eps as f32,
+            &mut normed,
+        );
+        let mut logits = vec![0.0f32; c.vocab];
+        match &self.lm_head_q8 {
+            Some(head) => head.matvec(&normed, &mut logits),
+            None => crate::model::ops::matvec(
+                tensor(data, &self.lm_head),
+                c.vocab,
+                d,
+                &normed,
+                &mut logits,
+            ),
+        }
+        self.pos += 1;
+        logits
     }
+}
+
+/// Shared generation loop for the Qwen runtime.
+pub fn qwen_run_turn(
+    ids: &[u32],
+    max_new: usize,
+    tok: &crate::tokenizer::AnyTokenizer,
+    model: &mut QwenModel,
+    debug: bool,
+    debug_routing: bool,
+    stop_id: u32,
+    sampler: &mut super::Sampler,
+) -> String {
+    model.reset();
+    super::run_turn_core(
+        ids,
+        max_new,
+        tok,
+        &mut |id| model.forward(id),
+        debug,
+        debug_routing,
+        stop_id,
+        sampler,
+    )
+}
+
+/// Hidden parity helper: writes per-token logits as
+/// `QWLOGIT1 | u32 n_tokens | u32 vocab | f32 logits...`.
+pub fn dump_cmd(args: &[String]) {
+    let value = |flag: &str| {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let model_path = value("--model").expect("qwen-dump requires --model MODEL.bin");
+    let tokens: Vec<u32> = value("--tokens")
+        .expect("qwen-dump requires --tokens ID,ID,...")
+        .split(',')
+        .map(|value| value.parse().expect("qwen-dump: invalid token id"))
+        .collect();
+    assert!(!tokens.is_empty(), "qwen-dump: token list is empty");
+    let out_path = value("--out").expect("qwen-dump requires --out LOGITS.bin");
+    let mut model = QwenModel::load(&model_path);
+    let mut file = std::fs::File::create(&out_path).unwrap();
+    use std::io::Write;
+    file.write_all(b"QWLOGIT1").unwrap();
+    file.write_all(&(tokens.len() as u32).to_le_bytes())
+        .unwrap();
+    file.write_all(&(model.cfg.vocab as u32).to_le_bytes())
+        .unwrap();
+    for token in tokens {
+        let logits = model.forward(token);
+        file.write_all(&crate::quant::weights::f32_to_bytes(&logits))
+            .unwrap();
+    }
+    file.sync_all().unwrap();
+    println!("Qwen logits: {}", out_path);
 }
 
 #[cfg(test)]
 mod model_tests {
     use super::*;
 
-    fn build(c: QwenConfig) -> QwenModel {
-        let d = c.d;
-        let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
-        let conv_dim = kt * 2 + vt;
-        let mk_ffn = |inter: usize, s: f32| {
-            (
-                vec![0.05f32; inter * d],
-                vec![0.05f32; inter * d],
-                vec![s; inter * d],
-            )
-        };
-        let layers = (0..c.n_layers)
-            .map(|l| QwenLayer {
-                input_norm: vec![1.0; d],
-                post_norm: vec![1.0; d],
-                router: vec![0.01; c.n_experts * d],
-                experts: (0..c.n_experts)
-                    .map(|e| mk_ffn(c.moe_inter, 0.01 * (e + 1) as f32))
-                    .collect(),
-                shared: mk_ffn(c.shared_inter, 0.01),
-                shared_gate: vec![0.0; d],
-                lin: if c.is_full_attn(l) {
-                    None
-                } else {
-                    Some(QwenLinWeights {
-                        in_qkv: vec![0.02; conv_dim * d],
-                        in_z: vec![0.03; vt * d],
-                        in_b: vec![0.0; c.lin_v_heads * d],
-                        in_a: vec![0.0; c.lin_v_heads * d],
-                        conv: {
-                            let mut v = vec![0.0f32; conv_dim * c.conv_kernel];
-                            for i in 0..conv_dim {
-                                v[i * c.conv_kernel + c.conv_kernel - 1] = 1.0;
-                            }
-                            v
-                        },
-                        a_log: vec![0.0; c.lin_v_heads],
-                        dt_bias: vec![0.0; c.lin_v_heads],
-                        norm: vec![1.0; c.lin_v_dim],
-                        out_proj: vec![0.02; d * vt],
-                    })
-                },
-            })
-            .collect();
-        let mut m = QwenModel {
-            embed: vec![0.1; c.vocab * d],
-            norm_f: vec![1.0; d],
-            lm_head: vec![0.05; c.vocab * d],
-            layers,
-            caches: Vec::new(),
-            cfg: c,
-        };
-        m.reset();
-        m
-    }
-
-    fn tiny() -> QwenConfig {
+    fn bin_tiny() -> QwenConfig {
         let mut c = QwenConfig::qwen35_moe();
         c.n_layers = 4;
-        c.d = 8;
-        c.vocab = 16;
-        c.n_experts = 4;
-        c.top_k = 2;
-        c.moe_inter = 6;
-        c.shared_inter = 6;
+        c.d = 32;
+        c.vocab = 64;
+        c.n_heads = 2;
+        c.n_kv_heads = 1;
+        c.head_dim = 16;
+        c.partial_rotary = 0.5;
         c.lin_k_heads = 1;
-        c.lin_v_heads = 2;
-        c.lin_k_dim = 4;
-        c.lin_v_dim = 4;
+        c.lin_v_heads = 1;
+        c.lin_k_dim = 32;
+        c.lin_v_dim = 32;
+        c.n_experts = 2;
+        c.top_k = 1;
+        c.moe_inter = 32;
+        c.shared_inter = 32;
         c
     }
 
-    #[test]
-    fn full_stack_step_produces_finite_logits() {
-        let c = tiny();
-        let vocab = c.vocab;
-        let mut m = build(c);
-        let mut logits = vec![0.0f32; vocab];
-        m.step(3, &mut logits);
-        assert!(logits.iter().all(|v| v.is_finite()), "{:?}", logits);
-        assert!(logits.iter().any(|v| v.abs() > 1e-9));
+    fn checkpoint_fixture(c: &QwenConfig) -> String {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "microkimi_qwen_fixture_{}_{}.bin",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("test")
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let layout = crate::tools::convert_qwen::output_layout(c);
+        let mut writer = crate::quant::weights::BinWriter::new();
+        for (name, dtype, dims) in &layout {
+            writer.add(name, *dtype, dims.clone());
+        }
+        let mut file = std::fs::File::create(&path).unwrap();
+        let offsets = writer.write_header_v2(
+            &mut file,
+            &crate::tools::convert_qwen::config_json(c, "qwen.tokenizer.json"),
+        );
+        for ((name, dtype, dims), offset) in layout.iter().zip(offsets) {
+            let n: usize = dims.iter().map(|&d| d as usize).product();
+            let blob = if *dtype == DTYPE_MXFP4 {
+                let values: Vec<f32> = (0..n).map(|i| ((i % 9) as f32 - 4.0) * 0.004).collect();
+                let (packed, scales) =
+                    crate::quant::mxfp4::quantize(&values, dims[0] as usize, dims[1] as usize);
+                [packed, scales].concat()
+            } else {
+                let mut values = if name.contains(".linear_attn.norm.weight") {
+                    vec![1.0f32; n]
+                } else if name.ends_with("norm.weight")
+                    || name.ends_with("layernorm.weight")
+                    || name.ends_with("A_log")
+                    || name.ends_with("dt_bias")
+                    || name.ends_with("shared_expert_gate.weight")
+                {
+                    vec![0.0f32; n]
+                } else {
+                    (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.002).collect()
+                };
+                if name.ends_with("linear_attn.conv1d.weight") {
+                    values.fill(0.0);
+                    for channel in 0..(n / c.conv_kernel) {
+                        values[channel * c.conv_kernel + c.conv_kernel - 1] = 1.0;
+                    }
+                }
+                crate::quant::weights::f32_to_bytes(&values)
+            };
+            writer.write_blob_at(&mut file, offset, &blob);
+        }
+        file.sync_all().unwrap();
+        path
     }
 
     #[test]
-    fn reset_makes_decoding_reproducible() {
-        // the recurrence itself is covered by forward_tests; here the
-        // contract is that reset() returns the model to its first-token
-        // state, so two runs of the same sequence agree exactly
-        let c = tiny();
-        let vocab = c.vocab;
-        let mut m = build(c);
-        let mut a = vec![0.0f32; vocab];
-        let mut b = vec![0.0f32; vocab];
-        for t in [3u32, 5, 1] {
-            m.step(t, &mut a);
+    fn checkpoint_runtime_executes_both_attention_kinds_and_resets() {
+        let c = bin_tiny();
+        let path = checkpoint_fixture(&c);
+        let mut model = QwenModel::load(&path);
+        let first = model.forward(3);
+        let second = model.forward(5);
+        assert_eq!(first.len(), c.vocab);
+        assert!(first.iter().chain(&second).all(|v| v.is_finite()));
+        assert!(first.iter().any(|v| v.abs() > 1e-9));
+        match &model.caches[3] {
+            QwenCache::Full(cache) => assert_eq!(cache.len, 2),
+            _ => panic!("layer 3 must have a full-attention cache"),
         }
-        m.reset();
-        for t in [3u32, 5, 1] {
-            m.step(t, &mut b);
-        }
-        for i in 0..vocab {
-            assert!((a[i] - b[i]).abs() < 1e-6, "reset did not clear state");
-        }
-        assert!(a.iter().all(|v| v.is_finite()));
-    }
-
-    #[test]
-    fn cache_allocation_follows_the_attention_stride() {
-        let c = tiny();
-        let m = build(c);
-        for l in 0..m.layers.len() {
-            let full = m.cfg.is_full_attn(l);
-            assert_eq!(m.caches[l].is_none(), full, "layer {}", l);
-            assert_eq!(m.layers[l].lin.is_none(), full, "layer {}", l);
-        }
+        model.reset();
+        let replay = model.forward(3);
+        assert_eq!(first, replay);
+        drop(model);
+        std::fs::remove_file(path).ok();
     }
 }

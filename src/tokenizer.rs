@@ -470,6 +470,7 @@ pub enum AnyTokenizer {
     Nano(NanoTokenizer),
     Ds(crate::model::dstok::DsTokenizer),
     DsNano(DsNanoTokenizer),
+    Qwen(crate::model::qwentok::QwenTokenizer),
 }
 
 /// DeepSeek-V4 nano remap (nanodeepseek): real V4 BPE → nano ids (top-8192
@@ -569,6 +570,7 @@ impl AnyTokenizer {
             AnyTokenizer::Nano(n) => n.markers.end_of_msg,
             AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
+            AnyTokenizer::Qwen(_) => crate::model::qwentok::QWEN_IM_END,
         }
     }
 
@@ -579,6 +581,7 @@ impl AnyTokenizer {
             AnyTokenizer::Nano(n) => n.vocab_size,
             AnyTokenizer::Ds(_) => 129_280,
             AnyTokenizer::DsNano(n) => n.vocab_size,
+            AnyTokenizer::Qwen(t) => t.vocab_size(),
         }
     }
 
@@ -602,6 +605,7 @@ impl AnyTokenizer {
                 ids
             }
             AnyTokenizer::DsNano(n) => n.encode_raw_nano(text),
+            AnyTokenizer::Qwen(t) => t.encode(text),
         }
     }
 
@@ -612,6 +616,7 @@ impl AnyTokenizer {
             AnyTokenizer::Nano(n) => n.eos,
             AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
+            AnyTokenizer::Qwen(_) => crate::model::qwentok::QWEN_ENDOFTEXT,
         }
     }
 
@@ -622,6 +627,7 @@ impl AnyTokenizer {
             AnyTokenizer::Ds(t) => t.encode_chat(history, question),
             // nanodeepseek is trained on raw stories: chat == raw completion
             AnyTokenizer::DsNano(n) => n.encode_raw_nano(question),
+            AnyTokenizer::Qwen(t) => t.encode_chat(history, question),
         }
     }
 
@@ -639,6 +645,7 @@ impl AnyTokenizer {
             }
             AnyTokenizer::Ds(t) => t.decode_id(id),
             AnyTokenizer::DsNano(n) => n.decode_nano_id(id),
+            AnyTokenizer::Qwen(t) => t.decode_id(id),
         }
     }
 
@@ -668,6 +675,7 @@ impl AnyTokenizer {
             }
             AnyTokenizer::Ds(t) => t.decode(ids),
             AnyTokenizer::DsNano(n) => n.decode_nano(ids),
+            AnyTokenizer::Qwen(t) => t.decode(ids),
         }
     }
 }

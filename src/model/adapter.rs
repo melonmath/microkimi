@@ -12,8 +12,11 @@
 //! quantization decision.
 
 use crate::json::Json;
+use crate::model::pool::{pool, Job, MPtr, SPtr};
 use crate::quant::weights::{BinFile, DTYPE_F32};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"MKADAPT1";
 const MAX_MANIFEST: usize = 16 << 20;
@@ -131,6 +134,10 @@ fn checked_bytes(a: usize, b: usize, where_: &str) -> Result<usize, String> {
     a.checked_mul(b)
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| format!("{} dimensions overflow", where_))
+}
+
+unsafe fn mutable_f32_slice<'a>(pointer: MPtr, len: usize) -> &'a mut [f32] {
+    unsafe { std::slice::from_raw_parts_mut(pointer.0, len) }
 }
 
 fn decode_f32(blob: &[u8], where_: &str) -> Result<Vec<f32>, String> {
@@ -368,29 +375,68 @@ pub(super) fn apply_packs(
                 tensor
             ));
         }
-        for row in 0..out {
-            let mut accumulated: Vec<f64> = weight[row * input..(row + 1) * input]
-                .iter()
-                .map(|&value| value as f64)
-                .collect();
-            for &(pack_index, update_index) in refs {
+        let updates: Vec<(usize, f64, SPtr, SPtr)> = refs
+            .iter()
+            .map(|&(pack_index, update_index)| {
                 let update = &packs[pack_index].updates[update_index];
-                for rank_index in 0..update.rank {
-                    let coefficient =
-                        update.scale * update.b[row * update.rank + rank_index] as f64;
-                    let a_row = &update.a[rank_index * input..(rank_index + 1) * input];
-                    for column in 0..input {
-                        accumulated[column] += coefficient * a_row[column] as f64;
+                (
+                    update.rank,
+                    update.scale,
+                    SPtr(update.a.as_ptr()),
+                    SPtr(update.b.as_ptr()),
+                )
+            })
+            .collect();
+        let failed = Arc::new(AtomicBool::new(false));
+        let job_count = pool().workers.min(out).max(1);
+        let rows_per_job = out.div_ceil(job_count);
+        let mut jobs: Vec<Job> = Vec::with_capacity(job_count);
+        for row_start in (0..out).step_by(rows_per_job) {
+            let row_end = (row_start + rows_per_job).min(out);
+            let row_count = row_end - row_start;
+            let output = MPtr(unsafe { weight.as_mut_ptr().add(row_start * input) });
+            let updates = updates.clone();
+            let failed = failed.clone();
+            jobs.push(Box::new(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Every job owns a disjoint range of output rows. Factor
+                    // pointers stay valid until the pool barrier below returns.
+                    let output = unsafe { mutable_f32_slice(output, row_count * input) };
+                    let mut accumulated = vec![0.0f64; input];
+                    for local_row in 0..row_count {
+                        let row = row_start + local_row;
+                        let row_weight = &mut output[local_row * input..(local_row + 1) * input];
+                        for column in 0..input {
+                            accumulated[column] = row_weight[column] as f64;
+                        }
+                        for &(rank, scale, a_ptr, b_ptr) in &updates {
+                            let a = unsafe { std::slice::from_raw_parts(a_ptr.0, rank * input) };
+                            let b = unsafe { std::slice::from_raw_parts(b_ptr.0, out * rank) };
+                            for rank_index in 0..rank {
+                                let coefficient = scale * b[row * rank + rank_index] as f64;
+                                let a_row = &a[rank_index * input..(rank_index + 1) * input];
+                                for column in 0..input {
+                                    accumulated[column] += coefficient * a_row[column] as f64;
+                                }
+                            }
+                        }
+                        for column in 0..input {
+                            let value = accumulated[column] as f32;
+                            if !value.is_finite() {
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                            row_weight[column] = value;
+                        }
                     }
+                }));
+                if result.is_err() {
+                    failed.store(true, Ordering::Relaxed);
                 }
-            }
-            for column in 0..input {
-                let value = accumulated[column] as f32;
-                if !value.is_finite() {
-                    return Err(format!("{} fold produced a non-finite weight", tensor));
-                }
-                weight[row * input + column] = value;
-            }
+            }));
+        }
+        pool().run(jobs);
+        if failed.load(Ordering::Relaxed) {
+            return Err(format!("{} fold produced a non-finite weight", tensor));
         }
     }
 

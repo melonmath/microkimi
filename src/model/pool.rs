@@ -98,7 +98,9 @@ unsafe impl Send for SPtr {}
 pub struct MPtr(pub *mut f32);
 unsafe impl Send for MPtr {}
 #[derive(Clone, Copy)]
+pub struct MPtrU8(pub *mut u8);
+unsafe impl Send for MPtrU8 {}
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct SPtrU8(pub *const u8);
 unsafe impl Send for SPtrU8 {}
-

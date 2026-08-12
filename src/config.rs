@@ -367,8 +367,11 @@ impl QwenConfig {
         c.n_heads = Self::num(d, "num_attention_heads", c.n_heads as f64) as usize;
         c.n_kv_heads = Self::num(d, "num_key_value_heads", c.n_kv_heads as f64) as usize;
         c.head_dim = Self::num(d, "head_dim", c.head_dim as f64) as usize;
-        c.partial_rotary = Self::num(d, "partial_rotary_factor", c.partial_rotary);
-        c.rope_theta = Self::num(d, "rope_theta", c.rope_theta);
+        // HF checkpoints keep these under rope_parameters; converted
+        // MKIM0002 files store the same values flat in the qwen object.
+        let rope = d.get("rope_parameters").unwrap_or(d);
+        c.partial_rotary = Self::num(rope, "partial_rotary_factor", c.partial_rotary);
+        c.rope_theta = Self::num(rope, "rope_theta", c.rope_theta);
         c.lin_k_heads = Self::num(d, "linear_num_key_heads", c.lin_k_heads as f64) as usize;
         c.lin_v_heads = Self::num(d, "linear_num_value_heads", c.lin_v_heads as f64) as usize;
         c.lin_k_dim = Self::num(d, "linear_key_head_dim", c.lin_k_dim as f64) as usize;

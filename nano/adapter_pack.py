@@ -16,6 +16,8 @@ non-fp32 base targets are rejected instead of being approximated.
 
 Examples:
   python3 nano/adapter_pack.py create --base model.bin \
+      --adapter /path/to/peft_adapter --name arithmetic --out arithmetic.mkap
+  python3 nano/adapter_pack.py create --base model.bin \
       --adapter-config adapter_config.json \
       --adapter-model adapter_model.safetensors \
       --name arithmetic --out arithmetic.mkap
@@ -330,7 +332,9 @@ def target_candidates(module):
             add(value[len(prefix):])
     marker = value.find("layers.")
     if marker >= 0:
-        add(value[marker:])
+        tail = value[marker:]
+        for prefix in ("", "model.", "language_model.", "model.language_model."):
+            add(prefix + tail)
     for root in ("embed_tokens", "lm_head", "norm"):
         marker = value.rfind(root)
         if marker >= 0:
@@ -663,6 +667,9 @@ def selftest():
         assert checked["sha256"] == summary["sha256"]
         assert checked["base_sha256"] == file_sha256(base)
         assert checked["targets"] == ["layers.0.proj.weight"]
+        assert "model.language_model.layers.0.proj.weight" in target_candidates(
+            "model.layers.0.proj"
+        )
         corrupted = bytearray(pack.read_bytes())
         corrupted[-1] ^= 1
         bad = root / "bad.mkap"
@@ -682,8 +689,9 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
     create = subparsers.add_parser("create", help="build MKADAPT1 from a standard PEFT LoRA")
     create.add_argument("--base", required=True, help="exact microkimi .bin base")
-    create.add_argument("--adapter-config", required=True)
-    create.add_argument("--adapter-model", required=True)
+    create.add_argument("--adapter", help="PEFT adapter directory")
+    create.add_argument("--adapter-config")
+    create.add_argument("--adapter-model")
     create.add_argument("--name", required=True)
     create.add_argument("--out", required=True)
     inspect = subparsers.add_parser("inspect", help="validate and describe an MKADAPT1 pack")
@@ -693,10 +701,21 @@ def main():
     if args.selftest:
         selftest()
     elif args.command == "create":
+        if args.adapter is not None:
+            if args.adapter_config is not None or args.adapter_model is not None:
+                create.error("--adapter cannot be combined with explicit adapter paths")
+            adapter_root = Path(args.adapter)
+            adapter_config = adapter_root / "adapter_config.json"
+            adapter_model = adapter_root / "adapter_model.safetensors"
+        else:
+            if args.adapter_config is None or args.adapter_model is None:
+                create.error("pass --adapter DIR or both --adapter-config and --adapter-model")
+            adapter_config = Path(args.adapter_config)
+            adapter_model = Path(args.adapter_model)
         build_pack(
             args.base,
-            args.adapter_config,
-            args.adapter_model,
+            adapter_config,
+            adapter_model,
             args.name,
             args.out,
         )
