@@ -21,6 +21,9 @@ Examples:
       --adapter /path/to/peft_adapter --multiplier 0.5 \
       --name arithmetic-half --out arithmetic-half.mkap
   python3 nano/adapter_pack.py create --base model.bin \
+      --adapter /path/to/peft_adapter --include-target '\\.self_attn\\.' \
+      --name attention-only --out attention-only.mkap
+  python3 nano/adapter_pack.py create --base model.bin \
       --adapter-config adapter_config.json \
       --adapter-model adapter_model.safetensors \
       --name arithmetic --out arithmetic.mkap
@@ -134,6 +137,18 @@ def validated_multiplier(value):
             "LoRA multiplier must be finite, non-zero, and at most 1e6 in magnitude"
         )
     return float(value)
+
+
+def compile_include_patterns(values):
+    patterns = []
+    for value in values or ():
+        if not isinstance(value, str) or not value:
+            raise ValueError("LoRA include-target patterns must be non-empty strings")
+        try:
+            patterns.append(re.compile(value))
+        except re.error as error:
+            raise ValueError(f"invalid LoRA include-target pattern {value!r}: {error}") from error
+    return patterns
 
 
 def read_model_directory(path):
@@ -382,7 +397,15 @@ def pair_adapter_factors(safetensors):
     return pairs
 
 
-def build_pack(base_path, config_path, adapter_path, name, out_path, multiplier=1.0):
+def build_pack(
+    base_path,
+    config_path,
+    adapter_path,
+    name,
+    out_path,
+    multiplier=1.0,
+    include_targets=(),
+):
     if not name or len(name.encode("utf-8")) > 128 or _contains_control(name):
         raise ValueError("pack name must contain no control characters and fit in 128 UTF-8 bytes")
     multiplier = validated_multiplier(multiplier)
@@ -390,6 +413,15 @@ def build_pack(base_path, config_path, adapter_path, name, out_path, multiplier=
     rank, alpha = load_standard_lora_config(config_path)
     adapter = Safetensors(adapter_path)
     pairs = pair_adapter_factors(adapter)
+    include_patterns = compile_include_patterns(include_targets)
+    if include_patterns:
+        pairs = {
+            module: factors
+            for module, factors in pairs.items()
+            if any(pattern.search(module) for pattern in include_patterns)
+        }
+        if not pairs:
+            raise ValueError("LoRA include-target patterns matched no adapter module")
     targets = []
     for module, factors in pairs.items():
         matches = [candidate for candidate in target_candidates(module) if candidate in model_entries]
@@ -474,6 +506,7 @@ def build_pack(base_path, config_path, adapter_path, name, out_path, multiplier=
         "targets": len(manifest_targets),
         "factor_bytes": len(payload),
         "multiplier": multiplier,
+        "include_targets": list(include_targets),
     }
     print(json.dumps(summary, indent=2))
     return summary
@@ -681,7 +714,15 @@ def selftest():
                 "base_model.model.model.layers.0.proj.lora_B.weight": np.array([[4], [5]], np.float32),
             },
         )
-        summary = build_pack(base, config, adapter, "selftest", pack, multiplier=0.25)
+        summary = build_pack(
+            base,
+            config,
+            adapter,
+            "selftest",
+            pack,
+            multiplier=0.25,
+            include_targets=[r"\.proj$"],
+        )
         checked = inspect_pack(pack)
         assert checked["sha256"] == summary["sha256"]
         assert checked["base_sha256"] == file_sha256(base)
@@ -690,6 +731,7 @@ def selftest():
         manifest = json.loads(pack.read_bytes()[12:12 + manifest_size])
         assert manifest["targets"][0]["scale"] == 0.5
         assert summary["multiplier"] == 0.25
+        assert summary["include_targets"] == [r"\.proj$"]
         for invalid in (False, 0, float("inf"), 1e7):
             try:
                 validated_multiplier(invalid)
@@ -729,6 +771,12 @@ def main():
         default=1.0,
         help="multiply the adapter's declared alpha/rank scale (default: 1)",
     )
+    create.add_argument(
+        "--include-target",
+        action="append",
+        default=[],
+        help="include adapter modules matching this regex; repeatable",
+    )
     create.add_argument("--out", required=True)
     inspect = subparsers.add_parser("inspect", help="validate and describe an MKADAPT1 pack")
     inspect.add_argument("pack")
@@ -755,6 +803,7 @@ def main():
             args.name,
             args.out,
             args.multiplier,
+            args.include_target,
         )
     elif args.command == "inspect":
         print(json.dumps(inspect_pack(args.pack, not args.no_verify), indent=2))

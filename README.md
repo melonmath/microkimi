@@ -68,7 +68,7 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | structural slicing | `microkimi slice` prunes layers / hidden channels / experts (`--layers --hidden --experts`) and vocabulary (`--vocab-top`) from a .bin or straight from remote safetensors; crash-safe resume (`.sliceckpt`) and a persistent expert-score cache |
 | evaluation | `microkimi eval --model X.bin` - deterministic scorecard: 40 factual QA probes (2 phrasings) + perplexity, `--json` for archiving |
 | batch completion | `microkimi complete-batch` evaluates JSONL prompts with one model and adapter load, resetting caches between prompts and atomically writing JSONL results |
-| model adapter packs | K3 and Qwen f32 spine tensors: `nano/adapter_pack.py` turns a standard exact-same-base PEFT LoRA into a hash-bound `.mkap`, optionally with an explicit scale multiplier; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
+| model adapter packs | K3 and Qwen f32 spine tensors: `nano/adapter_pack.py` turns all or an explicitly selected subset of a standard exact-same-base PEFT LoRA into a hash-bound `.mkap`, optionally with a scale multiplier; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
 | memory packs | K3 only: `microkimi absorb doc.txt --out pack.mkmem` snapshots the fixed-size KDA state; `run --memory pack.mkmem` resumes it. A video-game save state - details in [KIMI.md](KIMI.md#memory-packs-save-states-for-a-neural-network) |
 
 ## License

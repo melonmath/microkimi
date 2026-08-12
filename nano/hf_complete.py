@@ -28,6 +28,7 @@ Examples:
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,18 @@ def validated_multiplier(value):
             "LoRA multiplier must be finite, non-zero, and at most 1e6 in magnitude"
         )
     return float(value)
+
+
+def compile_include_patterns(values):
+    patterns = []
+    for value in values or ():
+        if not isinstance(value, str) or not value:
+            raise ValueError("LoRA include-target patterns must be non-empty strings")
+        try:
+            patterns.append(re.compile(value))
+        except re.error as error:
+            raise ValueError(f"invalid LoRA include-target pattern {value!r}: {error}") from error
+    return patterns
 
 
 def load_lora_pairs(adapter_dir):
@@ -98,13 +111,22 @@ def load_lora_pairs(adapter_dir):
     return scale, pairs
 
 
-def fold_lora(model, adapter_dir, multiplier=1.0):
+def fold_lora(model, adapter_dir, multiplier=1.0, include_targets=()):
     """Fold the adapter into the loaded weights; returns the target count."""
 
     import torch
 
     multiplier = validated_multiplier(multiplier)
     scale, pairs = load_lora_pairs(adapter_dir)
+    include_patterns = compile_include_patterns(include_targets)
+    if include_patterns:
+        pairs = {
+            module: factors
+            for module, factors in pairs.items()
+            if any(pattern.search(module) for pattern in include_patterns)
+        }
+        if not pairs:
+            raise ValueError("LoRA include-target patterns matched no adapter module")
     scale *= multiplier
     modules = dict(model.named_modules())
     with torch.no_grad():
@@ -161,7 +183,9 @@ def generate_all(args):
     model.eval()
     print(f"model loaded in {time.time() - started:.0f}s", flush=True)
     if args.lora:
-        folded = fold_lora(model, args.lora, args.lora_multiplier)
+        folded = fold_lora(
+            model, args.lora, args.lora_multiplier, args.include_target
+        )
         print(
             f"folded {folded} LoRA targets from {args.lora} "
             f"at multiplier {args.lora_multiplier:g}",
@@ -281,6 +305,16 @@ def selftest():
                 pass
             else:
                 raise AssertionError(f"invalid multiplier {invalid!r} was accepted")
+        assert [pattern.pattern for pattern in compile_include_patterns([r"\.proj$"])] == [
+            r"\.proj$"
+        ]
+        for invalid_pattern in ("", "["):
+            try:
+                compile_include_patterns([invalid_pattern])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid include pattern {invalid_pattern!r} was accepted")
     print("hf_complete selftest OK")
 
 
@@ -294,6 +328,12 @@ def main():
         type=float,
         default=1.0,
         help="multiply the adapter's declared alpha/rank scale (default: 1)",
+    )
+    parser.add_argument(
+        "--include-target",
+        action="append",
+        default=[],
+        help="include adapter modules matching this regex; repeatable",
     )
     parser.add_argument("--prompts", help="input JSONL with id/prompt/max_new")
     parser.add_argument("--out", help="output JSONL with id/completion")
@@ -309,6 +349,8 @@ def main():
         parser.error("--model, --prompts, and --out are required")
     if args.lora is None and args.lora_multiplier != 1.0:
         parser.error("--lora-multiplier needs --lora")
+    if args.lora is None and args.include_target:
+        parser.error("--include-target needs --lora")
     generate_all(args)
     return 0
 
