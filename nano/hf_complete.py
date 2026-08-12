@@ -9,7 +9,7 @@ excludes the prompt text.
 With --lora the tool first folds an elementary PEFT LoRA adapter into the
 loaded weights:
 
-    W <- W + (lora_alpha / r) * B @ A
+    W <- W + lora_multiplier * (lora_alpha / r) * B @ A
 
 Only plain LoRA is accepted (no DoRA, rank patterns, alpha patterns, bias
 tensors, or modules_to_save); anything else is rejected instead of being
@@ -21,18 +21,33 @@ Examples:
       --prompts prompts.jsonl --out completions.jsonl \
       --stop $'\ndef ' --stop $'\nclass '
   python3 nano/hf_complete.py --model /models/checkpoint --lora /adapters/x \
-      --prompts prompts.jsonl --out completions.jsonl
+      --lora-multiplier 0.5 --prompts prompts.jsonl --out completions.jsonl
   python3 nano/hf_complete.py --selftest
 """
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 
 LORA_KEY_SUFFIXES = (".lora_A.weight", ".lora_B.weight")
 WRAPPER_PREFIX = "base_model.model."
+
+
+def validated_multiplier(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value == 0.0
+        or abs(value) > 1e6
+    ):
+        raise ValueError(
+            "LoRA multiplier must be finite, non-zero, and at most 1e6 in magnitude"
+        )
+    return float(value)
 
 
 def load_lora_pairs(adapter_dir):
@@ -83,12 +98,14 @@ def load_lora_pairs(adapter_dir):
     return scale, pairs
 
 
-def fold_lora(model, adapter_dir):
+def fold_lora(model, adapter_dir, multiplier=1.0):
     """Fold the adapter into the loaded weights; returns the target count."""
 
     import torch
 
+    multiplier = validated_multiplier(multiplier)
     scale, pairs = load_lora_pairs(adapter_dir)
+    scale *= multiplier
     modules = dict(model.named_modules())
     with torch.no_grad():
         for name in sorted(pairs):
@@ -144,8 +161,12 @@ def generate_all(args):
     model.eval()
     print(f"model loaded in {time.time() - started:.0f}s", flush=True)
     if args.lora:
-        folded = fold_lora(model, args.lora)
-        print(f"folded {folded} LoRA targets from {args.lora}", flush=True)
+        folded = fold_lora(model, args.lora, args.lora_multiplier)
+        print(
+            f"folded {folded} LoRA targets from {args.lora} "
+            f"at multiplier {args.lora_multiplier:g}",
+            flush=True,
+        )
 
     rows = []
     for index, row in enumerate(prompts):
@@ -253,6 +274,13 @@ def selftest():
             assert "DoRA" in str(error)
         else:
             raise AssertionError("a DoRA adapter was accepted")
+        for invalid in (False, 0, float("inf"), 1e7):
+            try:
+                validated_multiplier(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid multiplier {invalid!r} was accepted")
     print("hf_complete selftest OK")
 
 
@@ -261,6 +289,12 @@ def main():
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--model", help="local checkpoint directory")
     parser.add_argument("--lora", help="fold this adapter directory before generating")
+    parser.add_argument(
+        "--lora-multiplier",
+        type=float,
+        default=1.0,
+        help="multiply the adapter's declared alpha/rank scale (default: 1)",
+    )
     parser.add_argument("--prompts", help="input JSONL with id/prompt/max_new")
     parser.add_argument("--out", help="output JSONL with id/completion")
     parser.add_argument("--max-new", type=int, default=256, help="default token budget")
@@ -273,6 +307,8 @@ def main():
         return 0
     if not (args.model and args.prompts and args.out):
         parser.error("--model, --prompts, and --out are required")
+    if args.lora is None and args.lora_multiplier != 1.0:
+        parser.error("--lora-multiplier needs --lora")
     generate_all(args)
     return 0
 

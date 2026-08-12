@@ -3,7 +3,7 @@
 
 An MKADAPT1 pack contains standard low-rank updates for named fp32 matrices:
 
-    W <- W + (lora_alpha / rank) * B @ A
+    W <- W + multiplier * (lora_alpha / rank) * B @ A
 
 The pack records the SHA-256 of the exact base .bin. The Rust engine refuses a
 different base, verifies every factor, and folds one or more packs into private
@@ -17,6 +17,9 @@ non-fp32 base targets are rejected instead of being approximated.
 Examples:
   python3 nano/adapter_pack.py create --base model.bin \
       --adapter /path/to/peft_adapter --name arithmetic --out arithmetic.mkap
+  python3 nano/adapter_pack.py create --base model.bin \
+      --adapter /path/to/peft_adapter --multiplier 0.5 \
+      --name arithmetic-half --out arithmetic-half.mkap
   python3 nano/adapter_pack.py create --base model.bin \
       --adapter-config adapter_config.json \
       --adapter-model adapter_model.safetensors \
@@ -117,6 +120,20 @@ def _contains_control(value):
 
 def _reject_json_constant(token):
     raise ValueError(f"non-finite JSON number {token}")
+
+
+def validated_multiplier(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value == 0.0
+        or abs(value) > 1e6
+    ):
+        raise ValueError(
+            "LoRA multiplier must be finite, non-zero, and at most 1e6 in magnitude"
+        )
+    return float(value)
 
 
 def read_model_directory(path):
@@ -365,9 +382,10 @@ def pair_adapter_factors(safetensors):
     return pairs
 
 
-def build_pack(base_path, config_path, adapter_path, name, out_path):
+def build_pack(base_path, config_path, adapter_path, name, out_path, multiplier=1.0):
     if not name or len(name.encode("utf-8")) > 128 or _contains_control(name):
         raise ValueError("pack name must contain no control characters and fit in 128 UTF-8 bytes")
+    multiplier = validated_multiplier(multiplier)
     model_entries = read_model_directory(base_path)
     rank, alpha = load_standard_lora_config(config_path)
     adapter = Safetensors(adapter_path)
@@ -401,7 +419,7 @@ def build_pack(base_path, config_path, adapter_path, name, out_path):
 
     payload = bytearray()
     manifest_targets = []
-    scale = alpha / rank
+    scale = multiplier * alpha / rank
     if not math.isfinite(scale) or scale == 0.0 or abs(scale) > 1e6:
         raise ValueError("LoRA alpha/rank scale is outside the supported range")
     for tensor, out_features, in_features, a, b in targets:
@@ -455,6 +473,7 @@ def build_pack(base_path, config_path, adapter_path, name, out_path):
         "base_sha256": manifest["base_sha256"],
         "targets": len(manifest_targets),
         "factor_bytes": len(payload),
+        "multiplier": multiplier,
     }
     print(json.dumps(summary, indent=2))
     return summary
@@ -662,11 +681,22 @@ def selftest():
                 "base_model.model.model.layers.0.proj.lora_B.weight": np.array([[4], [5]], np.float32),
             },
         )
-        summary = build_pack(base, config, adapter, "selftest", pack)
+        summary = build_pack(base, config, adapter, "selftest", pack, multiplier=0.25)
         checked = inspect_pack(pack)
         assert checked["sha256"] == summary["sha256"]
         assert checked["base_sha256"] == file_sha256(base)
         assert checked["targets"] == ["layers.0.proj.weight"]
+        manifest_size = struct.unpack("<I", pack.read_bytes()[8:12])[0]
+        manifest = json.loads(pack.read_bytes()[12:12 + manifest_size])
+        assert manifest["targets"][0]["scale"] == 0.5
+        assert summary["multiplier"] == 0.25
+        for invalid in (False, 0, float("inf"), 1e7):
+            try:
+                validated_multiplier(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid multiplier {invalid!r} was accepted")
         assert "model.language_model.layers.0.proj.weight" in target_candidates(
             "model.layers.0.proj"
         )
@@ -693,6 +723,12 @@ def main():
     create.add_argument("--adapter-config")
     create.add_argument("--adapter-model")
     create.add_argument("--name", required=True)
+    create.add_argument(
+        "--multiplier",
+        type=float,
+        default=1.0,
+        help="multiply the adapter's declared alpha/rank scale (default: 1)",
+    )
     create.add_argument("--out", required=True)
     inspect = subparsers.add_parser("inspect", help="validate and describe an MKADAPT1 pack")
     inspect.add_argument("pack")
@@ -718,6 +754,7 @@ def main():
             adapter_model,
             args.name,
             args.out,
+            args.multiplier,
         )
     elif args.command == "inspect":
         print(json.dumps(inspect_pack(args.pack, not args.no_verify), indent=2))
