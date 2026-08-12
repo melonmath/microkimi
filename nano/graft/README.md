@@ -24,6 +24,14 @@ ratio. Anything injected at a block's output lives at that scale, which
 differs from the post-norm scale by 20-70x in practice and varies by
 layer.
 
+**`compat_map.py`** - compatibility map. Runs the scan over every
+ordered pair of captured models and every layer pair, and reports the
+matrix, the best layer pair per model pair, and the directional
+asymmetry. The score is directional: predicting A's delta from B's
+stream is a different question from the reverse, and measurements show
+the asymmetry can exceed 0.4 - predictability is largely a property of
+the target model, not of the pair.
+
 **`eval_compare.py`** - paired per-document comparison of two .bin
 models: corpus cross-entropy, the paired delta with a bootstrap
 confidence interval (documents are the resampling unit), and a one-sided
