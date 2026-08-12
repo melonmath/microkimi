@@ -41,6 +41,8 @@ pub struct Config {
     /// seam.A / seam.B, written by nano/apply_lora_bin.py --write-seam) is
     /// applied to the residual stream. None: no seam adapter.
     pub seam_after: Option<usize>,
+    /// Present when the MKIM0002 config JSON declares arch "qwen3_5_moe"
+    pub qwen: Option<QwenConfig>,
     /// Present when the MKIM0002 config JSON declares arch "deepseek_v4"
     /// (parsed from the "ds" object). None for K3 (microkimi/nanokimi).
     pub ds: Option<DsConfig>,
@@ -77,6 +79,7 @@ impl Config {
             eos_id: 163_586,
             bos_id: 163_584,
             ds: None,
+            qwen: None,
             mla_layers: None,
             dense_layers: None,
             seam_after: None,
@@ -120,6 +123,9 @@ impl Config {
         }
         if j.get("arch").and_then(|x| x.as_str()) == Some("deepseek_v4") {
             c.ds = Some(DsConfig::from_json(j));
+        }
+        if j.get("arch").and_then(|x| x.as_str()) == Some("qwen3_5_moe") {
+            c.qwen = Some(QwenConfig::from_json(j));
         }
         let ids = |key: &str| -> Option<Vec<usize>> {
             j.get(key).and_then(|x| x.as_arr()).map(|a| a.iter().filter_map(|v| v.as_num().map(|n| n as usize)).collect())
@@ -289,5 +295,103 @@ impl DsConfig {
 
     pub fn compress_ratio(&self, layer: usize) -> i32 {
         self.compress_ratios.get(layer).copied().unwrap_or(0)
+    }
+}
+
+
+/// Qwen3.5-MoE text decoder. Layers alternate a gated delta-rule linear
+/// attention with a full-attention layer every `full_attn_interval`;
+/// every layer carries a softmax-routed expert bank plus one always-on
+/// shared expert.
+#[derive(Clone, Debug)]
+pub struct QwenConfig {
+    pub n_layers: usize,
+    pub d: usize,
+    pub vocab: usize,
+    /// full attention: heads, kv heads, head dim, partial rope fraction
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub partial_rotary: f64,
+    pub rope_theta: f64,
+    /// linear attention: key/value heads and dims, depthwise conv width
+    pub lin_k_heads: usize,
+    pub lin_v_heads: usize,
+    pub lin_k_dim: usize,
+    pub lin_v_dim: usize,
+    pub conv_kernel: usize,
+    /// one full-attention layer every `full_attn_interval` layers
+    pub full_attn_interval: usize,
+    pub n_experts: usize,
+    pub top_k: usize,
+    pub moe_inter: usize,
+    pub shared_inter: usize,
+    pub norm_eps: f64,
+}
+
+impl QwenConfig {
+    pub fn qwen35_moe() -> QwenConfig {
+        QwenConfig {
+            n_layers: 40,
+            d: 2048,
+            vocab: 248320,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            partial_rotary: 0.25,
+            rope_theta: 10_000_000.0,
+            lin_k_heads: 16,
+            lin_v_heads: 32,
+            lin_k_dim: 128,
+            lin_v_dim: 128,
+            conv_kernel: 4,
+            full_attn_interval: 4,
+            n_experts: 256,
+            top_k: 8,
+            moe_inter: 512,
+            shared_inter: 512,
+            norm_eps: 1e-6,
+        }
+    }
+
+    fn num(j: &Json, key: &str, default: f64) -> f64 {
+        j.get(key).and_then(|x| x.as_num()).unwrap_or(default)
+    }
+
+    pub fn from_json(j: &Json) -> QwenConfig {
+        let mut c = QwenConfig::qwen35_moe();
+        let d = j.get("qwen").unwrap_or(j);
+        c.n_layers = Self::num(d, "num_hidden_layers", c.n_layers as f64) as usize;
+        c.d = Self::num(d, "hidden_size", c.d as f64) as usize;
+        c.vocab = Self::num(d, "vocab_size", c.vocab as f64) as usize;
+        c.n_heads = Self::num(d, "num_attention_heads", c.n_heads as f64) as usize;
+        c.n_kv_heads = Self::num(d, "num_key_value_heads", c.n_kv_heads as f64) as usize;
+        c.head_dim = Self::num(d, "head_dim", c.head_dim as f64) as usize;
+        c.partial_rotary = Self::num(d, "partial_rotary_factor", c.partial_rotary);
+        c.rope_theta = Self::num(d, "rope_theta", c.rope_theta);
+        c.lin_k_heads = Self::num(d, "linear_num_key_heads", c.lin_k_heads as f64) as usize;
+        c.lin_v_heads = Self::num(d, "linear_num_value_heads", c.lin_v_heads as f64) as usize;
+        c.lin_k_dim = Self::num(d, "linear_key_head_dim", c.lin_k_dim as f64) as usize;
+        c.lin_v_dim = Self::num(d, "linear_value_head_dim", c.lin_v_dim as f64) as usize;
+        c.conv_kernel = Self::num(d, "linear_conv_kernel_dim", c.conv_kernel as f64) as usize;
+        c.full_attn_interval = Self::num(d, "full_attention_interval", c.full_attn_interval as f64) as usize;
+        c.n_experts = Self::num(d, "num_experts", c.n_experts as f64) as usize;
+        c.top_k = Self::num(d, "num_experts_per_tok", c.top_k as f64) as usize;
+        c.moe_inter = Self::num(d, "moe_intermediate_size", c.moe_inter as f64) as usize;
+        c.shared_inter = Self::num(d, "shared_expert_intermediate_size", c.shared_inter as f64) as usize;
+        c.norm_eps = Self::num(d, "rms_norm_eps", c.norm_eps);
+        c
+    }
+
+    /// Layers are linear-attention unless their index sits on the full
+    /// attention stride (the reference uses index+1 % interval == 0).
+    pub fn is_full_attn(&self, layer: usize) -> bool {
+        (layer + 1) % self.full_attn_interval == 0
+    }
+
+    pub fn lin_key_total(&self) -> usize { self.lin_k_heads * self.lin_k_dim }
+    pub fn lin_value_total(&self) -> usize { self.lin_v_heads * self.lin_v_dim }
+    pub fn rope_dim(&self) -> usize {
+        ((self.head_dim as f64 * self.partial_rotary) as usize) / 2 * 2
     }
 }
