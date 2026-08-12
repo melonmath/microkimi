@@ -2,6 +2,8 @@
 
 A zero-dependency Rust engine for two frontier MoE architectures - **Kimi K3** and **DeepSeek-V4-Flash-0731** - verified 1:1 against the official reference code.
 
+The Python side under `nano/graft/` adds architecture-agnostic instruments: compatibility scans between two models, per-expert utility measurement, paired evaluation with bootstrap intervals, and closed-form feed-forward transfer. Those read and write **Qwen3.5-MoE** (`qwen3_5_moe`, routed and shared experts), **Qwen3.5 dense**, **DeepSeek-V4**, **Gemma 3** and llama-style checkpoints in addition to the engine's own format - see `nano/graft/README.md`.
+
 **This is a framework for developers, including an end-to-end engine and a test model - not a model for end-users.**
 
 > _Almost all of the code was written by Kimi K3 itself - the quiet beauty of an LLM giving birth to another._
