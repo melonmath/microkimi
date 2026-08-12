@@ -269,3 +269,257 @@ mod tests {
         assert!(x[1] > 100.0);
     }
 }
+
+// ─────────────────────────── assembled forward ───────────────────────────
+
+/// Plain RMS norm with a weight vector (the trunk norms; the gated
+/// variant above is the delta-rule output norm).
+pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (ms + eps).sqrt();
+    for i in 0..x.len() {
+        out[i] = x[i] * inv * w[i];
+    }
+}
+
+/// SiLU-gated feed-forward: down(silu(gate(x)) * up(x)). Used for both a
+/// routed expert and the shared expert.
+pub fn ffn(x: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32], inter: usize, d: usize, out: &mut [f32]) {
+    let mut h = vec![0.0f32; inter];
+    for r in 0..inter {
+        let (mut g, mut u) = (0.0f32, 0.0f32);
+        let (rg, ru) = (&w_gate[r * d..(r + 1) * d], &w_up[r * d..(r + 1) * d]);
+        for c in 0..d {
+            g += rg[c] * x[c];
+            u += ru[c] * x[c];
+        }
+        h[r] = (g / (1.0 + (-g).exp())) * u;
+    }
+    for o in out.iter_mut() {
+        *o = 0.0;
+    }
+    for r in 0..inter {
+        let hr = h[r];
+        if hr == 0.0 {
+            continue;
+        }
+        let row = &w_down[r * d..(r + 1) * d];
+        for c in 0..d {
+            out[c] += hr * row[c];
+        }
+    }
+}
+
+/// Weights of one MoE block: a router, `n_experts` routed experts and
+/// one shared expert gated by a sigmoid. `experts[e]` is
+/// (gate, up, down), each row-major.
+pub struct MoeBlock<'a> {
+    pub router: &'a [f32],
+    pub experts: Vec<(&'a [f32], &'a [f32], &'a [f32])>,
+    pub shared: (&'a [f32], &'a [f32], &'a [f32]),
+    pub shared_gate: &'a [f32],
+}
+
+/// Runs the block: shared expert always, plus the top-k routed experts
+/// mixed by their renormalized softmax weights.
+pub fn moe_forward(b: &MoeBlock, x: &[f32], c: &QwenConfig, out: &mut [f32]) {
+    let d = c.d;
+    let n_e = b.experts.len();
+    let mut logits = vec![0.0f32; n_e];
+    for e in 0..n_e {
+        let row = &b.router[e * d..(e + 1) * d];
+        logits[e] = row.iter().zip(x).map(|(a, y)| a * y).sum();
+    }
+    for o in out.iter_mut() {
+        *o = 0.0;
+    }
+    let mut tmp = vec![0.0f32; d];
+    for (e, w) in route_topk(&logits, c.top_k.min(n_e)) {
+        let (g, u, dn) = b.experts[e];
+        ffn(x, g, u, dn, c.moe_inter, d, &mut tmp);
+        for i in 0..d {
+            out[i] += w * tmp[i];
+        }
+    }
+    // shared expert, scaled by sigmoid of its own gate
+    let sg: f32 = b.shared_gate.iter().zip(x).map(|(a, y)| a * y).sum();
+    let sg = 1.0 / (1.0 + (-sg).exp());
+    ffn(x, b.shared.0, b.shared.1, b.shared.2, c.shared_inter, d, &mut tmp);
+    for i in 0..d {
+        out[i] += sg * tmp[i];
+    }
+}
+
+/// Weights of one gated delta-rule (linear attention) layer.
+pub struct LinAttn<'a> {
+    pub in_qkv: &'a [f32],
+    pub in_z: &'a [f32],
+    pub in_b: &'a [f32],
+    pub in_a: &'a [f32],
+    pub conv: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm: &'a [f32],
+    pub out_proj: &'a [f32],
+}
+
+/// One decode step of a linear-attention layer. `cache` carries the conv
+/// history and the per-head states across tokens.
+pub fn lin_attn_step(w: &LinAttn, c: &QwenConfig, x: &[f32], cache: &mut LinCache, out: &mut [f32]) {
+    let d = c.d;
+    let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+    let conv_dim = kt * 2 + vt;
+
+    let mut qkv = vec![0.0f32; conv_dim];
+    crate::model::ops::matvec(w.in_qkv, conv_dim, d, x, &mut qkv);
+    let mut conved = vec![0.0f32; conv_dim];
+    conv_step(&qkv, w.conv, c.conv_kernel, &mut cache.conv, &mut conved);
+
+    let mut z = vec![0.0f32; vt];
+    crate::model::ops::matvec(w.in_z, vt, d, x, &mut z);
+    let mut b_raw = vec![0.0f32; c.lin_v_heads];
+    let mut a_raw = vec![0.0f32; c.lin_v_heads];
+    crate::model::ops::matvec(w.in_b, c.lin_v_heads, d, x, &mut b_raw);
+    crate::model::ops::matvec(w.in_a, c.lin_v_heads, d, x, &mut a_raw);
+
+    let rep = c.lin_v_heads / c.lin_k_heads.max(1);
+    let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
+    let mut mixed = vec![0.0f32; vt];
+    for h in 0..c.lin_v_heads {
+        let kh = h / rep.max(1);
+        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
+        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
+        l2norm(&mut q, 1e-6);
+        l2norm(&mut k, 1e-6);
+        let scale = 1.0 / (kd as f32).sqrt();
+        for t in q.iter_mut() {
+            *t *= scale;
+        }
+        let beta = 1.0 / (1.0 + (-b_raw[h]).exp());
+        let sp = {
+            let t = a_raw[h] + w.dt_bias[h];
+            if t > 20.0 { t } else { (1.0 + t.exp()).ln() }
+        };
+        let g = -w.a_log[h].exp() * sp;
+        let st = &mut cache.state[h * kd * vd..(h + 1) * kd * vd];
+        delta_step(st, &q, &k, v, g, beta, &mut mixed[h * vd..(h + 1) * vd]);
+    }
+    // per-head gated norm, then the output projection
+    for h in 0..c.lin_v_heads {
+        let (s, e) = (h * vd, (h + 1) * vd);
+        rmsnorm_gated(&mut mixed[s..e], w.norm, &z[s..e], c.norm_eps as f32);
+    }
+    crate::model::ops::matvec(w.out_proj, d, vt, &mixed, out);
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    fn tiny() -> QwenConfig {
+        let mut c = QwenConfig::qwen35_moe();
+        c.n_layers = 4;
+        c.d = 8;
+        c.n_experts = 4;
+        c.top_k = 2;
+        c.moe_inter = 6;
+        c.shared_inter = 6;
+        c.lin_k_heads = 1;
+        c.lin_v_heads = 2;
+        c.lin_k_dim = 4;
+        c.lin_v_dim = 4;
+        c
+    }
+
+    #[test]
+    fn moe_mixes_only_the_selected_experts() {
+        let c = tiny();
+        let d = c.d;
+        // expert e outputs e+1 on every channel, whatever the input:
+        // gate rows are zero except a bias-like constant path, so we
+        // build the output directly through down with a fixed hidden
+        let mut router = vec![0.0f32; c.n_experts * d];
+        // expert 0 wins on channel 0, expert 3 on channel 1
+        router[0] = 10.0;
+        router[3 * d + 1] = 10.0;
+        let mk = |scale: f32| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let g = vec![1.0f32; c.moe_inter * d];
+            let u = vec![1.0f32; c.moe_inter * d];
+            let dn = vec![scale; c.moe_inter * d];
+            (g, u, dn)
+        };
+        let bank: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+            (0..c.n_experts).map(|e| mk((e + 1) as f32)).collect();
+        let sh = mk(0.0);
+        let b = MoeBlock {
+            router: &router,
+            experts: bank.iter().map(|(g, u, dn)| (&g[..], &u[..], &dn[..])).collect(),
+            shared: (&sh.0[..], &sh.1[..], &sh.2[..]),
+            shared_gate: &vec![0.0f32; d],
+        };
+        let mut x = vec![0.0f32; d];
+        x[0] = 1.0;
+        let mut out = vec![0.0f32; d];
+        moe_forward(&b, &x, &c, &mut out);
+        // expert 0 dominates: output sign follows its down scale
+        assert!(out[0] > 0.0);
+        let base = out[0];
+
+        x[0] = 0.0;
+        x[1] = 1.0;
+        moe_forward(&b, &x, &c, &mut out);
+        // expert 3 has 4x the down scale of expert 0
+        assert!(out[0] > base * 2.0, "{} vs {}", out[0], base);
+    }
+
+    #[test]
+    fn lin_attn_step_runs_and_carries_state() {
+        let c = tiny();
+        let (d, kt, vt) = (c.d, c.lin_key_total(), c.lin_value_total());
+        let conv_dim = kt * 2 + vt;
+        let w = LinAttn {
+            in_qkv: &vec![0.1f32; conv_dim * d],
+            in_z: &vec![0.2f32; vt * d],
+            in_b: &vec![0.0f32; c.lin_v_heads * d],
+            in_a: &vec![0.0f32; c.lin_v_heads * d],
+            conv: &{
+                let mut v = vec![0.0f32; conv_dim * c.conv_kernel];
+                for i in 0..conv_dim {
+                    v[i * c.conv_kernel + c.conv_kernel - 1] = 1.0;
+                }
+                v
+            },
+            a_log: &vec![0.0f32; c.lin_v_heads],
+            dt_bias: &vec![0.0f32; c.lin_v_heads],
+            norm: &vec![1.0f32; c.lin_v_dim],
+            out_proj: &vec![0.05f32; d * vt],
+        };
+        let mut cache = LinCache::new(&c);
+        let x = vec![1.0f32; d];
+        let mut out1 = vec![0.0f32; d];
+        lin_attn_step(&w, &c, &x, &mut cache, &mut out1);
+        assert!(out1.iter().all(|v| v.is_finite()));
+        // the state is no longer empty, so a second identical token
+        // produces a different output: the layer is recurrent
+        let mut out2 = vec![0.0f32; d];
+        lin_attn_step(&w, &c, &x, &mut cache, &mut out2);
+        let moved: f32 = out1.iter().zip(&out2).map(|(a, b)| (a - b).abs()).sum();
+        assert!(moved > 1e-6, "state did not carry: {:?} {:?}", out1, out2);
+    }
+
+    #[test]
+    fn rmsnorm_matches_the_gated_variant_at_unit_gate() {
+        let x = vec![3.0f32, 4.0, 0.0];
+        let w = vec![1.0f32; 3];
+        let mut plain = vec![0.0f32; 3];
+        rmsnorm(&x, &w, 1e-6, &mut plain);
+        let mut gated = x.clone();
+        // silu(g) = g/(1+e^-g); pick g so the factor is 1
+        let g: Vec<f32> = vec![1.2784645f32; 3];
+        rmsnorm_gated(&mut gated, &w, &g, 1e-6);
+        for i in 0..3 {
+            assert!((plain[i] - gated[i]).abs() < 1e-3, "{:?} {:?}", plain, gated);
+        }
+    }
+}
