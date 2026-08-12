@@ -4,6 +4,7 @@
 
 pub mod build;
 pub mod build_ds;
+pub mod convert_qwen;
 pub mod eval;
 pub mod parity;
 pub mod replay;
