@@ -1,16 +1,30 @@
-# Qwen3.5-MoE text runtime
+# Qwen3.5-family text runtime
 
-microkimi can convert and run the text decoder used by Qwen3.5-MoE and
-Qwen3.6-MoE checkpoints. The implementation covers the alternating 3:1
-Gated DeltaNet/full-attention backbone, softmax top-k routed experts, the
-always-on sigmoid-gated shared expert, partial rotary embeddings, grouped
-query attention, and the checkpoint's byte-level BPE chat tokenizer.
+microkimi can convert and run both text decoders of the Qwen3.5
+architecture family:
 
-Qwen3.6 uses the same `qwen3_5_moe_text` architecture and Transformers model
-classes as Qwen3.5. See the upstream
+- the MoE variant (`qwen3_5_moe_text`): Qwen3.5-MoE, Qwen3.6-MoE, and the
+  Qwen3.8-2.4T-A95B open-weights release;
+- the dense variant (`qwen3_5_text`): Qwen3.8-27B, the dense multimodal
+  checkpoint whose text decoder shares the same backbone.
+
+The implementation covers the alternating 3:1 Gated DeltaNet/full-attention
+backbone, partial rotary embeddings, grouped query attention, the sigmoid
+attention output gate, and the checkpoint's byte-level BPE chat tokenizer.
+On the MoE variant every layer runs softmax top-k routed experts plus the
+always-on sigmoid-gated shared expert; on the dense variant every layer runs
+a single SiLU-gated MLP whose matrices are MXFP4-packed exactly like routed
+experts.
+
+Qwen3.6 and Qwen3.8-2.4T-A95B use the same `qwen3_5_moe_text` architecture
+and Transformers model classes as Qwen3.5; Qwen3.8-27B uses the sibling
+`qwen3_5_text` classes. See the upstream
 [architecture documentation](https://github.com/huggingface/transformers/blob/main/docs/source/en/model_doc/qwen3_5_moe.md)
-and
-[reference implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py).
+and the
+[MoE](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py)
+/
+[dense](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py)
+reference implementations.
 
 ## Convert and run
 
@@ -57,22 +71,27 @@ The converter fails closed on an unsupported model type, attention bias,
 dropout, tied embeddings, rope mode, layer pattern, missing tensor, unexpected
 text-decoder tensor, dtype, shape, or non-finite value. Vision and
 multi-token-prediction tensors are separate from the text decoder and are not
-copied.
+copied. The variant is taken from the checkpoint's `model_type` and must agree
+with the presence of `intermediate_size`.
 
 ## Storage and execution
 
 Float spine tensors keep their native logical names and are converted to f32.
 This includes embeddings, attention, norms, routing, shared experts, and the
 language-model head. Each fused routed-expert bank is split into independent
-gate/down/up matrices and quantized to MXFP4. Conversion streams large float
-tensors in bounded chunks, reads only one expert matrix at a time, and
+gate/down/up matrices and quantized to MXFP4; on the dense variant the
+per-layer `mlp.gate_proj` / `up_proj` / `down_proj` matrices are quantized to
+MXFP4 the same way. Conversion streams large float tensors and dense MLP
+matrices in bounded chunks, reads only one expert matrix at a time, and
 parallelizes quantization across the available CPU cores.
 
 At inference time the model is a private, demand-paged mapping. Float tensors
-are zero-copy slices of that mapping. Only the selected routed experts are
-read and evaluated; their packed matrix-vector products run in parallel. The
-linear-attention layers retain fixed recurrent and convolution states, while
-every fourth layer keeps an ordinary growing KV cache.
+are zero-copy slices of that mapping. On the MoE variant only the selected
+routed experts are read and evaluated; their packed matrix-vector products run
+in parallel. On the dense variant the three MLP matvecs run row-parallel
+across the worker pool. The linear-attention layers retain fixed recurrent and
+convolution states, while every fourth layer keeps an ordinary growing KV
+cache.
 
 The regular Qwen RMSNorm weights are checkpoint offsets from one. The gated
 DeltaNet output norm uses direct multipliers. The runtime preserves this
@@ -95,8 +114,9 @@ python3 nano/adapter_pack.py create \
 
 The complete base file and every factor are SHA-256 verified before private
 copy-on-write pages are patched. Several packs compose additively in pack
-digest order. Routed experts are packed rather than f32, so expert targets are
-rejected instead of being silently requantized.
+digest order. Routed experts and the dense variant's MLP matrices are packed
+rather than f32, so those targets are rejected instead of being silently
+requantized.
 
 ## Deterministic evaluation
 
@@ -116,9 +136,10 @@ compute budget. Both choices are recorded in the JSON scorecard:
 `ref/qwen_parity.py` constructs a deterministic four-layer Transformers
 checkpoint with three Gated DeltaNet layers, one full-attention layer, routed
 and shared experts, and values exactly representable by the MXFP4 converter.
-It writes reference logits that can be compared with the hidden `qwen-dump`
-development command. Disable the optional q8 language-model-head cache for
-this exact f32 comparison:
+`--dense` builds the dense `qwen3_5_text` sibling (per-layer MLP instead of
+experts) through the same steps. It writes reference logits that can be
+compared with the hidden `qwen-dump` development command. Disable the
+optional q8 language-model-head cache for this exact f32 comparison:
 
 The reference-only Python step requires PyTorch, Transformers, and
 safetensors; the converter and runtime remain dependency-free Rust.
@@ -134,18 +155,20 @@ python3 ref/qwen_parity.py --out /tmp/qwen-parity \
   --compare /tmp/qwen-parity/rust_logits.bin
 ```
 
-Against Transformers 5.14.1 on the four-token fixture:
+Against Transformers 5.14.1 on the four-token fixtures:
 
-| check | result |
-|---|---|
-| maximum absolute logit difference | `2.38e-7` |
-| overall logit RMSE | `4.99e-8` |
-| top-1 tokens | 4 of 4 exact |
-| per-token cosine similarity | effectively `1.0` |
+| check | MoE fixture | dense fixture (`--dense`) |
+|---|---|---|
+| maximum absolute logit difference | `8.34e-7` | `8.18e-7` |
+| overall logit RMSE | `1.70e-7` | `1.85e-7` |
+| top-1 tokens | 4 of 4 exact | 4 of 4 exact |
 
 The tokenizer is independently compared with the checkpoint tokenizer on
 ordinary text, source code, multilingual text, decomposed Unicode, and the
-default thinking chat template. Those cases match token for token. NFC is
+default thinking chat template. Those cases match token for token, including
+against the published Qwen3.8-27B `tokenizer.json` (same 248320-entry
+vocabulary and special tokens as Qwen3.5/3.6, and the same
+`<|im_start|>assistant` + `<think>` generation prompt). NFC is
 implemented with generated Unicode 15.1 canonical tables and algorithmic
 Hangul composition, without adding a crate.
 

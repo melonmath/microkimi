@@ -1,15 +1,20 @@
-//! Local Qwen3.5-MoE text-checkpoint conversion.
+//! Local Qwen3.5-family text-checkpoint conversion.
 //!
 //! The converter reads a sharded Hugging Face safetensors directory and
-//! writes an MKIM0002 model. Text-spine tensors become f32 under their native
-//! logical names, so low-rank adapter targets remain unambiguous. The fused
-//! routed-expert banks are split into one gate/down/up matrix per expert and
-//! quantized to MXFP4. Vision and multi-token-prediction tensors are outside
-//! the text decoder and are not copied.
+//! writes an MKIM0002 model. It accepts both text decoders of the family:
+//! the MoE variant (`qwen3_5_moe_text`: Qwen3.5/3.6-MoE, Qwen3.8-2.4T-A95B)
+//! and the dense variant (`qwen3_5_text`: Qwen3.8-27B). Text-spine tensors
+//! become f32 under their native logical names, so low-rank adapter targets
+//! remain unambiguous. The fused routed-expert banks are split into one
+//! gate/down/up matrix per expert and quantized to MXFP4; the dense
+//! variant's per-layer MLP matrices are quantized to MXFP4 the same way.
+//! Vision and multi-token-prediction tensors are outside the text decoder
+//! and are not copied.
 //!
-//! Peak conversion memory is bounded by one source chunk or one expert
-//! matrix. Embeddings and the language-model head are converted in chunks;
-//! a fused expert bank is read only over the selected expert's byte range.
+//! Peak conversion memory is bounded by one source chunk, one expert
+//! matrix, or one dense-MLP row block. Embeddings, the language-model head,
+//! and dense MLP matrices are converted in chunks; a fused expert bank is
+//! read only over the selected expert's byte range.
 
 use crate::config::QwenConfig;
 use crate::json::{self, Json};
@@ -397,6 +402,8 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[derive(Clone)]
 enum PlanSource {
     F32(String),
+    /// A whole source tensor quantized to MXFP4 (dense MLP matrices).
+    Packed(String),
     Gate {
         bank: String,
         expert: usize,
@@ -529,6 +536,22 @@ fn conversion_plan(c: &QwenConfig) -> Vec<PlannedTensor> {
                 vec![c.lin_v_dim as u32],
             );
         }
+        if c.is_dense() {
+            for (suffix, dims) in [
+                ("gate_proj", vec![c.dense_inter as u32, c.d as u32]),
+                ("up_proj", vec![c.dense_inter as u32, c.d as u32]),
+                ("down_proj", vec![c.d as u32, c.dense_inter as u32]),
+            ] {
+                let name = format!("{}.mlp.{}.weight", p, suffix);
+                out.push(PlannedTensor {
+                    source: PlanSource::Packed(name.clone()),
+                    name,
+                    dtype: DTYPE_MXFP4,
+                    dims,
+                });
+            }
+            continue;
+        }
         add_f32(
             &mut out,
             format!("{}.mlp.gate.weight", p),
@@ -600,7 +623,9 @@ pub fn layer_tensors(c: &QwenConfig, l: usize) -> Vec<String> {
     let mut names: Vec<String> = conversion_plan(c)
         .into_iter()
         .filter_map(|entry| match entry.source {
-            PlanSource::F32(name) if name.starts_with(&prefix) => Some(name),
+            PlanSource::F32(name) | PlanSource::Packed(name) if name.starts_with(&prefix) => {
+                Some(name)
+            }
             PlanSource::Gate { bank, .. } | PlanSource::Down { bank, .. }
                 if bank.starts_with(&prefix) =>
             {
@@ -623,18 +648,30 @@ pub fn output_layout(c: &QwenConfig) -> Vec<(String, u8, Vec<u32>)> {
         .collect()
 }
 
-/// Emits the MKIM0002 config block for a converted checkpoint.
+/// Emits the MKIM0002 config block for a converted checkpoint. Dense
+/// decoders declare arch "qwen3_5" and `intermediate_size`; MoE decoders
+/// declare arch "qwen3_5_moe" and the expert fields.
 pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
+    let arch = if c.is_dense() { "qwen3_5" } else { "qwen3_5_moe" };
+    let mlp = if c.is_dense() {
+        format!("\"intermediate_size\":{}", c.dense_inter)
+    } else {
+        format!(
+            "\"num_experts\":{},\"num_experts_per_tok\":{},\"moe_intermediate_size\":{},\
+             \"shared_expert_intermediate_size\":{}",
+            c.n_experts, c.top_k, c.moe_inter, c.shared_inter
+        )
+    };
     format!(
-        "{{\"format\":2,\"arch\":\"qwen3_5_moe\",\"n_layers\":{},\"hidden\":{},\"vocab\":{},\
+        "{{\"format\":2,\"arch\":\"{}\",\"n_layers\":{},\"hidden\":{},\"vocab\":{},\
          \"tokenizer\":\"{}\",\"specials\":{{\"bos\":248044,\"end_of_msg\":248046}},\
          \"qwen\":{{\"num_hidden_layers\":{},\"hidden_size\":{},\"vocab_size\":{},\
          \"num_attention_heads\":{},\"num_key_value_heads\":{},\"head_dim\":{},\
          \"partial_rotary_factor\":{},\"rope_theta\":{},\"linear_num_key_heads\":{},\
          \"linear_num_value_heads\":{},\"linear_key_head_dim\":{},\"linear_value_head_dim\":{},\
-         \"linear_conv_kernel_dim\":{},\"full_attention_interval\":{},\"num_experts\":{},\
-         \"num_experts_per_tok\":{},\"moe_intermediate_size\":{},\
-         \"shared_expert_intermediate_size\":{},\"rms_norm_eps\":{}}}}}",
+         \"linear_conv_kernel_dim\":{},\"full_attention_interval\":{},{},\
+         \"rms_norm_eps\":{}}}}}",
+        arch,
         c.n_layers,
         c.d,
         c.vocab,
@@ -653,10 +690,7 @@ pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
         c.lin_v_dim,
         c.conv_kernel,
         c.full_attn_interval,
-        c.n_experts,
-        c.top_k,
-        c.moe_inter,
-        c.shared_inter,
+        mlp,
         c.norm_eps
     )
 }
@@ -680,10 +714,11 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
         std::fs::read(&path).unwrap_or_else(|e| panic!("{} unreadable: {}", path.display(), e));
     let j = json::parse_complete(&raw);
     let t = j.get("text_config").unwrap_or(&j);
-    assert_eq!(
-        t.get("model_type").and_then(|x| x.as_str()),
-        Some("qwen3_5_moe_text"),
-        "config.json: expected qwen3_5_moe_text"
+    let model_type = t.get("model_type").and_then(|x| x.as_str());
+    assert!(
+        matches!(model_type, Some("qwen3_5_moe_text") | Some("qwen3_5_text")),
+        "config.json: expected qwen3_5_moe_text or qwen3_5_text, found {:?}",
+        model_type
     );
     assert_eq!(t.get("hidden_act").and_then(|x| x.as_str()), Some("silu"));
     assert!(!json_bool(t.get("attention_bias"), "attention_bias"));
@@ -697,6 +732,11 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
         "attention dropout is unsupported"
     );
     let c = QwenConfig::from_json(t);
+    assert_eq!(
+        c.is_dense(),
+        model_type == Some("qwen3_5_text"),
+        "config.json: model_type and intermediate_size disagree on density"
+    );
     let types = t
         .get("layer_types")
         .and_then(|x| x.as_arr())
@@ -726,12 +766,18 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
         rope.get("rope_type").and_then(|x| x.as_str()),
         Some("default")
     );
-    assert!(json_bool(
-        rope.get("mrope_interleaved"),
-        "rope_parameters.mrope_interleaved"
-    ));
+    // Multimodal checkpoints declare interleaved mrope, which degenerates
+    // to standard rope on the text path; text-only checkpoints (e.g.
+    // Qwen3.8-2.4T-A95B) omit the key entirely.
+    if rope.get("mrope_interleaved").is_some() {
+        assert!(json_bool(
+            rope.get("mrope_interleaved"),
+            "rope_parameters.mrope_interleaved"
+        ));
+    }
+    let packed_inter = if c.is_dense() { c.dense_inter } else { c.moe_inter };
     assert!(
-        c.d % 32 == 0 && c.moe_inter % 32 == 0,
+        c.d % 32 == 0 && packed_inter % 32 == 0,
         "MXFP4 dimensions must be multiples of 32"
     );
     c
@@ -741,7 +787,7 @@ fn expected_sources(c: &QwenConfig) -> HashMap<String, Vec<usize>> {
     let mut expected = HashMap::new();
     for item in conversion_plan(c) {
         match item.source {
-            PlanSource::F32(name) => {
+            PlanSource::F32(name) | PlanSource::Packed(name) => {
                 expected.insert(name, item.dims.iter().map(|&d| d as usize).collect());
             }
             PlanSource::Gate { bank, .. } => {
@@ -817,6 +863,46 @@ fn quantize_parallel(values: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<
     (packed, scales)
 }
 
+/// Quantizes one whole source matrix to MXFP4 in bounded row blocks. The
+/// output blob is all packed nibbles then all scales, so each block lands
+/// at two computed offsets.
+fn write_packed_streamed(
+    source: &StSource,
+    source_name: &str,
+    rows: usize,
+    cols: usize,
+    file: &mut std::fs::File,
+    offset: u64,
+) {
+    let rows_per_block = (CHUNK_BYTES / (cols * 4)).max(1);
+    write_packed_blocks(source, source_name, rows, cols, file, offset, rows_per_block);
+}
+
+fn write_packed_blocks(
+    source: &StSource,
+    source_name: &str,
+    rows: usize,
+    cols: usize,
+    file: &mut std::fs::File,
+    offset: u64,
+    rows_per_block: usize,
+) {
+    let scales_base = offset + (rows * cols / 2) as u64;
+    let mut row = 0usize;
+    while row < rows {
+        let n = (rows - row).min(rows_per_block);
+        let values = source.read_f32(source_name, row * cols, n * cols);
+        let (packed, scales) = quantize_parallel(&values, n, cols);
+        file.seek(SeekFrom::Start(offset + (row * cols / 2) as u64))
+            .unwrap();
+        file.write_all(&packed).unwrap();
+        file.seek(SeekFrom::Start(scales_base + (row * cols / 32) as u64))
+            .unwrap();
+        file.write_all(&scales).unwrap();
+        row += n;
+    }
+}
+
 fn write_expert(
     source: &StSource,
     item: &PlannedTensor,
@@ -839,7 +925,7 @@ fn write_expert(
             c.d,
             c.moe_inter,
         ),
-        PlanSource::F32(_) => unreachable!(),
+        PlanSource::F32(_) | PlanSource::Packed(_) => unreachable!(),
     };
     let (packed, scales) = quantize_parallel(&values, rows, cols);
     file.seek(SeekFrom::Start(offset)).unwrap();
@@ -887,10 +973,17 @@ pub fn run(args: &[String]) {
         "unsupported text-decoder tensors in checkpoint, e.g. {:?}",
         &unexpected[..unexpected.len().min(8)]
     );
-    println!(
-        "Qwen text checkpoint: {} layers, hidden {}, {} experts top-{}",
-        c.n_layers, c.d, c.n_experts, c.top_k
-    );
+    if c.is_dense() {
+        println!(
+            "Qwen text checkpoint: {} layers, hidden {}, dense MLP {}",
+            c.n_layers, c.d, c.dense_inter
+        );
+    } else {
+        println!(
+            "Qwen text checkpoint: {} layers, hidden {}, {} experts top-{}",
+            c.n_layers, c.d, c.n_experts, c.top_k
+        );
+    }
     println!(
         "source audit: {} required tensors, all shapes and dtypes accepted",
         expected.len()
@@ -935,6 +1028,16 @@ pub fn run(args: &[String]) {
             PlanSource::F32(source_name) => {
                 let elements = item.dims.iter().map(|&d| d as usize).product();
                 write_f32_tensor(&source, source_name, elements, &mut file, offset);
+            }
+            PlanSource::Packed(source_name) => {
+                write_packed_streamed(
+                    &source,
+                    source_name,
+                    item.dims[0] as usize,
+                    item.dims[1] as usize,
+                    &mut file,
+                    offset,
+                );
             }
             PlanSource::Gate { .. } | PlanSource::Down { .. } => {
                 write_expert(&source, item, &c, &mut file, offset);
@@ -1074,10 +1177,83 @@ mod tests {
     }
 
     #[test]
+    fn dense_layout_packs_the_mlp_and_skips_expert_tensors() {
+        let mut c = QwenConfig::qwen38_dense();
+        c.n_layers = 4;
+        let layout = output_layout(&c);
+        assert!(!layout
+            .iter()
+            .any(|(name, _, _)| name.contains("experts") || name.contains("shared_expert")));
+        let mlp: Vec<_> = layout
+            .iter()
+            .filter(|(name, _, _)| name.contains(".mlp."))
+            .collect();
+        assert_eq!(mlp.len(), c.n_layers * 3);
+        assert!(mlp.iter().all(|(_, dtype, _)| *dtype == DTYPE_MXFP4));
+        assert!(layout.iter().any(|(name, dtype, dims)| {
+            name == "model.language_model.layers.0.mlp.down_proj.weight"
+                && *dtype == DTYPE_MXFP4
+                && dims == &vec![c.d as u32, c.dense_inter as u32]
+        }));
+        // attention spine stays f32
+        assert!(layout.iter().any(|(name, dtype, _)| {
+            name == "model.language_model.layers.3.self_attn.q_proj.weight" && *dtype == DTYPE_F32
+        }));
+    }
+
+    #[test]
+    fn dense_config_block_round_trips() {
+        let mut c = QwenConfig::qwen38_dense();
+        c.n_layers = 8;
+        let s = config_json(&c, TOKENIZER_NAME);
+        let j = json::parse_complete(s.as_bytes());
+        assert_eq!(j.get("arch").and_then(|x| x.as_str()), Some("qwen3_5"));
+        let back = QwenConfig::from_json(j.get("qwen").unwrap());
+        assert!(back.is_dense());
+        assert_eq!(back.n_layers, 8);
+        assert_eq!(back.dense_inter, c.dense_inter);
+        assert_eq!(back.n_experts, 0);
+        assert_eq!(back.n_heads, 24);
+        assert_eq!(back.lin_v_heads, 48);
+        let full = crate::config::Config::from_json(&j);
+        assert!(full.qwen.is_some_and(|q| q.is_dense()));
+    }
+
+    #[test]
     fn half_conversion_handles_normals_and_subnormals() {
         assert_eq!(f16_to_f32(0x3c00), 1.0);
         assert_eq!(f16_to_f32(0xc000), -2.0);
         assert_eq!(f16_to_f32(0x0001).to_bits(), 0x3380_0000);
+    }
+
+    #[test]
+    fn streamed_packed_write_matches_one_shot_quantization() {
+        let (rows, cols) = (7usize, 64usize);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 29 + 3) % 191) as f32 - 95.0) * 0.001)
+            .collect();
+        let payload = crate::quant::weights::f32_to_bytes(&values);
+        let header = format!(
+            r#"{{"m":{{"dtype":"F32","shape":[{},{}],"data_offsets":[0,{}]}}}}"#,
+            rows,
+            cols,
+            payload.len()
+        );
+        let st_path = safetensors_file("streamed.st", &header, &payload);
+        let source = StSource::open(&st_path.to_string_lossy());
+        let out_path = std::env::temp_dir().join(format!(
+            "microkimi_qwen_streamed_out_{}",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&out_path).unwrap();
+        // three rows per block: exercises full blocks plus a short tail
+        write_packed_blocks(&source, "m", rows, cols, &mut file, 0, 3);
+        file.sync_all().unwrap();
+        let written = std::fs::read(&out_path).unwrap();
+        let (packed, scales) = crate::quant::mxfp4::quantize(&values, rows, cols);
+        assert_eq!(written, [packed, scales].concat());
+        std::fs::remove_file(st_path).ok();
+        std::fs::remove_file(out_path).ok();
     }
 
     #[test]

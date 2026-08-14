@@ -1,9 +1,11 @@
-//! Qwen3.5-MoE text decoder.
+//! Qwen3.5-family text decoder (MoE and dense variants).
 //!
 //! Layer alternation: three gated delta-rule linear-attention layers
-//! then one full-attention layer (`full_attention_interval`). Every
-//! layer carries a softmax-routed expert bank plus one always-on shared
-//! expert gated by a sigmoid.
+//! then one full-attention layer (`full_attention_interval`). In the MoE
+//! variant (Qwen3.5/3.6-MoE, Qwen3.8-2.4T-A95B) every layer carries a
+//! softmax-routed expert bank plus one always-on shared expert gated by
+//! a sigmoid; in the dense variant (Qwen3.8-27B) every layer carries a
+//! single SiLU-gated MLP, MXFP4-packed like the routed experts.
 //!
 //! The delta rule is the same family as KDA (see `kda.rs`): a per-head
 //! state S is decayed, corrected by the difference between the value and
@@ -799,14 +801,25 @@ enum QwenAttnW {
     Full(QwenFullW),
 }
 
+enum QwenMlpW {
+    Moe {
+        router: T,
+        experts: Vec<[PackedT; 3]>, // w1=gate, w2=down, w3=up
+        shared: [T; 3],             // gate, down, up
+        shared_gate: T,
+    },
+    Dense {
+        gate: PackedT,
+        up: PackedT,
+        down: PackedT,
+    },
+}
+
 struct QwenLayerW {
     input_norm: T,
     post_norm: T,
     attn: QwenAttnW,
-    router: T,
-    experts: Vec<[PackedT; 3]>, // w1=gate, w2=down, w3=up
-    shared: [T; 3],             // gate, down, up
-    shared_gate: T,
+    mlp: QwenMlpW,
 }
 
 enum QwenCache {
@@ -814,9 +827,10 @@ enum QwenCache {
     Full(FullCache),
 }
 
-/// A zero-copy Qwen3.5-MoE text decoder backed by an MKIM0002 file.
-/// Float spine tensors remain in private file-backed pages; routed experts
-/// stay MXFP4-packed and are evaluated only when selected by the router.
+/// A zero-copy Qwen3.5-family text decoder backed by an MKIM0002 file.
+/// Float spine tensors remain in private file-backed pages. Routed experts
+/// stay MXFP4-packed and are evaluated only when selected by the router;
+/// the dense variant's MLP matrices stay MXFP4-packed and run row-parallel.
 pub struct QwenModel {
     pub cfg: QwenConfig,
     bin: BinFile,
@@ -913,15 +927,17 @@ fn packed_parts<'a>(data: &'a [u8], t: &PackedT) -> (&'a [u8], &'a [u8]) {
     (&data[t.off..t.off + np], &data[t.off + np..t.off + np + ns])
 }
 
-fn packed_moe(data: &[u8], layer: &QwenLayerW, c: &QwenConfig, x: &[f32]) -> Vec<f32> {
+fn packed_moe(
+    data: &[u8],
+    router: &T,
+    experts: &[[PackedT; 3]],
+    shared: &[T; 3],
+    shared_gate: &T,
+    c: &QwenConfig,
+    x: &[f32],
+) -> Vec<f32> {
     let mut logits = vec![0.0f32; c.n_experts];
-    crate::model::ops::matvec(
-        tensor(data, &layer.router),
-        c.n_experts,
-        c.d,
-        x,
-        &mut logits,
-    );
+    crate::model::ops::matvec(tensor(data, router), c.n_experts, c.d, x, &mut logits);
     let selected = route_topk(&logits, c.top_k);
     let mut routed = vec![0.0f32; selected.len() * c.d];
 
@@ -934,7 +950,7 @@ fn packed_moe(data: &[u8], layer: &QwenLayerW, c: &QwenConfig, x: &[f32]) -> Vec
         let op = crate::model::pool::MPtr(routed.as_mut_ptr());
         let mut jobs: Vec<crate::model::pool::Job> = Vec::with_capacity(selected.len());
         for (slot, &(expert, _)) in selected.iter().enumerate() {
-            let weights = layer.experts[expert];
+            let weights = experts[expert];
             let d = c.d;
             let inter = c.moe_inter;
             jobs.push(Box::new(move || {
@@ -969,21 +985,49 @@ fn packed_moe(data: &[u8], layer: &QwenLayerW, c: &QwenConfig, x: &[f32]) -> Vec
         }
     }
 
-    let shared_gate = crate::model::ops::dot(tensor(data, &layer.shared_gate), x);
+    let shared_gate = crate::model::ops::dot(tensor(data, shared_gate), x);
     let shared_scale = 1.0 / (1.0 + (-shared_gate).exp());
-    let mut shared = vec![0.0f32; c.d];
+    let mut shared_out = vec![0.0f32; c.d];
     ffn(
         x,
-        tensor(data, &layer.shared[0]),
-        tensor(data, &layer.shared[2]),
-        tensor(data, &layer.shared[1]),
+        tensor(data, &shared[0]),
+        tensor(data, &shared[2]),
+        tensor(data, &shared[1]),
         c.shared_inter,
         c.d,
-        &mut shared,
+        &mut shared_out,
     );
     for i in 0..c.d {
-        out[i] += shared_scale * shared[i];
+        out[i] += shared_scale * shared_out[i];
     }
+    out
+}
+
+/// Dense-variant MLP: down(silu(gate(x)) * up(x)) over MXFP4-packed
+/// matrices. The three matvecs dominate a dense layer, so each one runs
+/// row-parallel across the worker pool.
+fn packed_dense_mlp(
+    data: &[u8],
+    gate: &PackedT,
+    up: &PackedT,
+    down: &PackedT,
+    c: &QwenConfig,
+    x: &[f32],
+) -> Vec<f32> {
+    let inter = c.dense_inter;
+    let threads = crate::model::pool::pool().workers.max(1);
+    let mut h_gate = vec![0.0f32; inter];
+    let mut h_up = vec![0.0f32; inter];
+    let (pg, sg) = packed_parts(data, gate);
+    crate::quant::mxfp4::matvec_packed(pg, sg, inter, c.d, x, &mut h_gate, threads);
+    let (pu, su) = packed_parts(data, up);
+    crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, x, &mut h_up, threads);
+    for i in 0..inter {
+        h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+    }
+    let mut out = vec![0.0f32; c.d];
+    let (pd, sd) = packed_parts(data, down);
+    crate::quant::mxfp4::matvec_packed(pd, sd, c.d, inter, &h_gate, &mut out, threads);
     out
 }
 
@@ -1006,11 +1050,15 @@ impl QwenModel {
             .config
             .qwen
             .clone()
-            .expect("model is not a qwen3_5_moe MKIM0002 file");
+            .expect("model is not a Qwen-family MKIM0002 file");
         assert!(c.n_kv_heads > 0 && c.n_heads % c.n_kv_heads == 0);
         assert!(c.lin_k_heads > 0 && c.lin_v_heads % c.lin_k_heads == 0);
-        assert!(c.top_k > 0 && c.top_k <= c.n_experts);
-        assert!(c.d % 32 == 0 && c.moe_inter % 32 == 0 && c.shared_inter > 0);
+        if c.is_dense() {
+            assert!(c.d % 32 == 0 && c.dense_inter % 32 == 0);
+        } else {
+            assert!(c.top_k > 0 && c.top_k <= c.n_experts);
+            assert!(c.d % 32 == 0 && c.moe_inter % 32 == 0 && c.shared_inter > 0);
+        }
 
         let embed = expect_f32(
             &bin,
@@ -1111,47 +1159,74 @@ impl QwenModel {
                     ),
                 })
             };
-            let router = expect_f32(&bin, &format!("{}.mlp.gate.weight", p), &[c.n_experts, c.d]);
-            let shared = [
-                expect_f32(
+            let mlp = if c.is_dense() {
+                QwenMlpW::Dense {
+                    gate: expect_packed(
+                        &bin,
+                        &format!("{}.mlp.gate_proj.weight", p),
+                        c.dense_inter,
+                        c.d,
+                    ),
+                    up: expect_packed(
+                        &bin,
+                        &format!("{}.mlp.up_proj.weight", p),
+                        c.dense_inter,
+                        c.d,
+                    ),
+                    down: expect_packed(
+                        &bin,
+                        &format!("{}.mlp.down_proj.weight", p),
+                        c.d,
+                        c.dense_inter,
+                    ),
+                }
+            } else {
+                let router =
+                    expect_f32(&bin, &format!("{}.mlp.gate.weight", p), &[c.n_experts, c.d]);
+                let shared = [
+                    expect_f32(
+                        &bin,
+                        &format!("{}.mlp.shared_expert.gate_proj.weight", p),
+                        &[c.shared_inter, c.d],
+                    ),
+                    expect_f32(
+                        &bin,
+                        &format!("{}.mlp.shared_expert.down_proj.weight", p),
+                        &[c.d, c.shared_inter],
+                    ),
+                    expect_f32(
+                        &bin,
+                        &format!("{}.mlp.shared_expert.up_proj.weight", p),
+                        &[c.shared_inter, c.d],
+                    ),
+                ];
+                let shared_gate = expect_f32(
                     &bin,
-                    &format!("{}.mlp.shared_expert.gate_proj.weight", p),
-                    &[c.shared_inter, c.d],
-                ),
-                expect_f32(
-                    &bin,
-                    &format!("{}.mlp.shared_expert.down_proj.weight", p),
-                    &[c.d, c.shared_inter],
-                ),
-                expect_f32(
-                    &bin,
-                    &format!("{}.mlp.shared_expert.up_proj.weight", p),
-                    &[c.shared_inter, c.d],
-                ),
-            ];
-            let shared_gate = expect_f32(
-                &bin,
-                &format!("{}.mlp.shared_expert_gate.weight", p),
-                &[1, c.d],
-            );
-            let experts = (0..c.n_experts)
-                .map(|e| {
-                    let ep = format!("layers.{}.block_sparse_moe.experts.{}", l, e);
-                    [
-                        expect_packed(&bin, &format!("{}.w1", ep), c.moe_inter, c.d),
-                        expect_packed(&bin, &format!("{}.w2", ep), c.d, c.moe_inter),
-                        expect_packed(&bin, &format!("{}.w3", ep), c.moe_inter, c.d),
-                    ]
-                })
-                .collect();
+                    &format!("{}.mlp.shared_expert_gate.weight", p),
+                    &[1, c.d],
+                );
+                let experts = (0..c.n_experts)
+                    .map(|e| {
+                        let ep = format!("layers.{}.block_sparse_moe.experts.{}", l, e);
+                        [
+                            expect_packed(&bin, &format!("{}.w1", ep), c.moe_inter, c.d),
+                            expect_packed(&bin, &format!("{}.w2", ep), c.d, c.moe_inter),
+                            expect_packed(&bin, &format!("{}.w3", ep), c.moe_inter, c.d),
+                        ]
+                    })
+                    .collect();
+                QwenMlpW::Moe {
+                    router,
+                    experts,
+                    shared,
+                    shared_gate,
+                }
+            };
             layers.push(QwenLayerW {
                 input_norm,
                 post_norm,
                 attn,
-                router,
-                experts,
-                shared,
-                shared_gate,
+                mlp,
             });
         }
 
@@ -1264,9 +1339,19 @@ impl QwenModel {
                 c.norm_eps as f32,
                 &mut normed,
             );
-            let moe = packed_moe(data, layer, c, &normed);
+            let mlp = match &layer.mlp {
+                QwenMlpW::Moe {
+                    router,
+                    experts,
+                    shared,
+                    shared_gate,
+                } => packed_moe(data, router, experts, shared, shared_gate, c, &normed),
+                QwenMlpW::Dense { gate, up, down } => {
+                    packed_dense_mlp(data, gate, up, down, c, &normed)
+                }
+            };
             for i in 0..d {
-                hidden[i] += moe[i];
+                hidden[i] += mlp[i];
             }
         }
 
@@ -1425,6 +1510,34 @@ mod model_tests {
         }
         file.sync_all().unwrap();
         path
+    }
+
+    fn bin_tiny_dense() -> QwenConfig {
+        let mut c = bin_tiny();
+        c.n_experts = 0;
+        c.top_k = 0;
+        c.moe_inter = 0;
+        c.shared_inter = 0;
+        c.dense_inter = 64;
+        c
+    }
+
+    #[test]
+    fn dense_checkpoint_runtime_runs_and_resets() {
+        let c = bin_tiny_dense();
+        let path = checkpoint_fixture(&c);
+        let mut model = QwenModel::load(&path);
+        assert!(model.cfg.is_dense());
+        let first = model.forward(3);
+        let second = model.forward(5);
+        assert_eq!(first.len(), c.vocab);
+        assert!(first.iter().chain(&second).all(|v| v.is_finite()));
+        assert!(first.iter().any(|v| v.abs() > 1e-9));
+        model.reset();
+        let replay = model.forward(3);
+        assert_eq!(first, replay);
+        drop(model);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

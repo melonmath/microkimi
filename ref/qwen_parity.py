@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build a tiny deterministic Qwen3.5-MoE checkpoint and reference logits.
+"""Build a tiny deterministic Qwen3.5-family checkpoint and reference logits.
+
+Default: the MoE text decoder (qwen3_5_moe_text). With ``--dense``: the dense
+text decoder (qwen3_5_text) used by Qwen3.8-27B.
 
 This is a development parity fixture for ``microkimi convert-qwen`` and the
 Rust decoder. It requires PyTorch, Transformers, and safetensors, but none of
@@ -13,7 +16,12 @@ import struct
 
 import torch
 from safetensors.torch import save_file
-from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
+from transformers import (
+    Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
+)
 
 
 TOKENS = [3, 5, 7, 11]
@@ -57,11 +65,44 @@ def config():
     )
 
 
-def make_exact_mxfp4_experts(model):
-    """Use values exactly representable by microkimi's MXFP4 encoding."""
+def dense_config():
+    rope = {
+        "rope_type": "default",
+        "rope_theta": 10_000.0,
+        "partial_rotary_factor": 0.5,
+        "mrope_interleaved": True,
+        "mrope_section": [2, 1, 1],
+    }
+    return Qwen3_5TextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        rms_norm_eps=1e-6,
+        rope_parameters=rope,
+        attention_bias=False,
+        attention_dropout=0.0,
+        tie_word_embeddings=False,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        use_cache=True,
+    )
+
+
+def make_exact_mxfp4(model, dense):
+    """Use values exactly representable by microkimi's MXFP4 encoding on
+    every matrix the converter quantizes: routed experts for the MoE
+    variant, the per-layer MLP for the dense variant."""
+    marker = ".mlp." if dense else ".mlp.experts."
     with torch.no_grad():
         for name, parameter in model.named_parameters():
-            if ".mlp.experts." not in name:
+            if marker not in name:
                 continue
             values = E2M1.repeat((parameter.numel() + 15) // 16)[: parameter.numel()]
             parameter.copy_((values * (2.0 ** -5)).reshape_as(parameter))
@@ -116,6 +157,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--compare", type=pathlib.Path)
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="build the dense qwen3_5_text variant instead of the MoE one",
+    )
     args = parser.parse_args()
     if args.compare is not None:
         compare_logits(args.out / "hf_logits.bin", args.compare)
@@ -123,9 +169,13 @@ def main():
     args.out.mkdir(parents=True, exist_ok=False)
 
     torch.manual_seed(0x5147)
-    cfg = config()
-    model = Qwen3_5MoeForCausalLM(cfg).to(dtype=torch.float32).eval()
-    make_exact_mxfp4_experts(model)
+    if args.dense:
+        cfg = dense_config()
+        model = Qwen3_5ForCausalLM(cfg).to(dtype=torch.float32).eval()
+    else:
+        cfg = config()
+        model = Qwen3_5MoeForCausalLM(cfg).to(dtype=torch.float32).eval()
+    make_exact_mxfp4(model, args.dense)
     ids = torch.tensor([TOKENS], dtype=torch.long)
     with torch.no_grad():
         result = model(ids, use_cache=False, output_hidden_states=True)

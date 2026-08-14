@@ -42,6 +42,8 @@ pub struct Config {
     /// applied to the residual stream. None: no seam adapter.
     pub seam_after: Option<usize>,
     /// Present when the MKIM0002 config JSON declares arch "qwen3_5_moe"
+    /// (MoE text decoders: Qwen3.5/3.6-MoE, Qwen3.8-2.4T-A95B) or
+    /// "qwen3_5" (dense text decoders: Qwen3.8-27B).
     pub qwen: Option<QwenConfig>,
     /// Present when the MKIM0002 config JSON declares arch "deepseek_v4"
     /// (parsed from the "ds" object). None for K3 (microkimi/nanokimi).
@@ -124,7 +126,10 @@ impl Config {
         if j.get("arch").and_then(|x| x.as_str()) == Some("deepseek_v4") {
             c.ds = Some(DsConfig::from_json(j));
         }
-        if j.get("arch").and_then(|x| x.as_str()) == Some("qwen3_5_moe") {
+        if matches!(
+            j.get("arch").and_then(|x| x.as_str()),
+            Some("qwen3_5_moe") | Some("qwen3_5")
+        ) {
             c.qwen = Some(QwenConfig::from_json(j));
         }
         let ids = |key: &str| -> Option<Vec<usize>> {
@@ -299,10 +304,12 @@ impl DsConfig {
 }
 
 
-/// Qwen3.5-MoE text decoder. Layers alternate a gated delta-rule linear
-/// attention with a full-attention layer every `full_attn_interval`;
-/// every layer carries a softmax-routed expert bank plus one always-on
-/// shared expert.
+/// Qwen3.5-family text decoder. Layers alternate a gated delta-rule
+/// linear attention with a full-attention layer every
+/// `full_attn_interval`. The MoE variant (qwen3_5_moe_text) carries a
+/// softmax-routed expert bank plus one always-on shared expert on every
+/// layer; the dense variant (qwen3_5_text, e.g. Qwen3.8-27B) carries a
+/// single SiLU-gated MLP of width `dense_inter` instead.
 #[derive(Clone, Debug)]
 pub struct QwenConfig {
     pub n_layers: usize,
@@ -326,6 +333,9 @@ pub struct QwenConfig {
     pub top_k: usize,
     pub moe_inter: usize,
     pub shared_inter: usize,
+    /// Dense MLP width (HF `intermediate_size`). Zero for MoE decoders;
+    /// nonzero marks the dense variant and voids the MoE fields above.
+    pub dense_inter: usize,
     pub norm_eps: f64,
 }
 
@@ -350,6 +360,34 @@ impl QwenConfig {
             top_k: 8,
             moe_inter: 512,
             shared_inter: 512,
+            dense_inter: 0,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// Qwen3.8-27B: the dense multimodal checkpoint's text decoder.
+    #[cfg(test)]
+    pub fn qwen38_dense() -> QwenConfig {
+        QwenConfig {
+            n_layers: 64,
+            d: 5120,
+            vocab: 248320,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            partial_rotary: 0.25,
+            rope_theta: 10_000_000.0,
+            lin_k_heads: 16,
+            lin_v_heads: 48,
+            lin_k_dim: 128,
+            lin_v_dim: 128,
+            conv_kernel: 4,
+            full_attn_interval: 4,
+            n_experts: 0,
+            top_k: 0,
+            moe_inter: 0,
+            shared_inter: 0,
+            dense_inter: 17408,
             norm_eps: 1e-6,
         }
     }
@@ -382,8 +420,22 @@ impl QwenConfig {
         c.top_k = Self::num(d, "num_experts_per_tok", c.top_k as f64) as usize;
         c.moe_inter = Self::num(d, "moe_intermediate_size", c.moe_inter as f64) as usize;
         c.shared_inter = Self::num(d, "shared_expert_intermediate_size", c.shared_inter as f64) as usize;
+        c.dense_inter = Self::num(d, "intermediate_size", 0.0) as usize;
+        if c.dense_inter > 0 {
+            // The dense variant has no router, expert bank, or shared
+            // expert; zero the MoE fields so their defaults cannot leak.
+            c.n_experts = 0;
+            c.top_k = 0;
+            c.moe_inter = 0;
+            c.shared_inter = 0;
+        }
         c.norm_eps = Self::num(d, "rms_norm_eps", c.norm_eps);
         c
+    }
+
+    /// Dense decoder (qwen3_5_text): one SiLU MLP per layer, no experts.
+    pub fn is_dense(&self) -> bool {
+        self.dense_inter > 0
     }
 
     /// Layers are linear-attention unless their index sits on the full

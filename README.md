@@ -1,6 +1,6 @@
 # microkimi
 
-A zero-dependency Rust engine for three modern MoE architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5/Qwen3.6-MoE text decoder** - verified against their reference implementations.
+A zero-dependency Rust engine for modern large-model architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5-family text decoders** (Qwen3.5/Qwen3.6-MoE, Qwen3.8-2.4T-A95B, and the dense Qwen3.8-27B) - verified against their reference implementations.
 
 The Python side under `nano/graft/` adds architecture-agnostic instruments: compatibility scans between two models, per-expert utility measurement, paired evaluation with bootstrap intervals, and closed-form feed-forward transfer. Those read and write **Qwen3.5-MoE** (`qwen3_5_moe`, routed and shared experts), **Qwen3.5 dense**, **DeepSeek-V4**, **Gemma 3** and llama-style checkpoints in addition to the engine's own format - see `nano/graft/README.md`.
 
@@ -42,11 +42,11 @@ Naming rule: **nano** models are trained from scratch here; **micro** models are
 | **nanokimi-0.2b** | 0.2B Kimi K3 model, trained from scratch | [Releases](https://github.com/microkimi/microkimi/releases) - see [KIMI.md](KIMI.md) |
 | **microkimi-debug** | full 93-layer K3 skeleton, synthetic weights | `microkimi build` - see [KIMI.md](KIMI.md) |
 | **microdeepseek-debug** | DeepSeek-V4 skeleton, synthetic weights | `microkimi build --arch dsv4` - see [DEEPSEEK.md](DEEPSEEK.md) |
-| **converted Qwen3.5/Qwen3.6-MoE** | text checkpoint converted to f32 spine + MXFP4 routed experts | `microkimi convert-qwen` - see [QWEN.md](QWEN.md) |
+| **converted Qwen3.5/3.6/3.8 (MoE or dense)** | text checkpoint converted to f32 spine + MXFP4 routed experts (MoE) or MXFP4 MLP (dense, e.g. Qwen3.8-27B) | `microkimi convert-qwen` - see [QWEN.md](QWEN.md) |
 
 ## Commands
 
-| task | Kimi K3 | DeepSeek-V4-Flash-0731 | Qwen3.5/Qwen3.6-MoE |
+| task | Kimi K3 | DeepSeek-V4-Flash-0731 | Qwen3.5 family (MoE + dense) |
 |---|---|---|---|
 | assemble or convert weights | `microkimi build` | `microkimi build --arch dsv4` | `microkimi convert-qwen --source DIR --out qwen.bin` |
 | verify vs reference code | `microkimi paritytest` | `microkimi parity --arch dsv4` | `python3 ref/qwen_parity.py --out DIR` + `qwen-dump` |
