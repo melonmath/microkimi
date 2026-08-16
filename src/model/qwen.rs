@@ -2516,7 +2516,19 @@ fn lin_attn_prefill(
     // recurrence, parallel over heads: each head replays its own tokens in
     // order against its private state slice (head-major mixed buffer)
     let mut mixed_hm = vec![0.0f32; heads * t_count * vd];
-    {
+    // GPU scan (MICROKIMI_QWEN_GPU=1): the same recurrence as one thread
+    // per (head, value column) on the GPU; falls back to the CPU scan on
+    // any refusal (MICROKIMI_QWEN_GPU_NOSCAN=1 pins it to the CPU).
+    #[allow(unused_mut)]
+    let mut scan_done = false;
+    #[cfg(target_os = "macos")]
+    if crate::model::metal::qwen_gpu_scan_on() && t_count >= crate::model::metal::GEMM_MIN_T {
+        scan_done = gpu_lin_scan(
+            &conved, b_raw.as_slice(), a_raw.as_slice(), dt_bias, a_log, &mut cache.state,
+            heads, rep, kd, vd, kt, conv_dim, t_count, &mut mixed_hm,
+        );
+    }
+    if !scan_done {
         std::thread::scope(|s| {
             let mut state_rest = cache.state.as_mut_slice();
             let mut mixed_rest = mixed_hm.as_mut_slice();
@@ -2889,6 +2901,90 @@ fn full_attn_prefill(
             None => crate::model::ops::matvec_multi(o_proj, d, q_width, &xs, &mut outs),
         }
     }
+}
+
+/// Prepares the delta-scan inputs exactly as the CPU scan computes them
+/// per token (l2-normalized q and k with the 1/sqrt(kd) query scale,
+/// kv-heads expanded across their group, sigmoid beta, softplus-gated
+/// decay), then runs the whole recurrence on the GPU. `state` is the
+/// live recurrent carry ([heads, kd, vd]) and is updated in place;
+/// `mixed_hm` receives the head-major readout. False = CPU scan.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_lin_scan(
+    conved: &[f32],
+    b_raw: &[f32],
+    a_raw: &[f32],
+    dt_bias: &[f32],
+    a_log: &[f32],
+    state: &mut [f32],
+    heads: usize,
+    rep: usize,
+    kd: usize,
+    vd: usize,
+    kt: usize,
+    conv_dim: usize,
+    t_count: usize,
+    mixed_hm: &mut [f32],
+) -> bool {
+    let mut qn = vec![0.0f32; t_count * heads * kd];
+    let mut kn = vec![0.0f32; t_count * heads * kd];
+    let mut va = vec![0.0f32; t_count * heads * vd];
+    let mut beta = vec![0.0f32; t_count * heads];
+    let mut gv = vec![0.0f32; t_count * heads];
+    let workers = prefill_workers(t_count);
+    std::thread::scope(|s| {
+        let (mut q_rest, mut k_rest, mut v_rest) =
+            (qn.as_mut_slice(), kn.as_mut_slice(), va.as_mut_slice());
+        let (mut b_rest, mut g_rest) = (beta.as_mut_slice(), gv.as_mut_slice());
+        for (t0, t1) in ranges(t_count, workers) {
+            let n = t1 - t0;
+            let (q_c, qr) = q_rest.split_at_mut(n * heads * kd);
+            let (k_c, kr) = k_rest.split_at_mut(n * heads * kd);
+            let (v_c, vr) = v_rest.split_at_mut(n * heads * vd);
+            let (b_c, br) = b_rest.split_at_mut(n * heads);
+            let (g_c, gr) = g_rest.split_at_mut(n * heads);
+            q_rest = qr;
+            k_rest = kr;
+            v_rest = vr;
+            b_rest = br;
+            g_rest = gr;
+            s.spawn(move || {
+                let scale = 1.0 / (kd as f32).sqrt();
+                for i in 0..n {
+                    let t = t0 + i;
+                    let row = &conved[t * conv_dim..(t + 1) * conv_dim];
+                    for h in 0..heads {
+                        let kh = h / rep.max(1);
+                        let q = &mut q_c[(i * heads + h) * kd..(i * heads + h + 1) * kd];
+                        q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
+                        l2norm(q, 1e-6);
+                        for value in q.iter_mut() {
+                            *value *= scale;
+                        }
+                        let k = &mut k_c[(i * heads + h) * kd..(i * heads + h + 1) * kd];
+                        k.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
+                        l2norm(k, 1e-6);
+                        v_c[(i * heads + h) * vd..(i * heads + h + 1) * vd]
+                            .copy_from_slice(&row[2 * kt + h * vd..2 * kt + (h + 1) * vd]);
+                        b_c[i * heads + h] = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
+                        let sp = {
+                            let arg = a_raw[t * heads + h] + dt_bias[h];
+                            if arg > 20.0 {
+                                arg
+                            } else {
+                                (1.0 + arg.exp()).ln()
+                            }
+                        };
+                        g_c[i * heads + h] = -a_log[h].exp() * sp;
+                    }
+                }
+            });
+        }
+    });
+    crate::model::metal::gpu_delta_scan(
+        &qn, &kn, &va, &beta, &gv, state, mixed_hm, t_count, heads, kd, vd,
+    )
 }
 
 /// Full attention over the causal prefix as two batched GPU GEMMs -

@@ -324,7 +324,7 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             cpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
         );
         println!(
-            "  split: {:.2} ms/token inside {} GEMMs | {:.2} ms/token cpu tissue (the phase-2 porting target)",
+            "  split: {:.2} ms/token inside {} gpu ops | {:.2} ms/token cpu tissue",
             gm,
             gemm_calls,
             (g - gm).max(0.0)

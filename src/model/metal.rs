@@ -413,6 +413,7 @@ pub struct IoBufs {
     y: (Id, usize),
     cols: (Id, usize),
     z: (Id, usize),    // second input for the batched GEMMs (attention K/V)
+    st: (Id, usize),   // read-write state for the delta-scan kernel
 }
 
 pub struct WeightCache {
@@ -583,6 +584,7 @@ fn init_ctx() -> Option<MetalCtx> {
                 y: (std::ptr::null_mut(), 0),
                 cols: (std::ptr::null_mut(), 0),
                 z: (std::ptr::null_mut(), 0),
+                st: (std::ptr::null_mut(), 0),
             }),
         };
         retain(library);
@@ -2037,4 +2039,239 @@ fn weight_buffer_f16(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols
     }
     cache.insert(key, (buf, tag));
     Some(buf)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Delta-scan kernel: the recurrence itself on the GPU
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The delta rule is sequential over time but COLUMN-SEPARABLE: for a
+// fixed value column j, every operation touches only S[.,j], pred[j],
+// v[j] and out[j], with k and q shared reads. So the scan launches one
+// thread per (head, column) - 4096 independent sequential scans for the
+// 0.8B - each carrying its state column (<= 128 f32) in thread-private
+// memory, with NO barriers anywhere. All scan traffic stays f32: the
+// recurrence is the numerically delicate part and its bytes are small
+// next to the GEMM weights. Failures compile-time or dispatch-time fall
+// back to the CPU scan; MICROKIMI_QWEN_GPU_NOSCAN=1 is the kill switch.
+
+const DELTA_SCAN_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// One thread per (head, value column). Layouts:
+//   q, k   [t, heads, kd]   (kv-heads pre-expanded across their group)
+//   v      [t, heads, vd]
+//   beta,g [t, heads]
+//   state  [heads, kd, vd]  (read-write, f32 - the recurrent object)
+//   out    [heads, t, vd]
+// Per token, matching the CPU delta_step order: decay the column, read
+// the prediction, apply the beta-scaled delta, emit the q readout.
+kernel void delta_scan(device const float* q     [[buffer(0)]],
+                       device const float* k     [[buffer(1)]],
+                       device const float* v     [[buffer(2)]],
+                       device const float* beta  [[buffer(3)]],
+                       device const float* g     [[buffer(4)]],
+                       device float*       state [[buffer(5)]],
+                       device float*       out   [[buffer(6)]],
+                       constant uint4&     dims  [[buffer(7)]],
+                       uint tid [[thread_position_in_grid]]) {
+    uint t_count = dims.x, heads = dims.y, kd = dims.z, vd = dims.w;
+    uint h = tid / vd;
+    uint j = tid % vd;
+    if (h >= heads) { return; }
+    float s[128];
+    device float* scol = state + (size_t)h * kd * vd + j;
+    for (uint i = 0; i < kd; i++) { s[i] = scol[i * vd]; }
+    for (uint t = 0; t < t_count; t++) {
+        float decay = exp(g[t * heads + h]);
+        float bet = beta[t * heads + h];
+        float vj = v[(size_t)(t * heads + h) * vd + j];
+        device const float* kt = k + (size_t)(t * heads + h) * kd;
+        device const float* qt = q + (size_t)(t * heads + h) * kd;
+        float pred = 0.0f;
+        for (uint i = 0; i < kd; i++) { s[i] *= decay; pred += kt[i] * s[i]; }
+        float delta = (vj - pred) * bet;
+        float o = 0.0f;
+        for (uint i = 0; i < kd; i++) {
+            s[i] += kt[i] * delta;
+            o += qt[i] * s[i];
+        }
+        out[((size_t)h * t_count + t) * vd + j] = o;
+    }
+    for (uint i = 0; i < kd; i++) { scol[i * vd] = s[i]; }
+}
+"#;
+
+struct ScanCtx {
+    pipeline: Id,
+}
+
+// SAFETY: the pipeline is a retained device-owned object; encoding is
+// serialized on the MetalCtx io mutex like every other path here.
+unsafe impl Send for ScanCtx {}
+unsafe impl Sync for ScanCtx {}
+
+static SCAN: std::sync::OnceLock<Option<ScanCtx>> = std::sync::OnceLock::new();
+
+fn scan_ctx() -> Option<(&'static MetalCtx, &'static ScanCtx)> {
+    let base = ctx()?;
+    let scan = SCAN
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(DELTA_SCAN_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: delta-scan shader compilation error: {} - scan stays on CPU", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let function = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library, sel("newFunctionWithName:"), ns_string("delta_scan"))
+                };
+                let mut perr: Id = std::ptr::null_mut();
+                let pipeline = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                };
+                if pipeline.is_null() {
+                    println!("gpu: delta-scan pipeline error: {} - scan stays on CPU", err_desc(perr));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                retain(pipeline);
+                retain(function);
+                retain(library);
+                println!("gpu: delta-scan kernel ready");
+                msg_void(pool, sel("drain"));
+                Some(ScanCtx { pipeline })
+            }
+        })
+        .as_ref()?;
+    Some((base, scan))
+}
+
+/// True when the delta scan runs on the GPU (with the offload, unless
+/// MICROKIMI_QWEN_GPU_NOSCAN=1 pins it to the CPU).
+pub fn qwen_gpu_scan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    qwen_gpu_on()
+        && *ON.get_or_init(|| {
+            std::env::var("MICROKIMI_QWEN_GPU_NOSCAN").map(|v| v != "1").unwrap_or(true)
+        })
+}
+
+/// Runs the whole delta recurrence of one layer on the GPU. `state` is
+/// [heads, kd, vd] and is read AND written (the recurrent carry); `out`
+/// is [heads, t, vd]. Returns false when the kernel is unavailable or
+/// kd exceeds the thread-private column budget (caller keeps its CPU
+/// scan).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_delta_scan(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    g: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    t_count: usize,
+    heads: usize,
+    kd: usize,
+    vd: usize,
+) -> bool {
+    if kd > 128 {
+        return false;
+    }
+    assert_eq!(q.len(), t_count * heads * kd);
+    assert_eq!(k.len(), t_count * heads * kd);
+    assert_eq!(v.len(), t_count * heads * vd);
+    assert_eq!(beta.len(), t_count * heads);
+    assert_eq!(g.len(), t_count * heads);
+    assert_eq!(state.len(), heads * kd * vd);
+    assert_eq!(out.len(), heads * t_count * vd);
+    let Some((base, scan)) = scan_ctx() else {
+        return false;
+    };
+    let t_start = std::time::Instant::now();
+    // one staging buffer for the five read-only inputs, offset-addressed
+    let sizes = [q.len(), k.len(), v.len(), beta.len(), g.len()];
+    let mut offs = [0usize; 5];
+    let mut total = 0usize;
+    for (i, len) in sizes.iter().enumerate() {
+        offs[i] = total;
+        total += len.div_ceil(4) * 4; // keep every section 16-byte aligned
+    }
+    // SAFETY: same invariants as the GEMM paths - io mutex held across
+    // encode/wait/readback, waitUntilCompleted before reads, fresh
+    // autorelease pool for the transients.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (in_ptr, buf_in) = ensure_buf(base, &mut io.x, total * 4);
+        let (out_ptr, buf_out) = ensure_buf(base, &mut io.y, out.len() * 4);
+        let (st_ptr, buf_st) = ensure_buf(base, &mut io.st, state.len() * 4);
+        if buf_in.is_null() || buf_out.is_null() || buf_st.is_null() || in_ptr.is_null() || out_ptr.is_null() || st_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        for (src, off) in [(q, offs[0]), (k, offs[1]), (v, offs[2]), (beta, offs[3]), (g, offs[4])] {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), (in_ptr as *mut f32).add(off), src.len());
+        }
+        std::ptr::copy_nonoverlapping(state.as_ptr(), st_ptr as *mut f32, state.len());
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        let encoder = msg_id(cmdbuf, sel("computeCommandEncoder"));
+        {
+            let f: extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(encoder, sel("setComputePipelineState:"), scan.pipeline);
+        }
+        {
+            let f: extern "C" fn(Id, Sel, Id, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            for (idx, off) in offs.iter().enumerate() {
+                f(encoder, sel("setBuffer:offset:atIndex:"), buf_in, (off * 4) as u64, idx as u64);
+            }
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_st, 0, 5);
+            f(encoder, sel("setBuffer:offset:atIndex:"), buf_out, 0, 6);
+        }
+        {
+            let dims: [u32; 4] = [t_count as u32, heads as u32, kd as u32, vd as u32];
+            let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(encoder, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 16, 7);
+        }
+        {
+            let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                encoder,
+                sel("dispatchThreads:threadsPerThreadgroup:"),
+                MTLSize { width: (heads * vd) as u64, height: 1, depth: 1 },
+                MTLSize { width: 64, height: 1, depth: 1 },
+            );
+        }
+        msg_void(encoder, sel("endEncoding"));
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        out.copy_from_slice(std::slice::from_raw_parts(out_ptr as *const f32, out.len()));
+        state.copy_from_slice(std::slice::from_raw_parts(st_ptr as *const f32, state.len()));
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
 }
