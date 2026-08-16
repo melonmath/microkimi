@@ -276,6 +276,29 @@ CPU-versus-CPU row, and the reading are in [BENCH.md](BENCH.md); the
 structural conclusion is that parity on Apple silicon runs through a
 Metal backend for this runtime, not through more CPU kernels.
 
+## GPU prefill offload (macOS)
+
+`MICROKIMI_QWEN_GPU=1` routes every batched-prefill matmul through one
+MPSMatrixMultiplication GEMM per weight matrix (still zero crates: the
+Metal Performance Shaders framework is reached over the same
+objc_msgSend FFI as the K3 Metal path). The regime argument decides
+what moves: a Metal dispatch costs ~0.25 ms of sync latency, so decode
+(~100 matvecs per token) stays on the CPU kernels where it belongs,
+while prefill pays one dispatch per weight matrix for the WHOLE prompt
+- the latency amortizes to ~0.03 ms/token at 1k tokens and the
+arithmetic runs on the GPU. The nonlinear tissue between matmuls
+(norms, the conv, the delta scan, softmax attention, activations)
+stays on the CPU, with activations crossing through unified memory.
+MXFP4 MLP weights are dequantized to f32 once at first use and cached
+on device (~1 GB for the 0.8B stack); f32 attention matrices upload
+as-is and are cached too. The offload is NOT bit-exact against the
+CPU path (no q8 activation quantization, GPU reassociation) - the
+qwengpubench arm prints the measured last-position logits disagreement
+next to the timing, and every failure path falls back to the CPU
+kernels rather than erroring. Gated off by default; lane-batched
+decode and small batches never take this route (16-lane minimum,
+1M-element minimum per matrix).
+
 ## Chained drafting and lane-batched decoding
 
 Two throughput mechanisms, both bit-identical to plain decoding and both

@@ -552,6 +552,18 @@ pub fn matvec_packed_multi(
     if lanes == 0 {
         return;
     }
+    // Qwen prefill offload (MICROKIMI_QWEN_GPU=1, macOS): one f32 GEMM
+    // over the device-cached dequantized copy for the whole batch. Note
+    // the numerics differ from the CPU path twice over (no q8 activation
+    // quantization, GPU reassociation); any failure falls through.
+    #[cfg(target_os = "macos")]
+    if crate::model::metal::qwen_gpu_on()
+        && lanes >= crate::model::metal::GEMM_MIN_T
+        && rows * cols >= crate::model::metal::GEMM_MIN_ELEMS
+        && crate::model::metal::gpu_gemm_xwt_fp4(packed, scales, rows, cols, xs, outs)
+    {
+        return;
+    }
     if crate::quant::q8::q8_enabled() {
         let xqs: Vec<crate::quant::q8::Q8Vec> =
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();

@@ -188,6 +188,17 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
     if lanes == 0 {
         return;
     }
+    // Qwen prefill offload (MICROKIMI_QWEN_GPU=1, macOS): one MPS GEMM for
+    // the whole batch. Only worth it above the lane/size thresholds; any
+    // failure falls through to the CPU kernels below.
+    #[cfg(target_os = "macos")]
+    if crate::model::metal::qwen_gpu_on()
+        && lanes >= crate::model::metal::GEMM_MIN_T
+        && rows * cols >= crate::model::metal::GEMM_MIN_ELEMS
+        && crate::model::metal::gpu_gemm_xwt(w, rows, cols, xs, outs)
+    {
+        return;
+    }
     let p = crate::model::pool::pool();
     let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
     if njobs <= 1 {

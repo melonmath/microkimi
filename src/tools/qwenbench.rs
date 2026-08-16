@@ -156,6 +156,23 @@ pub fn run(args: &[String]) {
         _ => println!("  unavailable"),
     }
 
+    // ── GPU prefill (macOS: MPS GEMM offload, in-process paired child) ──
+    #[cfg(target_os = "macos")]
+    {
+        let out = run_self(&["qwengpubench", "--model", &model, "--rounds", "3"], &[]);
+        println!("prefill gpu (MPS GEMM, in-process A/B):");
+        let mut shown = false;
+        for line in out.lines() {
+            if line.starts_with("  ") || line.starts_with("gpu gemm check") {
+                println!("  {}", line.trim_start());
+                shown = true;
+            }
+        }
+        if !shown {
+            println!("  unavailable ({})", out.lines().last().unwrap_or("no output").trim());
+        }
+    }
+
     // ── lanes A/B (q8 spine) ──
     println!("lane-batched aggregate (q8 spine, in-process A/B):");
     for lanes in [4usize, 8] {
@@ -194,4 +211,85 @@ pub fn run(args: &[String]) {
     println!(
         "compare with llama.cpp on this machine per BENCH.md (same checkpoint, Q8_0, llama-bench)."
     );
+}
+
+/// `microkimi qwengpubench --model X.bin [--rounds N] [--tokens T]`
+///
+/// In-process paired CPU/GPU batched-prefill benchmark. The GPU arm is
+/// the MPS GEMM offload (macOS); the first GPU prefill is a discarded
+/// warm-up that pays the one-time dequant/upload of the weight stack,
+/// then rounds alternate GPU and CPU on the SAME loaded model with a
+/// snapshot restore between runs. Also reports the last-position logits
+/// disagreement between the two arms (the offload is not bit-exact: no
+/// q8 activation quantization, GPU reassociation).
+pub fn gpu_prefill_cmd(args: &[String]) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        println!("qwengpubench: macOS only (Metal / MPS)");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let model_path = crate::value_flag(args, "--model").unwrap_or_else(|| {
+            eprintln!("error: qwengpubench requires --model MODEL.bin");
+            std::process::exit(2);
+        });
+        let rounds: usize = crate::value_flag(args, "--rounds")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let n_tokens: usize = crate::value_flag(args, "--tokens")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        crate::model::metal::set_qwen_gpu(true);
+        if !crate::model::metal::mps_available() {
+            println!("qwengpubench: no usable Metal/MPS context - nothing to measure");
+            return;
+        }
+        let mut model = crate::model::qwen::QwenModel::load(&model_path);
+        let vocab = (model.cfg.vocab as u32).min(50_000);
+        let prompt: Vec<u32> = (0..n_tokens as u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let snap = model.snapshot();
+
+        // warm-up: pays dequant + upload, and yields the GPU-arm logits
+        let gpu_out = model.prefill_collect(&prompt, false);
+        let gpu_logits = gpu_out.logits.last().cloned().unwrap_or_default();
+
+        crate::model::metal::set_qwen_gpu(false);
+        model.restore(&snap);
+        let cpu_out = model.prefill_collect(&prompt, false);
+        let cpu_logits = cpu_out.logits.last().cloned().unwrap_or_default();
+        let scale = cpu_logits.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let max_rel = gpu_logits
+            .iter()
+            .zip(&cpu_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / scale;
+
+        let time_prefill = |model: &mut crate::model::qwen::QwenModel| -> f64 {
+            model.restore(&snap);
+            let t0 = std::time::Instant::now();
+            let out = model.prefill_collect(&prompt, false);
+            std::hint::black_box(&out.logits);
+            t0.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64
+        };
+        let (mut gpu_ms, mut cpu_ms) = (Vec::new(), Vec::new());
+        for _ in 0..rounds {
+            crate::model::metal::set_qwen_gpu(true);
+            gpu_ms.push(time_prefill(&mut model));
+            crate::model::metal::set_qwen_gpu(false);
+            cpu_ms.push(time_prefill(&mut model));
+        }
+        let (g, c) = (median(gpu_ms.clone()), median(cpu_ms.clone()));
+        println!("gpu prefill (MPS GEMM), {} tokens, paired rounds:", n_tokens);
+        println!(
+            "  gpu {:>6.2} ms/token | cpu batched {:>6.2} ms/token | {:.2}x  (gpu rounds: {:?}, cpu rounds: {:?})",
+            g,
+            c,
+            c / g,
+            gpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            cpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
+        );
+        println!("  last-position logits: max rel diff {:.2e} vs the CPU path", max_rel);
+    }
 }

@@ -10,10 +10,14 @@ cargo build --release
 
 The battery: single-stream decode with the f32, q8, and fp4 spines;
 the SDOT kernel A/B; batched-versus-sequential prefill on a ~1k-token
-prompt; in-process lane-batched aggregate A/B at 4 and 8 lanes; and the
-chained-MTP speculative A/B when the model carries its draft head.
-Every arm shows its per-round values so host variance is visible, and
-medians are the numbers to quote.
+prompt; on macOS the MPS-GEMM GPU prefill against the CPU batched
+prefill (in-process paired rounds after a discarded upload warm-up,
+plus the last-position logits disagreement); in-process lane-batched
+aggregate A/B at 4 and 8 lanes; and the chained-MTP speculative A/B
+when the model carries its draft head. Every arm shows its per-round
+values so host variance is visible, and medians are the numbers to
+quote. `microkimi qwengpubench --model X.bin` runs the GPU prefill
+arm alone.
 
 ## macOS (Apple silicon), outside any container
 

@@ -1339,3 +1339,323 @@ pub fn metaltest_packed() {
         println!("METALTEST-PACKED FAIL");
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// MPS GEMM: Qwen batched-prefill offload (MICROKIMI_QWEN_GPU=1)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The decode regime cannot win on this path: each Metal dispatch costs
+// ~0.25 ms of sync latency and a single token walks ~100 matvecs, so
+// per-op offload would cost more than the whole CPU token. The batched
+// prefill is the opposite regime: ONE GEMM per weight matrix covers the
+// whole prompt, so the sync cost amortizes to ~0.03 ms/token at 1k
+// tokens while the arithmetic moves to the GPU. The nonlinear tissue
+// between matmuls (norms, conv, delta scan, softmax, activations) stays
+// on the CPU; activations round-trip through unified memory, which is
+// cheap next to the weight traffic the GPU absorbs.
+//
+// The GEMM itself is MPSMatrixMultiplication (Metal Performance
+// Shaders), reached through the same objc_msgSend FFI as the rest of
+// this file - still zero crates. Result layout: Y = X · Wᵀ with X as
+// [t, cols] row-major, so each token's output row lands contiguous.
+//
+// MXFP4 weights are dequantized to f32 once at first use and cached on
+// device (the prefill regime is compute-bound on the GPU, so the 8x
+// traffic increase against packed nibbles is paid from spare bandwidth;
+// ~1 GB for the 0.8B MLP stack in unified memory).
+
+#[link(name = "MetalPerformanceShaders", kind = "framework")]
+unsafe extern "C" {
+    fn MPSSupportsMTLDevice(device: Id) -> bool;
+}
+
+const MPS_FLOAT32: u32 = 0x10000020; // MPSDataTypeFloatBit | 32
+
+/// Below this lane count the caller is lane-batched decode or a tiny
+/// batch: the per-op sync latency dominates, stay on the CPU kernels.
+pub const GEMM_MIN_T: usize = 16;
+/// Below this weight size a dispatch is not worth its latency.
+pub const GEMM_MIN_ELEMS: usize = 1 << 20;
+/// Staging-buffer ceiling for one GEMM result (guards the all-logits
+/// lm_head case: t x vocab would want hundreds of MB).
+const GEMM_MAX_OUT_BYTES: usize = 256 * 1024 * 1024;
+
+static QWEN_GPU: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+fn qwen_gpu_flag() -> &'static std::sync::atomic::AtomicBool {
+    QWEN_GPU.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("MICROKIMI_QWEN_GPU").map(|v| v == "1").unwrap_or(false),
+        )
+    })
+}
+
+/// True when the Qwen GEMM offload is armed (env MICROKIMI_QWEN_GPU=1,
+/// or set_qwen_gpu for in-process A/B benchmarks).
+pub fn qwen_gpu_on() -> bool {
+    qwen_gpu_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_qwen_gpu(on: bool) {
+    qwen_gpu_flag().store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+struct MpsCtx {
+    // (t, rows, cols) → retained MPSMatrixMultiplication kernel
+    gemms: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), Id>>,
+    // (packed ptr, rows, cols) → (retained f32 device buffer, first packed bytes as alias tag)
+    dequant: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, [u8; 16])>>,
+}
+
+// SAFETY: same argument as MetalCtx - kernel objects and buffers are
+// device-owned, all mutation goes through the mutexes, and encoding is
+// serialized on the MetalCtx io mutex.
+unsafe impl Send for MpsCtx {}
+unsafe impl Sync for MpsCtx {}
+
+static MPS: std::sync::OnceLock<Option<MpsCtx>> = std::sync::OnceLock::new();
+
+fn mps_ctx() -> Option<(&'static MetalCtx, &'static MpsCtx)> {
+    let base = ctx()?;
+    let mps = MPS
+        .get_or_init(|| {
+            // SAFETY: class lookups and a device-capability C call only.
+            let ok = unsafe { MPSSupportsMTLDevice(base.device) }
+                && !class("MPSMatrixMultiplication").is_null()
+                && !class("MPSMatrixDescriptor").is_null()
+                && !class("MPSMatrix").is_null();
+            if !ok {
+                println!("gpu: MPS matrix kernels unavailable - qwen prefill stays on CPU");
+                return None;
+            }
+            println!("gpu: MPS GEMM ready (qwen batched-prefill offload)");
+            Some(MpsCtx {
+                gemms: std::sync::Mutex::new(std::collections::HashMap::new()),
+                dequant: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        })
+        .as_ref()?;
+    Some((base, mps))
+}
+
+/// True when the full offload stack (Metal device + MPS kernels) is up.
+pub fn mps_available() -> bool {
+    mps_ctx().is_some()
+}
+
+/// Cached MPSMatrixMultiplication for Y[t,rows] = X[t,cols] · W[rows,cols]ᵀ.
+fn gemm_kernel(base: &MetalCtx, mps: &MpsCtx, t: usize, rows: usize, cols: usize) -> Option<Id> {
+    let mut cache = mps.gemms.lock().unwrap();
+    if let Some(&k) = cache.get(&(t, rows, cols)) {
+        return Some(k);
+    }
+    // SAFETY: alloc/init on a resolved class; the typed signature matches
+    // initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:
+    // interiorColumns:alpha:beta: (BOOL is one byte on arm64, NSUInteger is
+    // u64, alpha/beta are doubles).
+    let kernel = unsafe {
+        let alloc = msg_id(class("MPSMatrixMultiplication"), sel("alloc"));
+        let f: extern "C" fn(Id, Sel, Id, bool, bool, u64, u64, u64, f64, f64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        f(
+            alloc,
+            sel("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:"),
+            base.device,
+            false,
+            true,
+            t as u64,
+            rows as u64,
+            cols as u64,
+            1.0,
+            0.0,
+        )
+    };
+    if kernel.is_null() {
+        return None;
+    }
+    cache.insert((t, rows, cols), kernel); // init gave +1; owned by the cache
+    Some(kernel)
+}
+
+/// One-shot numeric sanity line, printed on the first successful GEMM:
+/// recomputes row 0 of lane 0 on the CPU and reports the relative error.
+fn gemm_check_once(kind: &str, w_row0: &[f32], x0: &[f32], got: f32, rows: usize, cols: usize, t: usize) {
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut acc = 0f64;
+    for (a, b) in w_row0.iter().zip(x0) {
+        acc += *a as f64 * *b as f64;
+    }
+    let cpu = acc as f32;
+    let scale = cpu.abs().max(1e-6);
+    println!(
+        "gpu gemm check ({kind}, [{rows}x{cols}] t={t}): row0 cpu {cpu:.6} gpu {got:.6} rel {:.2e}",
+        (got - cpu).abs() / scale
+    );
+}
+
+/// Shared encode/run path: packs `xs` into the staging X buffer, runs the
+/// GEMM against `buf_w` (a device-resident [rows, cols] f32 matrix), and
+/// scatters Y back into `outs`. Returns false on any allocation failure
+/// (caller falls back to the CPU kernels - never fatal).
+fn run_gemm(
+    base: &MetalCtx,
+    mps: &MpsCtx,
+    buf_w: Id,
+    rows: usize,
+    cols: usize,
+    xs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> bool {
+    let t = xs.len();
+    if t * rows * 4 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
+    let Some(kernel) = gemm_kernel(base, mps, t, rows, cols) else {
+        return false;
+    };
+    // SAFETY: same invariants as gpu_matvec - Metal objects come from the
+    // live context/caches; the io mutex serializes staging-buffer use for
+    // the whole encode/wait/readback; waitUntilCompleted precedes readback;
+    // a fresh autorelease pool covers the transient objects. The MPSMatrix
+    // wrappers are alloc/init-owned and explicitly released below.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (x_ptr, buf_x) = ensure_buf(base, &mut io.x, t * cols * 4);
+        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * rows * 4);
+        if buf_x.is_null() || buf_y.is_null() || x_ptr.is_null() || y_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        for (l, x) in xs.iter().enumerate() {
+            debug_assert_eq!(x.len(), cols);
+            std::ptr::copy_nonoverlapping(x.as_ptr(), (x_ptr as *mut f32).add(l * cols), cols);
+        }
+
+        let desc = |r: usize, c: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                class("MPSMatrixDescriptor"),
+                sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"),
+                r as u64,
+                c as u64,
+                (c * 4) as u64,
+                MPS_FLOAT32,
+            )
+        };
+        let matrix = |buf: Id, d: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:descriptor:"), buf, d)
+        };
+        let mx = matrix(buf_x, desc(t, cols));
+        let mw = matrix(buf_w, desc(rows, cols));
+        let my = matrix(buf_y, desc(t, rows));
+        if mx.is_null() || mw.is_null() || my.is_null() {
+            for m in [mx, mw, my] {
+                if !m.is_null() {
+                    msg_void(m, sel("release"));
+                }
+            }
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        {
+            let f: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(kernel, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mw, my);
+        }
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        let y = y_ptr as *const f32;
+        for (l, out) in outs.iter_mut().enumerate() {
+            debug_assert_eq!(out.len(), rows);
+            out.copy_from_slice(std::slice::from_raw_parts(y.add(l * rows), rows));
+        }
+        for m in [mx, mw, my] {
+            msg_void(m, sel("release"));
+        }
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    true
+}
+
+/// f32 multi-lane matvec on the GPU as one GEMM. Returns false when the
+/// offload is unavailable (caller falls back to the CPU kernels).
+pub fn gpu_gemm_xwt(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [&mut [f32]]) -> bool {
+    debug_assert_eq!(w.len(), rows * cols);
+    let Some((base, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some(buf_w) = weight_buffer(base, w, rows, cols) else {
+        return false;
+    };
+    if !run_gemm(base, mps, buf_w, rows, cols, xs, outs) {
+        return false;
+    }
+    gemm_check_once("f32", &w[..cols], xs[0], outs[0][0], rows, cols, xs.len());
+    true
+}
+
+/// Device-resident f32 copy of an MXFP4 matrix, dequantized on first use.
+/// The alias tag (first packed bytes) guards against allocator address
+/// reuse, like the other weight caches.
+fn dequant_buffer(base: &MetalCtx, mps: &MpsCtx, packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Option<Id> {
+    let key = (packed.as_ptr() as usize, rows, cols);
+    let mut tag = [0u8; 16];
+    let n = packed.len().min(16);
+    tag[..n].copy_from_slice(&packed[..n]);
+    let mut cache = mps.dequant.lock().unwrap();
+    if let Some(&(buf, seen)) = cache.get(&key) {
+        if seen == tag {
+            return Some(buf);
+        }
+        cache.remove(&key);
+        // SAFETY: the stale buffer is owned by this cache (retained at insert).
+        unsafe { msg_void(buf, sel("release")) };
+    }
+    let w = crate::quant::mxfp4::dequant(packed, scales, rows, cols);
+    // SAFETY: `w` is alive for the whole call; the buffer copies its bytes.
+    let buf = unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let b = f(
+            base.device,
+            sel("newBufferWithBytes:length:options:"),
+            w.as_ptr() as *const c_void,
+            (w.len() * 4) as u64,
+            0,
+        );
+        if !b.is_null() {
+            retain(b);
+        }
+        b
+    };
+    if buf.is_null() {
+        return None;
+    }
+    cache.insert(key, (buf, tag));
+    Some(buf)
+}
+
+/// MXFP4 multi-lane matvec on the GPU as one f32 GEMM over the cached
+/// dequantized copy. Returns false when the offload is unavailable.
+pub fn gpu_gemm_xwt_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [&mut [f32]]) -> bool {
+    let Some((base, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some(buf_w) = dequant_buffer(base, mps, packed, scales, rows, cols) else {
+        return false;
+    };
+    run_gemm(base, mps, buf_w, rows, cols, xs, outs)
+}
