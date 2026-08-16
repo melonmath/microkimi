@@ -232,6 +232,62 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
     p.run(jobs);
 }
 
+/// Row-range q8 dot against one quantized activation, four rows at a
+/// time through the fused SDOT kernel when available: the activation
+/// blocks are loaded once per quad and the four accumulator chains are
+/// independent. Integer sums are exact, so results are bit-identical to
+/// the single-row loop. Shared by the Q8Head methods and the pool jobs.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn q8_rows_dot(
+    q: &[i8],
+    scales: &[f32],
+    cols: usize,
+    r0: usize,
+    n: usize,
+    xq_q: &[i8],
+    xq_scales: &[f32],
+    out: &mut [f32],
+) {
+    let nb = cols / 32;
+    let mut r = 0usize;
+    if crate::quant::q8::sdot4_available() {
+        while r + 4 <= n {
+            let base = r0 + r;
+            let mut sums = [0f32; 4];
+            for g in 0..nb {
+                let x_block = &xq_q[g * 32..(g + 1) * 32];
+                let idots = unsafe {
+                    crate::quant::q8::dot_i8_sdot4(
+                        &q[base * cols + g * 32..base * cols + (g + 1) * 32],
+                        &q[(base + 1) * cols + g * 32..(base + 1) * cols + (g + 1) * 32],
+                        &q[(base + 2) * cols + g * 32..(base + 2) * cols + (g + 1) * 32],
+                        &q[(base + 3) * cols + g * 32..(base + 3) * cols + (g + 1) * 32],
+                        x_block,
+                    )
+                };
+                for k in 0..4 {
+                    sums[k] += idots[k] as f32 * (scales[(base + k) * nb + g] * xq_scales[g]);
+                }
+            }
+            out[r..r + 4].copy_from_slice(&sums);
+            r += 4;
+        }
+    }
+    while r < n {
+        let row = r0 + r;
+        let mut sum = 0f32;
+        for g in 0..nb {
+            let idot = crate::quant::q8::block_dot_i8(
+                &q[row * cols + g * 32..row * cols + (g + 1) * 32],
+                &xq_q[g * 32..(g + 1) * 32],
+            );
+            sum += idot as f32 * (scales[row * nb + g] * xq_scales[g]);
+        }
+        out[r] = sum;
+        r += 1;
+    }
+}
+
 // ── q8_0 lm_head (runtime copy, built once at load) ──
 //
 // The final logits projection re-reads the whole f32 lm_head tensor every
@@ -276,9 +332,22 @@ impl Q8Head {
     /// pooled `matvec`.
     pub(super) fn matvec_st(&self, x: &[f32], out: &mut [f32]) {
         let xq = crate::quant::q8::quantize_q8(x);
-        for (r, o) in out.iter_mut().enumerate() {
-            *o = self.row_dot(r, &xq);
-        }
+        self.rows_dot(0, out.len(), &xq, out);
+    }
+
+    /// Dots rows [r0, r0+n) against one quantized activation, four rows at
+    /// a time through the fused SDOT kernel when available.
+    fn rows_dot(&self, r0: usize, n: usize, xq: &crate::quant::q8::Q8Vec, out: &mut [f32]) {
+        q8_rows_dot(
+            &self.q,
+            &self.scales,
+            self.cols,
+            r0,
+            n,
+            &xq.q,
+            &xq.scales,
+            out,
+        );
     }
 
     /// Multi-lane head matvec: each q8 row is read once and dotted
@@ -361,14 +430,7 @@ impl Q8Head {
                     let xq8 = std::slice::from_raw_parts(xp.0 as *const i8, cols);
                     let xs = std::slice::from_raw_parts(xsp.0, nb);
                     let out = std::slice::from_raw_parts_mut(op.0, rows);
-                    for r in r0..r1 {
-                        let mut acc = 0f32;
-                        for g in 0..nb {
-                            let idot = crate::quant::q8::block_dot_i8(&q[r * cols + g * 32..r * cols + g * 32 + 32], &xq8[g * 32..g * 32 + 32]);
-                            acc += ws[r * nb + g] * xs[g] * idot as f32;
-                        }
-                        out[r] = acc;
-                    }
+                    q8_rows_dot(q, ws, cols, r0, r1 - r0, xq8, xs, &mut out[r0..r1]);
                 }
             }));
         }

@@ -137,6 +137,73 @@ fn dot_i8_scalar(w32: &[i8], x32: &[i8]) -> i32 {
     s
 }
 
+/// Four-row fused int8 dot: the activation block is loaded ONCE per 32
+/// columns and dotted against four consecutive weight rows through four
+/// independent SDOT accumulator chains (better instruction-level
+/// parallelism, a quarter of the activation loads). Integer sums are
+/// exact, so the result equals four scalar dots.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn dot_i8_sdot4(
+    w0: &[i8],
+    w1: &[i8],
+    w2: &[i8],
+    w3: &[i8],
+    x32: &[i8],
+) -> [i32; 4] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let x0 = vld1q_s8(x32.as_ptr());
+        let x1 = vld1q_s8(x32.as_ptr().add(16));
+        let mut a0 = vdupq_n_s32(0);
+        let mut a1 = vdupq_n_s32(0);
+        let mut a2 = vdupq_n_s32(0);
+        let mut a3 = vdupq_n_s32(0);
+        let w00 = vld1q_s8(w0.as_ptr());
+        let w01 = vld1q_s8(w0.as_ptr().add(16));
+        let w10 = vld1q_s8(w1.as_ptr());
+        let w11 = vld1q_s8(w1.as_ptr().add(16));
+        let w20 = vld1q_s8(w2.as_ptr());
+        let w21 = vld1q_s8(w2.as_ptr().add(16));
+        let w30 = vld1q_s8(w3.as_ptr());
+        let w31 = vld1q_s8(w3.as_ptr().add(16));
+        std::arch::asm!(
+            ".arch_extension dotprod",
+            "sdot {a0:v}.4s, {w00:v}.16b, {x0:v}.16b",
+            "sdot {a1:v}.4s, {w10:v}.16b, {x0:v}.16b",
+            "sdot {a2:v}.4s, {w20:v}.16b, {x0:v}.16b",
+            "sdot {a3:v}.4s, {w30:v}.16b, {x0:v}.16b",
+            "sdot {a0:v}.4s, {w01:v}.16b, {x1:v}.16b",
+            "sdot {a1:v}.4s, {w11:v}.16b, {x1:v}.16b",
+            "sdot {a2:v}.4s, {w21:v}.16b, {x1:v}.16b",
+            "sdot {a3:v}.4s, {w31:v}.16b, {x1:v}.16b",
+            a0 = inout(vreg) a0,
+            a1 = inout(vreg) a1,
+            a2 = inout(vreg) a2,
+            a3 = inout(vreg) a3,
+            w00 = in(vreg) w00, w01 = in(vreg) w01,
+            w10 = in(vreg) w10, w11 = in(vreg) w11,
+            w20 = in(vreg) w20, w21 = in(vreg) w21,
+            w30 = in(vreg) w30, w31 = in(vreg) w31,
+            x0 = in(vreg) x0, x1 = in(vreg) x1,
+            options(pure, nomem, nostack)
+        );
+        [vaddvq_s32(a0), vaddvq_s32(a1), vaddvq_s32(a2), vaddvq_s32(a3)]
+    }
+}
+
+/// True when the four-row fused kernel may be used (dotprod present and
+/// not disabled by MICROKIMI_NO_SDOT).
+#[cfg(target_arch = "aarch64")]
+pub fn sdot4_available() -> bool {
+    std::arch::is_aarch64_feature_detected!("dotprod") && !no_sdot()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn sdot4_available() -> bool {
+    false
+}
+
 /// NEON dotprod path: one SDOT per 16 int8 lanes replaces the widening
 /// multiply + pairwise accumulate pair. Integer sums are exact whatever
 /// the accumulation shape, so this is bit-identical to the scalar
