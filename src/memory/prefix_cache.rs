@@ -157,7 +157,13 @@ impl Pck {
 
     /// Snapshots the current model state as the entry covering `tokens`.
     pub fn store(&self, model: &Model, tokens: &[u32], logits: &[f32]) {
-        write_entry(&self.dir, tokens, &crate::memory::memory_pack::serialize(model, logits));
+        self.store_payload(tokens, &crate::memory::memory_pack::serialize(model, logits));
+    }
+
+    /// Stores an already serialized state image as the entry covering
+    /// `tokens` (the Qwen turn serializes through MKMEMQW1).
+    pub fn store_payload(&self, tokens: &[u32], payload: &[u8]) {
+        write_entry(&self.dir, tokens, payload);
         self.evict();
     }
 
@@ -256,6 +262,95 @@ pub fn run_turn_chat(pck: Option<&Pck>, ids: &[u32], max_new: usize, tok: &AnyTo
     answer
 }
 
+/// Cached prompt ingestion for a Qwen model: restores the longest cached
+/// prefix, prefills only the suffix, and stores the post-prefill state
+/// (covering exactly `ids`). Returns the logits after the last prompt
+/// token. Bit-identity holds without any pinning: the Qwen batched
+/// prefill is per-position exact, so a resumed suffix reproduces the full
+/// prefill's state to the bit.
+pub fn qwen_cached_prefill(
+    pck: &Pck,
+    ids: &[u32],
+    model: &mut crate::model::qwen::QwenModel,
+) -> Vec<f32> {
+    let t0 = Instant::now();
+    model.reset();
+    let mut covered = 0usize;
+    let mut restored = None;
+    if let Some((k, blob)) = pck.lookup(ids) {
+        match crate::memory::qwen_state::load_slice(model, &blob, "pck entry") {
+            Ok(logits) => {
+                covered = k;
+                restored = Some(logits);
+            }
+            Err(e) => {
+                eprintln!("pck: ignoring unusable entry ({})", e);
+                model.reset();
+            }
+        }
+    }
+    let suffix = &ids[covered..];
+    let logits = if suffix.is_empty() {
+        restored.expect("a full-length pck hit carries its logits")
+    } else {
+        model.prefill(suffix)
+    };
+    eprintln!(
+        "pck: {}/{} prompt tokens from cache, prefilled {} in {:.1?}",
+        covered,
+        ids.len(),
+        suffix.len(),
+        t0.elapsed()
+    );
+    if covered < ids.len() {
+        match crate::memory::qwen_state::serialize(model) {
+            Ok(payload) => pck.store_payload(ids, &payload),
+            Err(e) => eprintln!("pck: state not stored ({})", e),
+        }
+    }
+    logits
+}
+
+/// One Qwen chat turn through the prefix cache. `pck == None` or `--mtp`
+/// falls back to the plain turn (the MTP pairing starts at the prompt and
+/// is not part of a resumable prefix).
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_run_turn_chat(
+    pck: Option<&Pck>,
+    ids: &[u32],
+    max_new: usize,
+    tok: &AnyTokenizer,
+    model: &mut crate::model::qwen::QwenModel,
+    debug_routing: bool,
+    stop_id: u32,
+    sampler: &mut Sampler,
+) -> String {
+    let Some(pck) = pck.filter(|_| !sampler.mtp && !ids.is_empty()) else {
+        return crate::model::qwen::qwen_run_turn(
+            ids,
+            max_new,
+            tok,
+            model,
+            false,
+            debug_routing,
+            stop_id,
+            sampler,
+        );
+    };
+    let logits = qwen_cached_prefill(pck, ids, model);
+    crate::model::run_turn_core_batch(
+        &[],
+        max_new,
+        tok,
+        &mut |batch: &[u32]| model.prefill(batch),
+        false,
+        debug_routing,
+        stop_id,
+        Some(logits),
+        sampler,
+    )
+}
+
 /// `microkimi pck --info` / `microkimi pck --clean [--model X.bin]`.
 pub fn cmd(args: &[String]) {
     let info = args.iter().any(|a| a == "--info");
@@ -319,6 +414,55 @@ mod tests {
 
     fn entry(dir: &str, tokens: &[u32]) {
         write_entry(dir, tokens, b"PAYLOAD");
+    }
+
+    #[test]
+    fn qwen_cached_prefill_resumes_bit_identically() {
+        let mut c = crate::config::QwenConfig::qwen38_dense();
+        c.n_layers = 4;
+        c.d = 32;
+        c.vocab = 64;
+        c.n_heads = 2;
+        c.n_kv_heads = 1;
+        c.head_dim = 16;
+        c.lin_k_heads = 1;
+        c.lin_v_heads = 1;
+        c.lin_k_dim = 32;
+        c.lin_v_dim = 32;
+        c.dense_inter = 64;
+        let model_path = crate::model::qwen::test_fixture(&c);
+        let dir = tmpdir("qwen_prefill");
+        let pck = Pck { dir: dir.clone() };
+
+        let turn1 = [3u32, 5, 7, 11];
+        let turn2 = [3u32, 5, 7, 11, 2, 9]; // extends turn1's prefix
+
+        // first turn: plain miss, stores the state covering turn1
+        let mut first = crate::model::qwen::QwenModel::load(&model_path);
+        let logits1 = qwen_cached_prefill(&pck, &turn1, &mut first);
+        drop(first);
+
+        // second turn resumes from the cache in a fresh model
+        let mut resumed = crate::model::qwen::QwenModel::load(&model_path);
+        let hit = pck.lookup(&turn2).expect("turn1 entry must match");
+        assert_eq!(hit.0, turn1.len());
+        let logits2 = qwen_cached_prefill(&pck, &turn2, &mut resumed);
+
+        // reference: the same turn fully prefilled, no cache
+        let mut reference = crate::model::qwen::QwenModel::load(&model_path);
+        let expected1 = reference.prefill(&turn1[..]);
+        assert_eq!(logits1, expected1);
+        reference.reset();
+        let expected2 = reference.prefill(&turn2[..]);
+        assert_eq!(logits2, expected2, "cached resume diverges from full prefill");
+        assert_eq!(resumed.forward(4), reference.forward(4));
+
+        // the second turn's own entry now covers the longer prefix
+        assert_eq!(pck.lookup(&turn2).unwrap().0, turn2.len());
+
+        drop((resumed, reference));
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_file(model_path).ok();
     }
 
     #[test]

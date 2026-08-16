@@ -112,7 +112,14 @@ pub fn save(model: &QwenModel, path: &str) -> Result<(), String> {
 /// to load when the fingerprint or the adapter-pack set does not match.
 pub fn load(model: &mut QwenModel, path: &str) -> Result<Vec<f32>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let mut r = Reader { b: &bytes, p: 0 };
+    load_slice(model, &bytes, path)
+}
+
+/// In-memory variant of `load` (prefix-cache entries embed a MKMEMQW1
+/// image); `label` only names the source in error messages.
+pub fn load_slice(model: &mut QwenModel, bytes: &[u8], label: &str) -> Result<Vec<f32>, String> {
+    let path = label;
+    let mut r = Reader { b: bytes, p: 0 };
     if r.take(8)? != MAGIC {
         return Err(format!("{}: not a Qwen .mkmem file (bad magic)", path));
     }

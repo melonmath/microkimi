@@ -254,8 +254,15 @@ fingerprint binds the snapshot to the model architecture and to the
 composed adapter-pack set (SHA-256), so a snapshot taken with packs only
 loads under the same packs.
 
-Current limits: `--stream`, prefix-cache snapshots, early exit, and the
-n-gram speculative decoder are not wired to the Qwen runtime (`--mtp` is
-the Qwen speculative path; `--memory` cannot combine with `--mtp`). The
-default mmap load is still demand-paged and does not copy the model file
-into anonymous RAM.
+The chat prefix cache also works on Qwen models: the state after each
+turn's prompt is snapshotted in `<model>.pck/` (MKMEMQW1 images keyed by
+token prefix) and a turn whose prompt extends a cached prefix resumes
+from the snapshot, bit-identically - across turns and across sessions.
+`MICROKIMI_NO_PCK=1` disables it; `--mtp` bypasses it (the draft pairing
+starts at the prompt).
+
+Current limits: `--stream`, early exit, and the n-gram speculative
+decoder are not wired to the Qwen runtime (`--mtp` is the Qwen
+speculative path; `--memory` cannot combine with `--mtp`). The default
+mmap load is still demand-paged and does not copy the model file into
+anonymous RAM.

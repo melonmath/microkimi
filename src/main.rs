@@ -1457,6 +1457,10 @@ fn chat_loop_qwen(
     } else {
         println!("\nInteractive mode - history kept (type 'quit' to exit)");
     }
+    // chat prefix cache: MKMEMQW1 images keyed by token prefix, so a turn
+    // whose prompt extends a previous turn (or a past session) resumes
+    // from the snapshot instead of re-ingesting the whole history
+    let pck = memory::prefix_cache::open(mp);
     let stdin = std::io::stdin();
     let mut history: Vec<(String, String)> = Vec::new();
     loop {
@@ -1478,12 +1482,12 @@ fn chat_loop_qwen(
         } else {
             (tok.encode_chat(&history, question), tok.end_of_msg())
         };
-        let answer = model::qwen::qwen_run_turn(
+        let answer = memory::prefix_cache::qwen_run_turn_chat(
+            pck.as_ref(),
             &ids,
             200,
             &tok,
             &mut qwen,
-            false,
             debug_routing,
             stop,
             sampler,
