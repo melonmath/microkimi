@@ -2416,72 +2416,32 @@ fn lin_attn_prefill(
     let norm = tensor(data, &w.norm);
     let out_proj = tensor(data, &w.out_proj);
 
-    // projections, parallel over token ranges
+    // projections: every weight row is streamed ONCE and dotted against
+    // all tokens (the multi kernels), instead of once per token per worker
     let mut qkv = vec![0.0f32; t_count * conv_dim];
     let mut z = vec![0.0f32; t_count * vt];
     let mut b_raw = vec![0.0f32; t_count * heads];
     let mut a_raw = vec![0.0f32; t_count * heads];
     {
-        let workers = prefill_workers(t_count);
-        std::thread::scope(|s| {
-            let mut qkv_rest = qkv.as_mut_slice();
-            let mut z_rest = z.as_mut_slice();
-            let mut b_rest = b_raw.as_mut_slice();
-            let mut a_rest = a_raw.as_mut_slice();
-            for (t0, t1) in ranges(t_count, workers) {
-                let n = t1 - t0;
-                let (qkv_c, qr) = qkv_rest.split_at_mut(n * conv_dim);
-                let (z_c, zr) = z_rest.split_at_mut(n * vt);
-                let (b_c, br) = b_rest.split_at_mut(n * heads);
-                let (a_c, ar) = a_rest.split_at_mut(n * heads);
-                qkv_rest = qr;
-                z_rest = zr;
-                b_rest = br;
-                a_rest = ar;
-                let x = &normed[t0 * d..t1 * d];
-                s.spawn(move || {
-                    for i in 0..n {
-                        let xt = &x[i * d..(i + 1) * d];
-                        match q8_mats {
-                            Some((q_qkv, q_z, _)) => {
-                                q_qkv.matvec_st(xt, &mut qkv_c[i * conv_dim..(i + 1) * conv_dim]);
-                                q_z.matvec_st(xt, &mut z_c[i * vt..(i + 1) * vt]);
-                            }
-                            None => {
-                                crate::model::ops::matvec_st(
-                                    in_qkv,
-                                    conv_dim,
-                                    d,
-                                    xt,
-                                    &mut qkv_c[i * conv_dim..(i + 1) * conv_dim],
-                                );
-                                crate::model::ops::matvec_st(
-                                    in_z,
-                                    vt,
-                                    d,
-                                    xt,
-                                    &mut z_c[i * vt..(i + 1) * vt],
-                                );
-                            }
-                        }
-                        crate::model::ops::matvec_st(
-                            in_b,
-                            heads,
-                            d,
-                            xt,
-                            &mut b_c[i * heads..(i + 1) * heads],
-                        );
-                        crate::model::ops::matvec_st(
-                            in_a,
-                            heads,
-                            d,
-                            xt,
-                            &mut a_c[i * heads..(i + 1) * heads],
-                        );
-                    }
-                });
+        let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
+        match q8_mats {
+            Some((q_qkv, q_z, _)) => {
+                let mut outs: Vec<&mut [f32]> = qkv.chunks_mut(conv_dim).collect();
+                q_qkv.matvec_multi(&xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = z.chunks_mut(vt).collect();
+                q_z.matvec_multi(&xs, &mut outs);
             }
-        });
+            None => {
+                let mut outs: Vec<&mut [f32]> = qkv.chunks_mut(conv_dim).collect();
+                crate::model::ops::matvec_multi(in_qkv, conv_dim, d, &xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = z.chunks_mut(vt).collect();
+                crate::model::ops::matvec_multi(in_z, vt, d, &xs, &mut outs);
+            }
+        }
+        let mut outs: Vec<&mut [f32]> = b_raw.chunks_mut(heads).collect();
+        crate::model::ops::matvec_multi(in_b, heads, d, &xs, &mut outs);
+        let mut outs: Vec<&mut [f32]> = a_raw.chunks_mut(heads).collect();
+        crate::model::ops::matvec_multi(in_a, heads, d, &xs, &mut outs);
     }
 
     // causal convolution: the sequential scan (cheap, carries cache.conv)
@@ -2549,24 +2509,27 @@ fn lin_attn_prefill(
         });
     }
 
-    // gated norm + output projection, parallel over token ranges
+    // gated norm per token (token-major gather), then ONE multi-lane
+    // output projection over all tokens
+    let mut mixed_tm = vec![0.0f32; t_count * vt];
     {
         let workers = prefill_workers(t_count);
         std::thread::scope(|s| {
-            let mut out_rest = &mut attn_out[..t_count * d];
+            let mut rest = mixed_tm.as_mut_slice();
             let mixed_hm = &mixed_hm;
             let z = &z;
             for (t0, t1) in ranges(t_count, workers) {
                 let n = t1 - t0;
-                let (out_c, or) = out_rest.split_at_mut(n * d);
-                out_rest = or;
+                let (chunk, r) = rest.split_at_mut(n * vt);
+                rest = r;
                 s.spawn(move || {
-                    let mut mixed = vec![0.0f32; vt];
                     for i in 0..n {
                         let t = t0 + i;
+                        let mixed = &mut chunk[i * vt..(i + 1) * vt];
                         for h in 0..heads {
-                            mixed[h * vd..(h + 1) * vd]
-                                .copy_from_slice(&mixed_hm[(h * t_count + t) * vd..(h * t_count + t + 1) * vd]);
+                            mixed[h * vd..(h + 1) * vd].copy_from_slice(
+                                &mixed_hm[(h * t_count + t) * vd..(h * t_count + t + 1) * vd],
+                            );
                         }
                         for h in 0..heads {
                             let (a, b) = (h * vd, (h + 1) * vd);
@@ -2577,22 +2540,18 @@ fn lin_attn_prefill(
                                 c.norm_eps as f32,
                             );
                         }
-                        match q8_mats {
-                            Some((_, _, q_out)) => {
-                                q_out.matvec_st(&mixed, &mut out_c[i * d..(i + 1) * d])
-                            }
-                            None => crate::model::ops::matvec_st(
-                                out_proj,
-                                d,
-                                vt,
-                                &mixed,
-                                &mut out_c[i * d..(i + 1) * d],
-                            ),
-                        }
                     }
                 });
             }
         });
+    }
+    {
+        let xs: Vec<&[f32]> = mixed_tm.chunks(vt).collect();
+        let mut outs: Vec<&mut [f32]> = attn_out[..t_count * d].chunks_mut(d).collect();
+        match q8_mats {
+            Some((_, _, q_out)) => q_out.matvec_multi(&xs, &mut outs),
+            None => crate::model::ops::matvec_multi(out_proj, d, vt, &xs, &mut outs),
+        }
     }
 }
 
@@ -2725,49 +2684,56 @@ fn full_attn_prefill(
     let q_norm = tensor(data, &w.q_norm);
     let k_norm = tensor(data, &w.k_norm);
 
+    // projections once for all tokens (weights streamed a single time),
+    // then the per-token interleave / norm / rotary phase fans out
+    let mut qg_all = vec![0.0f32; t_count * q_width * 2];
     let mut q_all = vec![0.0f32; t_count * q_width];
     let mut gate_all = vec![0.0f32; t_count * q_width];
     let mut k_all = vec![0.0f32; t_count * kv_width];
     let mut v_all = vec![0.0f32; t_count * kv_width];
+    {
+        let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
+        match q8_mats {
+            Some((qq, qk, qv, _)) => {
+                let mut outs: Vec<&mut [f32]> = qg_all.chunks_mut(q_width * 2).collect();
+                qq.matvec_multi(&xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = k_all.chunks_mut(kv_width).collect();
+                qk.matvec_multi(&xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = v_all.chunks_mut(kv_width).collect();
+                qv.matvec_multi(&xs, &mut outs);
+            }
+            None => {
+                let mut outs: Vec<&mut [f32]> = qg_all.chunks_mut(q_width * 2).collect();
+                crate::model::ops::matvec_multi(q_proj, q_width * 2, d, &xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = k_all.chunks_mut(kv_width).collect();
+                crate::model::ops::matvec_multi(k_proj, kv_width, d, &xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = v_all.chunks_mut(kv_width).collect();
+                crate::model::ops::matvec_multi(v_proj, kv_width, d, &xs, &mut outs);
+            }
+        }
+    }
     {
         let workers = prefill_workers(t_count);
         std::thread::scope(|s| {
             let mut q_rest = q_all.as_mut_slice();
             let mut g_rest = gate_all.as_mut_slice();
             let mut k_rest = k_all.as_mut_slice();
-            let mut v_rest = v_all.as_mut_slice();
+            let qg_all = &qg_all;
             for (t0, t1) in ranges(t_count, workers) {
                 let n = t1 - t0;
                 let (q_c, qr) = q_rest.split_at_mut(n * q_width);
                 let (g_c, gr) = g_rest.split_at_mut(n * q_width);
                 let (k_c, kr) = k_rest.split_at_mut(n * kv_width);
-                let (v_c, vr) = v_rest.split_at_mut(n * kv_width);
                 q_rest = qr;
                 g_rest = gr;
                 k_rest = kr;
-                v_rest = vr;
-                let x = &normed[t0 * d..t1 * d];
                 s.spawn(move || {
-                    let mut qg = vec![0.0f32; q_width * 2];
                     for i in 0..n {
-                        let xt = &x[i * d..(i + 1) * d];
                         let pos = base_pos + t0 + i;
-                        let k = &mut k_c[i * kv_width..(i + 1) * kv_width];
-                        let v = &mut v_c[i * kv_width..(i + 1) * kv_width];
-                        match q8_mats {
-                            Some((qq, qk, qv, _)) => {
-                                qq.matvec_st(xt, &mut qg);
-                                qk.matvec_st(xt, k);
-                                qv.matvec_st(xt, v);
-                            }
-                            None => {
-                                crate::model::ops::matvec_st(q_proj, q_width * 2, d, xt, &mut qg);
-                                crate::model::ops::matvec_st(k_proj, kv_width, d, xt, k);
-                                crate::model::ops::matvec_st(v_proj, kv_width, d, xt, v);
-                            }
-                        }
+                        let qg = &qg_all[(t0 + i) * q_width * 2..(t0 + i + 1) * q_width * 2];
                         let q = &mut q_c[i * q_width..(i + 1) * q_width];
                         let gate = &mut g_c[i * q_width..(i + 1) * q_width];
+                        let k = &mut k_c[i * kv_width..(i + 1) * kv_width];
                         for h in 0..c.n_heads {
                             let src = h * hd * 2;
                             q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
@@ -2790,21 +2756,23 @@ fn full_attn_prefill(
     cache.v.extend_from_slice(&v_all);
     cache.len += t_count;
 
-    // each position attends over its causal prefix, parallel over tokens
+    // each position attends over its causal prefix, parallel over tokens;
+    // gated mixes land token-major for the single multi o_proj below
+    let mut mixed_all = vec![0.0f32; t_count * q_width];
     {
         let workers = prefill_workers(t_count);
         let groups = c.n_heads / c.n_kv_heads;
         let scale = 1.0f32 / (hd as f32).sqrt();
         std::thread::scope(|s| {
-            let mut out_rest = &mut attn_out[..t_count * d];
+            let mut mixed_rest = mixed_all.as_mut_slice();
             let cache_k = &cache.k;
             let cache_v = &cache.v;
             let q_all = &q_all;
             let gate_all = &gate_all;
             for (t0, t1) in ranges(t_count, workers) {
                 let n = t1 - t0;
-                let (out_c, or) = out_rest.split_at_mut(n * d);
-                out_rest = or;
+                let (mixed_c, mr) = mixed_rest.split_at_mut(n * q_width);
+                mixed_rest = mr;
                 s.spawn(move || {
                     for i in 0..n {
                         let t = t0 + i;
@@ -2839,22 +2807,19 @@ fn full_attn_prefill(
                         for (j, value) in mixed.iter_mut().enumerate() {
                             *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
                         }
-                        match q8_mats {
-                            Some((_, _, _, qo)) => {
-                                qo.matvec_st(&mixed, &mut out_c[i * d..(i + 1) * d])
-                            }
-                            None => crate::model::ops::matvec_st(
-                                o_proj,
-                                d,
-                                q_width,
-                                &mixed,
-                                &mut out_c[i * d..(i + 1) * d],
-                            ),
-                        }
+                        mixed_c[i * q_width..(i + 1) * q_width].copy_from_slice(&mixed);
                     }
                 });
             }
         });
+    }
+    {
+        let xs: Vec<&[f32]> = mixed_all.chunks(q_width).collect();
+        let mut outs: Vec<&mut [f32]> = attn_out[..t_count * d].chunks_mut(d).collect();
+        match q8_mats {
+            Some((_, _, _, qo)) => qo.matvec_multi(&xs, &mut outs),
+            None => crate::model::ops::matvec_multi(o_proj, d, q_width, &xs, &mut outs),
+        }
     }
 }
 
@@ -2871,6 +2836,34 @@ fn mlp_prefill(
     out: &mut [f32],
 ) {
     let d = c.d;
+    // dense batch without a budget: three multi-kernel passes stream the
+    // packed weights once for ALL tokens
+    if t_count > 1 && bounds.is_none() {
+        if let QwenMlpW::Dense { gate, up, down } = mlp {
+            let inter = c.dense_inter;
+            let threads = crate::model::pool::pool().workers.max(1);
+            let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
+            let mut h_gate = vec![0.0f32; t_count * inter];
+            let mut h_up = vec![0.0f32; t_count * inter];
+            {
+                let (pg, sg) = packed_parts(data, gate);
+                let mut outs: Vec<&mut [f32]> = h_gate.chunks_mut(inter).collect();
+                crate::quant::mxfp4::matvec_packed_multi(pg, sg, inter, d, &xs, &mut outs, threads);
+                let (pu, su) = packed_parts(data, up);
+                let mut outs: Vec<&mut [f32]> = h_up.chunks_mut(inter).collect();
+                crate::quant::mxfp4::matvec_packed_multi(pu, su, inter, d, &xs, &mut outs, threads);
+            }
+            for i in 0..t_count * inter {
+                h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+            }
+            let hs: Vec<&[f32]> = h_gate.chunks(inter).collect();
+            let (pd, sd) = packed_parts(data, down);
+            let mut outs: Vec<&mut [f32]> = out[..t_count * d].chunks_mut(d).collect();
+            crate::quant::mxfp4::matvec_packed_multi(pd, sd, d, inter, &hs, &mut outs, threads);
+            return;
+        }
+    }
+
     // single-token decode: the row-parallel MLP (pool-threaded packed
     // matvecs, parallel routed experts) instead of one serial worker
     if t_count == 1 {
