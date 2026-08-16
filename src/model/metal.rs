@@ -412,6 +412,7 @@ pub struct IoBufs {
     x: (Id, usize),    // (buffer, capacity bytes)
     y: (Id, usize),
     cols: (Id, usize),
+    z: (Id, usize),    // second input for the batched GEMMs (attention K/V)
 }
 
 pub struct WeightCache {
@@ -581,6 +582,7 @@ fn init_ctx() -> Option<MetalCtx> {
                 x: (std::ptr::null_mut(), 0),
                 y: (std::ptr::null_mut(), 0),
                 cols: (std::ptr::null_mut(), 0),
+                z: (std::ptr::null_mut(), 0),
             }),
         };
         retain(library);
@@ -1401,8 +1403,9 @@ pub fn set_qwen_gpu(on: bool) {
 }
 
 struct MpsCtx {
-    // (t, rows, cols) → retained MPSMatrixMultiplication kernel
-    gemms: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), Id>>,
+    // (m, n, k, transpose_b, alpha bits) → retained MPSMatrixMultiplication
+    // kernel (the batch count lives in the matrix descriptors, not here)
+    gemms: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize, bool, u32), Id>>,
     // (packed ptr, rows, cols) → (retained f32 device buffer, first packed bytes as alias tag)
     dequant: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, [u8; 16])>>,
 }
@@ -1443,11 +1446,14 @@ pub fn mps_available() -> bool {
     mps_ctx().is_some()
 }
 
-/// Cached MPSMatrixMultiplication for Y[t,rows] = X[t,cols] · W[rows,cols]ᵀ.
-fn gemm_kernel(base: &MetalCtx, mps: &MpsCtx, t: usize, rows: usize, cols: usize) -> Option<Id> {
+/// Cached MPSMatrixMultiplication for C[m,n] = alpha · A[m,k] · B' where
+/// B' is B[n,k]ᵀ when `transpose_b` and B[k,n] otherwise. Batching comes
+/// from the matrix descriptors at encode time, not from the kernel.
+fn gemm_kernel(base: &MetalCtx, mps: &MpsCtx, m: usize, n: usize, k: usize, transpose_b: bool, alpha: f32) -> Option<Id> {
+    let key = (m, n, k, transpose_b, alpha.to_bits());
     let mut cache = mps.gemms.lock().unwrap();
-    if let Some(&k) = cache.get(&(t, rows, cols)) {
-        return Some(k);
+    if let Some(&kern) = cache.get(&key) {
+        return Some(kern);
     }
     // SAFETY: alloc/init on a resolved class; the typed signature matches
     // initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:
@@ -1462,18 +1468,18 @@ fn gemm_kernel(base: &MetalCtx, mps: &MpsCtx, t: usize, rows: usize, cols: usize
             sel("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:"),
             base.device,
             false,
-            true,
-            t as u64,
-            rows as u64,
-            cols as u64,
-            1.0,
+            transpose_b,
+            m as u64,
+            n as u64,
+            k as u64,
+            alpha as f64,
             0.0,
         )
     };
     if kernel.is_null() {
         return None;
     }
-    cache.insert((t, rows, cols), kernel); // init gave +1; owned by the cache
+    cache.insert(key, kernel); // init gave +1; owned by the cache
     Some(kernel)
 }
 
@@ -1513,7 +1519,7 @@ fn run_gemm(
     if t * rows * 4 > GEMM_MAX_OUT_BYTES {
         return false;
     }
-    let Some(kernel) = gemm_kernel(base, mps, t, rows, cols) else {
+    let Some(kernel) = gemm_kernel(base, mps, t, rows, cols, true, 1.0) else {
         return false;
     };
     let t_start = std::time::Instant::now();
@@ -1679,4 +1685,134 @@ pub fn gemm_stats_take() -> (u64, f64) {
     let calls = GEMM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
     let micros = GEMM_MICROS.swap(0, std::sync::atomic::Ordering::Relaxed);
     (calls, micros as f64 / 1000.0)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Batched GEMM: the attention offload (scores and mixes for every head in
+// one encode each; the causal softmax stays on the CPU between the two)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Batched C[b][m,n] = alpha · A[b][m,k] · B' for every b at once, where
+/// B' is B[b][n,k]ᵀ when `transpose_b` and B[b][k,n] otherwise. A, B and
+/// C are dense head-major stacks ([batch, rows, cols] contiguous). All
+/// staging goes through the shared io buffers (x = A, z = B, y = C).
+/// Returns false when the offload is unavailable or the result would
+/// exceed the staging ceiling (caller keeps its CPU path).
+pub fn gpu_gemm_batched(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    transpose_b: bool,
+    alpha: f32,
+    out: &mut [f32],
+) -> bool {
+    assert_eq!(a.len(), batch * m * k);
+    assert_eq!(b.len(), batch * n * k);
+    assert_eq!(out.len(), batch * m * n);
+    if batch * m * n * 4 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
+    let Some((base, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some(kernel) = gemm_kernel(base, mps, m, n, k, transpose_b, alpha) else {
+        return false;
+    };
+    let t_start = std::time::Instant::now();
+    // SAFETY: same invariants as run_gemm - io mutex serializes staging use
+    // for the whole encode/wait/readback, waitUntilCompleted precedes the
+    // readback, MPSMatrix wrappers are init-owned and released below.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (a_ptr, buf_a) = ensure_buf(base, &mut io.x, a.len() * 4);
+        let (b_ptr, buf_b) = ensure_buf(base, &mut io.z, b.len() * 4);
+        let (c_ptr, buf_c) = ensure_buf(base, &mut io.y, out.len() * 4);
+        if buf_a.is_null() || buf_b.is_null() || buf_c.is_null() || a_ptr.is_null() || b_ptr.is_null() || c_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(a.as_ptr(), a_ptr as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), b_ptr as *mut f32, b.len());
+
+        // batched descriptor: matrices = batch, matrixBytes = one matrix
+        let bdesc = |rows: usize, cols: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                class("MPSMatrixDescriptor"),
+                sel("matrixDescriptorWithRows:columns:matrices:rowBytes:matrixBytes:dataType:"),
+                rows as u64,
+                cols as u64,
+                batch as u64,
+                (cols * 4) as u64,
+                (rows * cols * 4) as u64,
+                MPS_FLOAT32,
+            )
+        };
+        let matrix = |buf: Id, d: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:descriptor:"), buf, d)
+        };
+        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+        let ma = matrix(buf_a, bdesc(m, k));
+        let mb = matrix(buf_b, bdesc(b_rows, b_cols));
+        let mc = matrix(buf_c, bdesc(m, n));
+        if ma.is_null() || mb.is_null() || mc.is_null() {
+            for mm in [ma, mb, mc] {
+                if !mm.is_null() {
+                    msg_void(mm, sel("release"));
+                }
+            }
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        {
+            // one kernel run per batch entry, all in one command buffer.
+            // batchSize lives on MPSMatrixBinaryKernel; its absence would
+            // raise an unrecognized-selector exception, so probe first
+            // (the default, 0, already means "the whole batch").
+            let responds: extern "C" fn(Id, Sel, Sel) -> bool =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            if responds(kernel, sel("respondsToSelector:"), sel("setBatchSize:")) {
+                let f: extern "C" fn(Id, Sel, u64) =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(kernel, sel("setBatchSize:"), batch as u64);
+            }
+        }
+        {
+            let f: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(kernel, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, ma, mb, mc);
+        }
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        out.copy_from_slice(std::slice::from_raw_parts(c_ptr as *const f32, out.len()));
+        for mm in [ma, mb, mc] {
+            msg_void(mm, sel("release"));
+        }
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
+}
+
+/// Kill switch for the attention offload alone (MICROKIMI_QWEN_GPU_NOATTN=1):
+/// the projection GEMMs stay offloaded, attention returns to the CPU loop.
+pub fn qwen_gpu_attn_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    qwen_gpu_on()
+        && *ON.get_or_init(|| {
+            std::env::var("MICROKIMI_QWEN_GPU_NOATTN").map(|v| v != "1").unwrap_or(true)
+        })
 }

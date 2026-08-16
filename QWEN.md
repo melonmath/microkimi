@@ -305,9 +305,30 @@ ms/token against the CPU batched prefill in paired in-process rounds -
 the last-position logits within 1.4e-2 of the CPU path (the expected
 dequant-versus-q8-activation delta). qwengpubench also reports the
 GEMM-versus-CPU-tissue split per token, which is the sizing datum for
-porting the remaining ops (delta scan, attention, norms) in a later
-phase; llama.cpp's full-Metal graph runs the same prefill at ~4700
-tok/s on this machine, so the ceiling is known and far.
+porting the remaining ops in later phases; llama.cpp's full-Metal
+graph runs the same prefill at ~4700 tok/s on this machine, so the
+ceiling is known and far.
+
+Phase 2 moved the full-attention layers onto the same machinery:
+scores = scale·Q·Kᵀ and mix = P·V run as BATCHED GEMMs (every head in
+one encode each, the GQA kv-heads expanded across their group), with
+the causal softmax on the CPU between the two and the masked tail
+zeroed so the P·V product runs over the full cache width.
+MICROKIMI_QWEN_GPU_NOATTN=1 is the kill switch that keeps the
+projection GEMMs offloaded while returning attention to the CPU loop;
+prompts whose scores stack would exceed the 256 MB staging ceiling
+fall back automatically. The CPU tissue itself also lost its serial
+spots in the same pass (measured on the container at ~27% of the
+batched prefill): the SiLU merge and the causal convolution now fan
+out over workers, attention token ranges are cut on causal cost
+rather than uniformly, and every pooled row kernel pulls fine chunks
+from a shared counter (MICROKIMI_NO_DYNROWS=1 for the A/B) so an
+E-core straggler delays one chunk instead of a quarter of the matrix.
+The delta-scan recurrence is the one block still CPU-bound by design:
+its GPU port is sized by the qwengpubench split line before being
+written. Not offloaded on the arithmetic: f16 GEMMs and paired
+command buffers (both under 0.05 ms/token at 1k tokens - the GEMM
+slice is ~0.2-0.3 ms/token; the tissue is where the time lives).
 
 ## Chained drafting and lane-batched decoding
 

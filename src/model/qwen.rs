@@ -2816,7 +2816,18 @@ fn full_attn_prefill(
     // each position attends over its causal prefix, parallel over tokens;
     // gated mixes land token-major for the single multi o_proj below
     let mut mixed_all = vec![0.0f32; t_count * q_width];
-    {
+    // GPU attention (MICROKIMI_QWEN_GPU=1): scores and mixes for every
+    // head as two batched GEMMs with the causal softmax on the CPU in
+    // between; falls back to the CPU loop below on any refusal.
+    #[allow(unused_mut)]
+    let mut gpu_attn_done = false;
+    #[cfg(target_os = "macos")]
+    if crate::model::metal::qwen_gpu_attn_on() && t_count >= crate::model::metal::GEMM_MIN_T {
+        gpu_attn_done = gpu_full_attention(
+            c, cache, &q_all, &gate_all, base_pos, t_count, q_width, kv_width, hd, &mut mixed_all,
+        );
+    }
+    if !gpu_attn_done {
         let workers = prefill_workers(t_count);
         let groups = c.n_heads / c.n_kv_heads;
         let scale = 1.0f32 / (hd as f32).sqrt();
@@ -2878,6 +2889,137 @@ fn full_attn_prefill(
             None => crate::model::ops::matvec_multi(o_proj, d, q_width, &xs, &mut outs),
         }
     }
+}
+
+/// Full attention over the causal prefix as two batched GPU GEMMs -
+/// scores = scale·Q·Kᵀ and mix = P·V for every head in one encode each -
+/// with the causal softmax on the CPU in between (masked tail zeroed so
+/// the P·V product runs over the full cache width). K and V expand their
+/// kv-head across the GQA group into head-major stacks. Numerics differ
+/// from the CPU loop only by GEMM reassociation; any refusal returns
+/// false and the caller keeps its CPU path.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_full_attention(
+    c: &QwenConfig,
+    cache: &FullCache,
+    q_all: &[f32],
+    gate_all: &[f32],
+    base_pos: usize,
+    t_count: usize,
+    q_width: usize,
+    kv_width: usize,
+    hd: usize,
+    mixed_all: &mut [f32],
+) -> bool {
+    let heads = c.n_heads;
+    let groups = (heads / c.n_kv_heads).max(1);
+    let l = cache.len;
+    debug_assert_eq!(l, base_pos + t_count);
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    // the scores stack is the big allocation; refuse early what the
+    // staging ceiling would refuse anyway (256 MB)
+    if heads * t_count * l * 4 > 256 * 1024 * 1024 || !crate::model::metal::mps_available() {
+        return false;
+    }
+
+    // head-major repacks, parallel over heads
+    let mut q_hm = vec![0.0f32; heads * t_count * hd];
+    let mut k_hm = vec![0.0f32; heads * l * hd];
+    let mut v_hm = vec![0.0f32; heads * l * hd];
+    std::thread::scope(|s| {
+        let mut q_rest = q_hm.as_mut_slice();
+        let mut k_rest = k_hm.as_mut_slice();
+        let mut v_rest = v_hm.as_mut_slice();
+        for h in 0..heads {
+            let (q_h, qr) = q_rest.split_at_mut(t_count * hd);
+            let (k_h, kr) = k_rest.split_at_mut(l * hd);
+            let (v_h, vr) = v_rest.split_at_mut(l * hd);
+            q_rest = qr;
+            k_rest = kr;
+            v_rest = vr;
+            let (ck, cv) = (&cache.k, &cache.v);
+            s.spawn(move || {
+                let kh = h / groups;
+                for t in 0..t_count {
+                    q_h[t * hd..(t + 1) * hd]
+                        .copy_from_slice(&q_all[t * q_width + h * hd..t * q_width + (h + 1) * hd]);
+                }
+                for u in 0..l {
+                    k_h[u * hd..(u + 1) * hd]
+                        .copy_from_slice(&ck[u * kv_width + kh * hd..u * kv_width + (kh + 1) * hd]);
+                    v_h[u * hd..(u + 1) * hd]
+                        .copy_from_slice(&cv[u * kv_width + kh * hd..u * kv_width + (kh + 1) * hd]);
+                }
+            });
+        }
+    });
+
+    let mut scores = vec![0.0f32; heads * t_count * l];
+    if !crate::model::metal::gpu_gemm_batched(&q_hm, &k_hm, heads, t_count, l, hd, true, scale, &mut scores) {
+        return false;
+    }
+    // causal softmax in place, parallel over heads
+    std::thread::scope(|s| {
+        let mut rest = scores.as_mut_slice();
+        for _ in 0..heads {
+            let (rows_h, r) = rest.split_at_mut(t_count * l);
+            rest = r;
+            s.spawn(move || {
+                for t in 0..t_count {
+                    let row = &mut rows_h[t * l..(t + 1) * l];
+                    let window = base_pos + t + 1;
+                    let mut mx = f32::NEG_INFINITY;
+                    for v in row[..window].iter() {
+                        mx = mx.max(*v);
+                    }
+                    let mut denom = 0.0f32;
+                    for v in row[..window].iter_mut() {
+                        *v = (*v - mx).exp();
+                        denom += *v;
+                    }
+                    let inv = 1.0 / denom;
+                    for v in row[..window].iter_mut() {
+                        *v *= inv;
+                    }
+                    for v in row[window..].iter_mut() {
+                        *v = 0.0;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut mixed_hm = vec![0.0f32; heads * t_count * hd];
+    if !crate::model::metal::gpu_gemm_batched(&scores, &v_hm, heads, t_count, hd, l, false, 1.0, &mut mixed_hm) {
+        return false;
+    }
+    // token-major gather + the sigmoid output gate (as the CPU loop)
+    {
+        let workers = prefill_workers(t_count);
+        std::thread::scope(|s| {
+            let mut rest = &mut mixed_all[..t_count * q_width];
+            let mixed_hm = &mixed_hm;
+            for (t0, t1) in ranges(t_count, workers) {
+                let (chunk, r) = rest.split_at_mut((t1 - t0) * q_width);
+                rest = r;
+                s.spawn(move || {
+                    for (i, t) in (t0..t1).enumerate() {
+                        let m = &mut chunk[i * q_width..(i + 1) * q_width];
+                        for h in 0..heads {
+                            m[h * hd..(h + 1) * hd].copy_from_slice(
+                                &mixed_hm[(h * t_count + t) * hd..(h * t_count + t + 1) * hd],
+                            );
+                        }
+                        for (j, value) in m.iter_mut().enumerate() {
+                            *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
+                        }
+                    }
+                });
+            }
+        });
+    }
+    true
 }
 
 /// Prefill MLP dispatch: every token is independent, so tokens fan out over
