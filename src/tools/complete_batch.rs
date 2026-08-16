@@ -45,13 +45,7 @@ impl BatchModel {
     fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
         match self {
             BatchModel::K3(model) => model.prefill(ids, 0),
-            BatchModel::Qwen(model) => {
-                let mut logits = Vec::new();
-                for &token in ids {
-                    logits = model.forward(token);
-                }
-                logits
-            }
+            BatchModel::Qwen(model) => model.prefill(ids),
             BatchModel::DeepSeek(model) => {
                 let mut logits = Vec::new();
                 for (pos, &token) in ids.iter().enumerate() {

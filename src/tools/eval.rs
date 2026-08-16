@@ -137,13 +137,7 @@ impl EvalModel {
     fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
         match self {
             EvalModel::K3(model) => model.prefill(ids, 0),
-            EvalModel::Qwen(model) => {
-                let mut logits = Vec::new();
-                for &token in ids {
-                    logits = model.forward(token);
-                }
-                logits
-            }
+            EvalModel::Qwen(model) => model.prefill(ids),
             EvalModel::DeepSeek(model) => {
                 let mut logits = Vec::new();
                 for (pos, &token) in ids.iter().enumerate() {
@@ -211,6 +205,92 @@ fn greedy_complete(
 
 /// Mean next-token NLL over the whole text (sequential forward, one window).
 /// Returns (ppl, n_tokens_scored, tokens_processed).
+/// Next-token NLL sum over `ids` on a Qwen model, scored through the
+/// batched layers-outer prefill in bounded chunks (the held per-position
+/// logits stay small while the weight-locality win remains). Prefill is
+/// bit-identical to sequential forwards, so the score is too.
+fn qwen_nll(qwen: &mut crate::model::qwen::QwenModel, ids: &[u32]) -> (f64, usize) {
+    let token_nll = |logits: &[f32], target: usize| -> f64 {
+        let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
+        let lse = logits
+            .iter()
+            .map(|&x| ((x as f64) - max).exp())
+            .sum::<f64>()
+            .ln()
+            + max;
+        lse - logits[target] as f64
+    };
+    const CHUNK: usize = 128;
+    let mut nll = 0f64;
+    let mut n = 0usize;
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + CHUNK).min(ids.len());
+        let out = qwen.prefill_collect(&ids[start..end], true);
+        for (offset, logits) in out.logits.iter().enumerate() {
+            let next = start + offset + 1;
+            if next < ids.len() {
+                nll += token_nll(logits, ids[next] as usize);
+                n += 1;
+            }
+        }
+        start = end;
+    }
+    (nll, n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_qwen_nll_matches_sequential_scoring() {
+        let mut c = crate::config::QwenConfig::qwen38_dense();
+        c.n_layers = 4;
+        c.d = 32;
+        c.vocab = 64;
+        c.n_heads = 2;
+        c.n_kv_heads = 1;
+        c.head_dim = 16;
+        c.lin_k_heads = 1;
+        c.lin_v_heads = 1;
+        c.lin_k_dim = 32;
+        c.lin_v_dim = 32;
+        c.dense_inter = 64;
+        let path = crate::model::qwen::test_fixture(&c);
+        // longer than one chunk would be better, but CHUNK = 128 makes a
+        // multi-chunk fixture slow; exercise the boundary with a small
+        // chunk-sized slice plus the cross-chunk target lookup
+        let ids: Vec<u32> = (0..200u32).map(|i| (i * 7 + 3) % 64).collect();
+
+        let mut sequential = crate::model::qwen::QwenModel::load(&path);
+        let mut nll_seq = 0f64;
+        let mut n_seq = 0usize;
+        for (i, &id) in ids.iter().enumerate() {
+            let logits = sequential.forward(id);
+            if i + 1 < ids.len() {
+                let target = ids[i + 1] as usize;
+                let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
+                let lse = logits
+                    .iter()
+                    .map(|&x| ((x as f64) - max).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max;
+                nll_seq += lse - logits[target] as f64;
+                n_seq += 1;
+            }
+        }
+
+        let mut batched = crate::model::qwen::QwenModel::load(&path);
+        let (nll, n) = qwen_nll(&mut batched, &ids);
+        assert_eq!(n, n_seq);
+        assert_eq!(nll, nll_seq, "chunked NLL diverges from sequential");
+        drop((sequential, batched));
+        std::fs::remove_file(path).ok();
+    }
+}
+
 fn perplexity(
     model: &mut EvalModel,
     tok: &crate::tokenizer::AnyTokenizer,
@@ -222,25 +302,30 @@ fn perplexity(
     if let Some(limit) = max_tokens {
         ids.truncate(limit);
     }
-    let mut nll = 0f64;
-    let mut n = 0usize;
-    let mut logits = Vec::new();
-    for (i, &id) in ids.iter().enumerate() {
-        logits = model.forward(id, i);
-        if i + 1 < ids.len() {
-            let target = ids[i + 1] as usize;
-            let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
-            let lse = logits
-                .iter()
-                .map(|&x| ((x as f64) - max).exp())
-                .sum::<f64>()
-                .ln()
-                + max;
-            nll += lse - logits[target] as f64;
-            n += 1;
+    let token_nll = |logits: &[f32], target: usize| -> f64 {
+        let max = logits.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) as f64;
+        let lse = logits
+            .iter()
+            .map(|&x| ((x as f64) - max).exp())
+            .sum::<f64>()
+            .ln()
+            + max;
+        lse - logits[target] as f64
+    };
+    let (nll, n) = if let EvalModel::Qwen(qwen) = model {
+        qwen_nll(qwen, &ids)
+    } else {
+        let mut nll = 0f64;
+        let mut n = 0usize;
+        for (i, &id) in ids.iter().enumerate() {
+            let logits = model.forward(id, i);
+            if i + 1 < ids.len() {
+                nll += token_nll(&logits, ids[i + 1] as usize);
+                n += 1;
+            }
         }
-    }
-    let _ = logits;
+        (nll, n)
+    };
     ((nll / n.max(1) as f64).exp(), n, ids.len())
 }
 
