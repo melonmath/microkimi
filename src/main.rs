@@ -56,6 +56,7 @@ fn main() {
         "dstest" => dstest_cmd(),
         "qwen-dump" => model::qwen::dump_cmd(&args),
         "lanebench" => model::qwen::lanebench_cmd(&args),
+        "qwenbench" => tools::qwenbench::run(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" | "parity" => {
@@ -257,6 +258,9 @@ fn main() {
             println!("                                         converts a local Qwen3.5-family text checkpoint (MoE or dense);");
             println!("                                         f32 spine + MXFP4 experts or dense MLP, bounded conversion RAM;");
             println!("                                         --imatrix: calibration-weighted MXFP4 scales (dense, see calibrate)");
+            println!("  microkimi qwenbench --model X.bin [--steps N] [--rounds R]");
+            println!("                                         full paired benchmark battery (decode spines, sdot, prefill,");
+            println!("                                         lanes, mtp) with one report; protocol vs llama.cpp in BENCH.md");
             println!("  microkimi lanebench --model X.bin [--lanes N] [--steps M]");
             println!("                                         aggregate decode throughput of lane-batched decoding (Qwen)");
             println!("  microkimi complete-batch --model X.bin --input REQUESTS.jsonl --out RESULTS.jsonl");

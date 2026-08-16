@@ -1402,6 +1402,51 @@ pub fn mlp_skip_stats() -> (u64, u64) {
     )
 }
 
+/// Builds the quantized spine copies for every layer (q8 or fp4).
+fn build_spine(
+    layers: &[QwenLayerW],
+    bin: &BinFile,
+    c: &QwenConfig,
+    fp4: bool,
+) -> Vec<Option<LayerQ8>> {
+    let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
+    let full_width = c.n_heads * c.head_dim;
+    let kvw = c.n_kv_heads * c.head_dim;
+    layers
+        .iter()
+        .map(|layer| {
+            Some(match &layer.attn {
+                QwenAttnW::Linear(w) => LayerQ8::Linear {
+                    in_qkv: SpineMat::build(tensor(&bin.data, &w.in_qkv), conv_dim, c.d, fp4),
+                    in_z: SpineMat::build(
+                        tensor(&bin.data, &w.in_z),
+                        c.lin_value_total(),
+                        c.d,
+                        fp4,
+                    ),
+                    out_proj: SpineMat::build(
+                        tensor(&bin.data, &w.out_proj),
+                        c.d,
+                        c.lin_value_total(),
+                        fp4,
+                    ),
+                },
+                QwenAttnW::Full(w) => LayerQ8::Full {
+                    q_proj: SpineMat::build(
+                        tensor(&bin.data, &w.q_proj),
+                        full_width * 2,
+                        c.d,
+                        fp4,
+                    ),
+                    k_proj: SpineMat::build(tensor(&bin.data, &w.k_proj), kvw, c.d, fp4),
+                    v_proj: SpineMat::build(tensor(&bin.data, &w.v_proj), kvw, c.d, fp4),
+                    o_proj: SpineMat::build(tensor(&bin.data, &w.o_proj), c.d, full_width, fp4),
+                },
+            })
+        })
+        .collect()
+}
+
 impl QwenModel {
     pub fn load(path: &str) -> QwenModel {
         Self::load_with_adapters(path, &[])
@@ -1674,55 +1719,9 @@ impl QwenModel {
             })
             .collect();
         let mtp_cache = FullCache::new(&c);
-        let q8_spine: Vec<Option<LayerQ8>> = if let Some(fp4) = spine_mode() {
-            let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
-            let full_width = c.n_heads * c.head_dim;
-            let kvw = c.n_kv_heads * c.head_dim;
-            layers
-                .iter()
-                .map(|layer| {
-                    Some(match &layer.attn {
-                        QwenAttnW::Linear(w) => LayerQ8::Linear {
-                            in_qkv: SpineMat::build(
-                                tensor(&bin.data, &w.in_qkv),
-                                conv_dim,
-                                c.d,
-                                fp4,
-                            ),
-                            in_z: SpineMat::build(
-                                tensor(&bin.data, &w.in_z),
-                                c.lin_value_total(),
-                                c.d,
-                                fp4,
-                            ),
-                            out_proj: SpineMat::build(
-                                tensor(&bin.data, &w.out_proj),
-                                c.d,
-                                c.lin_value_total(),
-                                fp4,
-                            ),
-                        },
-                        QwenAttnW::Full(w) => LayerQ8::Full {
-                            q_proj: SpineMat::build(
-                                tensor(&bin.data, &w.q_proj),
-                                full_width * 2,
-                                c.d,
-                                fp4,
-                            ),
-                            k_proj: SpineMat::build(tensor(&bin.data, &w.k_proj), kvw, c.d, fp4),
-                            v_proj: SpineMat::build(tensor(&bin.data, &w.v_proj), kvw, c.d, fp4),
-                            o_proj: SpineMat::build(
-                                tensor(&bin.data, &w.o_proj),
-                                c.d,
-                                full_width,
-                                fp4,
-                            ),
-                        },
-                    })
-                })
-                .collect()
-        } else {
-            (0..c.n_layers).map(|_| None).collect()
+        let q8_spine: Vec<Option<LayerQ8>> = match spine_mode() {
+            Some(fp4) => build_spine(&layers, &bin, &c, fp4),
+            None => (0..c.n_layers).map(|_| None).collect(),
         };
         let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
             layers
@@ -1778,6 +1777,16 @@ impl QwenModel {
             .collect();
         self.mtp_cache = FullCache::new(&self.cfg);
         self.pos = 0;
+    }
+
+    /// Rebuilds the spine quantization after load: None restores the
+    /// exact f32 spine, Some(false) selects q8, Some(true) selects MXFP4.
+    /// Tests inject modes this way instead of racing on process env.
+    pub(crate) fn set_spine_mode(&mut self, mode: Option<bool>) {
+        self.q8_spine = match mode {
+            Some(fp4) => build_spine(&self.layers, &self.bin, &self.cfg, fp4),
+            None => (0..self.cfg.n_layers).map(|_| None).collect(),
+        };
     }
 
     /// The converted checkpoint carries the multi-token-prediction head.
@@ -3898,11 +3907,12 @@ mod model_tests {
         let mut f32_model = QwenModel::load(&path);
         let f32_logits = f32_model.prefill(&tokens);
 
-        unsafe { std::env::set_var("MICROKIMI_Q8_SPINE", "1") };
         let mut q8_model = QwenModel::load(&path);
         let mut q8_forward = QwenModel::load(&path);
         let mut q8_lanes_model = QwenModel::load(&path);
-        unsafe { std::env::remove_var("MICROKIMI_Q8_SPINE") };
+        q8_model.set_spine_mode(Some(false));
+        q8_forward.set_spine_mode(Some(false));
+        q8_lanes_model.set_spine_mode(Some(false));
         assert!(q8_model.q8_spine.iter().all(|x| x.is_some()));
 
         // prefill vs forward (delegated) agree exactly
@@ -3918,12 +3928,8 @@ mod model_tests {
         q8_lanes_model.prefill_lane(&mut lane, &tokens[..4]);
         let mut refs = vec![&mut lane];
         let lane_logits = q8_lanes_model.forward_lanes(&mut refs, &tokens[4..5]);
-        let mut single = QwenModel::load(&path);
-        // fresh f32 model for shape only; rebuild a q8 single-stream ref
-        drop(single);
-        unsafe { std::env::set_var("MICROKIMI_Q8_SPINE", "1") };
         let mut q8_single = QwenModel::load(&path);
-        unsafe { std::env::remove_var("MICROKIMI_Q8_SPINE") };
+        q8_single.set_spine_mode(Some(false));
         q8_single.prefill(&tokens[..4]);
         let single_logits = q8_single.forward(tokens[4]);
         assert_eq!(lane_logits[0], single_logits, "q8 lanes diverge from single-stream");
@@ -3941,10 +3947,10 @@ mod model_tests {
         let c = bin_tiny_dense();
         let path = checkpoint_fixture(&c);
         let tokens = [3u32, 5, 7, 11, 2];
-        unsafe { std::env::set_var("MICROKIMI_FP4_SPINE", "1") };
         let mut fp4_prefill = QwenModel::load(&path);
         let mut fp4_forward = QwenModel::load(&path);
-        unsafe { std::env::remove_var("MICROKIMI_FP4_SPINE") };
+        fp4_prefill.set_spine_mode(Some(true));
+        fp4_forward.set_spine_mode(Some(true));
         assert!(fp4_prefill
             .q8_spine
             .iter()
