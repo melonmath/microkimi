@@ -225,7 +225,8 @@ fn parse_request(
     if body.is_empty() {
         return Err("empty body".to_string());
     }
-    let json = crate::json::parse_complete(body);
+    let json = std::panic::catch_unwind(|| crate::json::parse_complete(body))
+        .map_err(|_| "malformed JSON body".to_string())?;
     let (prompt_ids, conversation_split) = if chat {
         let (system, history, question) = parse_messages(&json)?;
         let AnyTokenizer::Qwen(qtok) = tok else {
@@ -312,14 +313,16 @@ struct Generated {
 }
 
 /// Plain sampling loop over an ingested prompt. `on_token` receives each
-/// new token id as it is committed (SSE streaming).
+/// committed token id (SSE streaming) and returns whether to continue: a
+/// disconnected client stops the generation instead of burning compute
+/// into a dead socket.
 fn generate(
     model: &mut QwenModel,
     mut logits: Vec<f32>,
     stop_id: u32,
     max_new: usize,
     sampler: &mut Sampler,
-    mut on_token: impl FnMut(u32),
+    mut on_token: impl FnMut(u32) -> bool,
 ) -> Generated {
     let mut ids = Vec::new();
     let mut finish = "length";
@@ -330,7 +333,10 @@ fn generate(
             break;
         }
         ids.push(next);
-        on_token(next);
+        if !on_token(next) {
+            finish = "stop";
+            break;
+        }
         logits = model.prefill(&[next]);
     }
     Generated { ids, finish }
@@ -449,10 +455,11 @@ impl Server {
                         AnyTokenizer::Qwen(qtok) => utf8.push(&qtok.decode_bytes(&[token])),
                         _ => self.tok.decode_id(token),
                     };
-                    if !piece.is_empty() {
-                        let _ = write!(stream, "data: {}\n\n", sse_chunk(object, id, created, &self.model_name, &piece, chat, None));
-                        let _ = stream.flush();
+                    if piece.is_empty() {
+                        return true;
                     }
+                    let ok = write!(stream, "data: {}\n\n", sse_chunk(object, id, created, &self.model_name, &piece, chat, None)).is_ok();
+                    ok && stream.flush().is_ok()
                 },
             );
             let tail = utf8.finish();
@@ -471,7 +478,7 @@ impl Server {
             return;
         }
 
-        let generated = generate(&mut self.model, logits, stop_id, parsed.max_new, &mut sampler, |_| {});
+        let generated = generate(&mut self.model, logits, stop_id, parsed.max_new, &mut sampler, |_| true);
         if chat {
             self.store_conversation(&parsed.prompt_ids, &generated.ids);
         }
@@ -629,6 +636,7 @@ pub fn run(args: &[String]) {
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let request = match read_request(&mut stream) {
             Ok(request) => request,
             Err(message) => {
