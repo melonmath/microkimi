@@ -60,26 +60,29 @@ Qwen3.5-0.8B:
 
 | arm | prefill | decode |
 |---|---|---|
-| microkimi q8 spine (CPU, 4 P-cores) | 64-73 tok/s | 47.6-58.8 tok/s |
-| microkimi + MPS GEMM prefill offload | 275 tok/s | (decode stays CPU) |
-| llama.cpp Q8_0 CPU-only (-ngl 0) | 664 tok/s | 86.3 tok/s |
-| llama.cpp Q8_0 (Metal GPU) | 4548-4743 tok/s | 109.8-110.8 tok/s |
-| llama.cpp Q4_0 (Metal GPU) | 4604-4715 tok/s | 139.7-140.1 tok/s |
+| microkimi q8 spine (CPU, 4 P-cores) | 64-81 tok/s | 47.6-62.5 tok/s |
+| microkimi + GPU offload (GEMMs + batched attention) | 699 tok/s | (decode stays CPU) |
+| llama.cpp Q8_0 CPU-only (-ngl 0) | 664-707 tok/s | 82.1-86.3 tok/s |
+| llama.cpp Q8_0 (Metal GPU) | 4548-4829 tok/s | 109.8-116.2 tok/s |
+| llama.cpp Q4_0 (Metal GPU) | 4604-4775 tok/s | 139.7-144.8 tok/s |
 
-Reading, from two runs on the same machine: the fair CPU-versus-CPU
-decode gap is 1.47x (58.8 vs 86.3 tok/s), and since microkimi reads
-LESS weight per token (MXFP4 MLP vs Q8_0 everywhere), that gap is
-kernel bandwidth-extraction, not traffic - llama.cpp's CPU build (with
-Accelerate) pulls roughly 70 GB/s from four threads against our ~40.
-The MPS GEMM prefill offload measured 3.74x over the CPU batched
-prefill on its first outing (13.6 to 3.64 ms/token, last-position
-logits within 1.4e-2); llama.cpp's 664 tok/s CPU prefill row shows
-what AMX-backed GEMMs do on this silicon, and their full-Metal graph
-at ~4700 tok/s is the end state - reaching it means moving the
-remaining CPU tissue (delta scan, attention, norms) onto the GPU, and
-qwengpubench prints the exact GEMM-versus-tissue split to size that
-work. Their Q4_0 gains only 27% over Q8_0 on the GPU (dispatch-bound
-at 0.8B, consistent with our fp4-spine rejection).
+Reading, across three runs on the same machine: the offloaded prefill
+went 13.6 to 3.64 ms/token on its first outing (projection GEMMs
+only), then to 1.43 ms/token once attention ran as batched GEMMs and
+the CPU tissue lost its serial spots - 8.15x over the CPU batched
+prefill, matching llama.cpp's Accelerate/AMX CPU row (699 vs 707
+tok/s) with last-position logits still within 1.4e-2. The measured
+split at 1.43 ms/token is 0.74 GEMM / 0.68 tissue, which is what
+sizes further ports; their full-Metal graph at ~4800 tok/s remains
+6.9x ahead. The fair CPU-versus-CPU decode gap is 1.31-1.47x, and
+since microkimi reads LESS weight per token (MXFP4 MLP vs Q8_0
+everywhere), that gap is kernel bandwidth-extraction, not traffic.
+Two threading verdicts from the same battery: SDOT is worth ~30% on
+decode (18 vs 26 ms/token medians), and running all 10 cores is
+WORSE than the 4 P-cores (29 vs 18 ms/token) even with dynamic row
+scheduling - the E-cluster adds stragglers, not bandwidth, on this
+part. Their Q4_0 gains only 27-31% over Q8_0 on the GPU
+(dispatch-bound at 0.8B, consistent with our fp4-spine rejection).
 
 Two honesty notes for any quote: microkimi's MLP is MXFP4 (4-bit)
 while Q8_0 is 8-bit everywhere, so microkimi reads less weight traffic

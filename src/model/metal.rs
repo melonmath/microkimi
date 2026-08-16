@@ -1406,8 +1406,12 @@ struct MpsCtx {
     // (m, n, k, transpose_b, alpha bits) → retained MPSMatrixMultiplication
     // kernel (the batch count lives in the matrix descriptors, not here)
     gemms: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize, bool, u32), Id>>,
-    // (packed ptr, rows, cols) → (retained f32 device buffer, first packed bytes as alias tag)
+    // (packed ptr, rows, cols) → (retained device buffer of the dequantized
+    // matrix - f16 or f32 per the process-constant mode - and the first
+    // packed bytes as alias tag)
     dequant: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, [u8; 16])>>,
+    // (f32 ptr, rows, cols) → (retained f16 device copy, first f32 bits as tag)
+    w16: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, u32)>>,
 }
 
 // SAFETY: same argument as MetalCtx - kernel objects and buffers are
@@ -1435,6 +1439,7 @@ fn mps_ctx() -> Option<(&'static MetalCtx, &'static MpsCtx)> {
             Some(MpsCtx {
                 gemms: std::sync::Mutex::new(std::collections::HashMap::new()),
                 dequant: std::sync::Mutex::new(std::collections::HashMap::new()),
+                w16: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         })
         .as_ref()?;
@@ -1528,11 +1533,13 @@ fn run_gemm(
     // the whole encode/wait/readback; waitUntilCompleted precedes readback;
     // a fresh autorelease pool covers the transient objects. The MPSMatrix
     // wrappers are alloc/init-owned and explicitly released below.
+    let f16 = gemm_f16_on();
+    let (esz, dtype) = if f16 { (2usize, MPS_FLOAT16) } else { (4usize, MPS_FLOAT32) };
     unsafe {
         let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
         let mut io = base.io.lock().unwrap();
-        let (x_ptr, buf_x) = ensure_buf(base, &mut io.x, t * cols * 4);
-        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * rows * 4);
+        let (x_ptr, buf_x) = ensure_buf(base, &mut io.x, t * cols * esz);
+        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * rows * esz);
         if buf_x.is_null() || buf_y.is_null() || x_ptr.is_null() || y_ptr.is_null() {
             drop(io);
             msg_void(pool, sel("drain"));
@@ -1540,7 +1547,12 @@ fn run_gemm(
         }
         for (l, x) in xs.iter().enumerate() {
             debug_assert_eq!(x.len(), cols);
-            std::ptr::copy_nonoverlapping(x.as_ptr(), (x_ptr as *mut f32).add(l * cols), cols);
+            if f16 {
+                let dst = std::slice::from_raw_parts_mut((x_ptr as *mut u16).add(l * cols), cols);
+                f32s_to_f16s(x, dst);
+            } else {
+                std::ptr::copy_nonoverlapping(x.as_ptr(), (x_ptr as *mut f32).add(l * cols), cols);
+            }
         }
 
         let desc = |r: usize, c: usize| -> Id {
@@ -1551,8 +1563,8 @@ fn run_gemm(
                 sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"),
                 r as u64,
                 c as u64,
-                (c * 4) as u64,
-                MPS_FLOAT32,
+                (c * esz) as u64,
+                dtype,
             )
         };
         let matrix = |buf: Id, d: Id| -> Id {
@@ -1583,10 +1595,14 @@ fn run_gemm(
         msg_void(cmdbuf, sel("commit"));
         msg_void(cmdbuf, sel("waitUntilCompleted"));
 
-        let y = y_ptr as *const f32;
         for (l, out) in outs.iter_mut().enumerate() {
             debug_assert_eq!(out.len(), rows);
-            out.copy_from_slice(std::slice::from_raw_parts(y.add(l * rows), rows));
+            if f16 {
+                let src = std::slice::from_raw_parts((y_ptr as *const u16).add(l * rows), rows);
+                f16s_to_f32s(src, out);
+            } else {
+                out.copy_from_slice(std::slice::from_raw_parts((y_ptr as *const f32).add(l * rows), rows));
+            }
         }
         for m in [mx, mw, my] {
             msg_void(m, sel("release"));
@@ -1605,7 +1621,12 @@ pub fn gpu_gemm_xwt(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
     let Some((base, mps)) = mps_ctx() else {
         return false;
     };
-    let Some(buf_w) = weight_buffer(base, w, rows, cols) else {
+    let buf_w = if gemm_f16_on() {
+        weight_buffer_f16(base, mps, w, rows, cols)
+    } else {
+        weight_buffer(base, w, rows, cols)
+    };
+    let Some(buf_w) = buf_w else {
         return false;
     };
     if !run_gemm(base, mps, buf_w, rows, cols, xs, outs) {
@@ -1633,17 +1654,26 @@ fn dequant_buffer(base: &MetalCtx, mps: &MpsCtx, packed: &[u8], scales: &[u8], r
         unsafe { msg_void(buf, sel("release")) };
     }
     let w = crate::quant::mxfp4::dequant(packed, scales, rows, cols);
-    // SAFETY: `w` is alive for the whole call; the buffer copies its bytes.
+    // f16 mode stores the dequantized copy in half precision (e2m1 x
+    // power-of-two scales convert exactly for every in-range value).
+    let (ptr, bytes, _h16);
+    if gemm_f16_on() {
+        let mut h = vec![0u16; w.len()];
+        f32s_to_f16s(&w, &mut h);
+        ptr = h.as_ptr() as *const c_void;
+        bytes = h.len() * 2;
+        _h16 = Some(h);
+    } else {
+        ptr = w.as_ptr() as *const c_void;
+        bytes = w.len() * 4;
+        _h16 = None;
+    }
+    // SAFETY: the source vec is alive for the whole call; the buffer
+    // copies its bytes.
     let buf = unsafe {
         let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
-        let b = f(
-            base.device,
-            sel("newBufferWithBytes:length:options:"),
-            w.as_ptr() as *const c_void,
-            (w.len() * 4) as u64,
-            0,
-        );
+        let b = f(base.device, sel("newBufferWithBytes:length:options:"), ptr, bytes as u64, 0);
         if !b.is_null() {
             retain(b);
         }
@@ -1725,19 +1755,26 @@ pub fn gpu_gemm_batched(
     // SAFETY: same invariants as run_gemm - io mutex serializes staging use
     // for the whole encode/wait/readback, waitUntilCompleted precedes the
     // readback, MPSMatrix wrappers are init-owned and released below.
+    let f16 = gemm_f16_on();
+    let (esz, dtype) = if f16 { (2usize, MPS_FLOAT16) } else { (4usize, MPS_FLOAT32) };
     unsafe {
         let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
         let mut io = base.io.lock().unwrap();
-        let (a_ptr, buf_a) = ensure_buf(base, &mut io.x, a.len() * 4);
-        let (b_ptr, buf_b) = ensure_buf(base, &mut io.z, b.len() * 4);
-        let (c_ptr, buf_c) = ensure_buf(base, &mut io.y, out.len() * 4);
+        let (a_ptr, buf_a) = ensure_buf(base, &mut io.x, a.len() * esz);
+        let (b_ptr, buf_b) = ensure_buf(base, &mut io.z, b.len() * esz);
+        let (c_ptr, buf_c) = ensure_buf(base, &mut io.y, out.len() * esz);
         if buf_a.is_null() || buf_b.is_null() || buf_c.is_null() || a_ptr.is_null() || b_ptr.is_null() || c_ptr.is_null() {
             drop(io);
             msg_void(pool, sel("drain"));
             return false;
         }
-        std::ptr::copy_nonoverlapping(a.as_ptr(), a_ptr as *mut f32, a.len());
-        std::ptr::copy_nonoverlapping(b.as_ptr(), b_ptr as *mut f32, b.len());
+        if f16 {
+            f32s_to_f16s(a, std::slice::from_raw_parts_mut(a_ptr as *mut u16, a.len()));
+            f32s_to_f16s(b, std::slice::from_raw_parts_mut(b_ptr as *mut u16, b.len()));
+        } else {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), a_ptr as *mut f32, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), b_ptr as *mut f32, b.len());
+        }
 
         // batched descriptor: matrices = batch, matrixBytes = one matrix
         let bdesc = |rows: usize, cols: usize| -> Id {
@@ -1749,9 +1786,9 @@ pub fn gpu_gemm_batched(
                 rows as u64,
                 cols as u64,
                 batch as u64,
-                (cols * 4) as u64,
-                (rows * cols * 4) as u64,
-                MPS_FLOAT32,
+                (cols * esz) as u64,
+                (rows * cols * esz) as u64,
+                dtype,
             )
         };
         let matrix = |buf: Id, d: Id| -> Id {
@@ -1796,7 +1833,11 @@ pub fn gpu_gemm_batched(
         msg_void(cmdbuf, sel("commit"));
         msg_void(cmdbuf, sel("waitUntilCompleted"));
 
-        out.copy_from_slice(std::slice::from_raw_parts(c_ptr as *const f32, out.len()));
+        if f16 {
+            f16s_to_f32s(std::slice::from_raw_parts(c_ptr as *const u16, out.len()), out);
+        } else {
+            out.copy_from_slice(std::slice::from_raw_parts(c_ptr as *const f32, out.len()));
+        }
         for mm in [ma, mb, mc] {
             msg_void(mm, sel("release"));
         }
@@ -1815,4 +1856,185 @@ pub fn qwen_gpu_attn_on() -> bool {
         && *ON.get_or_init(|| {
             std::env::var("MICROKIMI_QWEN_GPU_NOATTN").map(|v| v != "1").unwrap_or(true)
         })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Half-precision GEMM storage (the offload's default; f32 on demand)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The measured split at 1k tokens put ~half of the offloaded prefill
+// inside the GEMMs, and those GEMMs move mostly weight bytes - f16
+// storage halves that traffic (what llama.cpp's Metal path does
+// throughout). Weights convert once at upload; activations convert at
+// the staging boundary with fcvtn/fcvtl (base AArch64 instructions,
+// stable inline asm like the SDOT kernels; scalar fallback elsewhere).
+// Accumulation inside MPS stays wider than the storage, and the
+// qwengpubench parity line reports the end-to-end numeric cost.
+// MICROKIMI_QWEN_GPU_F32=1 restores full f32 storage.
+
+const MPS_FLOAT16: u32 = 0x10000010; // MPSDataTypeFloatBit | 16
+
+/// True when the offload stores GEMM operands in f16 (the default).
+pub fn gemm_f16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_QWEN_GPU_F32").map(|v| v != "1").unwrap_or(true))
+}
+
+fn f32_to_f16_scalar(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp8 = (b >> 23) & 0xff;
+    let man = b & 0x007f_ffff;
+    if exp8 == 0xff {
+        return sign | if man != 0 { 0x7e00 } else { 0x7c00 }; // qNaN / inf
+    }
+    let e = exp8 as i32 - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow -> signed zero
+        }
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let mid = 1u32 << (shift - 1);
+        let mut h = half as u16;
+        if rem > mid || (rem == mid && (half & 1) == 1) {
+            h += 1;
+        }
+        return sign | h;
+    }
+    let half = (man >> 13) as u16;
+    let rem = man & 0x1fff;
+    let mut h = sign | ((e as u16) << 10) | half;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        h = h.wrapping_add(1); // a carry into the exponent rounds up correctly
+    }
+    h
+}
+
+fn f16_to_f32_scalar(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let man = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            let mut e = 113u32; // 127 - 15 + 1
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7f80_0000 | (man << 13)
+    } else {
+        sign | ((exp + 112) << 23) | (man << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Bulk f32 -> f16, four lanes per fcvtn on aarch64 (RNE, matching the
+/// scalar tail), plain scalar elsewhere.
+fn f32s_to_f16s(src: &[f32], dst: &mut [u16]) {
+    assert_eq!(src.len(), dst.len());
+    #[allow(unused_mut)]
+    let mut done = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n4 = src.len() / 4 * 4;
+        while done < n4 {
+            // SAFETY: 4 f32 reads and 4 u16 writes inside the slices.
+            unsafe {
+                core::arch::asm!(
+                    "ld1 {{v0.4s}}, [{s}]",
+                    "fcvtn v0.4h, v0.4s",
+                    "st1 {{v0.4h}}, [{d}]",
+                    s = in(reg) src.as_ptr().add(done),
+                    d = in(reg) dst.as_mut_ptr().add(done),
+                    out("v0") _,
+                    options(nostack)
+                );
+            }
+            done += 4;
+        }
+    }
+    for i in done..src.len() {
+        dst[i] = f32_to_f16_scalar(src[i]);
+    }
+}
+
+/// Bulk f16 -> f32 (fcvtl on aarch64, scalar elsewhere); exact.
+fn f16s_to_f32s(src: &[u16], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    #[allow(unused_mut)]
+    let mut done = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n4 = src.len() / 4 * 4;
+        while done < n4 {
+            // SAFETY: 4 u16 reads and 4 f32 writes inside the slices.
+            unsafe {
+                core::arch::asm!(
+                    "ld1 {{v0.4h}}, [{s}]",
+                    "fcvtl v0.4s, v0.4h",
+                    "st1 {{v0.4s}}, [{d}]",
+                    s = in(reg) src.as_ptr().add(done),
+                    d = in(reg) dst.as_mut_ptr().add(done),
+                    out("v0") _,
+                    options(nostack)
+                );
+            }
+            done += 4;
+        }
+    }
+    for i in done..src.len() {
+        dst[i] = f16_to_f32_scalar(src[i]);
+    }
+}
+
+/// Device-resident f16 copy of an f32 weight matrix (spine attention
+/// matrices in f16 mode). Tagged with the first f32 bits against
+/// allocator address reuse, like the other weight caches.
+fn weight_buffer_f16(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols: usize) -> Option<Id> {
+    let key = (w.as_ptr() as usize, rows, cols);
+    let tag = w.first().map(|v| v.to_bits()).unwrap_or(0);
+    let mut cache = mps.w16.lock().unwrap();
+    if let Some(&(buf, seen)) = cache.get(&key) {
+        if seen == tag {
+            return Some(buf);
+        }
+        cache.remove(&key);
+        // SAFETY: the stale buffer is owned by this cache (retained at insert).
+        unsafe { msg_void(buf, sel("release")) };
+    }
+    let mut h = vec![0u16; w.len()];
+    f32s_to_f16s(w, &mut h);
+    // SAFETY: `h` is alive for the whole call; the buffer copies its bytes.
+    let buf = unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let b = f(
+            base.device,
+            sel("newBufferWithBytes:length:options:"),
+            h.as_ptr() as *const c_void,
+            (h.len() * 2) as u64,
+            0,
+        );
+        if !b.is_null() {
+            retain(b);
+        }
+        b
+    };
+    if buf.is_null() {
+        return None;
+    }
+    cache.insert(key, (buf, tag));
+    Some(buf)
 }

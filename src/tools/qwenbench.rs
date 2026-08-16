@@ -188,6 +188,7 @@ pub fn run(args: &[String]) {
             if t.starts_with("gpu ")
                 || t.starts_with("split:")
                 || t.starts_with("last-position")
+                || t.starts_with("precision:")
                 || t.starts_with("gpu gemm check")
             {
                 println!("  {}", t);
@@ -329,5 +330,9 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             (g - gm).max(0.0)
         );
         println!("  last-position logits: max rel diff {:.2e} vs the CPU path", max_rel);
+        println!(
+            "  precision: {} storage in the GEMMs (MICROKIMI_QWEN_GPU_F32=1 for f32)",
+            if crate::model::metal::gemm_f16_on() { "f16" } else { "f32" }
+        );
     }
 }
