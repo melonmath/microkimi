@@ -66,12 +66,14 @@ pub struct Sampler {
     /// --mtp: greedy self-speculative decoding through the converted
     /// multi-token-prediction head (Qwen dense models only).
     pub mtp: bool,
+    /// --mtp-depth: chained draft length per verification pass.
+    pub mtp_depth: usize,
     pub dry: f32,
 }
 
 impl Sampler {
     pub fn new(temp: f32, top_p: f32, seed: u64) -> Sampler {
-        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0, spec_rosa: 0, mtp: false, dry: 0.0 }
+        Sampler { temp, top_p, rng: XorShift::new(seed), spec: 0, spec_rosa: 0, mtp: false, mtp_depth: 4, dry: 0.0 }
     }
     /// Default no-op decoding: the historical greedy behavior.
     pub fn greedy() -> Sampler {

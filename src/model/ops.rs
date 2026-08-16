@@ -176,6 +176,62 @@ pub fn matvec_st(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]
     }
 }
 
+/// Multi-lane f32 matrix × vectors: each weight row is read ONCE and
+/// dotted against every lane's input. In the memory-bound decode regime
+/// the weight traffic dominates, so n lanes cost close to one - this is
+/// the kernel behind lane-batched decoding. Per-lane results are
+/// bit-identical to `matvec` (same row, same dot). Pool-parallel over
+/// row chunks like matvec_cpu.
+pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
+    assert_eq!(xs.len(), outs.len());
+    let lanes = xs.len();
+    if lanes == 0 {
+        return;
+    }
+    let p = crate::model::pool::pool();
+    let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
+    if njobs <= 1 {
+        for r in 0..rows {
+            let row = &w[r * cols..(r + 1) * cols];
+            for l in 0..lanes {
+                outs[l][r] = dot(row, xs[l]);
+            }
+        }
+        return;
+    }
+    let chunk = rows.div_ceil(njobs);
+    let wp = crate::model::pool::SPtr(w.as_ptr());
+    let xps: Vec<crate::model::pool::SPtr> =
+        xs.iter().map(|x| crate::model::pool::SPtr(x.as_ptr())).collect();
+    let ops: Vec<crate::model::pool::MPtr> = outs
+        .iter_mut()
+        .map(|o| crate::model::pool::MPtr(o.as_mut_ptr()))
+        .collect();
+    let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+    for j in 0..njobs {
+        let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+        if r0 >= r1 {
+            break;
+        }
+        let xps = xps.clone();
+        let ops = ops.clone();
+        jobs.push(Box::new(move || {
+            let (wp, xps, ops) = (wp, xps, ops);
+            unsafe {
+                let w = std::slice::from_raw_parts(wp.0, rows * cols);
+                for r in r0..r1 {
+                    let row = &w[r * cols..(r + 1) * cols];
+                    for l in 0..xps.len() {
+                        let x = std::slice::from_raw_parts(xps[l].0, cols);
+                        *ops[l].0.add(r) = dot(row, x);
+                    }
+                }
+            }
+        }));
+    }
+    p.run(jobs);
+}
+
 // ── q8_0 lm_head (runtime copy, built once at load) ──
 //
 // The final logits projection re-reads the whole f32 lm_head tensor every
@@ -213,6 +269,51 @@ impl Q8Head {
             scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
         }
         Q8Head { q, scales, rows, cols }
+    }
+
+    /// Multi-lane head matvec: each q8 row is read once and dotted
+    /// against every lane's quantized input; per-lane results are
+    /// bit-identical to `matvec`.
+    pub(super) fn matvec_multi(&self, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
+        assert_eq!(xs.len(), outs.len());
+        let lanes = xs.len();
+        if lanes == 0 {
+            return;
+        }
+        let (rows, cols) = (self.rows, self.cols);
+        let xqs: Vec<crate::quant::q8::Q8Vec> =
+            xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let p = crate::model::pool::pool();
+        let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
+        if njobs <= 1 {
+            for r in 0..rows {
+                for l in 0..lanes {
+                    outs[l][r] = self.row_dot(r, &xqs[l]);
+                }
+            }
+            return;
+        }
+        let chunk = rows.div_ceil(njobs);
+        let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        std::thread::scope(|scope| {
+            for j in 0..njobs {
+                let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+                if r0 >= r1 {
+                    break;
+                }
+                let this = &*self;
+                let xqs = &xqs;
+                let out_ptrs = out_ptrs.clone();
+                scope.spawn(move || {
+                    for r in r0..r1 {
+                        for l in 0..xqs.len() {
+                            let v = this.row_dot(r, &xqs[l]);
+                            unsafe { *(out_ptrs[l] as *mut f32).add(r) = v };
+                        }
+                    }
+                });
+            }
+        });
     }
 
     /// out[r] = <row r, x> computed in integer per 32-block, rescaled to f32.

@@ -226,6 +226,40 @@ token stream. Requests are served one at a time against the single
 stateful decoder; the default bind is 127.0.0.1 and there is no
 authentication layer - put a reverse proxy in front for anything else.
 
+## Chained drafting and lane-batched decoding
+
+Two throughput mechanisms, both bit-identical to plain decoding and both
+regime-dependent - the regime is stated with the numbers.
+
+**Chained MTP drafting.** `--mtp-depth N` (default 4) chains the draft
+head: each proposal's own final-normed hidden feeds the next step (the
+reference proposer's multi-step contract), and one batched trunk pass
+verifies the pending token plus the whole chain, with the standard
+speculative bonus token at the mismatch position. Draft argmax runs
+through a frequency-sliced head (`MICROKIMI_MTP_MINIHEAD` rows, default
+32768, 0 = full): BPE ids are roughly frequency-ordered, so the first
+rows plus the special block agree with the full argmax on most steps,
+and the full-head verification corrects the rest - the head choice moves
+the acceptance rate, never the output. Speculation pays where a
+verification batch is cheaper than sequential steps, i.e. the
+memory-bound regime (weights streaming against RAM or disk, loaded
+machines, large models). Measured honestly on the 0.8B: 1.40x under
+memory pressure, but SLOWER than plain decoding on an idle in-RAM run -
+the 27B, which pages from disk, is the intended target.
+
+**Lane-batched decoding.** `DecodeLane` gives every conversation its own
+caches while `forward_lanes` steps all lanes through the layers
+together: the multi-lane kernels (f32, q8 head, packed MXFP4) read every
+weight row ONCE and dot it against each lane's input, so n lanes cost
+close to one in weight traffic. Per-lane results are bit-identical to
+single-stream decoding (tested on both variants). `microkimi lanebench
+--lanes N` measures aggregate throughput; on the real 0.8B this
+container produced 33.9 aggregate tok/s at 4 lanes against 9 tok/s
+single-stream (3.7x) in a quiet window, with a 1.5x median across a
+noisy shared host - treat the ceiling, not the median, as the
+mechanism's value, and re-measure on dedicated hardware. Wiring lanes
+into serve and complete-batch is the designated next step.
+
 ## Timelines: version control for conversations
 
 A conversation state is a commit. `serve` content-addresses every

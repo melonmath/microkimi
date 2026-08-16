@@ -462,6 +462,103 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
         }
     });
 }
+/// Multi-lane packed matvec: each packed row (and its scales) is
+/// traversed ONCE and dotted against every lane's quantized input, so n
+/// decode lanes cost close to one in weight traffic. Per-lane results
+/// are bit-identical to `matvec_packed` with the same settings.
+pub fn matvec_packed_multi(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    xs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+    n_threads: usize,
+) {
+    assert_eq!(xs.len(), outs.len());
+    let lanes = xs.len();
+    if lanes == 0 {
+        return;
+    }
+    if crate::quant::q8::q8_enabled() {
+        let xqs: Vec<crate::quant::q8::Q8Vec> =
+            xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let row_dot = |prow: &[u8], srow: &[u8], xq: &crate::quant::q8::Q8Vec| -> f32 {
+            let mut sum = 0f32;
+            for g in 0..cols / 32 {
+                let idot = crate::quant::q8::block_dot(
+                    &prow[g * 16..(g + 1) * 16],
+                    &xq.q[g * 32..(g + 1) * 32],
+                );
+                sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+            }
+            sum
+        };
+        let nt = n_threads.min(rows).max(1);
+        if nt <= 1 {
+            for r in 0..rows {
+                let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+                let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+                for l in 0..lanes {
+                    outs[l][r] = row_dot(prow, srow, &xqs[l]);
+                }
+            }
+            return;
+        }
+        let chunk = rows.div_ceil(nt);
+        // per-lane raw output pointers shared across the scoped rows
+        let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        std::thread::scope(|scope| {
+            for j in 0..nt {
+                let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
+                if r0 >= r1 {
+                    break;
+                }
+                let xqs = &xqs;
+                let out_ptrs = out_ptrs.clone();
+                scope.spawn(move || {
+                    for r in r0..r1 {
+                        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+                        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+                        for l in 0..xqs.len() {
+                            let mut sum = 0f32;
+                            for g in 0..cols / 32 {
+                                let idot = crate::quant::q8::block_dot(
+                                    &prow[g * 16..(g + 1) * 16],
+                                    &xqs[l].q[g * 32..(g + 1) * 32],
+                                );
+                                sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xqs[l].scales[g]);
+                            }
+                            unsafe { *(out_ptrs[l] as *mut f32).add(r) = sum };
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
+    // exact f32 fallback (MICROKIMI_NO_Q8=1): row nibbles decoded once per
+    // row per lane through the same loop as matvec_packed's slow path
+    for r in 0..rows {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        for l in 0..lanes {
+            let mut sum = 0f32;
+            for g in 0..cols / 32 {
+                let mut gsum = 0f32;
+                for j in 0..32 {
+                    let c = g * 32 + j;
+                    let byte = prow[c / 2];
+                    let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                    gsum += E2M1[nib as usize] * xs[l][c];
+                }
+                sum += gsum * exp2_i(srow[g] as i32 - 127);
+            }
+            outs[l][r] = sum;
+        }
+    }
+}
+
 /// out[r] = Σ_c W[r,c] · x[c]. Per group of 32: Σ(lut·x) × scale - same
 /// mathematical result, one floating-point multiplication per group. Multithreaded over rows.
 ///

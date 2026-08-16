@@ -844,6 +844,79 @@ struct QwenMtpW {
     mlp_down: PackedT,
 }
 
+/// Frequency-sliced draft head for chained MTP proposals. BPE vocabulary
+/// ids are roughly frequency-ordered by construction (earlier merges are
+/// more frequent), so the argmax over the first K rows plus the special
+/// block agrees with the full-head argmax on most steps - and when it
+/// does not, the full-head verification pass rejects the draft, so the
+/// output stays bit-identical. At small model scale the lm_head
+/// dominates per-token compute; drafting through K rows instead of the
+/// full vocabulary is what makes deep draft chains close to free.
+pub(crate) struct DraftHead {
+    q8: crate::model::Q8Head,
+    rows: usize,
+    /// Start of the special-token block scored in f32 next to the q8
+    /// rows (vocab when absent).
+    specials_start: usize,
+}
+
+impl DraftHead {
+    /// Builds the head over the first `rows` lm_head rows (tied models
+    /// share them with the embedding). None when `rows` covers the whole
+    /// vocabulary (the full head is already optimal).
+    pub(crate) fn from_rows(model: &QwenModel, rows: usize) -> Option<DraftHead> {
+        let c = &model.cfg;
+        if rows == 0 || rows >= c.vocab || c.d % 32 != 0 {
+            return None;
+        }
+        let head = tensor(&model.bin.data, &model.lm_head);
+        let specials_start = if c.vocab > crate::model::qwentok::QWEN_ENDOFTEXT as usize {
+            crate::model::qwentok::QWEN_ENDOFTEXT as usize
+        } else {
+            c.vocab
+        };
+        Some(DraftHead {
+            q8: crate::model::Q8Head::from_f32(&head[..rows * c.d], rows, c.d),
+            rows,
+            specials_start,
+        })
+    }
+
+    /// Argmax over the covered rows (q8 block + f32 specials).
+    fn argmax(&self, model: &QwenModel, normed: &[f32]) -> u32 {
+        let mut scores = vec![0.0f32; self.rows];
+        self.q8.matvec(normed, &mut scores);
+        let mut best = 0usize;
+        for (i, &v) in scores.iter().enumerate() {
+            if v > scores[best] {
+                best = i;
+            }
+        }
+        let mut best_id = best as u32;
+        let mut best_score = scores[best];
+        let c = &model.cfg;
+        if self.specials_start < c.vocab {
+            let head = tensor(&model.bin.data, &model.lm_head);
+            let n = c.vocab - self.specials_start;
+            let mut sp = vec![0.0f32; n];
+            crate::model::ops::matvec_st(
+                &head[self.specials_start * c.d..],
+                n,
+                c.d,
+                normed,
+                &mut sp,
+            );
+            for (i, &v) in sp.iter().enumerate() {
+                if v > best_score {
+                    best_score = v;
+                    best_id = (self.specials_start + i) as u32;
+                }
+            }
+        }
+        best_id
+    }
+}
+
 /// Rollback point for speculative decoding: the linear states are
 /// recurrent (not truncatable) and are cloned; the append-only key/value
 /// caches only record their lengths and are truncated on restore.
@@ -868,6 +941,7 @@ pub struct QwenModel {
     layers: Vec<QwenLayerW>,
     pub(crate) caches: Vec<QwenCache>,
     mtp: Option<QwenMtpW>,
+    pub(crate) draft_head: Option<DraftHead>,
     pub(crate) mtp_cache: FullCache,
     pub(crate) pos: usize,
     /// Logits after the last ingested token (state snapshots resume from
@@ -1342,7 +1416,7 @@ impl QwenModel {
             })
             .collect();
         let mtp_cache = FullCache::new(&c);
-        QwenModel {
+        let mut model = QwenModel {
             cfg: c,
             bin,
             embed,
@@ -1352,11 +1426,21 @@ impl QwenModel {
             layers,
             caches,
             mtp,
+            draft_head: None,
             mtp_cache,
             pos: 0,
             last_logits: Vec::new(),
             adapter_packs,
+        };
+        if model.mtp.is_some() {
+            // MICROKIMI_MTP_MINIHEAD rows (default 32768, 0 = full head)
+            let rows = std::env::var("MICROKIMI_MTP_MINIHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32_768usize);
+            model.draft_head = DraftHead::from_rows(&model, rows);
         }
+        model
     }
 
     pub fn reset(&mut self) {
@@ -1494,6 +1578,105 @@ impl QwenModel {
             ),
         }
         Some(logits)
+    }
+
+    /// One chained draft step: ingests the pair, returns the final-normed
+    /// MTP hidden (the next chain step's hidden input, following the
+    /// reference proposer) and the draft argmax - through the
+    /// frequency-sliced head when available, the full head otherwise.
+    /// The verification pass corrects any draft, so the head choice never
+    /// changes the output, only the acceptance rate.
+    pub(crate) fn mtp_draft_step(&mut self, token: u32, hidden: &[f32]) -> (Vec<f32>, u32) {
+        self.mtp_chain_body(token, hidden)
+            .expect("mtp_draft_step requires the MTP head")
+    }
+
+    /// Chain-step body: like `mtp_advance(want_logits = true)` but returns
+    /// (final-normed hidden, draft id), scoring through the sliced draft
+    /// head when present instead of a full-vocabulary argmax.
+    fn mtp_chain_body(&mut self, token: u32, hidden: &[f32]) -> Option<(Vec<f32>, u32)> {
+        let c = self.cfg.clone();
+        let mtp = self.mtp.as_ref()?;
+        let data = &self.bin.data;
+        let d = c.d;
+        assert!((token as usize) < c.vocab && hidden.len() == d);
+        let embed = tensor(data, &self.embed);
+        let mut merged = vec![0.0f32; 2 * d];
+        {
+            let (e_half, h_half) = merged.split_at_mut(d);
+            rmsnorm(
+                &embed[token as usize * d..(token as usize + 1) * d],
+                tensor(data, &mtp.norm_e),
+                c.norm_eps as f32,
+                e_half,
+            );
+            rmsnorm(hidden, tensor(data, &mtp.norm_h), c.norm_eps as f32, h_half);
+        }
+        let mut x = vec![0.0f32; d];
+        crate::model::ops::matvec(tensor(data, &mtp.fc), d, 2 * d, &merged, &mut x);
+        let mut normed = vec![0.0f32; d];
+        let mut attn_out = vec![0.0f32; d];
+        rmsnorm(&x, tensor(data, &mtp.input_norm), c.norm_eps as f32, &mut normed);
+        let weights = FullAttn {
+            q_proj: tensor(data, &mtp.attn.q_proj),
+            k_proj: tensor(data, &mtp.attn.k_proj),
+            v_proj: tensor(data, &mtp.attn.v_proj),
+            o_proj: tensor(data, &mtp.attn.o_proj),
+            q_norm: tensor(data, &mtp.attn.q_norm),
+            k_norm: tensor(data, &mtp.attn.k_norm),
+        };
+        let pos = self.mtp_cache.len;
+        full_attn_step(&weights, &c, &normed, pos, &mut self.mtp_cache, &mut attn_out);
+        for i in 0..d {
+            x[i] += attn_out[i];
+        }
+        rmsnorm(&x, tensor(data, &mtp.post_norm), c.norm_eps as f32, &mut normed);
+        let mtp_w = self.mtp.as_ref().unwrap();
+        let mlp = packed_dense_mlp(
+            &self.bin.data,
+            &mtp_w.mlp_gate,
+            &mtp_w.mlp_up,
+            &mtp_w.mlp_down,
+            &c,
+            &normed,
+            None,
+        );
+        for i in 0..d {
+            x[i] += mlp[i];
+        }
+        let mtp_w = self.mtp.as_ref().unwrap();
+        rmsnorm(
+            &x,
+            tensor(&self.bin.data, &mtp_w.norm_f),
+            c.norm_eps as f32,
+            &mut normed,
+        );
+        let draft = match &self.draft_head {
+            Some(head) => head.argmax(self, &normed),
+            None => {
+                let mut logits = vec![0.0f32; c.vocab];
+                match &self.lm_head_q8 {
+                    Some(head) => head.matvec(&normed, &mut logits),
+                    None => crate::model::ops::matvec(
+                        tensor(&self.bin.data, &self.lm_head),
+                        c.vocab,
+                        d,
+                        &normed,
+                        &mut logits,
+                    ),
+                }
+                super::top_k_probs(&logits, 5)[0].0 as u32
+            }
+        };
+        Some((normed, draft))
+    }
+
+    /// Truncates the MTP draft cache to `len` pairs (chain rollback).
+    pub(crate) fn rollback_mtp(&mut self, len: usize) {
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        self.mtp_cache.k.truncate(len * kv_width);
+        self.mtp_cache.v.truncate(len * kv_width);
+        self.mtp_cache.len = len;
     }
 
     pub fn has_adapter_packs(&self) -> bool {
@@ -2218,6 +2401,397 @@ fn dense_token_serial(
     out
 }
 
+// ───────────────────── lane-batched decoding (throughput) ─────────────────────
+
+/// One independent decode stream: its own caches and position, stepped
+/// together with other lanes through `forward_lanes` so every weight
+/// region is read once per layer for ALL lanes. In the memory-bound
+/// decode regime this multiplies aggregate tokens/second by close to the
+/// lane count. Per-lane results are bit-identical to the single-stream
+/// `forward` (same per-row dots, same order).
+pub struct DecodeLane {
+    pub(crate) caches: Vec<QwenCache>,
+    pub(crate) pos: usize,
+}
+
+impl DecodeLane {
+    pub fn new(model: &QwenModel) -> DecodeLane {
+        let c = &model.cfg;
+        DecodeLane {
+            caches: (0..c.n_layers)
+                .map(|l| {
+                    if c.is_full_attn(l) {
+                        QwenCache::Full(FullCache::new(c))
+                    } else {
+                        QwenCache::Linear(LinCache::new(c))
+                    }
+                })
+                .collect(),
+            pos: 0,
+        }
+    }
+
+    pub fn reset(&mut self, model: &QwenModel) {
+        *self = DecodeLane::new(model);
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
+impl QwenModel {
+    /// Ingests a prompt into one lane by temporarily swapping its caches
+    /// into the model and running the batched prefill (bit-identical).
+    pub fn prefill_lane(&mut self, lane: &mut DecodeLane, tokens: &[u32]) -> Vec<f32> {
+        std::mem::swap(&mut self.caches, &mut lane.caches);
+        std::mem::swap(&mut self.pos, &mut lane.pos);
+        let logits = self.prefill(tokens);
+        std::mem::swap(&mut self.caches, &mut lane.caches);
+        std::mem::swap(&mut self.pos, &mut lane.pos);
+        logits
+    }
+
+    /// One decode step for every lane at once. The large projections and
+    /// the packed MLP run through the multi-lane kernels (weights read
+    /// once for all lanes); the recurrences, attention mixes, and norms
+    /// are per-lane and fan out over scoped threads.
+    pub fn forward_lanes(&self, lanes: &mut [&mut DecodeLane], tokens: &[u32]) -> Vec<Vec<f32>> {
+        assert_eq!(lanes.len(), tokens.len());
+        let n = lanes.len();
+        assert!(n > 0, "forward_lanes needs at least one lane");
+        let c = self.cfg.clone();
+        let d = c.d;
+        let data = &self.bin.data;
+        for &t in tokens {
+            assert!((t as usize) < c.vocab, "token outside the vocabulary");
+        }
+
+        let embed = tensor(data, &self.embed);
+        let mut hidden: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&t| embed[t as usize * d..(t as usize + 1) * d].to_vec())
+            .collect();
+        let mut normed: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
+
+        for l in 0..c.n_layers {
+            let layer = &self.layers[l];
+            {
+                let w = tensor(data, &layer.input_norm);
+                for i in 0..n {
+                    rmsnorm(&hidden[i], w, c.norm_eps as f32, &mut normed[i]);
+                }
+            }
+            let mut attn_out: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
+            match &layer.attn {
+                QwenAttnW::Linear(w) => {
+                    let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+                    let conv_dim = kt * 2 + vt;
+                    let heads = c.lin_v_heads;
+                    let mut qkv = vec![vec![0.0f32; conv_dim]; n];
+                    let mut z = vec![vec![0.0f32; vt]; n];
+                    let mut b_raw = vec![vec![0.0f32; heads]; n];
+                    let mut a_raw = vec![vec![0.0f32; heads]; n];
+                    let xs: Vec<&[f32]> = normed.iter().map(|v| v.as_slice()).collect();
+                    multi(tensor(data, &w.in_qkv), conv_dim, d, &xs, &mut qkv);
+                    multi(tensor(data, &w.in_z), vt, d, &xs, &mut z);
+                    multi(tensor(data, &w.in_b), heads, d, &xs, &mut b_raw);
+                    multi(tensor(data, &w.in_a), heads, d, &xs, &mut a_raw);
+                    let conv_w = tensor(data, &w.conv);
+                    let a_log = tensor(data, &w.a_log);
+                    let dt_bias = tensor(data, &w.dt_bias);
+                    let norm_w = tensor(data, &w.norm);
+                    let out_proj = tensor(data, &w.out_proj);
+                    std::thread::scope(|scope| {
+                        for ((((lane, out_i), qkv_i), z_i), (b_i, a_i)) in lanes
+                            .iter_mut()
+                            .zip(attn_out.iter_mut())
+                            .zip(qkv.iter())
+                            .zip(z.iter())
+                            .zip(b_raw.iter().zip(a_raw.iter()))
+                        {
+                            let QwenCache::Linear(cache) = &mut lane.caches[l] else {
+                                unreachable!("lane cache kind mismatch");
+                            };
+                            let cfg = &c;
+                            scope.spawn(move || {
+                                lin_attn_tail(
+                                    cfg, qkv_i, z_i, b_i, a_i, conv_w, a_log, dt_bias, norm_w,
+                                    out_proj, cache, out_i,
+                                );
+                            });
+                        }
+                    });
+                }
+                QwenAttnW::Full(w) => {
+                    let hd = c.head_dim;
+                    let q_width = c.n_heads * hd;
+                    let kv_width = c.n_kv_heads * hd;
+                    let mut qg = vec![vec![0.0f32; q_width * 2]; n];
+                    let mut k = vec![vec![0.0f32; kv_width]; n];
+                    let mut v = vec![vec![0.0f32; kv_width]; n];
+                    let xs: Vec<&[f32]> = normed.iter().map(|x| x.as_slice()).collect();
+                    multi(tensor(data, &w.q_proj), q_width * 2, d, &xs, &mut qg);
+                    multi(tensor(data, &w.k_proj), kv_width, d, &xs, &mut k);
+                    multi(tensor(data, &w.v_proj), kv_width, d, &xs, &mut v);
+                    let q_norm = tensor(data, &w.q_norm);
+                    let k_norm = tensor(data, &w.k_norm);
+                    let mut mixed = vec![vec![0.0f32; q_width]; n];
+                    std::thread::scope(|scope| {
+                        for (((lane, mixed_i), qg_i), (k_i, v_i)) in lanes
+                            .iter_mut()
+                            .zip(mixed.iter_mut())
+                            .zip(qg.iter())
+                            .zip(k.iter().zip(v.iter()))
+                        {
+                            let pos = lane.pos;
+                            let QwenCache::Full(cache) = &mut lane.caches[l] else {
+                                unreachable!("lane cache kind mismatch");
+                            };
+                            let cfg = &c;
+                            scope.spawn(move || {
+                                full_attn_tail(cfg, qg_i, k_i, v_i, q_norm, k_norm, pos, cache, mixed_i);
+                            });
+                        }
+                    });
+                    let ms: Vec<&[f32]> = mixed.iter().map(|x| x.as_slice()).collect();
+                    multi(tensor(data, &w.o_proj), d, q_width, &ms, &mut attn_out);
+                }
+            }
+            for i in 0..n {
+                for j in 0..d {
+                    hidden[i][j] += attn_out[i][j];
+                }
+            }
+            {
+                let w = tensor(data, &layer.post_norm);
+                for i in 0..n {
+                    rmsnorm(&hidden[i], w, c.norm_eps as f32, &mut normed[i]);
+                }
+            }
+            match &layer.mlp {
+                QwenMlpW::Dense { gate, up, down } => {
+                    let inter = c.dense_inter;
+                    let threads = crate::model::pool::pool().workers.max(1);
+                    let mut h_gate = vec![vec![0.0f32; inter]; n];
+                    let mut h_up = vec![vec![0.0f32; inter]; n];
+                    let xs: Vec<&[f32]> = normed.iter().map(|x| x.as_slice()).collect();
+                    {
+                        let (pg, sg) = packed_parts(data, gate);
+                        let mut outs: Vec<&mut [f32]> =
+                            h_gate.iter_mut().map(|x| x.as_mut_slice()).collect();
+                        crate::quant::mxfp4::matvec_packed_multi(pg, sg, inter, d, &xs, &mut outs, threads);
+                        let (pu, su) = packed_parts(data, up);
+                        let mut outs: Vec<&mut [f32]> =
+                            h_up.iter_mut().map(|x| x.as_mut_slice()).collect();
+                        crate::quant::mxfp4::matvec_packed_multi(pu, su, inter, d, &xs, &mut outs, threads);
+                    }
+                    for i in 0..n {
+                        for j in 0..inter {
+                            h_gate[i][j] = (h_gate[i][j] / (1.0 + (-h_gate[i][j]).exp())) * h_up[i][j];
+                        }
+                    }
+                    let hs: Vec<&[f32]> = h_gate.iter().map(|x| x.as_slice()).collect();
+                    let (pd, sd) = packed_parts(data, down);
+                    let mut outs: Vec<&mut [f32]> = Vec::with_capacity(n);
+                    let mut mlp_out: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
+                    for x in mlp_out.iter_mut() {
+                        outs.push(x.as_mut_slice());
+                    }
+                    crate::quant::mxfp4::matvec_packed_multi(pd, sd, d, inter, &hs, &mut outs, threads);
+                    for i in 0..n {
+                        for j in 0..d {
+                            hidden[i][j] += mlp_out[i][j];
+                        }
+                    }
+                }
+                QwenMlpW::Moe {
+                    router,
+                    experts,
+                    shared,
+                    shared_gate,
+                } => {
+                    // routed experts differ per lane: no shared weight read
+                    // exists by nature, so lanes run their exact serial MoE
+                    // concurrently
+                    let mut outs: Vec<Vec<f32>> = vec![Vec::new(); n];
+                    std::thread::scope(|scope| {
+                        for (i, out_slot) in outs.iter_mut().enumerate() {
+                            let x = &normed[i];
+                            let cfg = &c;
+                            scope.spawn(move || {
+                                *out_slot =
+                                    moe_token_serial(data, router, experts, shared, shared_gate, cfg, x);
+                            });
+                        }
+                    });
+                    for i in 0..n {
+                        for j in 0..d {
+                            hidden[i][j] += outs[i][j];
+                        }
+                    }
+                }
+            }
+        }
+
+        let norm_w = tensor(data, &self.norm_f);
+        for i in 0..n {
+            rmsnorm(&hidden[i], norm_w, c.norm_eps as f32, &mut normed[i]);
+        }
+        let mut logits: Vec<Vec<f32>> = vec![vec![0.0f32; c.vocab]; n];
+        {
+            let xs: Vec<&[f32]> = normed.iter().map(|x| x.as_slice()).collect();
+            let mut outs: Vec<&mut [f32]> = logits.iter_mut().map(|x| x.as_mut_slice()).collect();
+            match &self.lm_head_q8 {
+                Some(head) => head.matvec_multi(&xs, &mut outs),
+                None => crate::model::ops::matvec_multi(
+                    tensor(data, &self.lm_head),
+                    c.vocab,
+                    d,
+                    &xs,
+                    &mut outs,
+                ),
+            }
+        }
+        for lane in lanes.iter_mut() {
+            lane.pos += 1;
+        }
+        logits
+    }
+}
+
+/// f32 multi-lane matvec over Vec<Vec<f32>> outputs.
+fn multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [Vec<f32>]) {
+    let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|o| o.as_mut_slice()).collect();
+    crate::model::ops::matvec_multi(w, rows, cols, xs, &mut refs);
+}
+
+/// Post-projection tail of one linear-attention step for one lane:
+/// exactly the ops of `lin_attn_step` after its four matvecs.
+#[allow(clippy::too_many_arguments)]
+fn lin_attn_tail(
+    c: &QwenConfig,
+    qkv: &[f32],
+    z: &[f32],
+    b_raw: &[f32],
+    a_raw: &[f32],
+    conv_w: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm_w: &[f32],
+    out_proj: &[f32],
+    cache: &mut LinCache,
+    out: &mut [f32],
+) {
+    let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+    let conv_dim = kt * 2 + vt;
+    let mut conved = vec![0.0f32; conv_dim];
+    conv_step(qkv, conv_w, c.conv_kernel, &mut cache.conv, &mut conved);
+    let rep = c.lin_v_heads / c.lin_k_heads.max(1);
+    let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
+    let mut mixed = vec![0.0f32; vt];
+    for h in 0..c.lin_v_heads {
+        let kh = h / rep.max(1);
+        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
+        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
+        l2norm(&mut q, 1e-6);
+        l2norm(&mut k, 1e-6);
+        let scale = 1.0 / (kd as f32).sqrt();
+        for t in q.iter_mut() {
+            *t *= scale;
+        }
+        let beta = 1.0 / (1.0 + (-b_raw[h]).exp());
+        let sp = {
+            let t = a_raw[h] + dt_bias[h];
+            if t > 20.0 {
+                t
+            } else {
+                (1.0 + t.exp()).ln()
+            }
+        };
+        let g = -a_log[h].exp() * sp;
+        let st = &mut cache.state[h * kd * vd..(h + 1) * kd * vd];
+        delta_step(st, &q, &k, v, g, beta, &mut mixed[h * vd..(h + 1) * vd]);
+    }
+    for h in 0..c.lin_v_heads {
+        let (a, b) = (h * vd, (h + 1) * vd);
+        rmsnorm_gated(&mut mixed[a..b], norm_w, &z[a..b], c.norm_eps as f32);
+    }
+    crate::model::ops::matvec_st(out_proj, c.d, vt, &mixed, out);
+}
+
+/// Post-projection tail of one full-attention step for one lane: exactly
+/// the ops of `full_attn_step` after its three matvecs, writing the gated
+/// mix (before o_proj, which runs lane-batched).
+#[allow(clippy::too_many_arguments)]
+fn full_attn_tail(
+    c: &QwenConfig,
+    qg: &[f32],
+    k_in: &[f32],
+    v_in: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    pos: usize,
+    cache: &mut FullCache,
+    mixed: &mut [f32],
+) {
+    let hd = c.head_dim;
+    let q_width = c.n_heads * hd;
+    let kv_width = c.n_kv_heads * hd;
+    assert_eq!(cache.len, pos, "lane full-attention cache position mismatch");
+    let mut q = vec![0.0f32; q_width];
+    let mut gate = vec![0.0f32; q_width];
+    let mut k = k_in.to_vec();
+    let v = v_in;
+    for h in 0..c.n_heads {
+        let src = h * hd * 2;
+        q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
+        gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
+        let old = q[h * hd..(h + 1) * hd].to_vec();
+        rmsnorm(&old, q_norm, c.norm_eps as f32, &mut q[h * hd..(h + 1) * hd]);
+        rope_partial(&mut q[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+    }
+    for h in 0..c.n_kv_heads {
+        let old = k[h * hd..(h + 1) * hd].to_vec();
+        rmsnorm(&old, k_norm, c.norm_eps as f32, &mut k[h * hd..(h + 1) * hd]);
+        rope_partial(&mut k[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+    }
+    cache.k.extend_from_slice(&k);
+    cache.v.extend_from_slice(v);
+    cache.len += 1;
+    let groups = c.n_heads / c.n_kv_heads;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let mut scores = vec![0.0f32; cache.len];
+    for h in 0..c.n_heads {
+        let kh = h / groups;
+        let qh = &q[h * hd..(h + 1) * hd];
+        let mut max_score = f32::NEG_INFINITY;
+        for t in 0..cache.len {
+            let off = t * kv_width + kh * hd;
+            let sc = crate::model::ops::dot(qh, &cache.k[off..off + hd]) * scale;
+            scores[t] = sc;
+            max_score = max_score.max(sc);
+        }
+        let mut denom = 0.0f32;
+        for sc in scores.iter_mut() {
+            *sc = (*sc - max_score).exp();
+            denom += *sc;
+        }
+        let dst = &mut mixed[h * hd..(h + 1) * hd];
+        for t in 0..cache.len {
+            let off = t * kv_width + kh * hd;
+            let a = scores[t] / denom;
+            for i in 0..hd {
+                dst[i] += a * cache.v[off + i];
+            }
+        }
+    }
+    for (i, value) in mixed.iter_mut().enumerate() {
+        *value *= 1.0 / (1.0 + (-gate[i]).exp());
+    }
+}
+
 /// Shared generation loop for the Qwen runtime. The prompt is ingested in
 /// one batched prefill (bit-identical to sequential forwards); decoding
 /// then advances one token at a time, or two per accepted draft with
@@ -2327,12 +2901,12 @@ fn run_turn_mtp(
     if !generated.is_empty() {
         let moy = gen_dt / generated.len() as f64;
         println!(
-            "  ({:.0} ms/token, {:.1} tok/s | mtp: {} passes, {} drafts accepted, {:.0}% acceptance)",
+            "  ({:.0} ms/token, {:.1} tok/s | mtp: {} passes, {} drafts accepted, {:.2} tokens/pass)",
             moy * 1000.0,
             1.0 / moy,
             passes,
             accepted,
-            if passes > 0 { accepted as f64 / passes as f64 * 100.0 } else { 0.0 }
+            if passes > 0 { generated.len() as f64 / passes as f64 } else { 0.0 }
         );
     }
     answer
@@ -2340,6 +2914,19 @@ fn run_turn_mtp(
 
 /// Token-level MTP speculative loop (see `run_turn_mtp`). Returns the
 /// generated ids plus (verification passes, accepted drafts).
+///
+/// The draft is a CHAIN: the one-layer MTP head proposes up to
+/// `sampler.mtp_depth` tokens by feeding each proposal's own final-normed
+/// hidden into the next step (the reference proposer's multi-step
+/// contract), scored through the frequency-sliced draft head when the
+/// model has one. One batched trunk pass then verifies the pending token
+/// plus the whole chain; the longest matching prefix commits, the
+/// mismatch position yields the next token for free (the standard
+/// speculative bonus), and a partial accept rolls the trunk back exactly.
+/// The MTP cache is rebuilt from the verified trunk hiddens after every
+/// pass, so draft pairs never carry speculative state forward. Output is
+/// bit-identical to plain greedy decoding at every depth and with any
+/// draft head.
 pub(crate) fn mtp_generate(
     model: &mut QwenModel,
     ids: &[u32],
@@ -2353,6 +2940,7 @@ pub(crate) fn mtp_generate(
         !no_batch_prefill(),
         "--mtp requires the batched prefill (unset MICROKIMI_NO_QWEN_BATCH)"
     );
+    let depth = sampler.mtp_depth.max(1);
     // trunk prefill + MTP prompt ingestion: draft slot i pairs the prompt
     // token at i+1 with the trunk hidden at i
     let out = model.prefill_collect(ids, false);
@@ -2366,67 +2954,90 @@ pub(crate) fn mtp_generate(
     let mut passes = 0usize;
     let mut accepted = 0usize;
 
-    // first pending token + its draft
-    let mut pending = false;
-    let mut draft = 0u32;
     let first = mtp_select(&logits, sampler, &generated);
-    if first != stop_id {
-        generated.push(first);
-        let dl = model.mtp_advance(first, &hidden_prev, true).unwrap();
-        draft = super::top_k_probs(&dl, 5)[0].0 as u32;
-        pending = true;
+    if first == stop_id {
+        return (generated, passes, accepted);
     }
+    generated.push(first);
+    let mut pending = true;
 
     while pending && generated.len() < max_new {
         let n = *generated.last().unwrap();
         let snap = model.snapshot();
-        let batch = [n, draft];
+        let mtp_len = model.mtp_cache.len;
+
+        // chain draft: n's pair first, then each proposal chained on its
+        // own normed hidden; never draft the stop token or past max_new
+        let mut batch = vec![n];
+        let mut chain_hidden = hidden_prev.clone();
+        for _ in 0..depth {
+            if generated.len() + batch.len() > max_new {
+                break;
+            }
+            let (next_hidden, draft) = model.mtp_draft_step(*batch.last().unwrap(), &chain_hidden);
+            if draft == stop_id {
+                break;
+            }
+            batch.push(draft);
+            chain_hidden = next_hidden;
+        }
+
         let out = model.prefill_collect(&batch, true);
         passes += 1;
-        let sel = mtp_select(&out.logits[0], sampler, &generated);
-        if sel == stop_id {
-            // undo the draft ingestion so a saved state ends exactly at
-            // the last emitted token, like the plain loop
-            model.restore(&snap);
-            model.prefill_collect(&[n], false);
-            pending = false;
-            break;
+
+        // verify: accept drafts while they match the trunk's selection
+        let mut committed = 1usize;
+        let mut vctx: Vec<u32> = Vec::new();
+        while committed < batch.len() {
+            let sel = if sampler.dry > 0.0 {
+                vctx.clear();
+                vctx.extend_from_slice(&generated);
+                vctx.extend_from_slice(&batch[1..committed]);
+                mtp_select(&out.logits[committed - 1], sampler, &vctx)
+            } else {
+                mtp_select(&out.logits[committed - 1], sampler, &generated)
+            };
+            if sel != batch[committed] {
+                break;
+            }
+            committed += 1;
         }
-        if sel == draft {
-            // draft accepted: two tokens for one batched pass
-            accepted += 1;
+        accepted += committed - 1;
+        if debug {
+            println!(
+                "  mtp pass {}: drafted {}, accepted {}",
+                passes,
+                batch.len() - 1,
+                committed - 1
+            );
+        }
+
+        // partial accept: exact trunk rollback + reingest of the prefix
+        if committed < batch.len() {
+            model.restore(&snap);
+            model.prefill_collect(&batch[..committed], false);
+        }
+        // the MTP cache always rebuilds from verified trunk hiddens
+        model.rollback_mtp(mtp_len);
+        for j in 0..committed {
+            let h = if j == 0 { &hidden_prev } else { &out.hidden[j - 1] };
+            model.mtp_advance(batch[j], h, false);
+        }
+        for &draft in &batch[1..committed] {
             generated.push(draft);
-            model.mtp_advance(draft, &out.hidden[0], false);
-            logits = out.logits[1].clone();
-            hidden_prev = out.hidden[1].clone();
-            if debug {
-                println!("  mtp pass {}: draft token {} accepted", passes, draft);
-            }
-        } else {
-            // rejected: undo the draft ingestion, re-ingest the pending
-            // token alone (bit-identical state), continue from `sel`
-            model.restore(&snap);
-            model.prefill_collect(&[n], false);
-            logits = out.logits[0].clone();
-            hidden_prev = out.hidden[0].clone();
-            if debug {
-                println!(
-                    "  mtp pass {}: draft token {} rejected for {}",
-                    passes, draft, sel
-                );
-            }
         }
-        pending = false; // everything emitted so far is ingested
+        logits = out.logits[committed - 1].clone();
+        hidden_prev = out.hidden[committed - 1].clone();
+        pending = false;
         if generated.len() >= max_new {
             break;
         }
+        // bonus token: the mismatch position's own selection is free
         let next = mtp_select(&logits, sampler, &generated);
         if next == stop_id {
             break;
         }
         generated.push(next);
-        let dl = model.mtp_advance(next, &hidden_prev, true).unwrap();
-        draft = super::top_k_probs(&dl, 5)[0].0 as u32;
         pending = true;
     }
     if pending {
@@ -2435,6 +3046,49 @@ pub(crate) fn mtp_generate(
         model.prefill_collect(&[*generated.last().unwrap()], false);
     }
     (generated, passes, accepted)
+}
+
+/// `microkimi lanebench --model X.bin [--lanes N] [--steps M]`: aggregate
+/// decode throughput of lane-batched decoding. Each lane gets a distinct
+/// short prompt; every step decodes one token per lane through
+/// forward_lanes (greedy). Reports per-step wall time and aggregate
+/// tokens/second.
+pub fn lanebench_cmd(args: &[String]) {
+    let value = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let model_path = value("--model").expect("lanebench requires --model MODEL.bin");
+    let lanes_n: usize = value("--lanes").and_then(|v| v.parse().ok()).unwrap_or(4);
+    let steps: usize = value("--steps").and_then(|v| v.parse().ok()).unwrap_or(32);
+    let mut model = QwenModel::load(&model_path);
+    let vocab = model.cfg.vocab as u32;
+    let mut lanes: Vec<DecodeLane> = (0..lanes_n).map(|_| DecodeLane::new(&model)).collect();
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let prompt: Vec<u32> = (0..8).map(|j| (3 + i as u32 * 17 + j * 7) % vocab.min(50_000)).collect();
+        model.prefill_lane(lane, &prompt);
+    }
+    let mut tokens: Vec<u32> = (0..lanes_n).map(|i| (5 + i as u32 * 13) % vocab.min(50_000)).collect();
+    let t0 = std::time::Instant::now();
+    for _ in 0..steps {
+        let mut refs: Vec<&mut DecodeLane> = lanes.iter_mut().collect();
+        let logits = model.forward_lanes(&mut refs, &tokens);
+        for (i, l) in logits.iter().enumerate() {
+            tokens[i] = crate::model::top_k_probs(l, 5)[0].0 as u32;
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    let total = lanes_n * steps;
+    println!(
+        "lanes {:2}: {} tokens in {:.2} s -> {:.1} tok/s aggregate ({:.0} ms/step)",
+        lanes_n,
+        total,
+        dt,
+        total as f64 / dt,
+        dt / steps as f64 * 1000.0
+    );
 }
 
 /// Hidden parity helper: writes per-token logits as
@@ -2711,6 +3365,96 @@ mod model_tests {
             std::fs::remove_file(other_path).ok();
             std::fs::remove_file(mem_path).ok();
         }
+    }
+
+    #[test]
+    fn lane_batched_decode_matches_single_stream_bitwise() {
+        for c in [bin_tiny(), bin_tiny_dense()] {
+            let path = checkpoint_fixture(&c);
+            let model = QwenModel::load(&path);
+            // four lanes with different prompts and continuations
+            let prompts: [&[u32]; 4] = [&[3, 5, 7], &[11, 2], &[9, 13, 4, 6], &[1]];
+            let steps: [&[u32]; 4] = [&[8, 10], &[12, 3], &[5, 5], &[7, 9]];
+
+            // reference: each stream alone through the plain forward
+            let mut expected: Vec<Vec<Vec<f32>>> = Vec::new();
+            for i in 0..4 {
+                let mut single = QwenModel::load(&path);
+                single.prefill(prompts[i]);
+                let mut per_step = Vec::new();
+                for &t in steps[i] {
+                    per_step.push(single.forward(t));
+                }
+                expected.push(per_step);
+            }
+
+            // lanes: prompts ingested per lane, then decoded together
+            let mut model = model;
+            let mut lanes: Vec<DecodeLane> =
+                (0..4).map(|_| DecodeLane::new(&model)).collect();
+            for i in 0..4 {
+                model.prefill_lane(&mut lanes[i], prompts[i]);
+            }
+            for step in 0..2 {
+                let tokens: Vec<u32> = (0..4).map(|i| steps[i][step]).collect();
+                let mut refs: Vec<&mut DecodeLane> = lanes.iter_mut().collect();
+                let logits = model.forward_lanes(&mut refs, &tokens);
+                for i in 0..4 {
+                    assert_eq!(
+                        logits[i], expected[i][step],
+                        "lane {} step {} diverges from single-stream",
+                        i, step
+                    );
+                }
+            }
+            drop(model);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn chained_mtp_is_bit_identical_at_every_depth_and_head() {
+        let mut c = bin_tiny_dense();
+        c.mtp_layers = 1;
+        let path = checkpoint_fixture(&c);
+        let ids = [3u32, 5, 7, 11];
+        let max_new = 24;
+        let stop = 999_999;
+
+        let mut plain_model = QwenModel::load(&path);
+        let mut logits = plain_model.prefill(&ids);
+        let mut plain: Vec<u32> = Vec::new();
+        while plain.len() < max_new {
+            let next = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+            if next == stop {
+                break;
+            }
+            plain.push(next);
+            logits = plain_model.forward(next);
+        }
+
+        for depth in [1usize, 2, 4, 8] {
+            for mini_rows in [0usize, 32] {
+                let mut model = QwenModel::load(&path);
+                model.draft_head = if mini_rows > 0 {
+                    DraftHead::from_rows(&model, mini_rows)
+                } else {
+                    None
+                };
+                let mut sampler = crate::model::Sampler::greedy();
+                sampler.mtp_depth = depth;
+                let (spec, passes, accepted) =
+                    mtp_generate(&mut model, &ids, max_new, stop, &sampler, false);
+                assert_eq!(
+                    plain, spec,
+                    "divergence at depth {} mini {}",
+                    depth, mini_rows
+                );
+                assert!(passes > 0 && accepted <= passes * depth);
+            }
+        }
+        drop(plain_model);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

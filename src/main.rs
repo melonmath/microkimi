@@ -55,6 +55,7 @@ fn main() {
         "gputest" => gputest_cmd(),
         "dstest" => dstest_cmd(),
         "qwen-dump" => model::qwen::dump_cmd(&args),
+        "lanebench" => model::qwen::lanebench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" | "parity" => {
@@ -256,6 +257,8 @@ fn main() {
             println!("                                         converts a local Qwen3.5-family text checkpoint (MoE or dense);");
             println!("                                         f32 spine + MXFP4 experts or dense MLP, bounded conversion RAM;");
             println!("                                         --imatrix: calibration-weighted MXFP4 scales (dense, see calibrate)");
+            println!("  microkimi lanebench --model X.bin [--lanes N] [--steps M]");
+            println!("                                         aggregate decode throughput of lane-batched decoding (Qwen)");
             println!("  microkimi complete-batch --model X.bin --input REQUESTS.jsonl --out RESULTS.jsonl");
             println!("                        deterministic greedy completions, one model load; --chat optional;");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");
@@ -305,6 +308,8 @@ fn main() {
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
             println!("                    --spec-rosa N (suffix-automaton proposer, unbounded context, greedy only)");
             println!("                    --mtp (draft with the converted multi-token-prediction head, Qwen dense, greedy only)");
+            println!("                    --mtp-depth N (chained draft length per verification pass, default 4;");
+            println!("                        draft argmax through MICROKIMI_MTP_MINIHEAD rows, default 32768, 0 = full head)");
             println!("                    --dry P (DRY anti-repetition penalty, 0 = off)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --logit-lens (top-5 tokens of every layer through final norm + lm_head,");
@@ -957,6 +962,7 @@ fn sampler_flag(args: &[String]) -> model::Sampler {
     s.spec = value_flag(args, "--spec").and_then(|v| v.parse().ok()).unwrap_or(0);
     s.spec_rosa = value_flag(args, "--spec-rosa").and_then(|v| v.parse().ok()).unwrap_or(0);
     s.mtp = args.iter().any(|a| a == "--mtp");
+    s.mtp_depth = value_flag(args, "--mtp-depth").and_then(|v| v.parse().ok()).unwrap_or(4);
     s.dry = value_flag(args, "--dry").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     s
 }
