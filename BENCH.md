@@ -60,16 +60,26 @@ Qwen3.5-0.8B:
 
 | arm | prefill | decode |
 |---|---|---|
-| microkimi q8 spine (CPU, 4 P-cores) | ~69 tok/s | 52.6 tok/s |
-| llama.cpp Q8_0 (Metal GPU) | 4548 tok/s | 109.8 tok/s |
-| llama.cpp Q4_0 (Metal GPU) | 4715 tok/s | 140.1 tok/s |
+| microkimi q8 spine (CPU, 4 P-cores) | 64-73 tok/s | 47.6-58.8 tok/s |
+| microkimi + MPS GEMM prefill offload | 275 tok/s | (decode stays CPU) |
+| llama.cpp Q8_0 CPU-only (-ngl 0) | 664 tok/s | 86.3 tok/s |
+| llama.cpp Q8_0 (Metal GPU) | 4548-4743 tok/s | 109.8-110.8 tok/s |
+| llama.cpp Q4_0 (Metal GPU) | 4604-4715 tok/s | 139.7-140.1 tok/s |
 
-Reading: single-stream CPU decode lands within 2.1x of llama.cpp's GPU
-decode on the same silicon (bandwidth-bound regimes converge), and
-their Q4_0 gains only 27% over Q8_0 there (dispatch-bound at 0.8B,
-consistent with our fp4-spine rejection). Prefill is where the GPU is
-structurally ahead (~66x): matching llama.cpp on Apple silicon means a
-Metal backend for the Qwen runtime, not more CPU kernels.
+Reading, from two runs on the same machine: the fair CPU-versus-CPU
+decode gap is 1.47x (58.8 vs 86.3 tok/s), and since microkimi reads
+LESS weight per token (MXFP4 MLP vs Q8_0 everywhere), that gap is
+kernel bandwidth-extraction, not traffic - llama.cpp's CPU build (with
+Accelerate) pulls roughly 70 GB/s from four threads against our ~40.
+The MPS GEMM prefill offload measured 3.74x over the CPU batched
+prefill on its first outing (13.6 to 3.64 ms/token, last-position
+logits within 1.4e-2); llama.cpp's 664 tok/s CPU prefill row shows
+what AMX-backed GEMMs do on this silicon, and their full-Metal graph
+at ~4700 tok/s is the end state - reaching it means moving the
+remaining CPU tissue (delta scan, attention, norms) onto the GPU, and
+qwengpubench prints the exact GEMM-versus-tissue split to size that
+work. Their Q4_0 gains only 27% over Q8_0 on the GPU (dispatch-bound
+at 0.8B, consistent with our fp4-spine rejection).
 
 Two honesty notes for any quote: microkimi's MLP is MXFP4 (4-bit)
 while Q8_0 is 8-bit everywhere, so microkimi reads less weight traffic

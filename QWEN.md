@@ -299,6 +299,16 @@ kernels rather than erroring. Gated off by default; lane-batched
 decode and small batches never take this route (16-lane minimum,
 1M-element minimum per matrix).
 
+First bare-metal measurement (Apple M5, AC power): 3.64 vs 13.61
+ms/token against the CPU batched prefill in paired in-process rounds -
+3.74x, with the offloaded GEMMs matching a CPU recompute to 1.9e-7 and
+the last-position logits within 1.4e-2 of the CPU path (the expected
+dequant-versus-q8-activation delta). qwengpubench also reports the
+GEMM-versus-CPU-tissue split per token, which is the sizing datum for
+porting the remaining ops (delta scan, attention, norms) in a later
+phase; llama.cpp's full-Metal graph runs the same prefill at ~4700
+tok/s on this machine, so the ceiling is known and far.
+
 ## Chained drafting and lane-batched decoding
 
 Two throughput mechanisms, both bit-identical to plain decoding and both

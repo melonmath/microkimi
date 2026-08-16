@@ -1516,6 +1516,7 @@ fn run_gemm(
     let Some(kernel) = gemm_kernel(base, mps, t, rows, cols) else {
         return false;
     };
+    let t_start = std::time::Instant::now();
     // SAFETY: same invariants as gpu_matvec - Metal objects come from the
     // live context/caches; the io mutex serializes staging-buffer use for
     // the whole encode/wait/readback; waitUntilCompleted precedes readback;
@@ -1587,6 +1588,7 @@ fn run_gemm(
         drop(io);
         msg_void(pool, sel("drain"));
     }
+    gemm_account(t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -1658,4 +1660,23 @@ pub fn gpu_gemm_xwt_fp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
         return false;
     };
     run_gemm(base, mps, buf_w, rows, cols, xs, outs)
+}
+
+// ── GEMM time accounting (drives the Amdahl split in qwengpubench) ──
+
+static GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GEMM_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn gemm_account(micros: u64) {
+    GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GEMM_MICROS.fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns and resets the (calls, milliseconds) spent inside GPU GEMMs
+/// since the last take - the difference against wall time is the CPU
+/// tissue between matmuls, the phase-2 porting target.
+pub fn gemm_stats_take() -> (u64, f64) {
+    let calls = GEMM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let micros = GEMM_MICROS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    (calls, micros as f64 / 1000.0)
 }

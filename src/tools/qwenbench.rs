@@ -138,6 +138,25 @@ pub fn run(args: &[String]) {
     println!("kernels:");
     report_decode("q8 no-sdot", &nosdot_ms);
 
+    // ── threads A/B under q8: default (P-cores on macOS) vs all cores.
+    // The decode is bandwidth-bound; on big.LITTLE parts the E-cluster
+    // adds aggregate bandwidth but also adds barrier stragglers - which
+    // effect wins is machine-specific, so measure it.
+    let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    if all_cores > 0 {
+        let all_s = all_cores.to_string();
+        let mut allcore_ms = Vec::new();
+        for _ in 0..rounds {
+            if let Some(v) = ms_per_token(&run_self(
+                &base,
+                &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", &all_s)],
+            )) {
+                allcore_ms.push(v);
+            }
+        }
+        report_decode(&format!("q8 {}-thread", all_cores), &allcore_ms);
+    }
+
     // ── prefill A/B ──
     let long_prompt = "The history of computing spans mechanical calculators, vacuum tubes, transistors, integrated circuits, and modern accelerators. ".repeat(40);
     let pre: Vec<&str> = vec![
@@ -163,8 +182,15 @@ pub fn run(args: &[String]) {
         println!("prefill gpu (MPS GEMM, in-process A/B):");
         let mut shown = false;
         for line in out.lines() {
-            if line.starts_with("  ") || line.starts_with("gpu gemm check") {
-                println!("  {}", line.trim_start());
+            // only the report lines; the Metal shader compiler may echo
+            // indented source excerpts in warnings, so match prefixes.
+            let t = line.trim_start();
+            if t.starts_with("gpu ")
+                || t.starts_with("split:")
+                || t.starts_with("last-position")
+                || t.starts_with("gpu gemm check")
+            {
+                println!("  {}", t);
                 shown = true;
             }
         }
@@ -273,14 +299,20 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             std::hint::black_box(&out.logits);
             t0.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64
         };
-        let (mut gpu_ms, mut cpu_ms) = (Vec::new(), Vec::new());
+        let (mut gpu_ms, mut cpu_ms, mut gemm_ms) = (Vec::new(), Vec::new(), Vec::new());
+        let mut gemm_calls = 0u64;
         for _ in 0..rounds {
             crate::model::metal::set_qwen_gpu(true);
+            crate::model::metal::gemm_stats_take();
             gpu_ms.push(time_prefill(&mut model));
+            let (calls, ms) = crate::model::metal::gemm_stats_take();
+            gemm_calls = calls;
+            gemm_ms.push(ms / n_tokens as f64);
             crate::model::metal::set_qwen_gpu(false);
             cpu_ms.push(time_prefill(&mut model));
         }
         let (g, c) = (median(gpu_ms.clone()), median(cpu_ms.clone()));
+        let gm = median(gemm_ms.clone());
         println!("gpu prefill (MPS GEMM), {} tokens, paired rounds:", n_tokens);
         println!(
             "  gpu {:>6.2} ms/token | cpu batched {:>6.2} ms/token | {:.2}x  (gpu rounds: {:?}, cpu rounds: {:?})",
@@ -289,6 +321,12 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             c / g,
             gpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),
             cpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
+        );
+        println!(
+            "  split: {:.2} ms/token inside {} GEMMs | {:.2} ms/token cpu tissue (the phase-2 porting target)",
+            gm,
+            gemm_calls,
+            (g - gm).max(0.0)
         );
         println!("  last-position logits: max rel diff {:.2e} vs the CPU path", max_rel);
     }
