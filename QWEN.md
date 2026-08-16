@@ -202,6 +202,56 @@ compute budget. Both choices are recorded in the JSON scorecard:
   --json scorecard.json
 ```
 
+## Serving
+
+`microkimi serve` exposes the model as an OpenAI-compatible endpoint,
+still without dependencies:
+
+```bash
+./target/release/microkimi serve --model qwen.bin --port 8080
+curl http://127.0.0.1:8080/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "What is the capital of Japan?"}],
+  "max_tokens": 64, "enable_thinking": false}'
+```
+
+`/v1/completions` (raw) and `/v1/chat/completions` accept `max_tokens`,
+`temperature`, `top_p`, `seed`, `stream` (SSE), and `enable_thinking`
+(false renders the template's disabled think block, so a small model
+spends its budget on the visible answer). Chat answers split `<think>`
+reasoning into `reasoning_content`. Multi-turn conversations hit the
+chat prefix cache across requests: entries are stored at the
+conversation prefix and after generation, and disabled-think history is
+replayed exactly as it was ingested, so the next turn extends the exact
+token stream. Requests are served one at a time against the single
+stateful decoder; the default bind is 127.0.0.1 and there is no
+authentication layer - put a reverse proxy in front for anything else.
+
+## Measured on Qwen3.5-0.8B (real weights)
+
+All of the above is fixture-verified; the numbers below are measured on
+the real converted Qwen3.5-0.8B (dense, tied embeddings, MTP head;
+2.14 GB converted) on a shared aarch64 container - treat them as
+relative, not absolute:
+
+| measurement | result |
+|---|---|
+| batched prefill vs sequential, 961-token prompt | `12.2` vs `109.0` ms/token (`8.9x`) |
+| MTP draft acceptance (counting / prose / code prompts) | `96%` / `73%` / `98%`, outputs bit-identical to plain greedy |
+| MTP net speed on the counting prompt | `746` vs `1048` ms/token (`1.40x`) |
+| imatrix conversion vs plain, 4095-token held-out NLL | `2.7510` vs `2.7453` nats/token: **worse, rejected** (8192-token calibration) |
+| vocab slice, 5k rows from a 120 KB frequency corpus | `+128%` tokens, `+323%` total nats on held-out text: **rejected for general text** |
+| vocab slice, 11k rows covering the target domain | `1.17` vs `2.14` GB (`-45%`), `+0.23%` tokens, total nats within noise of full |
+| serve, turn two of a cached conversation | `38/49` prompt tokens restored, `11` prefilled |
+
+Two of those are negative results, kept on purpose. The importance-
+weighted quantization did not pay on this model and corpus budget - the
+plain conversion stays the default, and any larger model decides with
+the same A/B before adopting it. Vocabulary slicing collapses on
+out-of-coverage text because byte-fallback tokens are rare in
+pretraining: it is a domain-lock tool whose keep-set must be built from
+a corpus that covers the deployment distribution (and validated with
+exactly this total-nats measurement), not a general compressor.
+
 ## Independent parity
 
 `ref/qwen_parity.py` constructs a deterministic four-layer Transformers

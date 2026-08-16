@@ -1,6 +1,6 @@
 # microkimi
 
-A zero-dependency Rust engine for modern large-model architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5-family text decoders** (Qwen3.5/Qwen3.6-MoE, Qwen3.8-2.4T-A95B, and the dense Qwen3.8-27B) - verified against their reference implementations.
+A zero-dependency Rust engine for modern large-model architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5-family text decoders** (Qwen3.5/Qwen3.6-MoE, Qwen3.8-2.4T-A95B, and the dense Qwen3.8-27B and Qwen3.5-0.8B) - verified against their reference implementations and measured on real weights (see [QWEN.md](QWEN.md)): batched prefill at 8.9x sequential ingestion, MTP self-speculative decoding at 73-98% draft acceptance with bit-identical output, and an OpenAI-compatible `microkimi serve` endpoint with cross-request prefix caching.
 
 The Python side under `nano/graft/` adds architecture-agnostic instruments: compatibility scans between two models, per-expert utility measurement, paired evaluation with bootstrap intervals, and closed-form feed-forward transfer. Those read and write **Qwen3.5-MoE** (`qwen3_5_moe`, routed and shared experts), **Qwen3.5 dense**, **DeepSeek-V4**, **Gemma 3** and llama-style checkpoints in addition to the engine's own format - see `nano/graft/README.md`.
 
