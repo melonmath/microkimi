@@ -73,8 +73,38 @@ pub const fn is_moe(l: usize) -> bool {
     l >= 1
 }
 
+/// Worker count for the matvec pool. MICROKIMI_THREADS overrides; on
+/// macOS the default is the PERFORMANCE core count (efficiency cores are
+/// ~3x slower and every pool barrier waits for the slowest worker, so
+/// including them throttles the whole decode); elsewhere, all cores.
 pub fn n_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("MICROKIMI_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+        {
+            return n;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(out) = std::process::Command::new("sysctl")
+                .args(["-n", "hw.perflevel0.logicalcpu"])
+                .output()
+            {
+                if let Some(n) = String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n >= 1)
+                {
+                    return n;
+                }
+            }
+        }
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    })
 }
 
 // ── zero-copy bytes → f32 conversion (64-byte alignment guaranteed by the format) ──

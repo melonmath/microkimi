@@ -906,6 +906,24 @@ impl SpineMat {
         }
     }
 
+    /// Pool-parallel matvec (row-chunked, bit-identical to matvec_st):
+    /// the single-token decode path calls this from the main thread so
+    /// the whole worker pool serves one token's projections.
+    pub(crate) fn matvec(&self, x: &[f32], out: &mut [f32]) {
+        match self {
+            SpineMat::Q8(head) => head.matvec(x, out),
+            SpineMat::Fp4(m) => crate::quant::mxfp4::matvec_packed(
+                &m.packed,
+                &m.scales,
+                m.rows,
+                m.cols,
+                x,
+                out,
+                crate::model::pool::pool().workers.max(1),
+            ),
+        }
+    }
+
     pub(crate) fn matvec_multi(&self, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
         match self {
             SpineMat::Q8(head) => head.matvec_multi(xs, outs),
@@ -1782,6 +1800,7 @@ impl QwenModel {
     /// Rebuilds the spine quantization after load: None restores the
     /// exact f32 spine, Some(false) selects q8, Some(true) selects MXFP4.
     /// Tests inject modes this way instead of racing on process env.
+    #[cfg(test)]
     pub(crate) fn set_spine_mode(&mut self, mode: Option<bool>) {
         self.q8_spine = match mode {
             Some(fp4) => build_spine(&self.layers, &self.bin, &self.cfg, fp4),
@@ -2322,6 +2341,64 @@ fn lin_attn_prefill(
         LayerQ8::Linear { in_qkv, in_z, out_proj } => (in_qkv, in_z, out_proj),
         LayerQ8::Full { .. } => unreachable!("q8 layer kind mismatch"),
     });
+
+    // single-token decode: one token cannot fan out across tokens, so the
+    // projections run ROW-parallel on the whole pool from this thread
+    // (bit-identical: the pooled kernels chunk whole rows). Without this,
+    // decode would run every attention matvec on one core.
+    if t_count == 1 {
+        let d = c.d;
+        let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+        let conv_dim = kt * 2 + vt;
+        let heads = c.lin_v_heads;
+        let mut qkv = vec![0.0f32; conv_dim];
+        let mut z = vec![0.0f32; vt];
+        let mut b_raw = vec![0.0f32; heads];
+        let mut a_raw = vec![0.0f32; heads];
+        let x = &normed[..d];
+        match q8_mats {
+            Some((q_qkv, q_z, _)) => {
+                q_qkv.matvec(x, &mut qkv);
+                q_z.matvec(x, &mut z);
+            }
+            None => {
+                crate::model::ops::matvec(tensor(data, &w.in_qkv), conv_dim, d, x, &mut qkv);
+                crate::model::ops::matvec(tensor(data, &w.in_z), vt, d, x, &mut z);
+            }
+        }
+        crate::model::ops::matvec(tensor(data, &w.in_b), heads, d, x, &mut b_raw);
+        crate::model::ops::matvec(tensor(data, &w.in_a), heads, d, x, &mut a_raw);
+        let mut mixed = vec![0.0f32; vt];
+        lin_attn_recur(
+            c,
+            &qkv,
+            &b_raw,
+            &a_raw,
+            tensor(data, &w.conv),
+            tensor(data, &w.a_log),
+            tensor(data, &w.dt_bias),
+            cache,
+            &mut mixed,
+        );
+        let norm_w = tensor(data, &w.norm);
+        let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
+        let _ = kd;
+        for h in 0..heads {
+            let (a, b) = (h * vd, (h + 1) * vd);
+            rmsnorm_gated(&mut mixed[a..b], norm_w, &z[a..b], c.norm_eps as f32);
+        }
+        match q8_mats {
+            Some((_, _, q_out)) => q_out.matvec(&mixed, &mut attn_out[..d]),
+            None => crate::model::ops::matvec(
+                tensor(data, &w.out_proj),
+                d,
+                vt,
+                &mixed,
+                &mut attn_out[..d],
+            ),
+        }
+        return;
+    }
     let d = c.d;
     let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
     let conv_dim = kt * 2 + vt;
@@ -2519,6 +2596,53 @@ fn lin_attn_prefill(
     }
 }
 
+/// Convolution + per-head delta recurrence of one token (the exact ops
+/// of `lin_attn_step` between its projections and its gated norm).
+#[allow(clippy::too_many_arguments)]
+fn lin_attn_recur(
+    c: &QwenConfig,
+    qkv: &[f32],
+    b_raw: &[f32],
+    a_raw: &[f32],
+    conv_w: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    cache: &mut LinCache,
+    mixed: &mut [f32],
+) {
+    let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+    let conv_dim = kt * 2 + vt;
+    let mut conved = vec![0.0f32; conv_dim];
+    conv_step(qkv, conv_w, c.conv_kernel, &mut cache.conv, &mut conved);
+    let rep = c.lin_v_heads / c.lin_k_heads.max(1);
+    let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
+    let _ = vt;
+    for h in 0..c.lin_v_heads {
+        let kh = h / rep.max(1);
+        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
+        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
+        l2norm(&mut q, 1e-6);
+        l2norm(&mut k, 1e-6);
+        let scale = 1.0 / (kd as f32).sqrt();
+        for t in q.iter_mut() {
+            *t *= scale;
+        }
+        let beta = 1.0 / (1.0 + (-b_raw[h]).exp());
+        let sp = {
+            let t = a_raw[h] + dt_bias[h];
+            if t > 20.0 {
+                t
+            } else {
+                (1.0 + t.exp()).ln()
+            }
+        };
+        let g = -a_log[h].exp() * sp;
+        let st = &mut cache.state[h * kd * vd..(h + 1) * kd * vd];
+        delta_step(st, &q, &k, v, g, beta, &mut mixed[h * vd..(h + 1) * vd]);
+    }
+}
+
 /// Prefill for one full-attention layer: projections and per-head norms and
 /// rotary fan out over tokens, the key/value block is appended once, then
 /// each position attends over its causal prefix in parallel. Per-token
@@ -2539,6 +2663,55 @@ fn full_attn_prefill(
         LayerQ8::Full { q_proj, k_proj, v_proj, o_proj } => (q_proj, k_proj, v_proj, o_proj),
         LayerQ8::Linear { .. } => unreachable!("q8 layer kind mismatch"),
     });
+
+    // single-token decode: row-parallel projections on the whole pool
+    // (see lin_attn_prefill for the rationale; bit-identical)
+    if t_count == 1 {
+        let d = c.d;
+        let hd = c.head_dim;
+        let q_width = c.n_heads * hd;
+        let kv_width = c.n_kv_heads * hd;
+        assert_eq!(cache.len, base_pos, "full-attention cache position mismatch");
+        let x = &normed[..d];
+        let mut qg = vec![0.0f32; q_width * 2];
+        let mut k = vec![0.0f32; kv_width];
+        let mut v = vec![0.0f32; kv_width];
+        match q8_mats {
+            Some((qq, qk, qv, _)) => {
+                qq.matvec(x, &mut qg);
+                qk.matvec(x, &mut k);
+                qv.matvec(x, &mut v);
+            }
+            None => {
+                crate::model::ops::matvec(tensor(data, &w.q_proj), q_width * 2, d, x, &mut qg);
+                crate::model::ops::matvec(tensor(data, &w.k_proj), kv_width, d, x, &mut k);
+                crate::model::ops::matvec(tensor(data, &w.v_proj), kv_width, d, x, &mut v);
+            }
+        }
+        let mut mixed = vec![0.0f32; q_width];
+        full_attn_tail(
+            c,
+            &qg,
+            &k,
+            &v,
+            tensor(data, &w.q_norm),
+            tensor(data, &w.k_norm),
+            base_pos,
+            cache,
+            &mut mixed,
+        );
+        match q8_mats {
+            Some((_, _, _, qo)) => qo.matvec(&mixed, &mut attn_out[..d]),
+            None => crate::model::ops::matvec(
+                tensor(data, &w.o_proj),
+                d,
+                q_width,
+                &mixed,
+                &mut attn_out[..d],
+            ),
+        }
+        return;
+    }
     let d = c.d;
     let hd = c.head_dim;
     let q_width = c.n_heads * hd;
@@ -2698,6 +2871,23 @@ fn mlp_prefill(
     out: &mut [f32],
 ) {
     let d = c.d;
+    // single-token decode: the row-parallel MLP (pool-threaded packed
+    // matvecs, parallel routed experts) instead of one serial worker
+    if t_count == 1 {
+        let value = match mlp {
+            QwenMlpW::Moe {
+                router,
+                experts,
+                shared,
+                shared_gate,
+            } => packed_moe(data, router, experts, shared, shared_gate, c, &normed[..d]),
+            QwenMlpW::Dense { gate, up, down } => {
+                packed_dense_mlp(data, gate, up, down, c, &normed[..d], None, bounds)
+            }
+        };
+        out[..d].copy_from_slice(&value);
+        return;
+    }
     let workers = prefill_workers(t_count);
     std::thread::scope(|s| {
         let mut out_rest = &mut out[..t_count * d];
