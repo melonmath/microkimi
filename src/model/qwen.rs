@@ -917,6 +917,93 @@ impl DraftHead {
     }
 }
 
+/// Per-layer certified-skip statistics for the dense MLP, built once at
+/// load by scanning the packed matrices. For a 32-channel block b of the
+/// intermediate dimension:
+///   up_l2[i]  = L2 norm of up row i            (|u_i| <= up_l2[i] * |x|)
+///   down_sup[b] = max_{j, i in b} |down[j, i]|
+/// Skipping block b changes each MLP output coordinate by at most
+///   sum_{i in b} |silu(g_i)| * up_l2[i] * |x|_2 * down_sup[b]
+/// so after the gate matvec the engine can PROVE which blocks fit inside
+/// the caller's error budget (sup-norm of the MLP block output, per
+/// layer). Budget 0 skips nothing and stays bit-exact.
+pub(crate) struct SkipBounds {
+    /// per intermediate channel: L2 norm of the up row
+    up_l2: Vec<f32>,
+    /// per 32-block: sup of |down| over the block's columns
+    down_sup: Vec<f32>,
+}
+
+impl SkipBounds {
+    fn build(data: &[u8], gate: &PackedT, up: &PackedT, down: &PackedT, c: &QwenConfig) -> SkipBounds {
+        let _ = gate;
+        let inter = c.dense_inter;
+        let d = c.d;
+        let (pu, su) = packed_parts(data, up);
+        let up_f = crate::quant::mxfp4::dequant(pu, su, inter, d);
+        let up_l2: Vec<f32> = (0..inter)
+            .map(|i| up_f[i * d..(i + 1) * d].iter().map(|v| v * v).sum::<f32>().sqrt())
+            .collect();
+        let (pd, sd) = packed_parts(data, down);
+        let down_f = crate::quant::mxfp4::dequant(pd, sd, d, inter);
+        let blocks = inter / 32;
+        let mut down_sup = vec![0.0f32; blocks];
+        for j in 0..d {
+            let row = &down_f[j * inter..(j + 1) * inter];
+            for b in 0..blocks {
+                for i in b * 32..(b + 1) * 32 {
+                    let a = row[i].abs();
+                    if a > down_sup[b] {
+                        down_sup[b] = a;
+                    }
+                }
+            }
+        }
+        SkipBounds { up_l2, down_sup }
+    }
+
+    /// Given the gate activations, greedily selects the blocks whose
+    /// summed certified contribution stays within `budget`, cheapest
+    /// bounds first. Returns the keep mask per 32-block.
+    fn keep_mask(&self, silu_gate: &[f32], x_l2: f32, budget: f32) -> Vec<bool> {
+        let blocks = self.down_sup.len();
+        let mut keep = vec![true; blocks];
+        if budget <= 0.0 {
+            return keep;
+        }
+        let mut bounds: Vec<(f32, usize)> = (0..blocks)
+            .map(|b| {
+                let inner: f32 = (b * 32..(b + 1) * 32)
+                    .map(|i| silu_gate[i].abs() * self.up_l2[i])
+                    .sum();
+                (inner * x_l2 * self.down_sup[b], b)
+            })
+            .collect();
+        bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut spent = 0.0f32;
+        for (bound, b) in bounds {
+            if spent + bound > budget {
+                break;
+            }
+            spent += bound;
+            keep[b] = false;
+        }
+        keep
+    }
+}
+
+/// MICROKIMI_MLP_BUDGET: certified sup-norm error budget per MLP block
+/// output (0 = exact, the default).
+fn mlp_budget() -> f32 {
+    static ON: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MICROKIMI_MLP_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+
 /// Rollback point for speculative decoding: the linear states are
 /// recurrent (not truncatable) and are cloned; the append-only key/value
 /// caches only record their lengths and are truncated on restore.
@@ -942,6 +1029,8 @@ pub struct QwenModel {
     pub(crate) caches: Vec<QwenCache>,
     mtp: Option<QwenMtpW>,
     pub(crate) draft_head: Option<DraftHead>,
+    /// Per-layer certified-skip bounds (dense layers, budget mode only).
+    skip_bounds: Vec<Option<SkipBounds>>,
     pub(crate) mtp_cache: FullCache,
     pub(crate) pos: usize,
     /// Logits after the last ingested token (state snapshots resume from
@@ -1120,6 +1209,7 @@ fn packed_dense_mlp(
     c: &QwenConfig,
     x: &[f32],
     imatrix_layer: Option<usize>,
+    bounds: Option<&SkipBounds>,
 ) -> Vec<f32> {
     let inter = c.dense_inter;
     let threads = crate::model::pool::pool().workers.max(1);
@@ -1127,9 +1217,72 @@ fn packed_dense_mlp(
         crate::quant::imatrix::record_hidden(l, x);
     }
     let mut h_gate = vec![0.0f32; inter];
-    let mut h_up = vec![0.0f32; inter];
     let (pg, sg) = packed_parts(data, gate);
     crate::quant::mxfp4::matvec_packed(pg, sg, inter, c.d, x, &mut h_gate, threads);
+
+    // certified-budget path: after the gate matvec, silu magnitudes plus
+    // the precomputed norms bound each 32-block's possible contribution;
+    // blocks proven under the budget skip both their up rows and their
+    // down columns
+    if let (Some(bounds), budget) = (bounds, mlp_budget()) {
+        if budget > 0.0 {
+            let mut silu = vec![0.0f32; inter];
+            for i in 0..inter {
+                silu[i] = h_gate[i] / (1.0 + (-h_gate[i]).exp());
+            }
+            let x_l2 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let keep = bounds.keep_mask(&silu, x_l2, budget);
+            let kept: Vec<usize> = (0..inter / 32).filter(|&b| keep[b]).collect();
+            MLP_BLOCKS_TOTAL.fetch_add((inter / 32) as u64, std::sync::atomic::Ordering::Relaxed);
+            MLP_BLOCKS_SKIPPED.fetch_add(
+                (inter / 32 - kept.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let mut h = vec![0.0f32; inter];
+            let (pu, su) = packed_parts(data, up);
+            {
+                let nt = threads.min(kept.len()).max(1);
+                let chunk = kept.len().div_ceil(nt);
+                std::thread::scope(|scope| {
+                    for blocks in kept.chunks(chunk.max(1)) {
+                        let h_ptr = h.as_mut_ptr() as usize;
+                        let silu = &silu;
+                        scope.spawn(move || {
+                            for &b in blocks {
+                                let mut rows = [0.0f32; 32];
+                                crate::quant::mxfp4::matvec_packed(
+                                    &pu[b * 32 * c.d / 2..(b + 1) * 32 * c.d / 2],
+                                    &su[b * 32 * (c.d / 32)..(b + 1) * 32 * (c.d / 32)],
+                                    32,
+                                    c.d,
+                                    x,
+                                    &mut rows,
+                                    1,
+                                );
+                                for j in 0..32 {
+                                    let i = b * 32 + j;
+                                    unsafe {
+                                        *(h_ptr as *mut f32).add(i) = silu[i] * rows[j];
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            if let Some(l) = imatrix_layer {
+                crate::quant::imatrix::record_inter(l, &h);
+            }
+            let mut out = vec![0.0f32; c.d];
+            let (pd, sd) = packed_parts(data, down);
+            crate::quant::mxfp4::matvec_packed_colblocks(
+                pd, sd, c.d, inter, &kept, &h, &mut out, threads,
+            );
+            return out;
+        }
+    }
+
+    let mut h_up = vec![0.0f32; inter];
     let (pu, su) = packed_parts(data, up);
     crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, x, &mut h_up, threads);
     for i in 0..inter {
@@ -1142,6 +1295,18 @@ fn packed_dense_mlp(
     let (pd, sd) = packed_parts(data, down);
     crate::quant::mxfp4::matvec_packed(pd, sd, c.d, inter, &h_gate, &mut out, threads);
     out
+}
+
+/// Skip accounting for the budget mode (reported by run/serve).
+static MLP_BLOCKS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MLP_BLOCKS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (skipped, total) MLP blocks since process start (budget mode).
+pub fn mlp_skip_stats() -> (u64, u64) {
+    (
+        MLP_BLOCKS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        MLP_BLOCKS_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 impl QwenModel {
@@ -1416,6 +1581,19 @@ impl QwenModel {
             })
             .collect();
         let mtp_cache = FullCache::new(&c);
+        let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
+            layers
+                .iter()
+                .map(|layer| match &layer.mlp {
+                    QwenMlpW::Dense { gate, up, down } => {
+                        Some(SkipBounds::build(&bin.data, gate, up, down, &c))
+                    }
+                    QwenMlpW::Moe { .. } => None,
+                })
+                .collect()
+        } else {
+            (0..c.n_layers).map(|_| None).collect()
+        };
         let mut model = QwenModel {
             cfg: c,
             bin,
@@ -1427,6 +1605,7 @@ impl QwenModel {
             caches,
             mtp,
             draft_head: None,
+            skip_bounds,
             mtp_cache,
             pos: 0,
             last_logits: Vec::new(),
@@ -1558,7 +1737,7 @@ impl QwenModel {
             x[i] += attn_out[i];
         }
         rmsnorm(&x, tensor(data, &mtp.post_norm), c.norm_eps as f32, &mut normed);
-        let mlp = packed_dense_mlp(data, &mtp.mlp_gate, &mtp.mlp_up, &mtp.mlp_down, &c, &normed, None);
+        let mlp = packed_dense_mlp(data, &mtp.mlp_gate, &mtp.mlp_up, &mtp.mlp_down, &c, &normed, None, None);
         for i in 0..d {
             x[i] += mlp[i];
         }
@@ -1639,6 +1818,7 @@ impl QwenModel {
             &mtp_w.mlp_down,
             &c,
             &normed,
+            None,
             None,
         );
         for i in 0..d {
@@ -1755,7 +1935,7 @@ impl QwenModel {
                     shared_gate,
                 } => packed_moe(data, router, experts, shared, shared_gate, c, &normed),
                 QwenMlpW::Dense { gate, up, down } => {
-                    packed_dense_mlp(data, gate, up, down, c, &normed, Some(l))
+                    packed_dense_mlp(data, gate, up, down, c, &normed, Some(l), self.skip_bounds[l].as_ref())
                 }
             };
             for i in 0..d {
@@ -1907,7 +2087,15 @@ impl QwenModel {
                     rmsnorm(h, w, c.norm_eps as f32, n);
                 }
             }
-            mlp_prefill(data, &layer.mlp, &c, &normed, t_count, &mut attn_out);
+            mlp_prefill(
+                data,
+                &layer.mlp,
+                &c,
+                &normed,
+                t_count,
+                self.skip_bounds[l].as_ref(),
+                &mut attn_out,
+            );
             for i in 0..t_count * d {
                 hidden[i] += attn_out[i];
             }
@@ -2291,6 +2479,7 @@ fn mlp_prefill(
     c: &QwenConfig,
     normed: &[f32],
     t_count: usize,
+    bounds: Option<&SkipBounds>,
     out: &mut [f32],
 ) {
     let d = c.d;
@@ -2313,7 +2502,7 @@ fn mlp_prefill(
                             shared_gate,
                         } => moe_token_serial(data, router, experts, shared, shared_gate, c, x),
                         QwenMlpW::Dense { gate, up, down } => {
-                            dense_token_serial(data, gate, up, down, c, x)
+                            dense_token_serial(data, gate, up, down, c, x, bounds)
                         }
                     };
                     out_c[i * d..(i + 1) * d].copy_from_slice(&value);
@@ -2384,12 +2573,54 @@ fn dense_token_serial(
     down: &PackedT,
     c: &QwenConfig,
     x: &[f32],
+    bounds: Option<&SkipBounds>,
 ) -> Vec<f32> {
     let inter = c.dense_inter;
     let mut h_gate = vec![0.0f32; inter];
-    let mut h_up = vec![0.0f32; inter];
     let (pg, sg) = packed_parts(data, gate);
     crate::quant::mxfp4::matvec_packed(pg, sg, inter, c.d, x, &mut h_gate, 1);
+
+    // certified-budget path (see packed_dense_mlp for the contract)
+    if let (Some(bounds), budget) = (bounds, mlp_budget()) {
+        if budget > 0.0 {
+            let mut silu = vec![0.0f32; inter];
+            for i in 0..inter {
+                silu[i] = h_gate[i] / (1.0 + (-h_gate[i]).exp());
+            }
+            let x_l2 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let keep = bounds.keep_mask(&silu, x_l2, budget);
+            let kept: Vec<usize> = (0..inter / 32).filter(|&b| keep[b]).collect();
+            MLP_BLOCKS_TOTAL.fetch_add((inter / 32) as u64, std::sync::atomic::Ordering::Relaxed);
+            MLP_BLOCKS_SKIPPED.fetch_add(
+                (inter / 32 - kept.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let (pu, su) = packed_parts(data, up);
+            let mut h = vec![0.0f32; inter];
+            for &b in &kept {
+                let mut rows = [0.0f32; 32];
+                crate::quant::mxfp4::matvec_packed(
+                    &pu[b * 32 * c.d / 2..(b + 1) * 32 * c.d / 2],
+                    &su[b * 32 * (c.d / 32)..(b + 1) * 32 * (c.d / 32)],
+                    32,
+                    c.d,
+                    x,
+                    &mut rows,
+                    1,
+                );
+                for j in 0..32 {
+                    let i = b * 32 + j;
+                    h[i] = silu[i] * rows[j];
+                }
+            }
+            let mut out = vec![0.0f32; c.d];
+            let (pd, sd) = packed_parts(data, down);
+            crate::quant::mxfp4::matvec_packed_colblocks(pd, sd, c.d, inter, &kept, &h, &mut out, 1);
+            return out;
+        }
+    }
+
+    let mut h_up = vec![0.0f32; inter];
     let (pu, su) = packed_parts(data, up);
     crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, x, &mut h_up, 1);
     for i in 0..inter {
@@ -2431,13 +2662,6 @@ impl DecodeLane {
         }
     }
 
-    pub fn reset(&mut self, model: &QwenModel) {
-        *self = DecodeLane::new(model);
-    }
-
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
 }
 
 impl QwenModel {
@@ -2847,7 +3071,7 @@ pub fn qwen_run_turn_resume(
             return run_turn_mtp(ids, max_new, tok, model, debug, stop_id, sampler);
         }
     }
-    super::run_turn_core_batch(
+    let answer = super::run_turn_core_batch(
         ids,
         max_new,
         tok,
@@ -2857,7 +3081,20 @@ pub fn qwen_run_turn_resume(
         stop_id,
         init_logits,
         sampler,
-    )
+    );
+    if mlp_budget() > 0.0 {
+        let (skipped, total) = mlp_skip_stats();
+        if total > 0 {
+            eprintln!(
+                "mlp budget {}: {}/{} blocks skipped ({:.0}%)",
+                mlp_budget(),
+                skipped,
+                total,
+                skipped as f64 / total as f64 * 100.0
+            );
+        }
+    }
+    answer
 }
 
 /// Greedy selection with the same top-5 tie-breaking as the plain loop,
@@ -3072,7 +3309,7 @@ pub fn lanebench_cmd(args: &[String]) {
     }
     let mut tokens: Vec<u32> = (0..lanes_n).map(|i| (5 + i as u32 * 13) % vocab.min(50_000)).collect();
 
-    let mut run_phase = |model: &QwenModel, lanes: &mut [DecodeLane], tokens: &mut [u32], steps: usize| -> f64 {
+    let run_phase = |model: &QwenModel, lanes: &mut [DecodeLane], tokens: &mut [u32], steps: usize| -> f64 {
         let t0 = std::time::Instant::now();
         for _ in 0..steps {
             let n = tokens.len();
@@ -3408,6 +3645,99 @@ mod model_tests {
             std::fs::remove_file(path).ok();
             std::fs::remove_file(other_path).ok();
             std::fs::remove_file(mem_path).ok();
+        }
+    }
+
+    #[test]
+    fn certified_skip_bounds_hold_on_the_fixture() {
+        let c = bin_tiny_dense();
+        let path = checkpoint_fixture(&c);
+        let model = QwenModel::load(&path);
+        let (gate, up, down) = match &model.layers[0].mlp {
+            QwenMlpW::Dense { gate, up, down } => (*gate, *up, *down),
+            _ => unreachable!(),
+        };
+        let bounds = SkipBounds::build(&model.bin.data, &gate, &up, &down, &c);
+        assert_eq!(bounds.up_l2.len(), c.dense_inter);
+        assert_eq!(bounds.down_sup.len(), c.dense_inter / 32);
+
+        // exact MLP output vs output with one block zeroed: the certified
+        // bound must dominate the true sup-norm deviation
+        let x: Vec<f32> = (0..c.d).map(|i| ((i * 13 + 5) % 17) as f32 * 0.01 - 0.08).collect();
+        let exact = packed_dense_mlp(&model.bin.data, &gate, &up, &down, &c, &x, None, None);
+        let inter = c.dense_inter;
+        let (pg, sg) = packed_parts(&model.bin.data, &gate);
+        let mut g_act = vec![0.0f32; inter];
+        crate::quant::mxfp4::matvec_packed(pg, sg, inter, c.d, &x, &mut g_act, 1);
+        let (pu, su) = packed_parts(&model.bin.data, &up);
+        let mut u_act = vec![0.0f32; inter];
+        crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, &x, &mut u_act, 1);
+        let mut h = vec![0.0f32; inter];
+        for i in 0..inter {
+            h[i] = (g_act[i] / (1.0 + (-g_act[i]).exp())) * u_act[i];
+        }
+        let x_l2 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for skip_block in 0..inter / 32 {
+            let mut h_zeroed = h.clone();
+            for i in skip_block * 32..(skip_block + 1) * 32 {
+                h_zeroed[i] = 0.0;
+            }
+            let (pd, sd) = packed_parts(&model.bin.data, &down);
+            let mut approx = vec![0.0f32; c.d];
+            crate::quant::mxfp4::matvec_packed(pd, sd, c.d, inter, &h_zeroed, &mut approx, 1);
+            let true_dev = exact
+                .iter()
+                .zip(&approx)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let bound: f32 = (skip_block * 32..(skip_block + 1) * 32)
+                .map(|i| (g_act[i] / (1.0 + (-g_act[i]).exp())).abs() * bounds.up_l2[i])
+                .sum::<f32>()
+                * x_l2
+                * bounds.down_sup[skip_block];
+            assert!(
+                true_dev <= bound * 1.0001 + 1e-6,
+                "block {}: true deviation {} exceeds certified bound {}",
+                skip_block,
+                true_dev,
+                bound
+            );
+        }
+        drop(model);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn colblock_kernel_matches_full_and_zeroed_subsets() {
+        let (rows, cols) = (16usize, 128usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7 + 3) % 23) as f32 * 0.01 - 0.1).collect();
+        let (packed, scales) = crate::quant::mxfp4::quantize(&w, rows, cols);
+        let x: Vec<f32> = (0..cols).map(|i| ((i * 5 + 1) % 13) as f32 * 0.02 - 0.1).collect();
+        let all: Vec<usize> = (0..cols / 32).collect();
+        let mut full = vec![0.0f32; rows];
+        crate::quant::mxfp4::matvec_packed(&packed, &scales, rows, cols, &x, &mut full, 1);
+        let mut via_blocks = vec![0.0f32; rows];
+        crate::quant::mxfp4::matvec_packed_colblocks(
+            &packed, &scales, rows, cols, &all, &x, &mut via_blocks, 1,
+        );
+        assert_eq!(full, via_blocks, "all-kept must equal the plain kernel");
+
+        let kept = vec![0usize, 2];
+        let mut x_masked = x.clone();
+        for i in 32..64 {
+            x_masked[i] = 0.0;
+        }
+        for i in 96..128 {
+            x_masked[i] = 0.0;
+        }
+        let mut masked = vec![0.0f32; rows];
+        crate::quant::mxfp4::matvec_packed(&packed, &scales, rows, cols, &x_masked, &mut masked, 1);
+        let mut sparse = vec![0.0f32; rows];
+        crate::quant::mxfp4::matvec_packed_colblocks(
+            &packed, &scales, rows, cols, &kept, &x, &mut sparse, 1,
+        );
+        for (a, b) in masked.iter().zip(&sparse) {
+            assert!((a - b).abs() < 1e-5, "{} vs {}", a, b);
         }
     }
 

@@ -263,6 +263,36 @@ sublinear here because parts of the step are compute-bound on this
 host; the weight-traffic sharing grows with model size. Wiring lanes
 into serve and complete-batch is the designated next step.
 
+## Certified error-budget decoding
+
+`MICROKIMI_MLP_BUDGET=e` turns the dense MLP into an exactness dial with
+a mathematical guarantee. At load, the engine scans the packed matrices
+once and stores, per 32-channel block, the L2 norms of the `up` rows and
+the sup of the `down` block: after the gate matvec of each token, the
+possible contribution of every block is bounded by
+`sum |silu(g_i)| * |up_i|_2 * |x|_2 * sup|down_b|`, and blocks PROVEN to
+fit inside the budget skip both their up rows and their down columns
+through block-sparse kernels (SIMD granularity preserved). The
+certificate is per-layer MLP output sup-norm; budget 0 - the default -
+skips nothing and stays bit-exact, and the bound's dominance over the
+true deviation is unit-tested block by block.
+
+Measured curve on the real 0.8B (held-out NLL, 2600 scored tokens):
+
+| budget | blocks skipped | NLL | note |
+|---|---|---|---|
+| 0 | 0% | 2.7961 | exact baseline |
+| 2 | 0.7% | 2.7984 | within noise |
+| 10 | 4.7% | 2.8278 | small drift |
+| 50 | 20.7% | 3.0426 | real degradation |
+
+The honest conclusion is written into the design: certified bounds are
+conservative (Cauchy-Schwarz over the row norms), so at 0.8B the
+quality-neutral budget only buys sub-percent skips - at this scale the
+feature is a correctness dial, not a speed lever. Larger models carry
+more redundant channels and their curve is the interesting one; the
+mechanism, the kernels, and the measurement harness are ready for it.
+
 ## Timelines: version control for conversations
 
 A conversation state is a commit. `serve` content-addresses every

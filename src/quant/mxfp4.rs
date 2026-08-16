@@ -462,6 +462,78 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
         }
     });
 }
+/// Block-sparse packed matvec over the COLUMN dimension: only the listed
+/// 32-column blocks contribute. Per row, the q8 path walks exactly the
+/// kept blocks (the q8 activation blocks share the 32 granularity), so a
+/// skipped block costs nothing. Used by the certified-budget MLP down
+/// projection; results equal `matvec_packed` when every block is kept.
+pub fn matvec_packed_colblocks(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    kept: &[usize],
+    x: &[f32],
+    out: &mut [f32],
+    n_threads: usize,
+) {
+    if kept.len() == cols / 32 {
+        return matvec_packed(packed, scales, rows, cols, x, out, n_threads);
+    }
+    if crate::quant::q8::q8_enabled() {
+        let xq = crate::quant::q8::quantize_q8(x);
+        let row_dot = |r: usize| -> f32 {
+            let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+            let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+            let mut sum = 0f32;
+            for &g in kept {
+                let idot = crate::quant::q8::block_dot(
+                    &prow[g * 16..(g + 1) * 16],
+                    &xq.q[g * 32..(g + 1) * 32],
+                );
+                sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+            }
+            sum
+        };
+        let nt = n_threads.min(rows).max(1);
+        if nt <= 1 {
+            for (r, o) in out.iter_mut().enumerate() {
+                *o = row_dot(r);
+            }
+            return;
+        }
+        let chunk = rows.div_ceil(nt);
+        std::thread::scope(|scope| {
+            for (j, out_chunk) in out.chunks_mut(chunk).enumerate() {
+                let r0 = j * chunk;
+                scope.spawn(move || {
+                    for (i, o) in out_chunk.iter_mut().enumerate() {
+                        *o = row_dot(r0 + i);
+                    }
+                });
+            }
+        });
+        return;
+    }
+    // exact f32 fallback
+    for r in 0..rows {
+        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+        let mut sum = 0f32;
+        for &g in kept {
+            let mut gsum = 0f32;
+            for j in 0..32 {
+                let c = g * 32 + j;
+                let byte = prow[c / 2];
+                let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                gsum += E2M1[nib as usize] * x[c];
+            }
+            sum += gsum * exp2_i(srow[g] as i32 - 127);
+        }
+        out[r] = sum;
+    }
+}
+
 /// Multi-lane packed matvec: each packed row (and its scales) is
 /// traversed ONCE and dotted against every lane's quantized input, so n
 /// decode lanes cost close to one in weight traffic. Per-lane results

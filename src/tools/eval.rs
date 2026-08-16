@@ -291,6 +291,19 @@ mod tests {
     }
 }
 
+/// Budget-mode skip report (stderr), printed after scoring.
+fn report_mlp_skips() {
+    let (skipped, total) = crate::model::qwen::mlp_skip_stats();
+    if total > 0 {
+        eprintln!(
+            "mlp budget: {}/{} blocks skipped ({:.1}%)",
+            skipped,
+            total,
+            skipped as f64 / total as f64 * 100.0
+        );
+    }
+}
+
 fn perplexity(
     model: &mut EvalModel,
     tok: &crate::tokenizer::AnyTokenizer,
@@ -451,6 +464,7 @@ pub fn run(args: &[String]) {
     };
     let (ppl, ppl_tokens, ppl_processed) = perplexity(&mut model, &tok, &ppl_text, ppl_max_tokens);
     processed += ppl_processed;
+    report_mlp_skips();
 
     let dt = t0.elapsed().as_secs_f64();
     let tok_s = processed as f64 / dt;
