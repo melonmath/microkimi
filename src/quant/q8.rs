@@ -99,6 +99,14 @@ type I8Dot = unsafe fn(&[i8], &[i8]) -> i32;
 /// the quantize_q8 convention). Output: the exact int32 dot. Used by the
 /// q8_0 MLA KV cache (model.rs): the Q.K score of the latent part runs in
 /// integer between the q8 cache row and the q8 query.
+/// MICROKIMI_NO_SDOT=1 keeps the portable NEON kernels (A/B toggle; both
+/// paths are bit-identical, only the instruction count differs).
+#[cfg(target_arch = "aarch64")]
+fn no_sdot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_NO_SDOT").map(|v| v == "1").unwrap_or(false))
+}
+
 pub fn block_dot_i8(w32: &[i8], x32: &[i8]) -> i32 {
     static F: std::sync::OnceLock<I8Dot> = std::sync::OnceLock::new();
     fn pick() -> I8Dot {
@@ -107,7 +115,12 @@ pub fn block_dot_i8(w32: &[i8], x32: &[i8]) -> i32 {
             return dot_i8_avx2;
         }
         #[cfg(target_arch = "aarch64")]
-        return dot_i8_neon;
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") && !no_sdot() {
+                return dot_i8_sdot;
+            }
+            return dot_i8_neon;
+        }
         #[cfg(not(target_arch = "aarch64"))]
         return dot_i8_scalar;
     }
@@ -122,6 +135,37 @@ fn dot_i8_scalar(w32: &[i8], x32: &[i8]) -> i32 {
         s += w32[j] as i32 * x32[j] as i32;
     }
     s
+}
+
+/// NEON dotprod path: one SDOT per 16 int8 lanes replaces the widening
+/// multiply + pairwise accumulate pair. Integer sums are exact whatever
+/// the accumulation shape, so this is bit-identical to the scalar
+/// reference. vdotq_s32 is nightly-only in std::arch, but the instruction
+/// itself is stable silicon: stable inline asm emits it directly, and the
+/// dispatcher only selects this kernel when the CPU reports dotprod.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_i8_sdot(w32: &[i8], x32: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let w0 = vld1q_s8(w32.as_ptr());
+        let w1 = vld1q_s8(w32.as_ptr().add(16));
+        let x0 = vld1q_s8(x32.as_ptr());
+        let x1 = vld1q_s8(x32.as_ptr().add(16));
+        let mut acc = vdupq_n_s32(0);
+        std::arch::asm!(
+            ".arch_extension dotprod",
+            "sdot {acc:v}.4s, {w0:v}.16b, {x0:v}.16b",
+            "sdot {acc:v}.4s, {w1:v}.16b, {x1:v}.16b",
+            acc = inout(vreg) acc,
+            w0 = in(vreg) w0,
+            w1 = in(vreg) w1,
+            x0 = in(vreg) x0,
+            x1 = in(vreg) x1,
+            options(pure, nomem, nostack)
+        );
+        vaddvq_s32(acc)
+    }
 }
 
 /// NEON, portable integer path: widening multiply vmull_s8 + pairwise long
@@ -182,7 +226,12 @@ pub fn block_dot(packed16: &[u8], x32: &[i8]) -> i32 {
             return dot_block_avx2;
         }
         #[cfg(target_arch = "aarch64")]
-        return dot_block_neon;
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") && !no_sdot() {
+                return dot_block_sdot;
+            }
+            return dot_block_neon;
+        }
         #[cfg(not(target_arch = "aarch64"))]
         return dot_block_scalar;
     }
@@ -199,6 +248,37 @@ fn dot_block_scalar(packed16: &[u8], x32: &[i8]) -> i32 {
         s += E2M1_X2[(b >> 4) as usize] as i32 * x32[2 * j + 1] as i32;
     }
     s
+}
+
+/// NEON dotprod path for packed nibbles: same table-lookup decode as the
+/// portable kernel, SDOT tail (see dot_i8_sdot for the asm rationale).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_block_sdot(packed16: &[u8], x32: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let lut = vld1q_s8(E2M1_X2.as_ptr());
+        let b = vld1q_u8(packed16.as_ptr());
+        let lo = vqtbl1q_s8(lut, vandq_u8(b, vdupq_n_u8(0x0F)));
+        let hi = vqtbl1q_s8(lut, vshrq_n_u8::<4>(b));
+        let w0 = vzip1q_s8(lo, hi);
+        let w1 = vzip2q_s8(lo, hi);
+        let x0 = vld1q_s8(x32.as_ptr());
+        let x1 = vld1q_s8(x32.as_ptr().add(16));
+        let mut acc = vdupq_n_s32(0);
+        std::arch::asm!(
+            ".arch_extension dotprod",
+            "sdot {acc:v}.4s, {w0:v}.16b, {x0:v}.16b",
+            "sdot {acc:v}.4s, {w1:v}.16b, {x1:v}.16b",
+            acc = inout(vreg) acc,
+            w0 = in(vreg) w0,
+            w1 = in(vreg) w1,
+            x0 = in(vreg) x0,
+            x1 = in(vreg) x1,
+            options(pure, nomem, nostack)
+        );
+        vaddvq_s32(acc)
+    }
 }
 
 /// NEON, portable integer path: nibble decode via the 16-entry table lookup

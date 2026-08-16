@@ -246,9 +246,19 @@ the exact spine on this corpus. Combined with lane batching, eight q8
 lanes reached 84.1 aggregate tok/s (2.98x median over the q8
 single-stream in in-process A/B rounds). Session baseline was 9 tok/s:
 the q8 spine plus the batched prefill closed most of the gap to
-integer-kernel engines; what remains is their hand-tuned micro-kernels
-and 4-bit spines, both open follow-ups (the MXFP4 machinery already in
-the engine is the natural next step for the spine).
+integer-kernel engines.
+
+On aarch64 CPUs that report `dotprod`, the int8 kernels emit SDOT
+through stable inline asm (the intrinsic is nightly-only; the silicon is
+not): one instruction per 16 lanes instead of the widening
+multiply-accumulate pair. Integer sums are exact whatever the
+accumulation shape, so the kernel swap is bit-identical -
+`MICROKIMI_NO_SDOT=1` is the A/B toggle, and paired runs measured about
+5% end-to-end on this memory-bound decode (34 vs 36 ms/token median);
+the gap to hand-tuned engines that remains is their 4-bit spines - the
+engine's own MXFP4 machinery applied to the attention matrices would
+roughly halve the remaining spine traffic (0.24 to 0.12 GB/token on the
+0.8B), at a quality cost that must be measured before it ships.
 
 ## Chained drafting and lane-batched decoding
 
