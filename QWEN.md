@@ -197,7 +197,19 @@ vocabulary and special tokens as Qwen3.5/3.6, and the same
 implemented with generated Unicode 15.1 canonical tables and algorithmic
 Hangul composition, without adding a crate.
 
-Current limits: `--stream`, K3 memory snapshots, prefix-cache snapshots,
-early exit, and speculative decoding are not wired to the Qwen runtime. The
-default mmap load is still demand-paged and does not copy the model file into
-anonymous RAM.
+## State snapshots
+
+`run --save state.mkmem` snapshots the conversational state after the turn:
+recurrent and convolution states, key/value histories (including the MTP
+draft cache), the absolute position, and the logits after the last ingested
+token. `run --memory state.mkmem` restores it and continues on top -
+resuming is bit-identical to never having stopped. The `MKMEMQW1`
+fingerprint binds the snapshot to the model architecture and to the
+composed adapter-pack set (SHA-256), so a snapshot taken with packs only
+loads under the same packs.
+
+Current limits: `--stream`, prefix-cache snapshots, early exit, and the
+n-gram speculative decoder are not wired to the Qwen runtime (`--mtp` is
+the Qwen speculative path; `--memory` cannot combine with `--mtp`). The
+default mmap load is still demand-paged and does not copy the model file
+into anonymous RAM.

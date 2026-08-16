@@ -1028,14 +1028,14 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
             eprintln!("error: --stream is not yet supported for Qwen models (the default mmap load is demand-paged)");
             std::process::exit(1);
         }
-        if memory.is_some() || save.is_some() {
-            eprintln!("error: --memory/--save state snapshots are only supported for K3 models (not Qwen)");
-            std::process::exit(1);
-        }
         if sampler.spec > 0 || sampler.spec_rosa > 0 {
             eprintln!("warning: --spec/--spec-rosa are only supported for K3 models, ignoring them (Qwen)");
             sampler.spec = 0;
             sampler.spec_rosa = 0;
+        }
+        if memory.is_some() && sampler.mtp {
+            eprintln!("error: --mtp cannot resume from --memory (the draft cache is not part of the pairing prefix)");
+            std::process::exit(1);
         }
         let tok = load_qwen_any_tokenizer(&mp, vocab, mp_cfg.vocab);
         let packs = adapter_flags(&std::env::args().collect::<Vec<_>>());
@@ -1053,12 +1053,25 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
         println!("loading tokenizer + weights: {:.1?}", tl.elapsed());
         println!("cores used for matvecs: {}", model::n_threads());
         gpu_status_line();
+        let mut init_logits = None;
+        if let Some(m) = memory {
+            match crate::memory::qwen_state::load(&mut qwen, m) {
+                Ok(l) => {
+                    println!("memory loaded: {}", m);
+                    init_logits = Some(l);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         let (ids, stop) = if raw {
             (tok.encode_raw(question), tok.raw_stop())
         } else {
             (tok.encode_chat_user(question), tok.end_of_msg())
         };
-        return model::qwen::qwen_run_turn(
+        let answer = model::qwen::qwen_run_turn_resume(
             &ids,
             max_new,
             &tok,
@@ -1066,8 +1079,19 @@ fn run_inference(question: &str, max_new: usize, debug: bool, model_path: &Optio
             debug,
             debug_routing,
             stop,
+            init_logits,
             sampler,
         );
+        if let Some(s) = save {
+            match crate::memory::qwen_state::save(&qwen, s) {
+                Ok(()) => println!("memory saved: {}", s),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        return answer;
     }
     // DeepSeek-V4 model -> dedicated tokenizer + DsModel engine.
     if mp_cfg.ds.is_some() {

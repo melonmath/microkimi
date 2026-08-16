@@ -366,7 +366,7 @@ pub fn merge_interp(a_path: &str, b_path: &str, alpha: f32, out: &str) -> Result
     Ok(())
 }
 
-fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
+pub(crate) fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -374,7 +374,7 @@ fn put_vec(out: &mut Vec<u8>, v: &[f32]) {
 }
 
 /// Reads a Vec<f32> whose length is fixed by the config (KDA caches).
-fn get_fixed(r: &mut Reader, want: usize, path: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn get_fixed(r: &mut Reader, want: usize, path: &str) -> Result<Vec<f32>, String> {
     let v = r.vec_f32()?;
     if v.len() != want {
         return Err(format!("{}: corrupt .mkmem (cache length {} != expected {})", path, v.len(), want));
@@ -382,13 +382,13 @@ fn get_fixed(r: &mut Reader, want: usize, path: &str) -> Result<Vec<f32>, String
     Ok(v)
 }
 
-struct Reader<'a> {
-    b: &'a [u8],
-    p: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) p: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if self.p + n > self.b.len() {
             return Err("truncated .mkmem file".to_string());
         }
@@ -397,15 +397,15 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    fn vec_f32(&mut self) -> Result<Vec<f32>, String> {
+    pub(crate) fn vec_f32(&mut self) -> Result<Vec<f32>, String> {
         let n = self.u32()? as usize;
         let raw = self.take(n * 4)?;
         Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())

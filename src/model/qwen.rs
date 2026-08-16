@@ -822,7 +822,7 @@ struct QwenLayerW {
     mlp: QwenMlpW,
 }
 
-enum QwenCache {
+pub(crate) enum QwenCache {
     Linear(LinCache),
     Full(FullCache),
 }
@@ -866,10 +866,13 @@ pub struct QwenModel {
     lm_head: T,
     lm_head_q8: Option<Q8Head>,
     layers: Vec<QwenLayerW>,
-    caches: Vec<QwenCache>,
+    pub(crate) caches: Vec<QwenCache>,
     mtp: Option<QwenMtpW>,
-    mtp_cache: FullCache,
-    pos: usize,
+    pub(crate) mtp_cache: FullCache,
+    pub(crate) pos: usize,
+    /// Logits after the last ingested token (state snapshots resume from
+    /// them without re-ingesting anything).
+    pub last_logits: Vec<f32>,
     adapter_packs: AppliedPacks,
 }
 
@@ -1340,6 +1343,7 @@ impl QwenModel {
             mtp,
             mtp_cache,
             pos: 0,
+            last_logits: Vec::new(),
             adapter_packs,
         }
     }
@@ -1583,6 +1587,7 @@ impl QwenModel {
             ),
         }
         self.pos += 1;
+        self.last_logits = logits.clone();
         logits
     }
 }
@@ -1719,6 +1724,9 @@ impl QwenModel {
             out.logits.push(logits);
         }
         self.pos += t_count;
+        if let Some(last) = out.logits.last() {
+            self.last_logits = last.clone();
+        }
         out
     }
 }
@@ -2189,8 +2197,39 @@ pub fn qwen_run_turn(
     stop_id: u32,
     sampler: &mut super::Sampler,
 ) -> String {
-    model.reset();
-    if sampler.mtp {
+    qwen_run_turn_resume(
+        ids,
+        max_new,
+        tok,
+        model,
+        debug,
+        debug_routing,
+        stop_id,
+        None,
+        sampler,
+    )
+}
+
+/// `qwen_run_turn` + optional initial logits restored from a state
+/// snapshot: the caches are kept, the prompt tokens (possibly none) are
+/// ingested on top of the loaded state, and decoding starts from the
+/// stored logits when the prompt is empty.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_run_turn_resume(
+    ids: &[u32],
+    max_new: usize,
+    tok: &crate::tokenizer::AnyTokenizer,
+    model: &mut QwenModel,
+    debug: bool,
+    debug_routing: bool,
+    stop_id: u32,
+    init_logits: Option<Vec<f32>>,
+    sampler: &mut super::Sampler,
+) -> String {
+    if init_logits.is_none() {
+        model.reset();
+    }
+    if sampler.mtp && init_logits.is_none() {
         if !model.has_mtp() {
             eprintln!("warning: --mtp ignored, the model was converted without its MTP head");
         } else if sampler.temp > 0.0 {
@@ -2207,7 +2246,7 @@ pub fn qwen_run_turn(
         debug,
         debug_routing,
         stop_id,
-        None,
+        init_logits,
         sampler,
     )
 }
@@ -2307,6 +2346,11 @@ fn mtp_generate(
         passes += 1;
         let sel = mtp_select(&out.logits[0], sampler, &generated);
         if sel == stop_id {
+            // undo the draft ingestion so a saved state ends exactly at
+            // the last emitted token, like the plain loop
+            model.restore(&snap);
+            model.prefill_collect(&[n], false);
+            pending = false;
             break;
         }
         if sel == draft {
@@ -2333,6 +2377,7 @@ fn mtp_generate(
                 );
             }
         }
+        pending = false; // everything emitted so far is ingested
         if generated.len() >= max_new {
             break;
         }
@@ -2344,6 +2389,11 @@ fn mtp_generate(
         let dl = model.mtp_advance(next, &hidden_prev, true).unwrap();
         draft = super::top_k_probs(&dl, 5)[0].0 as u32;
         pending = true;
+    }
+    if pending {
+        // the trailing emitted token was never verified through the trunk:
+        // ingest it so the state (and last_logits) matches the plain loop
+        model.prefill_collect(&[*generated.last().unwrap()], false);
     }
     (generated, passes, accepted)
 }
@@ -2426,9 +2476,12 @@ mod model_tests {
     fn checkpoint_fixture(c: &QwenConfig) -> String {
         let path = std::env::temp_dir()
             .join(format!(
-                "microkimi_qwen_fixture_{}_{}.bin",
+                "microkimi_qwen_fixture_{}_{}_{}l_{}d_{}m.bin",
                 std::process::id(),
-                std::thread::current().name().unwrap_or("test")
+                std::thread::current().name().unwrap_or("test"),
+                c.n_layers,
+                c.dense_inter,
+                c.mtp_layers
             ))
             .to_string_lossy()
             .into_owned();
@@ -2537,6 +2590,49 @@ mod model_tests {
 
         drop((plain_model, spec_model));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn state_snapshot_resumes_bit_identically() {
+        for (c, tag) in [(bin_tiny(), "moe"), (bin_tiny_dense(), "dense")] {
+            let path = checkpoint_fixture(&c);
+            let mem_path = std::env::temp_dir()
+                .join(format!(
+                    "microkimi_qwen_state_{}_{}.mkmem",
+                    std::process::id(),
+                    tag
+                ))
+                .to_string_lossy()
+                .into_owned();
+
+            let mut uninterrupted = QwenModel::load(&path);
+            uninterrupted.prefill(&[3, 5, 7, 11]);
+            let expected = [uninterrupted.forward(2), uninterrupted.forward(9)];
+
+            let mut saver = QwenModel::load(&path);
+            let saved_logits = saver.prefill(&[3, 5, 7, 11]);
+            crate::memory::qwen_state::save(&saver, &mem_path).unwrap();
+            drop(saver);
+
+            let mut resumed = QwenModel::load(&path);
+            let restored = crate::memory::qwen_state::load(&mut resumed, &mem_path).unwrap();
+            assert_eq!(restored, saved_logits);
+            assert_eq!(resumed.pos, 4);
+            assert_eq!(resumed.forward(2), expected[0]);
+            assert_eq!(resumed.forward(9), expected[1]);
+
+            // fingerprint check: a different fixture must be refused
+            let mut other_cfg = c.clone();
+            other_cfg.n_layers = 8;
+            let other_path = checkpoint_fixture(&other_cfg);
+            let mut other = QwenModel::load(&other_path);
+            assert!(crate::memory::qwen_state::load(&mut other, &mem_path).is_err());
+
+            drop((uninterrupted, resumed, other));
+            std::fs::remove_file(path).ok();
+            std::fs::remove_file(other_path).ok();
+            std::fs::remove_file(mem_path).ok();
+        }
     }
 
     #[test]
