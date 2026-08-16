@@ -211,6 +211,26 @@ fn run_turn_impl(ids: &[u32], max_new: usize, tok: &AnyTokenizer, model: &mut Mo
     answer
 }
 
+/// One decoding selection over `logits`, exactly like the generation
+/// loop: greedy argmax of the top-5 at temperature 0, top-p nucleus
+/// sampling otherwise, with the optional DRY penalty over the emitted
+/// context. Shared with `microkimi serve`.
+pub(crate) fn sample_next(logits: &[f32], sampler: &mut Sampler, gen_ctx: &[u32]) -> u32 {
+    let mut dry_logits;
+    let sel: &[f32] = if sampler.dry > 0.0 {
+        dry_logits = logits.to_vec();
+        apply_dry(&mut dry_logits, gen_ctx, sampler.dry);
+        &dry_logits
+    } else {
+        logits
+    };
+    if sampler.temp > 0.0 {
+        sample_top_p(sel, sampler.temp, sampler.top_p, &mut sampler.rng).0
+    } else {
+        top_k_probs(sel, 5)[0].0 as u32
+    }
+}
+
 /// Generic greedy generation loop: prefill then argmax decode through the
 /// `fwd` closure (one forward per token, position tracked by the caller).
 /// With `sampler.temp > 0` the argmax becomes top-p nucleus sampling.

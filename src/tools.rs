@@ -10,6 +10,7 @@ pub mod eval;
 pub mod parity;
 pub mod replay;
 pub mod selftest;
+pub mod serve;
 pub mod slice;
 pub mod slice_qwen;
 pub mod slice_st;

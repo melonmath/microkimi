@@ -462,6 +462,13 @@ impl QwenTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// Raw decoded bytes (before UTF-8 replacement): streaming callers
+    /// buffer these and flush only complete UTF-8 prefixes, so a token
+    /// boundary inside a multibyte character never garbles the stream.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for &id in ids {
             let id = match &self.remap {
@@ -472,7 +479,7 @@ impl QwenTokenizer {
                 bytes.extend_from_slice(value);
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -483,7 +490,59 @@ impl QwenTokenizer {
     /// assistant reasoning is omitted, while a fresh generation starts the
     /// default thinking block exactly like tokenizer_config.json.
     pub fn encode_chat(&self, history: &[(String, String)], question: &str) -> Vec<u32> {
+        self.encode_chat_system(None, history, question)
+    }
+
+    /// `encode_chat` with an optional leading system block, exactly like
+    /// tokenizer_config.json renders one:
+    /// `<|im_start|>system\n{content}<|im_end|>\n`.
+    pub fn encode_chat_system(
+        &self,
+        system: Option<&str>,
+        history: &[(String, String)],
+        question: &str,
+    ) -> Vec<u32> {
+        self.encode_chat_prompt(system, history, question, true)
+    }
+
+    /// Full chat prompt with the thinking toggle: `thinking == false`
+    /// renders the template's disabled block `<think>\n\n</think>\n\n`
+    /// after the assistant header, exactly like
+    /// `enable_thinking=false` in tokenizer_config.json.
+    pub fn encode_chat_prompt(
+        &self,
+        system: Option<&str>,
+        history: &[(String, String)],
+        question: &str,
+        thinking: bool,
+    ) -> Vec<u32> {
+        self.encode_chat_split(system, history, question, thinking).0
+    }
+
+    /// `encode_chat_prompt` + the index where the final assistant priming
+    /// begins. Everything before that index is the conversation prefix a
+    /// future turn re-renders verbatim, so a prefix-cache entry stored at
+    /// the split survives across turns. With `thinking == false`, history
+    /// assistant turns replay the disabled think block exactly as it was
+    /// ingested when they were generated, keeping the token stream an
+    /// exact extension (the reference template strips it, which breaks
+    /// stream-prefix reuse; the empty block is what the model actually
+    /// saw, and it is three tokens per turn).
+    pub fn encode_chat_split(
+        &self,
+        system: Option<&str>,
+        history: &[(String, String)],
+        question: &str,
+        thinking: bool,
+    ) -> (Vec<u32>, usize) {
         let mut ids = Vec::new();
+        if let Some(content) = system {
+            ids.push(QWEN_IM_START);
+            ids.extend(self.encode_full("system\n"));
+            ids.extend(self.encode_full(content.trim()));
+            ids.push(QWEN_IM_END);
+            ids.extend(self.encode_full("\n"));
+        }
         for (q, answer) in history {
             ids.push(QWEN_IM_START);
             ids.extend(self.encode_full("user\n"));
@@ -498,6 +557,9 @@ impl QwenTokenizer {
                 .unwrap_or(trimmed);
             ids.push(QWEN_IM_START);
             ids.extend(self.encode_full("assistant\n"));
+            if !thinking {
+                self.push_disabled_think(&mut ids);
+            }
             ids.extend(self.encode_full(visible));
             ids.push(QWEN_IM_END);
             ids.extend(self.encode_full("\n"));
@@ -507,11 +569,24 @@ impl QwenTokenizer {
         ids.extend(self.encode_full(question.trim()));
         ids.push(QWEN_IM_END);
         ids.extend(self.encode_full("\n"));
+        let split = self.map_out(ids.clone()).len();
         ids.push(QWEN_IM_START);
         ids.extend(self.encode_full("assistant\n"));
+        if thinking {
+            ids.push(QWEN_THINK);
+            ids.extend(self.encode_full("\n"));
+        } else {
+            self.push_disabled_think(&mut ids);
+        }
+        (self.map_out(ids), split)
+    }
+
+    /// The template's disabled reasoning block `<think>\n\n</think>\n\n`.
+    fn push_disabled_think(&self, ids: &mut Vec<u32>) {
         ids.push(QWEN_THINK);
-        ids.extend(self.encode_full("\n"));
-        self.map_out(ids)
+        ids.extend(self.encode_full("\n\n"));
+        ids.extend(self.encode_full("</think>"));
+        ids.extend(self.encode_full("\n\n"));
     }
 }
 

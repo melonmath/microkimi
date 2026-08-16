@@ -46,6 +46,7 @@ fn main() {
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => tools::slice::run(&args),
         "slice-qwen-vocab" => tools::slice_qwen::run(&args),
+        "serve" => tools::serve::run(&args),
         // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
         "shadow" => stream::shadow::cmd(&args),
         "selftest" => { tools::selftest::run(); tools::selftest::run_ds(); tools::selftest::run_ds2(); tools::selftest::run_ds3(); tools::selftest::run_ds4(); tools::selftest::run_packed_emul(); tools::selftest::run_q8(); tools::selftest::run_flash(); tools::selftest::run_kvq8(); },
@@ -288,6 +289,10 @@ fn main() {
             println!("Run:");
             println!("  microkimi run \"prompt\" [--max-new N]  greedy generation with detailed steps");
             println!("  microkimi chat                       interactive with history ('quit' to exit)");
+            println!("  microkimi serve --model X.bin [--host 127.0.0.1] [--port 8080] [--mtp] [--max-new N]");
+            println!("                                         OpenAI-compatible HTTP endpoint (Qwen models): /v1/chat/completions");
+            println!("                                         and /v1/completions with SSE streaming, sampling per request,");
+            println!("                                         cross-request chat prefix cache; binds 127.0.0.1 by default");
             println!("  microkimi prefill \"text\" --save mem.mkmem  ingest text, snapshot the state (.mkmem)");
             println!("  microkimi absorb file.txt --out pack.mkmem  ingest a document file, snapshot the state (.mkmem)");
             println!("  run/chat options: --model X.bin --vocab vocab_nano.json (auto if next to the .bin)");

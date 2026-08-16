@@ -59,7 +59,7 @@ pub use lens::{
 };
 use lens::{dump_hidden_on, dump_hidden_print, lens_project, logit_lens_compute, logit_lens_on, parity_rec, vec_rms};
 pub use generate::{run_turn, run_turn_core, run_turn_core_batch, run_turn_resume, Sampler};
-pub(crate) use generate::{apply_dry, py_repr, top_k_probs};
+pub(crate) use generate::{apply_dry, py_repr, sample_next, top_k_probs};
 
 // ── default microkimi dims - used ONLY by build.rs (micro builder)
 // and tests (selftest/parity are micro-specific). The inference engine
