@@ -170,6 +170,7 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
 /// worker thread (batched prefill): per-row results are bit-identical to
 /// the pooled `matvec`, which chunks whole rows across jobs.
 pub fn matvec_st(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(out.len(), rows);
     for (r, o) in out.iter_mut().enumerate() {
         *o = dot(&w[r * cols..(r + 1) * cols], x);
     }

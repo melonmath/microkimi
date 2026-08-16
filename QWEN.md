@@ -51,6 +51,31 @@ cargo build --release
 `--vocab /path/to/tokenizer.json` overrides the tokenizer copied beside the
 model. `--raw` bypasses the chat template and performs a plain completion.
 
+The prompt is ingested by a batched layers-outer prefill: each weight
+region is traversed once per chunk instead of once per token, and
+token-independent work fans out across the CPU cores. The result is
+bit-identical to sequential single-token forwards.
+
+## Multi-token prediction (dense variant)
+
+Dense checkpoints that ship their `mtp.*` draft tensors (Qwen3.8-27B does)
+are converted with them automatically. `--mtp` on `run` and `chat` then
+enables greedy self-speculative decoding: the one-layer draft head proposes
+the next token, the trunk verifies the pending token and the draft in one
+two-token batched pass, and a rejected draft is rolled back exactly
+(linear states restored, key/value caches truncated). Every emitted token
+is the greedy argmax of the same logits the plain loop would produce, so
+the output is bit-identical; the tok/s line reports passes and acceptance.
+
+Transformers does not implement this module (its checkpoints keys are
+ignored on load), so the draft semantics follow the deployed reference
+proposers: draft slot `i` merges the embedding of committed token `i+1`
+with the trunk's final-norm hidden of position `i` at rotary position `i`.
+`ref/qwen_parity.py --dense` builds synthetic `mtp.*` tensors, computes
+reference draft logits with an independent PyTorch mirror of that math,
+and `microkimi qwen-dump --mtp` compares against it (`--compare-mtp`):
+measured `7.45e-7` maximum absolute difference, 3 of 3 top-1 exact.
+
 For independent prompts that should share one model and adapter load,
 `complete-batch` accepts JSONL requests and writes JSONL results atomically:
 

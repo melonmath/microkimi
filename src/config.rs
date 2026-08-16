@@ -336,6 +336,11 @@ pub struct QwenConfig {
     /// Dense MLP width (HF `intermediate_size`). Zero for MoE decoders;
     /// nonzero marks the dense variant and voids the MoE fields above.
     pub dense_inter: usize,
+    /// Converted multi-token-prediction depth (0 = the mtp tensors were
+    /// absent or not converted; 1 = one draft layer usable for greedy
+    /// self-speculative decoding). Set by the converter, never read from
+    /// Hugging Face configs (their key is mtp_num_hidden_layers).
+    pub mtp_layers: usize,
     pub norm_eps: f64,
 }
 
@@ -361,6 +366,7 @@ impl QwenConfig {
             moe_inter: 512,
             shared_inter: 512,
             dense_inter: 0,
+            mtp_layers: 0,
             norm_eps: 1e-6,
         }
     }
@@ -388,6 +394,7 @@ impl QwenConfig {
             moe_inter: 0,
             shared_inter: 0,
             dense_inter: 17408,
+            mtp_layers: 0,
             norm_eps: 1e-6,
         }
     }
@@ -421,6 +428,7 @@ impl QwenConfig {
         c.moe_inter = Self::num(d, "moe_intermediate_size", c.moe_inter as f64) as usize;
         c.shared_inter = Self::num(d, "shared_expert_intermediate_size", c.shared_inter as f64) as usize;
         c.dense_inter = Self::num(d, "intermediate_size", 0.0) as usize;
+        c.mtp_layers = Self::num(d, "mtp_layers", 0.0) as usize;
         if c.dense_inter > 0 {
             // The dense variant has no router, expert bank, or shared
             // expert; zero the MoE fields so their defaults cannot leak.

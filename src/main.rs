@@ -292,6 +292,7 @@ fn main() {
             println!("                    --temp T (0 = greedy, default)  --top-p P (nucleus, default 1.0)  --seed N");
             println!("                    --spec N (n-gram speculative decoding, greedy only)");
             println!("                    --spec-rosa N (suffix-automaton proposer, unbounded context, greedy only)");
+            println!("                    --mtp (draft with the converted multi-token-prediction head, Qwen dense, greedy only)");
             println!("                    --dry P (DRY anti-repetition penalty, 0 = off)");
             println!("                    --dump-hidden (per-layer hidden-state rms table, collapse diagnostic)");
             println!("                    --logit-lens (top-5 tokens of every layer through final norm + lm_head,");
@@ -943,6 +944,7 @@ fn sampler_flag(args: &[String]) -> model::Sampler {
     let mut s = model::Sampler::new(temp, top_p, seed);
     s.spec = value_flag(args, "--spec").and_then(|v| v.parse().ok()).unwrap_or(0);
     s.spec_rosa = value_flag(args, "--spec-rosa").and_then(|v| v.parse().ok()).unwrap_or(0);
+    s.mtp = args.iter().any(|a| a == "--mtp");
     s.dry = value_flag(args, "--dry").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     s
 }

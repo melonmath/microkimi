@@ -827,6 +827,33 @@ enum QwenCache {
     Full(FullCache),
 }
 
+/// Multi-token-prediction draft head (dense variant): the fc merge of the
+/// normed input embedding and the trunk's final-norm hidden, one
+/// trunk-style full-attention decoder layer, and a final norm feeding the
+/// shared language-model head.
+struct QwenMtpW {
+    fc: T,
+    norm_e: T,
+    norm_h: T,
+    norm_f: T,
+    input_norm: T,
+    post_norm: T,
+    attn: QwenFullW,
+    mlp_gate: PackedT,
+    mlp_up: PackedT,
+    mlp_down: PackedT,
+}
+
+/// Rollback point for speculative decoding: the linear states are
+/// recurrent (not truncatable) and are cloned; the append-only key/value
+/// caches only record their lengths and are truncated on restore.
+pub struct QwenSnapshot {
+    lin: Vec<(Vec<f32>, Vec<f32>)>,
+    full_lens: Vec<usize>,
+    mtp_len: usize,
+    pos: usize,
+}
+
 /// A zero-copy Qwen3.5-family text decoder backed by an MKIM0002 file.
 /// Float spine tensors remain in private file-backed pages. Routed experts
 /// stay MXFP4-packed and are evaluated only when selected by the router;
@@ -840,6 +867,8 @@ pub struct QwenModel {
     lm_head_q8: Option<Q8Head>,
     layers: Vec<QwenLayerW>,
     caches: Vec<QwenCache>,
+    mtp: Option<QwenMtpW>,
+    mtp_cache: FullCache,
     pos: usize,
     adapter_packs: AppliedPacks,
 }
@@ -1230,6 +1259,60 @@ impl QwenModel {
             });
         }
 
+        let mtp = if c.mtp_layers > 0 {
+            assert!(
+                c.is_dense() && c.mtp_layers == 1,
+                "MTP runtime supports exactly one draft layer on the dense variant"
+            );
+            Some(QwenMtpW {
+                fc: expect_f32(&bin, "mtp.fc.weight", &[c.d, 2 * c.d]),
+                norm_e: expect_f32(&bin, "mtp.pre_fc_norm_embedding.weight", &[c.d]),
+                norm_h: expect_f32(&bin, "mtp.pre_fc_norm_hidden.weight", &[c.d]),
+                norm_f: expect_f32(&bin, "mtp.norm.weight", &[c.d]),
+                input_norm: expect_f32(&bin, "mtp.layers.0.input_layernorm.weight", &[c.d]),
+                post_norm: expect_f32(&bin, "mtp.layers.0.post_attention_layernorm.weight", &[c.d]),
+                attn: QwenFullW {
+                    q_proj: expect_f32(
+                        &bin,
+                        "mtp.layers.0.self_attn.q_proj.weight",
+                        &[full_width * 2, c.d],
+                    ),
+                    k_proj: expect_f32(
+                        &bin,
+                        "mtp.layers.0.self_attn.k_proj.weight",
+                        &[kv_width, c.d],
+                    ),
+                    v_proj: expect_f32(
+                        &bin,
+                        "mtp.layers.0.self_attn.v_proj.weight",
+                        &[kv_width, c.d],
+                    ),
+                    o_proj: expect_f32(
+                        &bin,
+                        "mtp.layers.0.self_attn.o_proj.weight",
+                        &[c.d, full_width],
+                    ),
+                    q_norm: expect_f32(&bin, "mtp.layers.0.self_attn.q_norm.weight", &[c.head_dim]),
+                    k_norm: expect_f32(&bin, "mtp.layers.0.self_attn.k_norm.weight", &[c.head_dim]),
+                },
+                mlp_gate: expect_packed(
+                    &bin,
+                    "mtp.layers.0.mlp.gate_proj.weight",
+                    c.dense_inter,
+                    c.d,
+                ),
+                mlp_up: expect_packed(&bin, "mtp.layers.0.mlp.up_proj.weight", c.dense_inter, c.d),
+                mlp_down: expect_packed(
+                    &bin,
+                    "mtp.layers.0.mlp.down_proj.weight",
+                    c.d,
+                    c.dense_inter,
+                ),
+            })
+        } else {
+            None
+        };
+
         let lm_head_q8 = if super::ops::q8head_enabled() && !super::gpu_on() && c.d % 32 == 0 {
             Some(Q8Head::from_f32(tensor(&bin.data, &lm_head), c.vocab, c.d))
         } else {
@@ -1244,6 +1327,7 @@ impl QwenModel {
                 }
             })
             .collect();
+        let mtp_cache = FullCache::new(&c);
         QwenModel {
             cfg: c,
             bin,
@@ -1253,6 +1337,8 @@ impl QwenModel {
             lm_head_q8,
             layers,
             caches,
+            mtp,
+            mtp_cache,
             pos: 0,
             adapter_packs,
         }
@@ -1268,7 +1354,131 @@ impl QwenModel {
                 }
             })
             .collect();
+        self.mtp_cache = FullCache::new(&self.cfg);
         self.pos = 0;
+    }
+
+    /// The converted checkpoint carries the multi-token-prediction head.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Captures the rollback point for a speculative batch.
+    pub fn snapshot(&self) -> QwenSnapshot {
+        QwenSnapshot {
+            lin: self
+                .caches
+                .iter()
+                .filter_map(|cache| match cache {
+                    QwenCache::Linear(c) => Some((c.state.clone(), c.conv.clone())),
+                    QwenCache::Full(_) => None,
+                })
+                .collect(),
+            full_lens: self
+                .caches
+                .iter()
+                .filter_map(|cache| match cache {
+                    QwenCache::Full(c) => Some(c.len),
+                    QwenCache::Linear(_) => None,
+                })
+                .collect(),
+            mtp_len: self.mtp_cache.len,
+            pos: self.pos,
+        }
+    }
+
+    /// Restores a snapshot: linear states are copied back, append-only
+    /// key/value caches are truncated to their recorded lengths.
+    pub fn restore(&mut self, snap: &QwenSnapshot) {
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        let (mut li, mut fi) = (0usize, 0usize);
+        for cache in self.caches.iter_mut() {
+            match cache {
+                QwenCache::Linear(c) => {
+                    let (state, conv) = &snap.lin[li];
+                    c.state.copy_from_slice(state);
+                    c.conv.copy_from_slice(conv);
+                    li += 1;
+                }
+                QwenCache::Full(c) => {
+                    let len = snap.full_lens[fi];
+                    c.k.truncate(len * kv_width);
+                    c.v.truncate(len * kv_width);
+                    c.len = len;
+                    fi += 1;
+                }
+            }
+        }
+        self.mtp_cache.k.truncate(snap.mtp_len * kv_width);
+        self.mtp_cache.v.truncate(snap.mtp_len * kv_width);
+        self.mtp_cache.len = snap.mtp_len;
+        self.pos = snap.pos;
+    }
+
+    /// One multi-token-prediction step. Draft slot `i` pairs the committed
+    /// token at position `i + 1` with the trunk's final-norm hidden of
+    /// position `i`, at rotary position `i` (the reference proposer shifts
+    /// the input ids and leaves the positions unchanged). Returns the draft
+    /// logits when `want_logits`; cache-building calls skip the head.
+    pub fn mtp_advance(&mut self, token: u32, hidden: &[f32], want_logits: bool) -> Option<Vec<f32>> {
+        let c = self.cfg.clone();
+        let mtp = self.mtp.as_ref().expect("model has no MTP head");
+        let data = &self.bin.data;
+        let d = c.d;
+        assert!((token as usize) < c.vocab && hidden.len() == d);
+
+        let embed = tensor(data, &self.embed);
+        let mut merged = vec![0.0f32; 2 * d];
+        {
+            let (e_half, h_half) = merged.split_at_mut(d);
+            rmsnorm(
+                &embed[token as usize * d..(token as usize + 1) * d],
+                tensor(data, &mtp.norm_e),
+                c.norm_eps as f32,
+                e_half,
+            );
+            rmsnorm(hidden, tensor(data, &mtp.norm_h), c.norm_eps as f32, h_half);
+        }
+        let mut x = vec![0.0f32; d];
+        crate::model::ops::matvec(tensor(data, &mtp.fc), d, 2 * d, &merged, &mut x);
+
+        let mut normed = vec![0.0f32; d];
+        let mut attn_out = vec![0.0f32; d];
+        rmsnorm(&x, tensor(data, &mtp.input_norm), c.norm_eps as f32, &mut normed);
+        let weights = FullAttn {
+            q_proj: tensor(data, &mtp.attn.q_proj),
+            k_proj: tensor(data, &mtp.attn.k_proj),
+            v_proj: tensor(data, &mtp.attn.v_proj),
+            o_proj: tensor(data, &mtp.attn.o_proj),
+            q_norm: tensor(data, &mtp.attn.q_norm),
+            k_norm: tensor(data, &mtp.attn.k_norm),
+        };
+        let pos = self.mtp_cache.len;
+        full_attn_step(&weights, &c, &normed, pos, &mut self.mtp_cache, &mut attn_out);
+        for i in 0..d {
+            x[i] += attn_out[i];
+        }
+        rmsnorm(&x, tensor(data, &mtp.post_norm), c.norm_eps as f32, &mut normed);
+        let mlp = packed_dense_mlp(data, &mtp.mlp_gate, &mtp.mlp_up, &mtp.mlp_down, &c, &normed);
+        for i in 0..d {
+            x[i] += mlp[i];
+        }
+        if !want_logits {
+            return None;
+        }
+        rmsnorm(&x, tensor(data, &mtp.norm_f), c.norm_eps as f32, &mut normed);
+        let mut logits = vec![0.0f32; c.vocab];
+        match &self.lm_head_q8 {
+            Some(head) => head.matvec(&normed, &mut logits),
+            None => crate::model::ops::matvec(
+                tensor(data, &self.lm_head),
+                c.vocab,
+                d,
+                &normed,
+                &mut logits,
+            ),
+        }
+        Some(logits)
     }
 
     pub fn has_adapter_packs(&self) -> bool {
@@ -1967,7 +2177,8 @@ fn dense_token_serial(
 
 /// Shared generation loop for the Qwen runtime. The prompt is ingested in
 /// one batched prefill (bit-identical to sequential forwards); decoding
-/// then advances one token at a time.
+/// then advances one token at a time, or two per accepted draft with
+/// `--mtp` on a checkpoint converted with its multi-token-prediction head.
 pub fn qwen_run_turn(
     ids: &[u32],
     max_new: usize,
@@ -1979,6 +2190,15 @@ pub fn qwen_run_turn(
     sampler: &mut super::Sampler,
 ) -> String {
     model.reset();
+    if sampler.mtp {
+        if !model.has_mtp() {
+            eprintln!("warning: --mtp ignored, the model was converted without its MTP head");
+        } else if sampler.temp > 0.0 {
+            eprintln!("warning: --mtp is greedy-only, ignoring it with --temp > 0");
+        } else {
+            return run_turn_mtp(ids, max_new, tok, model, debug, stop_id, sampler);
+        }
+    }
     super::run_turn_core_batch(
         ids,
         max_new,
@@ -1990,6 +2210,142 @@ pub fn qwen_run_turn(
         None,
         sampler,
     )
+}
+
+/// Greedy selection with the same top-5 tie-breaking as the plain loop,
+/// including the --dry anti-repetition context (required for the
+/// bit-identity of speculative output).
+fn mtp_select(logits: &[f32], sampler: &super::Sampler, gen_ctx: &[u32]) -> u32 {
+    if sampler.dry > 0.0 {
+        let mut adjusted = logits.to_vec();
+        super::apply_dry(&mut adjusted, gen_ctx, sampler.dry);
+        return super::top_k_probs(&adjusted, 5)[0].0 as u32;
+    }
+    super::top_k_probs(logits, 5)[0].0 as u32
+}
+
+/// Greedy self-speculative decoding: the MTP head drafts one token ahead,
+/// the trunk verifies the pending token and the draft in one two-token
+/// batched prefill, and a rejected draft is rolled back (linear states
+/// restored, key/value caches truncated) before the pending token is
+/// re-ingested alone. Every emitted token is the greedy argmax of the same
+/// logits the plain loop would produce, so the output is bit-identical.
+fn run_turn_mtp(
+    ids: &[u32],
+    max_new: usize,
+    tok: &crate::tokenizer::AnyTokenizer,
+    model: &mut QwenModel,
+    debug: bool,
+    stop_id: u32,
+    sampler: &mut super::Sampler,
+) -> String {
+    use std::time::Instant;
+    let t_gen = Instant::now();
+    let (generated, passes, accepted) = mtp_generate(model, ids, max_new, stop_id, sampler, debug);
+    let gen_dt = t_gen.elapsed().as_secs_f64();
+    let answer = tok.decode(&generated);
+    if debug {
+        println!();
+        println!("answer: {}", answer);
+    } else {
+        println!("Bot > {}", answer);
+    }
+    if !generated.is_empty() {
+        let moy = gen_dt / generated.len() as f64;
+        println!(
+            "  ({:.0} ms/token, {:.1} tok/s | mtp: {} passes, {} drafts accepted, {:.0}% acceptance)",
+            moy * 1000.0,
+            1.0 / moy,
+            passes,
+            accepted,
+            if passes > 0 { accepted as f64 / passes as f64 * 100.0 } else { 0.0 }
+        );
+    }
+    answer
+}
+
+/// Token-level MTP speculative loop (see `run_turn_mtp`). Returns the
+/// generated ids plus (verification passes, accepted drafts).
+fn mtp_generate(
+    model: &mut QwenModel,
+    ids: &[u32],
+    max_new: usize,
+    stop_id: u32,
+    sampler: &super::Sampler,
+    debug: bool,
+) -> (Vec<u32>, usize, usize) {
+    assert!(!ids.is_empty(), "MTP decoding requires a prompt");
+    // trunk prefill + MTP prompt ingestion: draft slot i pairs the prompt
+    // token at i+1 with the trunk hidden at i
+    let out = model.prefill_collect(ids, false);
+    let mut logits = out.logits.into_iter().next_back().unwrap();
+    let mut hidden_prev = out.hidden.last().unwrap().clone();
+    for i in 0..ids.len() - 1 {
+        model.mtp_advance(ids[i + 1], &out.hidden[i], false);
+    }
+
+    let mut generated: Vec<u32> = Vec::new();
+    let mut passes = 0usize;
+    let mut accepted = 0usize;
+
+    // first pending token + its draft
+    let mut pending = false;
+    let mut draft = 0u32;
+    let first = mtp_select(&logits, sampler, &generated);
+    if first != stop_id {
+        generated.push(first);
+        let dl = model.mtp_advance(first, &hidden_prev, true).unwrap();
+        draft = super::top_k_probs(&dl, 5)[0].0 as u32;
+        pending = true;
+    }
+
+    while pending && generated.len() < max_new {
+        let n = *generated.last().unwrap();
+        let snap = model.snapshot();
+        let batch = [n, draft];
+        let out = model.prefill_collect(&batch, true);
+        passes += 1;
+        let sel = mtp_select(&out.logits[0], sampler, &generated);
+        if sel == stop_id {
+            break;
+        }
+        if sel == draft {
+            // draft accepted: two tokens for one batched pass
+            accepted += 1;
+            generated.push(draft);
+            model.mtp_advance(draft, &out.hidden[0], false);
+            logits = out.logits[1].clone();
+            hidden_prev = out.hidden[1].clone();
+            if debug {
+                println!("  mtp pass {}: draft token {} accepted", passes, draft);
+            }
+        } else {
+            // rejected: undo the draft ingestion, re-ingest the pending
+            // token alone (bit-identical state), continue from `sel`
+            model.restore(&snap);
+            model.prefill_collect(&[n], false);
+            logits = out.logits[0].clone();
+            hidden_prev = out.hidden[0].clone();
+            if debug {
+                println!(
+                    "  mtp pass {}: draft token {} rejected for {}",
+                    passes, draft, sel
+                );
+            }
+        }
+        if generated.len() >= max_new {
+            break;
+        }
+        let next = mtp_select(&logits, sampler, &generated);
+        if next == stop_id {
+            break;
+        }
+        generated.push(next);
+        let dl = model.mtp_advance(next, &hidden_prev, true).unwrap();
+        draft = super::top_k_probs(&dl, 5)[0].0 as u32;
+        pending = true;
+    }
+    (generated, passes, accepted)
 }
 
 /// Hidden parity helper: writes per-token logits as
@@ -2013,14 +2369,31 @@ pub fn dump_cmd(args: &[String]) {
     let mut file = std::fs::File::create(&out_path).unwrap();
     use std::io::Write;
     file.write_all(b"QWLOGIT1").unwrap();
-    file.write_all(&(tokens.len() as u32).to_le_bytes())
-        .unwrap();
-    file.write_all(&(model.cfg.vocab as u32).to_le_bytes())
-        .unwrap();
-    for token in tokens {
-        let logits = model.forward(token);
-        file.write_all(&crate::quant::weights::f32_to_bytes(&logits))
+    if args.iter().any(|arg| arg == "--mtp") {
+        // draft logits for every prompt pair: slot i = (token[i+1], hidden[i])
+        assert!(model.has_mtp(), "qwen-dump --mtp: model has no MTP head");
+        assert!(tokens.len() >= 2, "qwen-dump --mtp needs at least two tokens");
+        let out = model.prefill_collect(&tokens, false);
+        file.write_all(&((tokens.len() - 1) as u32).to_le_bytes())
             .unwrap();
+        file.write_all(&(model.cfg.vocab as u32).to_le_bytes())
+            .unwrap();
+        for i in 0..tokens.len() - 1 {
+            let hidden = out.hidden[i].clone();
+            let logits = model.mtp_advance(tokens[i + 1], &hidden, true).unwrap();
+            file.write_all(&crate::quant::weights::f32_to_bytes(&logits))
+                .unwrap();
+        }
+    } else {
+        file.write_all(&(tokens.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&(model.cfg.vocab as u32).to_le_bytes())
+            .unwrap();
+        for token in tokens {
+            let logits = model.forward(token);
+            file.write_all(&crate::quant::weights::f32_to_bytes(&logits))
+                .unwrap();
+        }
     }
     file.sync_all().unwrap();
     println!("Qwen logits: {}", out_path);
@@ -2128,6 +2501,63 @@ mod model_tests {
         let replay = model.forward(3);
         assert_eq!(first, replay);
         drop(model);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn mtp_speculative_output_matches_plain_greedy() {
+        let mut c = bin_tiny_dense();
+        c.mtp_layers = 1;
+        let path = checkpoint_fixture(&c);
+        let ids = [3u32, 5, 7, 11];
+        let max_new = 24;
+        let stop = 999_999; // unreachable: exercise the full loop
+
+        // plain greedy reference: same selection as the generation loop
+        let mut plain_model = QwenModel::load(&path);
+        let mut logits = plain_model.prefill(&ids);
+        let mut plain: Vec<u32> = Vec::new();
+        while plain.len() < max_new {
+            let next = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+            if next == stop {
+                break;
+            }
+            plain.push(next);
+            logits = plain_model.forward(next);
+        }
+
+        let mut spec_model = QwenModel::load(&path);
+        assert!(spec_model.has_mtp());
+        let sampler = crate::model::Sampler::greedy();
+        let (spec, passes, accepted) =
+            mtp_generate(&mut spec_model, &ids, max_new, stop, &sampler, false);
+        assert_eq!(plain, spec, "MTP speculative output diverges from greedy");
+        assert!(passes > 0);
+        assert!(accepted <= passes);
+
+        drop((plain_model, spec_model));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn mtp_rollback_restores_the_exact_state() {
+        let mut c = bin_tiny_dense();
+        c.mtp_layers = 1;
+        let path = checkpoint_fixture(&c);
+        let mut model = QwenModel::load(&path);
+        let baseline = model.prefill_collect(&[3, 5, 7], false);
+        let snap = model.snapshot();
+        // speculative ingestion of two tokens, then rollback
+        model.prefill_collect(&[11, 2], true);
+        model.restore(&snap);
+        // the continuation must be bit-identical to never having speculated
+        let after = model.forward(11);
+
+        let mut reference = QwenModel::load(&path);
+        reference.prefill_collect(&[3, 5, 7], false);
+        let expected = reference.forward(11);
+        assert_eq!(after, expected);
+        drop((model, reference, baseline));
         std::fs::remove_file(path).ok();
     }
 

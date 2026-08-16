@@ -432,8 +432,76 @@ fn add_f32(plan: &mut Vec<PlannedTensor>, name: String, dims: Vec<u32>) {
     });
 }
 
+/// Multi-token-prediction draft head of the dense variant: one trunk-style
+/// full-attention decoder layer plus the fc merge and its three norms. The
+/// MLP matrices are MXFP4-packed exactly like the trunk MLP.
+fn mtp_plan(c: &QwenConfig, out: &mut Vec<PlannedTensor>) {
+    let full = c.n_heads * c.head_dim;
+    let kv = c.n_kv_heads * c.head_dim;
+    add_f32(out, "mtp.fc.weight".to_string(), vec![c.d as u32, 2 * c.d as u32]);
+    for name in [
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.norm.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+    ] {
+        add_f32(out, name.to_string(), vec![c.d as u32]);
+    }
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+        vec![(2 * full) as u32, c.d as u32],
+    );
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.k_proj.weight".to_string(),
+        vec![kv as u32, c.d as u32],
+    );
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.v_proj.weight".to_string(),
+        vec![kv as u32, c.d as u32],
+    );
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.o_proj.weight".to_string(),
+        vec![c.d as u32, full as u32],
+    );
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.q_norm.weight".to_string(),
+        vec![c.head_dim as u32],
+    );
+    add_f32(
+        out,
+        "mtp.layers.0.self_attn.k_norm.weight".to_string(),
+        vec![c.head_dim as u32],
+    );
+    for (suffix, dims) in [
+        ("gate_proj", vec![c.dense_inter as u32, c.d as u32]),
+        ("up_proj", vec![c.dense_inter as u32, c.d as u32]),
+        ("down_proj", vec![c.d as u32, c.dense_inter as u32]),
+    ] {
+        let name = format!("mtp.layers.0.mlp.{}.weight", suffix);
+        out.push(PlannedTensor {
+            source: PlanSource::Packed(name.clone()),
+            name,
+            dtype: DTYPE_MXFP4,
+            dims,
+        });
+    }
+}
+
 fn conversion_plan(c: &QwenConfig) -> Vec<PlannedTensor> {
     let mut out = Vec::new();
+    if c.mtp_layers > 0 {
+        assert!(
+            c.is_dense() && c.mtp_layers == 1,
+            "MTP conversion supports exactly one draft layer on the dense variant"
+        );
+        mtp_plan(c, &mut out);
+    }
     add_f32(
         &mut out,
         "model.language_model.embed_tokens.weight".to_string(),
@@ -654,7 +722,10 @@ pub fn output_layout(c: &QwenConfig) -> Vec<(String, u8, Vec<u32>)> {
 pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
     let arch = if c.is_dense() { "qwen3_5" } else { "qwen3_5_moe" };
     let mlp = if c.is_dense() {
-        format!("\"intermediate_size\":{}", c.dense_inter)
+        format!(
+            "\"intermediate_size\":{},\"mtp_layers\":{}",
+            c.dense_inter, c.mtp_layers
+        )
     } else {
         format!(
             "\"num_experts\":{},\"num_experts_per_tok\":{},\"moe_intermediate_size\":{},\
@@ -954,8 +1025,12 @@ pub fn run(args: &[String]) {
         "{} already exists",
         out_path
     );
-    let c = read_hf_config(&source_path);
+    let mut c = read_hf_config(&source_path);
     let source = StSource::open(&source_path);
+    if c.is_dense() && source.tensors.contains_key("mtp.fc.weight") {
+        c.mtp_layers = 1;
+        println!("multi-token-prediction head found: converting the draft layer");
+    }
     let expected = expected_sources(&c);
     for (name, shape) in &expected {
         source.expect(name, shape);
@@ -964,7 +1039,9 @@ pub fn run(args: &[String]) {
         .tensors
         .keys()
         .filter(|name| {
-            (**name == "lm_head.weight" || name.starts_with("model.language_model."))
+            (**name == "lm_head.weight"
+                || name.starts_with("model.language_model.")
+                || (c.mtp_layers > 0 && name.starts_with("mtp.")))
                 && !expected.contains_key(*name)
         })
         .collect();

@@ -11,6 +11,7 @@ those packages are runtime dependencies of microkimi.
 
 import argparse
 import json
+import math
 import pathlib
 import struct
 
@@ -95,6 +96,141 @@ def dense_config():
     )
 
 
+def exact_mxfp4_values(shape, generator=None):
+    numel = 1
+    for size in shape:
+        numel *= size
+    values = E2M1.repeat((numel + 15) // 16)[:numel]
+    return (values * (2.0 ** -5)).reshape(shape)
+
+
+def make_mtp_tensors(cfg):
+    """Synthetic multi-token-prediction tensors for the dense fixture.
+
+    Transformers does not implement the MTP module (its keys are ignored on
+    load), so the reference logits for these tensors are computed by
+    ``mtp_reference`` below, which mirrors the deployed proposer semantics:
+    slot i merges the embedding of token i+1 with the trunk's final-norm
+    hidden of position i at rotary position i.
+    """
+    generator = torch.Generator().manual_seed(0x51478)
+    d = cfg.hidden_size
+    heads = cfg.num_attention_heads
+    kv = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    inter = cfg.intermediate_size
+
+    def randn(*shape, scale=0.05):
+        return torch.randn(*shape, generator=generator, dtype=torch.float32) * scale
+
+    return {
+        "mtp.fc.weight": randn(d, 2 * d),
+        "mtp.pre_fc_norm_embedding.weight": randn(d, scale=0.1),
+        "mtp.pre_fc_norm_hidden.weight": randn(d, scale=0.1),
+        "mtp.norm.weight": randn(d, scale=0.1),
+        "mtp.layers.0.input_layernorm.weight": randn(d, scale=0.1),
+        "mtp.layers.0.post_attention_layernorm.weight": randn(d, scale=0.1),
+        "mtp.layers.0.self_attn.q_proj.weight": randn(2 * heads * hd, d),
+        "mtp.layers.0.self_attn.k_proj.weight": randn(kv * hd, d),
+        "mtp.layers.0.self_attn.v_proj.weight": randn(kv * hd, d),
+        "mtp.layers.0.self_attn.o_proj.weight": randn(d, heads * hd),
+        "mtp.layers.0.self_attn.q_norm.weight": randn(hd, scale=0.1),
+        "mtp.layers.0.self_attn.k_norm.weight": randn(hd, scale=0.1),
+        "mtp.layers.0.mlp.gate_proj.weight": exact_mxfp4_values((inter, d)),
+        "mtp.layers.0.mlp.up_proj.weight": exact_mxfp4_values((inter, d)),
+        "mtp.layers.0.mlp.down_proj.weight": exact_mxfp4_values((d, inter)),
+    }
+
+
+def rmsnorm1p(x, weight, eps=1e-6):
+    inv = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    return x.float() * inv * (1.0 + weight.float())
+
+
+def rope_partial(vec, pos, rope_dim, theta):
+    out = vec.clone()
+    half = rope_dim // 2
+    for i in range(half):
+        freq = 1.0 / (theta ** (2.0 * i / rope_dim))
+        ang = pos * freq
+        s, c = math.sin(ang), math.cos(ang)
+        a, b = vec[i].item(), vec[i + half].item()
+        out[i] = a * c - b * s
+        out[i + half] = a * s + b * c
+    return out
+
+
+def mtp_reference(model, cfg, mtp, tokens, hidden_norm):
+    """Draft logits per prompt pair, mirroring the runtime math exactly."""
+    d = cfg.hidden_size
+    heads = cfg.num_attention_heads
+    kv_heads = cfg.num_key_value_heads
+    hd = cfg.head_dim
+    theta = cfg.rope_parameters["rope_theta"]
+    rope_dim = int(hd * cfg.rope_parameters["partial_rotary_factor"]) // 2 * 2
+    groups = heads // kv_heads
+    embed = model.get_input_embeddings().weight.detach().float()
+
+    cache_k, cache_v = [], []
+    out_logits = []
+    for i in range(len(tokens) - 1):
+        e = rmsnorm1p(embed[tokens[i + 1]], mtp["mtp.pre_fc_norm_embedding.weight"])
+        h = rmsnorm1p(hidden_norm[i], mtp["mtp.pre_fc_norm_hidden.weight"])
+        x = mtp["mtp.fc.weight"].float() @ torch.cat([e, h])
+
+        normed = rmsnorm1p(x, mtp["mtp.layers.0.input_layernorm.weight"])
+        qg = (mtp["mtp.layers.0.self_attn.q_proj.weight"].float() @ normed).view(heads, 2, hd)
+        k_raw = (mtp["mtp.layers.0.self_attn.k_proj.weight"].float() @ normed).view(kv_heads, hd)
+        v = (mtp["mtp.layers.0.self_attn.v_proj.weight"].float() @ normed).view(kv_heads, hd)
+        q = torch.stack(
+            [
+                rope_partial(
+                    rmsnorm1p(qg[h_i, 0], mtp["mtp.layers.0.self_attn.q_norm.weight"]),
+                    i,
+                    rope_dim,
+                    theta,
+                )
+                for h_i in range(heads)
+            ]
+        )
+        gate = qg[:, 1, :].reshape(-1)
+        k = torch.stack(
+            [
+                rope_partial(
+                    rmsnorm1p(k_raw[h_i], mtp["mtp.layers.0.self_attn.k_norm.weight"]),
+                    i,
+                    rope_dim,
+                    theta,
+                )
+                for h_i in range(kv_heads)
+            ]
+        )
+        cache_k.append(k)
+        cache_v.append(v)
+
+        mixed = torch.zeros(heads, hd)
+        for h_i in range(heads):
+            kh = h_i // groups
+            scores = torch.tensor(
+                [float(q[h_i] @ cache_k[t][kh]) / math.sqrt(hd) for t in range(len(cache_k))]
+            )
+            attn = torch.softmax(scores, dim=-1)
+            for t in range(len(cache_v)):
+                mixed[h_i] += attn[t] * cache_v[t][kh]
+        mixed = mixed.reshape(-1) * torch.sigmoid(gate)
+        x = x + mtp["mtp.layers.0.self_attn.o_proj.weight"].float() @ mixed
+
+        normed = rmsnorm1p(x, mtp["mtp.layers.0.post_attention_layernorm.weight"])
+        gate_h = mtp["mtp.layers.0.mlp.gate_proj.weight"].float() @ normed
+        up_h = mtp["mtp.layers.0.mlp.up_proj.weight"].float() @ normed
+        act = torch.nn.functional.silu(gate_h) * up_h
+        x = x + mtp["mtp.layers.0.mlp.down_proj.weight"].float() @ act
+
+        final = rmsnorm1p(x, mtp["mtp.norm.weight"])
+        out_logits.append(model.lm_head.weight.detach().float() @ final)
+    return torch.stack(out_logits)
+
+
 def make_exact_mxfp4(model, dense):
     """Use values exactly representable by microkimi's MXFP4 encoding on
     every matrix the converter quantizes: routed experts for the MoE
@@ -162,7 +298,15 @@ def main():
         action="store_true",
         help="build the dense qwen3_5_text variant instead of the MoE one",
     )
+    parser.add_argument(
+        "--compare-mtp",
+        type=pathlib.Path,
+        help="compare a qwen-dump --mtp output against the MTP reference",
+    )
     args = parser.parse_args()
+    if args.compare_mtp is not None:
+        compare_logits(args.out / "hf_mtp_logits.bin", args.compare_mtp)
+        return
     if args.compare is not None:
         compare_logits(args.out / "hf_logits.bin", args.compare)
         return
@@ -187,7 +331,17 @@ def main():
         json.dumps(root_config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    save_file(renamed_state(model), args.out / "model.safetensors")
+    state = renamed_state(model)
+    if args.dense:
+        mtp = make_mtp_tensors(cfg)
+        state.update({name: tensor.contiguous() for name, tensor in mtp.items()})
+        final_norm_weight = model.model.norm.weight.detach()
+        hidden_norm = rmsnorm1p(result.hidden_states[-1][0].detach(), final_norm_weight)
+        write_logits(
+            args.out / "hf_mtp_logits.bin",
+            mtp_reference(model, cfg, mtp, TOKENS, hidden_norm),
+        )
+    save_file(state, args.out / "model.safetensors")
     write_logits(args.out / "hf_logits.bin", result.logits[0])
     torch.save(
         {
