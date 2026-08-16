@@ -341,6 +341,10 @@ pub struct QwenConfig {
     /// self-speculative decoding). Set by the converter, never read from
     /// Hugging Face configs (their key is mtp_num_hidden_layers).
     pub mtp_layers: usize,
+    /// The checkpoint ties lm_head to the input embedding (small dense
+    /// models, e.g. Qwen3.5-0.8B): the converted file stores the matrix
+    /// once and the runtime reads logits through the embedding rows.
+    pub tied_embeddings: bool,
     pub norm_eps: f64,
 }
 
@@ -367,6 +371,7 @@ impl QwenConfig {
             shared_inter: 512,
             dense_inter: 0,
             mtp_layers: 0,
+            tied_embeddings: false,
             norm_eps: 1e-6,
         }
     }
@@ -395,6 +400,7 @@ impl QwenConfig {
             shared_inter: 0,
             dense_inter: 17408,
             mtp_layers: 0,
+            tied_embeddings: false,
             norm_eps: 1e-6,
         }
     }
@@ -429,6 +435,7 @@ impl QwenConfig {
         c.shared_inter = Self::num(d, "shared_expert_intermediate_size", c.shared_inter as f64) as usize;
         c.dense_inter = Self::num(d, "intermediate_size", 0.0) as usize;
         c.mtp_layers = Self::num(d, "mtp_layers", 0.0) as usize;
+        c.tied_embeddings = Self::num(d, "tie_word_embeddings", 0.0) != 0.0;
         if c.dense_inter > 0 {
             // The dense variant has no router, expert bank, or shared
             // expert; zero the MoE fields so their defaults cannot leak.

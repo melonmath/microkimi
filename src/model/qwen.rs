@@ -1105,7 +1105,11 @@ impl QwenModel {
             &[c.vocab, c.d],
         );
         let norm_f = expect_f32(&bin, "model.language_model.norm.weight", &[c.d]);
-        let lm_head = expect_f32(&bin, "lm_head.weight", &[c.vocab, c.d]);
+        let lm_head = if c.tied_embeddings {
+            embed
+        } else {
+            expect_f32(&bin, "lm_head.weight", &[c.vocab, c.d])
+        };
         let mut layers = Vec::with_capacity(c.n_layers);
         let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
         let full_width = c.n_heads * c.head_dim;
@@ -1603,6 +1607,14 @@ impl QwenModel {
 
 /// Number of prefill worker threads (the shared pool size; prefill phases
 /// use scoped threads over contiguous token or head ranges).
+/// True when MICROKIMI_NO_QWEN_BATCH=1 (sequential prefill fallback).
+fn no_batch_prefill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MICROKIMI_NO_QWEN_BATCH").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 fn prefill_workers(items: usize) -> usize {
     crate::model::pool::pool().workers.max(1).min(items.max(1))
 }
@@ -1642,8 +1654,24 @@ impl QwenModel {
     /// and, with `all_logits`, the logits of every position (speculative
     /// verification). `logits` holds one entry per position, or only the
     /// last position's entry when `all_logits` is false.
+    /// MICROKIMI_NO_QWEN_BATCH=1 forces the sequential single-token path
+    /// (A/B benchmarking toggle; both paths are bit-identical).
     pub fn prefill_collect(&mut self, tokens: &[u32], all_logits: bool) -> QwenPrefillOut {
         assert!(!tokens.is_empty(), "prefill requires at least one token");
+        if no_batch_prefill() {
+            // A/B benchmarking fallback: one forward per token, bit-identical
+            // logits. Final-norm hiddens are not recoverable from forward, so
+            // they stay empty; the MTP drafter checks and refuses the toggle.
+            let mut out = QwenPrefillOut { logits: Vec::new(), hidden: Vec::new() };
+            for (i, &token) in tokens.iter().enumerate() {
+                let logits = self.forward(token);
+                out.hidden.push(Vec::new());
+                if all_logits || i + 1 == tokens.len() {
+                    out.logits.push(logits);
+                }
+            }
+            return out;
+        }
         let c = self.cfg.clone();
         let t_count = tokens.len();
         let d = c.d;
@@ -2312,7 +2340,7 @@ fn run_turn_mtp(
 
 /// Token-level MTP speculative loop (see `run_turn_mtp`). Returns the
 /// generated ids plus (verification passes, accepted drafts).
-fn mtp_generate(
+pub(crate) fn mtp_generate(
     model: &mut QwenModel,
     ids: &[u32],
     max_new: usize,
@@ -2321,6 +2349,10 @@ fn mtp_generate(
     debug: bool,
 ) -> (Vec<u32>, usize, usize) {
     assert!(!ids.is_empty(), "MTP decoding requires a prompt");
+    assert!(
+        !no_batch_prefill(),
+        "--mtp requires the batched prefill (unset MICROKIMI_NO_QWEN_BATCH)"
+    );
     // trunk prefill + MTP prompt ingestion: draft slot i pairs the prompt
     // token at i+1 with the trunk hidden at i
     let out = model.prefill_collect(ids, false);
@@ -2490,12 +2522,13 @@ mod model_tests {
     pub(super) fn checkpoint_fixture(c: &QwenConfig) -> String {
         let path = std::env::temp_dir()
             .join(format!(
-                "microkimi_qwen_fixture_{}_{}_{}l_{}d_{}m.bin",
+                "microkimi_qwen_fixture_{}_{}_{}l_{}d_{}m_{}t.bin",
                 std::process::id(),
                 std::thread::current().name().unwrap_or("test"),
                 c.n_layers,
                 c.dense_inter,
-                c.mtp_layers
+                c.mtp_layers,
+                c.tied_embeddings as u8
             ))
             .to_string_lossy()
             .into_owned();
@@ -2551,6 +2584,37 @@ mod model_tests {
         c.shared_inter = 0;
         c.dense_inter = 64;
         c
+    }
+
+    #[test]
+    fn tied_embeddings_share_one_matrix_and_run() {
+        let mut c = bin_tiny_dense();
+        c.tied_embeddings = true;
+        let layout = crate::tools::convert_qwen::output_layout(&c);
+        assert!(
+            !layout.iter().any(|(name, _, _)| name == "lm_head.weight"),
+            "tied checkpoints must not duplicate the head"
+        );
+        let path = checkpoint_fixture(&c);
+        let mut model = QwenModel::load(&path);
+        assert!(model.cfg.tied_embeddings);
+        let logits = model.forward(3);
+        assert_eq!(logits.len(), c.vocab);
+        assert!(logits.iter().all(|v| v.is_finite()));
+        // the head really is the embedding: feeding the argmax row back in
+        // stays finite and deterministic across a reset
+        let top = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0 as u32;
+        let continued = model.forward(top);
+        model.reset();
+        model.forward(3);
+        assert_eq!(model.forward(top), continued);
+        drop(model);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -16,7 +16,8 @@
 //   magic       : 8 bytes "MKMEMQW1"
 //   fingerprint : u32 n_layers, d, vocab, lin_k_heads, lin_v_heads,
 //                 lin_k_dim, lin_v_dim, conv_kernel, n_heads, n_kv_heads,
-//                 head_dim, dense_inter, n_experts, mtp_layers
+//                 head_dim, dense_inter, n_experts, mtp_layers,
+//                 tied_embeddings
 //   adapters    : u8 flag, then 32 bytes pack-set SHA-256 (zero if none)
 //   position    : u64 tokens ingested
 //   per layer   : u8 kind (0 = linear, 1 = full), then
@@ -30,7 +31,7 @@ use crate::model::qwen::{QwenCache, QwenModel};
 
 const MAGIC: &[u8; 8] = b"MKMEMQW1";
 
-fn fingerprint(model: &QwenModel) -> [usize; 14] {
+fn fingerprint(model: &QwenModel) -> [usize; 15] {
     let c = &model.cfg;
     [
         c.n_layers,
@@ -47,6 +48,7 @@ fn fingerprint(model: &QwenModel) -> [usize; 14] {
         c.dense_inter,
         c.n_experts,
         c.mtp_layers,
+        c.tied_embeddings as usize,
     ]
 }
 
@@ -124,7 +126,7 @@ pub fn load_slice(model: &mut QwenModel, bytes: &[u8], label: &str) -> Result<Ve
         return Err(format!("{}: not a Qwen .mkmem file (bad magic)", path));
     }
     let want = fingerprint(model);
-    let mut got = [0usize; 14];
+    let mut got = [0usize; 15];
     for slot in got.iter_mut() {
         *slot = r.u32()? as usize;
     }

@@ -512,11 +512,13 @@ fn conversion_plan(c: &QwenConfig) -> Vec<PlannedTensor> {
         "model.language_model.norm.weight".to_string(),
         vec![c.d as u32],
     );
-    add_f32(
-        &mut out,
-        "lm_head.weight".to_string(),
-        vec![c.vocab as u32, c.d as u32],
-    );
+    if !c.tied_embeddings {
+        add_f32(
+            &mut out,
+            "lm_head.weight".to_string(),
+            vec![c.vocab as u32, c.d as u32],
+        );
+    }
     for l in 0..c.n_layers {
         let p = format!("model.language_model.layers.{}", l);
         add_f32(
@@ -753,7 +755,7 @@ pub fn config_json_with_specials(
          \"partial_rotary_factor\":{},\"rope_theta\":{},\"linear_num_key_heads\":{},\
          \"linear_num_value_heads\":{},\"linear_key_head_dim\":{},\"linear_value_head_dim\":{},\
          \"linear_conv_kernel_dim\":{},\"full_attention_interval\":{},{},\
-         \"rms_norm_eps\":{}}}}}",
+         \"tie_word_embeddings\":{},\"rms_norm_eps\":{}}}}}",
         arch,
         c.n_layers,
         c.d,
@@ -776,6 +778,7 @@ pub fn config_json_with_specials(
         c.conv_kernel,
         c.full_attn_interval,
         mlp,
+        c.tied_embeddings as u8,
         c.norm_eps
     )
 }
@@ -807,16 +810,14 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
     );
     assert_eq!(t.get("hidden_act").and_then(|x| x.as_str()), Some("silu"));
     assert!(!json_bool(t.get("attention_bias"), "attention_bias"));
-    assert!(!json_bool(
-        t.get("tie_word_embeddings"),
-        "tie_word_embeddings"
-    ));
+    let tied = json_bool(t.get("tie_word_embeddings"), "tie_word_embeddings");
     assert_eq!(
         t.get("attention_dropout").and_then(|x| x.as_num()),
         Some(0.0),
         "attention dropout is unsupported"
     );
-    let c = QwenConfig::from_json(t);
+    let mut c = QwenConfig::from_json(t);
+    c.tied_embeddings = tied;
     assert_eq!(
         c.is_dense(),
         model_type == Some("qwen3_5_text"),
