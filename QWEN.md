@@ -265,6 +265,17 @@ spot on the 0.8B; the fp4 mode stays available because its traffic
 argument returns on bandwidth-starved hosts (a 27B paging from disk),
 where it must be re-measured before use.
 
+On bare metal (Apple M5, 4P/6E, 16 GB, AC power) the same binary
+measured q8 decode at 52.6 tok/s single-stream (19 ms/token, medians
+over 5 rounds) and batched prefill at 14.5 ms/token, and the llama.cpp
+head-to-head on the same machine and checkpoint (ggml-org Q8_0 GGUF,
+llama-bench -p 1024 -n 64) put their **Metal GPU** backend at 109.8
+tok/s tg64 and 4548 tok/s pp1024 - CPU decode within 2.1x of the GPU,
+prefill ~66x behind it. The full protocol, the fair `-ngl 0`
+CPU-versus-CPU row, and the reading are in [BENCH.md](BENCH.md); the
+structural conclusion is that parity on Apple silicon runs through a
+Metal backend for this runtime, not through more CPU kernels.
+
 ## Chained drafting and lane-batched decoding
 
 Two throughput mechanisms, both bit-identical to plain decoding and both

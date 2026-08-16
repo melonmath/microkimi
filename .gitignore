@@ -1,5 +1,6 @@
 # build artifacts & binaries
 target/
+target-macos/
 *.bin
 *.pt
 

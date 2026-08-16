@@ -36,20 +36,40 @@ is the honest comparison to llama.cpp's CPU backend.
 
 ## Comparing with llama.cpp on the same machine
 
-Same checkpoint, closest quantization, same machine, no other load:
+Same checkpoint, closest quantization, same machine, no other load.
+No conversion needed: ggml-org publishes ready-made GGUFs.
 
 ```bash
-# in a llama.cpp checkout
-python3 convert_hf_to_gguf.py /path/to/Qwen3.5-0.8B --outfile q08-f16.gguf
-./build/bin/llama-quantize q08-f16.gguf q08-q8_0.gguf Q8_0
-./build/bin/llama-bench -m q08-q8_0.gguf -p 1024 -n 64
+# in a llama.cpp checkout (cmake -B build && cmake --build build -t llama-bench)
+curl -fLO https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf
+./build/bin/llama-bench -m Qwen3.5-0.8B-Q8_0.gguf -p 1024 -n 64          # Metal GPU (macOS default)
+./build/bin/llama-bench -m Qwen3.5-0.8B-Q8_0.gguf -p 1024 -n 64 -ngl 0  # CPU-only row
 ```
 
-Read llama-bench's `pp1024` row against the qwenbench prefill line and
-its `tg64` row against the q8-spine decode line. Two honesty notes for
-the comparison: microkimi's MLP is MXFP4 (4-bit) while Q8_0 is 8-bit
-everywhere, so microkimi reads less weight traffic per token than a
-pure Q8_0 build of the same model; and microkimi's q8 spine is off by
+One trap: on macOS llama-bench runs the **Metal GPU backend by
+default** (backend column says `MTL`). The fair CPU-versus-CPU row
+needs `-ngl 0`. Read `pp1024` against the qwenbench prefill line and
+`tg64` against the q8-spine decode line.
+
+Measured on an Apple M5 (4P/6E, 16 GB, AC power, 2026-08-16),
+Qwen3.5-0.8B:
+
+| arm | prefill | decode |
+|---|---|---|
+| microkimi q8 spine (CPU, 4 P-cores) | ~69 tok/s | 52.6 tok/s |
+| llama.cpp Q8_0 (Metal GPU) | 4548 tok/s | 109.8 tok/s |
+| llama.cpp Q4_0 (Metal GPU) | 4715 tok/s | 140.1 tok/s |
+
+Reading: single-stream CPU decode lands within 2.1x of llama.cpp's GPU
+decode on the same silicon (bandwidth-bound regimes converge), and
+their Q4_0 gains only 27% over Q8_0 there (dispatch-bound at 0.8B,
+consistent with our fp4-spine rejection). Prefill is where the GPU is
+structurally ahead (~66x): matching llama.cpp on Apple silicon means a
+Metal backend for the Qwen runtime, not more CPU kernels.
+
+Two honesty notes for any quote: microkimi's MLP is MXFP4 (4-bit)
+while Q8_0 is 8-bit everywhere, so microkimi reads less weight traffic
+per token than a pure Q8_0 build; and microkimi's q8 spine is off by
 default because the default path is bit-exact f32 - quote whichever arm
 matches the property you need, and quote the NLL deltas published in
 QWEN.md next to any speed claim.
