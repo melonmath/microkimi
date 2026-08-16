@@ -88,12 +88,7 @@ fn group_sse(group: &[f32], e: i32, imp: Option<&[f32]>) -> f64 {
 /// group max but doubles the grid step, a finer e+1 wastes range). The naive
 /// e is scored first and wins ties, candidates outside [-127, 128] are
 /// skipped, so the returned exponent is never worse than e on the group.
-pub fn search_mx_scale(group: &[f32], e: i32) -> i32 {
-    search_mx_scale_weighted(group, e, None)
-}
-
-/// `search_mx_scale` under an optional per-column importance weighting.
-fn search_mx_scale_weighted(group: &[f32], e: i32, imp: Option<&[f32]>) -> i32 {
+pub fn search_mx_scale(group: &[f32], e: i32, imp: Option<&[f32]>) -> i32 {
     debug_assert_eq!(group.len(), 32);
     let mut best = e;
     let mut best_sse = group_sse(group, e, imp);
@@ -136,7 +131,7 @@ fn quantize_impl(
             .min(128);
             if search && maxabs != 0.0 {
                 let imp = col_imp.map(|imp| &imp[g * 32..(g + 1) * 32]);
-                e = search_mx_scale_weighted(group, e, imp);
+                e = search_mx_scale(group, e, imp);
             }
             scales[r * cols / 32 + g] = (e + 127).clamp(0, 255) as u8;
             let inv = 1.0 / exp2_i(e);

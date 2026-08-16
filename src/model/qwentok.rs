@@ -20,6 +20,50 @@ pub struct QwenTokenizer {
     id_to_bytes: Vec<Vec<u8>>,
     added: Vec<(String, u32)>,
     model_vocab: usize,
+    /// Sliced-vocabulary remap (qwen.vocabmap.json beside the model).
+    remap: Option<QwenVocabRemap>,
+}
+
+/// Remap for a vocabulary-sliced model: encoding runs on the full
+/// vocabulary, then every id is translated to its kept row; a dropped
+/// token falls back to its single-byte tokens, which the slicer always
+/// keeps (byte-level BPE covers any byte sequence with them).
+pub struct QwenVocabRemap {
+    pub new_to_old: Vec<u32>,
+    old_to_new: Vec<u32>,
+    byte_new_ids: [u32; 256],
+}
+
+impl QwenVocabRemap {
+    /// Builds the remap from the sidecar's new -> old table, resolving the
+    /// 256 single-byte tokens through the full tokenizer. Fails closed on
+    /// out-of-range entries, duplicates, or a dropped byte token.
+    pub fn build(new_to_old: Vec<u32>, full: &QwenTokenizer) -> Result<QwenVocabRemap, String> {
+        let full_vocab = full.id_to_bytes.len();
+        let mut old_to_new = vec![u32::MAX; full_vocab];
+        for (new_id, &old_id) in new_to_old.iter().enumerate() {
+            if old_id as usize >= full_vocab {
+                return Err(format!("vocab map: id {} exceeds the full vocabulary", old_id));
+            }
+            if old_to_new[old_id as usize] != u32::MAX {
+                return Err(format!("vocab map: duplicate id {}", old_id));
+            }
+            old_to_new[old_id as usize] = new_id as u32;
+        }
+        let mut byte_new_ids = [0u32; 256];
+        for b in 0..256usize {
+            let full_id = *full
+                .ids
+                .get(&vec![b as u8])
+                .ok_or_else(|| format!("tokenizer has no single-byte token for byte {}", b))?;
+            let new_id = old_to_new[full_id as usize];
+            if new_id == u32::MAX {
+                return Err(format!("vocab map drops the byte token for byte {}", b));
+            }
+            byte_new_ids[b] = new_id;
+        }
+        Ok(QwenVocabRemap { new_to_old, old_to_new, byte_new_ids })
+    }
 }
 
 fn byte_to_char_table() -> [char; 256] {
@@ -263,7 +307,64 @@ impl QwenTokenizer {
             id_to_bytes,
             added,
             model_vocab,
+            remap: None,
         }
+    }
+
+    /// Attaches a sliced-vocabulary remap; ids produced and consumed by
+    /// this tokenizer then live in the sliced space of `sliced_vocab`.
+    pub fn attach_remap(&mut self, new_to_old: Vec<u32>, sliced_vocab: usize) -> Result<(), String> {
+        if new_to_old.len() != sliced_vocab {
+            return Err("vocab map length does not match the sliced vocabulary".to_string());
+        }
+        let remap = QwenVocabRemap::build(new_to_old, self)?;
+        self.model_vocab = sliced_vocab;
+        self.remap = Some(remap);
+        Ok(())
+    }
+
+    /// Translates full-vocabulary ids into the sliced space, expanding a
+    /// dropped token into its kept single-byte tokens. Identity without a
+    /// remap.
+    fn map_out(&self, ids: Vec<u32>) -> Vec<u32> {
+        let Some(remap) = &self.remap else { return ids };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mapped = remap.old_to_new.get(id as usize).copied().unwrap_or(u32::MAX);
+            if mapped != u32::MAX {
+                out.push(mapped);
+            } else {
+                for &b in &self.id_to_bytes[id as usize] {
+                    out.push(remap.byte_new_ids[b as usize]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Full-vocabulary id of the single-byte token for `b` (byte-level BPE
+    /// has one for every byte). The vocabulary slicer keeps all of them so
+    /// dropped tokens can fall back to bytes.
+    pub fn single_byte_full_id(&self, b: u8) -> Option<u32> {
+        self.ids.get(&vec![b]).copied()
+    }
+
+    /// A special token's id in the tokenizer's output space.
+    fn special_out(&self, full_id: u32) -> u32 {
+        match &self.remap {
+            Some(remap) => remap.old_to_new[full_id as usize],
+            None => full_id,
+        }
+    }
+
+    /// Generation stop in chat mode (im_end), in the output space.
+    pub fn stop_end_of_msg(&self) -> u32 {
+        self.special_out(QWEN_IM_END)
+    }
+
+    /// Generation stop in raw completion mode, in the output space.
+    pub fn stop_endoftext(&self) -> u32 {
+        self.special_out(QWEN_ENDOFTEXT)
     }
 
     fn bpe(&self, bytes: &[u8]) -> Vec<u32> {
@@ -314,6 +415,12 @@ impl QwenTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let ids = self.encode_full(text);
+        self.map_out(ids)
+    }
+
+    /// Full-vocabulary encoding (before any sliced remap).
+    fn encode_full(&self, text: &str) -> Vec<u32> {
         let normalized = crate::unicode_nfc::normalize_nfc(text);
         let text = normalized.as_str();
         let mut out = Vec::new();
@@ -343,6 +450,10 @@ impl QwenTokenizer {
     }
 
     pub fn decode_id(&self, id: u32) -> String {
+        let id = match &self.remap {
+            Some(remap) => remap.new_to_old.get(id as usize).copied().unwrap_or(id),
+            None => id,
+        };
         self.id_to_bytes
             .get(id as usize)
             .filter(|bytes| !bytes.is_empty())
@@ -353,6 +464,10 @@ impl QwenTokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
+            let id = match &self.remap {
+                Some(remap) => remap.new_to_old.get(id as usize).copied().unwrap_or(id),
+                None => id,
+            };
             if let Some(value) = self.id_to_bytes.get(id as usize) {
                 bytes.extend_from_slice(value);
             }
@@ -371,10 +486,10 @@ impl QwenTokenizer {
         let mut ids = Vec::new();
         for (q, answer) in history {
             ids.push(QWEN_IM_START);
-            ids.extend(self.encode("user\n"));
-            ids.extend(self.encode(q.trim()));
+            ids.extend(self.encode_full("user\n"));
+            ids.extend(self.encode_full(q.trim()));
             ids.push(QWEN_IM_END);
-            ids.extend(self.encode("\n"));
+            ids.extend(self.encode_full("\n"));
 
             let trimmed = answer.trim();
             let visible = trimmed
@@ -382,21 +497,21 @@ impl QwenTokenizer {
                 .map(|(_, rest)| rest.trim_start_matches('\n'))
                 .unwrap_or(trimmed);
             ids.push(QWEN_IM_START);
-            ids.extend(self.encode("assistant\n"));
-            ids.extend(self.encode(visible));
+            ids.extend(self.encode_full("assistant\n"));
+            ids.extend(self.encode_full(visible));
             ids.push(QWEN_IM_END);
-            ids.extend(self.encode("\n"));
+            ids.extend(self.encode_full("\n"));
         }
         ids.push(QWEN_IM_START);
-        ids.extend(self.encode("user\n"));
-        ids.extend(self.encode(question.trim()));
+        ids.extend(self.encode_full("user\n"));
+        ids.extend(self.encode_full(question.trim()));
         ids.push(QWEN_IM_END);
-        ids.extend(self.encode("\n"));
+        ids.extend(self.encode_full("\n"));
         ids.push(QWEN_IM_START);
-        ids.extend(self.encode("assistant\n"));
+        ids.extend(self.encode_full("assistant\n"));
         ids.push(QWEN_THINK);
-        ids.extend(self.encode("\n"));
-        ids
+        ids.extend(self.encode_full("\n"));
+        self.map_out(ids)
     }
 }
 
@@ -431,6 +546,50 @@ pub fn dump_cmd(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic byte-level tokenizer: 256 single-byte tokens at their
+    /// byte value, "ab" at 256, "cd" at 257.
+    fn byte_level_fixture() -> QwenTokenizer {
+        let mut ids = HashMap::new();
+        let mut id_to_bytes: Vec<Vec<u8>> = Vec::new();
+        for b in 0..=255u8 {
+            ids.insert(vec![b], b as u32);
+            id_to_bytes.push(vec![b]);
+        }
+        ids.insert(b"ab".to_vec(), 256);
+        id_to_bytes.push(b"ab".to_vec());
+        ids.insert(b"cd".to_vec(), 257);
+        id_to_bytes.push(b"cd".to_vec());
+        QwenTokenizer {
+            ids,
+            pair_rank: HashMap::new(),
+            id_to_bytes,
+            added: Vec::new(),
+            model_vocab: 258,
+            remap: None,
+        }
+    }
+
+    #[test]
+    fn sliced_remap_falls_back_to_byte_tokens() {
+        let mut tok = byte_level_fixture();
+        // keep every byte token plus "ab"; drop "cd"
+        let new_to_old: Vec<u32> = (0..=255).chain([256]).collect();
+        tok.attach_remap(new_to_old.clone(), 257).unwrap();
+        assert_eq!(tok.vocab_size(), 257);
+        // kept token maps to its new row; dropped token becomes bytes
+        assert_eq!(tok.map_out(vec![256, 257]), vec![256, b'c' as u32, b'd' as u32]);
+        // decoding round-trips through the new ids
+        assert_eq!(tok.decode(&[256, b'c' as u32, b'd' as u32]), "abcd");
+    }
+
+    #[test]
+    fn sliced_remap_refuses_a_dropped_byte_token() {
+        let mut tok = byte_level_fixture();
+        // dropping byte 7 makes the fallback unsound: fail closed
+        let new_to_old: Vec<u32> = (0..=255).filter(|&b| b != 7).chain([256, 257]).collect();
+        assert!(tok.attach_remap(new_to_old, 257).is_err());
+    }
 
     #[test]
     fn ascii_pretokenizer_follows_qwen_alternatives() {
@@ -474,6 +633,7 @@ mod tests {
             id_to_bytes: Vec::new(),
             added: Vec::new(),
             model_vocab: 5,
+            remap: None,
         };
         assert_eq!(tokenizer.bpe(b"abc"), vec![3, 2]);
     }

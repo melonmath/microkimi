@@ -104,6 +104,13 @@ mod plan;
 mod score;
 mod source;
 mod vocab;
+
+/// Freqfile parser shared with the Qwen vocabulary slicer (same
+/// "<token_id> <count>" and JSON-object formats, same fail-closed range
+/// check against the model's current vocabulary).
+pub(crate) fn parse_freqfile_pub(path: &str, vocab: usize) -> Vec<u64> {
+    vocab::parse_freqfile(path, vocab)
+}
 mod vq;
 
 pub(crate) use source::{split_layer, DirEntry};

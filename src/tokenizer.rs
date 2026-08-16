@@ -570,7 +570,7 @@ impl AnyTokenizer {
             AnyTokenizer::Nano(n) => n.markers.end_of_msg,
             AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
-            AnyTokenizer::Qwen(_) => crate::model::qwentok::QWEN_IM_END,
+            AnyTokenizer::Qwen(t) => t.stop_end_of_msg(),
         }
     }
 
@@ -616,7 +616,7 @@ impl AnyTokenizer {
             AnyTokenizer::Nano(n) => n.eos,
             AnyTokenizer::Ds(_) => crate::model::dstok::DS_EOS,
             AnyTokenizer::DsNano(n) => n.eos,
-            AnyTokenizer::Qwen(_) => crate::model::qwentok::QWEN_ENDOFTEXT,
+            AnyTokenizer::Qwen(t) => t.stop_endoftext(),
         }
     }
 

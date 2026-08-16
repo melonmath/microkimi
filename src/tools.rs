@@ -11,4 +11,5 @@ pub mod parity;
 pub mod replay;
 pub mod selftest;
 pub mod slice;
+pub mod slice_qwen;
 pub mod slice_st;

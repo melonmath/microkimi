@@ -148,6 +148,27 @@ runs on an already-converted model, so the statistics see MXFP4 rather
 than bf16 activations upstream; this is the standard imatrix compromise.
 MTP tensors stay unweighted (their activations are not in the pass).
 
+## Vocabulary slicing
+
+Most deployments never emit most of the 248320-entry vocabulary; its
+embedding and head rows dominate the f32 spine. `slice-qwen-vocab` keeps a
+subset of rows and rewrites the converted file:
+
+```bash
+./target/release/microkimi slice-qwen-vocab --model qwen.bin \
+  --out sliced/qwen-small.bin --top 32768 --freqfile corpus_ids.txt
+```
+
+The keep set is the whole added-special block, the 256 single-byte tokens,
+the chat-template pieces, and the top-N ids of a frequency file counting
+the model's own token ids. A `qwen.vocabmap.json` sidecar written beside
+the output carries the new-to-old table: the tokenizer loads it, encodes
+on the full vocabulary, remaps, and re-encodes any dropped token as its
+single-byte tokens - byte-level BPE keeps every byte sequence
+representable, so no unknown token exists or is needed (a slice that
+would drop a byte token is refused). Kept rows are bit-identical to the
+source model's, and the sliced config remaps the special ids.
+
 ## Adapter packs
 
 The generic `MKADAPT1` format works on Qwen float spine matrices. Convert an

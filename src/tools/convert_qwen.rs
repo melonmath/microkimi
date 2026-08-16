@@ -707,8 +707,9 @@ pub fn layer_tensors(c: &QwenConfig, l: usize) -> Vec<String> {
     names
 }
 
-/// Layout summary used by lightweight fixture tests.
-#[cfg(test)]
+/// Layout summary: every tensor of a converted checkpoint in file order.
+/// Used by fixture tests and by the vocabulary slicer, which rewrites a
+/// converted file tensor by tensor.
 pub fn output_layout(c: &QwenConfig) -> Vec<(String, u8, Vec<u32>)> {
     conversion_plan(c)
         .into_iter()
@@ -720,6 +721,17 @@ pub fn output_layout(c: &QwenConfig) -> Vec<(String, u8, Vec<u32>)> {
 /// decoders declare arch "qwen3_5" and `intermediate_size`; MoE decoders
 /// declare arch "qwen3_5_moe" and the expert fields.
 pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
+    config_json_with_specials(c, tokenizer, 248044, 248046)
+}
+
+/// `config_json` with explicit special ids (a vocabulary-sliced model
+/// remaps bos and end_of_msg into its kept rows).
+pub fn config_json_with_specials(
+    c: &QwenConfig,
+    tokenizer: &str,
+    bos: u32,
+    end_of_msg: u32,
+) -> String {
     let arch = if c.is_dense() { "qwen3_5" } else { "qwen3_5_moe" };
     let mlp = if c.is_dense() {
         format!(
@@ -735,7 +747,7 @@ pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
     };
     format!(
         "{{\"format\":2,\"arch\":\"{}\",\"n_layers\":{},\"hidden\":{},\"vocab\":{},\
-         \"tokenizer\":\"{}\",\"specials\":{{\"bos\":248044,\"end_of_msg\":248046}},\
+         \"tokenizer\":\"{}\",\"specials\":{{\"bos\":{},\"end_of_msg\":{}}},\
          \"qwen\":{{\"num_hidden_layers\":{},\"hidden_size\":{},\"vocab_size\":{},\
          \"num_attention_heads\":{},\"num_key_value_heads\":{},\"head_dim\":{},\
          \"partial_rotary_factor\":{},\"rope_theta\":{},\"linear_num_key_heads\":{},\
@@ -747,6 +759,8 @@ pub fn config_json(c: &QwenConfig, tokenizer: &str) -> String {
         c.d,
         c.vocab,
         tokenizer,
+        bos,
+        end_of_msg,
         c.n_layers,
         c.d,
         c.vocab,

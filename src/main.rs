@@ -45,6 +45,7 @@ fn main() {
         "complete-batch" => tools::complete_batch::run(&args),
         // microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers "0-11"]
         "slice" => tools::slice::run(&args),
+        "slice-qwen-vocab" => tools::slice_qwen::run(&args),
         // microkimi shadow --model X.bin [--out X.shadows]  (VQ1 expert shadows for --stream-fallback)
         "shadow" => stream::shadow::cmd(&args),
         "selftest" => { tools::selftest::run(); tools::selftest::run_ds(); tools::selftest::run_ds2(); tools::selftest::run_ds3(); tools::selftest::run_ds4(); tools::selftest::run_packed_emul(); tools::selftest::run_q8(); tools::selftest::run_flash(); tools::selftest::run_kvq8(); },
@@ -272,6 +273,11 @@ fn main() {
             println!("      --model also accepts safetensors: model.safetensors, a directory with an index,");
             println!("      or https://huggingface.co/org/repo (range requests: only the needed tensors");
             println!("      and, for expert ranking, only the weight_scale bytes are fetched)");
+            println!("  microkimi slice-qwen-vocab --model X.bin --out Y.bin --top N --freqfile F [--vocab T.json]");
+            println!("                                         vocabulary pruning for Qwen models: keeps the special block,");
+            println!("                                         the 256 byte tokens, the chat-template pieces and the top-N");
+            println!("                                         frequent ids; writes qwen.vocabmap.json beside the output");
+            println!("                                         (dropped tokens re-encode as byte tokens at runtime)");
             println!("  microkimi shadow --model X.bin [--out X.shadows]");
             println!("                                         VQ1 (0.5-bit) shadows of EVERY expert + one global");
             println!("                                         codebook, the resident low-precision tier served on");
@@ -1513,6 +1519,39 @@ fn load_qwen_any_tokenizer(
             })
     };
     println!("Qwen tokenizer: {}", path);
+    // A vocabulary-sliced model keeps qwen.vocabmap.json beside it: the
+    // tokenizer then loads the full vocabulary and remaps its output.
+    let map_path = std::path::Path::new(model_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("qwen.vocabmap.json");
+    if map_path.exists() {
+        let bytes = std::fs::read(&map_path).unwrap();
+        let j = json::parse_complete(&bytes);
+        let sliced = j.get("vocab_size").and_then(|x| x.as_num()).map(|n| n as usize);
+        let full = j.get("full_vocab_size").and_then(|x| x.as_num()).map(|n| n as usize);
+        let new_to_old: Vec<u32> = j
+            .get("new_to_old")
+            .and_then(|x| x.as_arr())
+            .map(|a| a.iter().filter_map(|v| v.as_num().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        if sliced != Some(model_vocab) {
+            eprintln!(
+                "error: {} was built for vocab {:?}, the model has {}",
+                map_path.display(),
+                sliced,
+                model_vocab
+            );
+            std::process::exit(1);
+        }
+        let mut tok = model::qwentok::QwenTokenizer::load(&path, full.unwrap_or(248_320));
+        if let Err(e) = tok.attach_remap(new_to_old, model_vocab) {
+            eprintln!("error: {}: {}", map_path.display(), e);
+            std::process::exit(1);
+        }
+        println!("Qwen vocab map: {} ({} kept rows)", map_path.display(), model_vocab);
+        return tokenizer::AnyTokenizer::Qwen(tok);
+    }
     tokenizer::AnyTokenizer::Qwen(model::qwentok::QwenTokenizer::load(
         &path,
         model_vocab,
