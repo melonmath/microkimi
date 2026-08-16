@@ -271,6 +271,16 @@ impl Q8Head {
         Q8Head { q, scales, rows, cols }
     }
 
+    /// Single-threaded q8 matvec for callers that already own a worker
+    /// thread (prefill workers): per-row results are bit-identical to the
+    /// pooled `matvec`.
+    pub(super) fn matvec_st(&self, x: &[f32], out: &mut [f32]) {
+        let xq = crate::quant::q8::quantize_q8(x);
+        for (r, o) in out.iter_mut().enumerate() {
+            *o = self.row_dot(r, &xq);
+        }
+    }
+
     /// Multi-lane head matvec: each q8 row is read once and dotted
     /// against every lane's quantized input; per-lane results are
     /// bit-identical to `matvec`.

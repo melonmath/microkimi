@@ -844,6 +844,33 @@ struct QwenMtpW {
     mlp_down: PackedT,
 }
 
+/// Q8 copies of one layer's large attention matrices (spine q8 mode):
+/// the f32 spine dominates per-token weight traffic, and quantizing it to
+/// q8 at load cuts that traffic roughly 4x on the covered matrices, the
+/// same trade llama.cpp makes everywhere. Norms, the convolution, the
+/// small b/a projections, and the MTP head stay f32. NOT bit-identical
+/// to the f32 spine (q8 rounding, same bound as the q8 lm_head); the
+/// quality delta is measured, not promised.
+pub(crate) enum LayerQ8 {
+    Linear {
+        in_qkv: crate::model::Q8Head,
+        in_z: crate::model::Q8Head,
+        out_proj: crate::model::Q8Head,
+    },
+    Full {
+        q_proj: crate::model::Q8Head,
+        k_proj: crate::model::Q8Head,
+        v_proj: crate::model::Q8Head,
+        o_proj: crate::model::Q8Head,
+    },
+}
+
+/// MICROKIMI_Q8_SPINE=1 enables the q8 spine at load (read per load so
+/// tests can exercise both modes in one process).
+fn q8_spine_enabled() -> bool {
+    std::env::var("MICROKIMI_Q8_SPINE").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Frequency-sliced draft head for chained MTP proposals. BPE vocabulary
 /// ids are roughly frequency-ordered by construction (earlier merges are
 /// more frequent), so the argmax over the first K rows plus the special
@@ -1031,6 +1058,8 @@ pub struct QwenModel {
     pub(crate) draft_head: Option<DraftHead>,
     /// Per-layer certified-skip bounds (dense layers, budget mode only).
     skip_bounds: Vec<Option<SkipBounds>>,
+    /// Q8 spine copies (spine q8 mode only; empty otherwise).
+    pub(crate) q8_spine: Vec<Option<LayerQ8>>,
     pub(crate) mtp_cache: FullCache,
     pub(crate) pos: usize,
     /// Logits after the last ingested token (state snapshots resume from
@@ -1581,6 +1610,59 @@ impl QwenModel {
             })
             .collect();
         let mtp_cache = FullCache::new(&c);
+        let q8_spine: Vec<Option<LayerQ8>> = if q8_spine_enabled() {
+            let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
+            let full_width = c.n_heads * c.head_dim;
+            let kvw = c.n_kv_heads * c.head_dim;
+            layers
+                .iter()
+                .map(|layer| {
+                    Some(match &layer.attn {
+                        QwenAttnW::Linear(w) => LayerQ8::Linear {
+                            in_qkv: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.in_qkv),
+                                conv_dim,
+                                c.d,
+                            ),
+                            in_z: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.in_z),
+                                c.lin_value_total(),
+                                c.d,
+                            ),
+                            out_proj: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.out_proj),
+                                c.d,
+                                c.lin_value_total(),
+                            ),
+                        },
+                        QwenAttnW::Full(w) => LayerQ8::Full {
+                            q_proj: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.q_proj),
+                                full_width * 2,
+                                c.d,
+                            ),
+                            k_proj: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.k_proj),
+                                kvw,
+                                c.d,
+                            ),
+                            v_proj: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.v_proj),
+                                kvw,
+                                c.d,
+                            ),
+                            o_proj: crate::model::Q8Head::from_f32(
+                                tensor(&bin.data, &w.o_proj),
+                                c.d,
+                                full_width,
+                            ),
+                        },
+                    })
+                })
+                .collect()
+        } else {
+            (0..c.n_layers).map(|_| None).collect()
+        };
         let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
             layers
                 .iter()
@@ -1606,6 +1688,7 @@ impl QwenModel {
             mtp,
             draft_head: None,
             skip_bounds,
+            q8_spine,
             mtp_cache,
             pos: 0,
             last_logits: Vec::new(),
@@ -1868,7 +1951,12 @@ impl QwenModel {
     }
 
     /// Advances the autoregressive decoder by one token and returns logits.
+    /// In q8-spine mode this delegates to the batched single-token prefill,
+    /// which carries the q8 routing (one code path, no drift).
     pub fn forward(&mut self, token: u32) -> Vec<f32> {
+        if self.q8_spine.iter().any(|x| x.is_some()) {
+            return self.prefill(&[token]);
+        }
         assert!(
             (token as usize) < self.cfg.vocab,
             "token {} is outside the Qwen vocabulary",
@@ -2022,6 +2110,10 @@ impl QwenModel {
     pub fn prefill_collect(&mut self, tokens: &[u32], all_logits: bool) -> QwenPrefillOut {
         assert!(!tokens.is_empty(), "prefill requires at least one token");
         if no_batch_prefill() {
+            assert!(
+                self.q8_spine.iter().all(|x| x.is_none()),
+                "the q8 spine requires the batched prefill (unset MICROKIMI_NO_QWEN_BATCH)"
+            );
             // A/B benchmarking fallback: one forward per token, bit-identical
             // logits. Final-norm hiddens are not recoverable from forward, so
             // they stay empty; the MTP drafter checks and refuses the toggle.
@@ -2068,12 +2160,15 @@ impl QwenModel {
                     rmsnorm(h, w, c.norm_eps as f32, n);
                 }
             }
+            let q8 = self.q8_spine[l].as_ref();
             match (&layer.attn, &mut self.caches[l]) {
                 (QwenAttnW::Linear(w), QwenCache::Linear(cache)) => {
-                    lin_attn_prefill(data, w, &c, &normed, t_count, cache, &mut attn_out);
+                    lin_attn_prefill(data, w, q8, &c, &normed, t_count, cache, &mut attn_out);
                 }
                 (QwenAttnW::Full(w), QwenCache::Full(cache)) => {
-                    full_attn_prefill(data, w, &c, &normed, t_count, self.pos, cache, &mut attn_out);
+                    full_attn_prefill(
+                        data, w, q8, &c, &normed, t_count, self.pos, cache, &mut attn_out,
+                    );
                 }
                 _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
             }
@@ -2142,15 +2237,21 @@ impl QwenModel {
 /// fans out over heads (each head replays its own token sequence), and the
 /// gated norm plus output projection fan out over tokens again. Per-token
 /// float operations are exactly those of `lin_attn_step`.
+#[allow(clippy::too_many_arguments)]
 fn lin_attn_prefill(
     data: &[u8],
     w: &QwenLinW,
+    q8: Option<&LayerQ8>,
     c: &QwenConfig,
     normed: &[f32],
     t_count: usize,
     cache: &mut LinCache,
     attn_out: &mut [f32],
 ) {
+    let q8_mats = q8.map(|q| match q {
+        LayerQ8::Linear { in_qkv, in_z, out_proj } => (in_qkv, in_z, out_proj),
+        LayerQ8::Full { .. } => unreachable!("q8 layer kind mismatch"),
+    });
     let d = c.d;
     let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
     let conv_dim = kt * 2 + vt;
@@ -2194,14 +2295,28 @@ fn lin_attn_prefill(
                 s.spawn(move || {
                     for i in 0..n {
                         let xt = &x[i * d..(i + 1) * d];
-                        crate::model::ops::matvec_st(
-                            in_qkv,
-                            conv_dim,
-                            d,
-                            xt,
-                            &mut qkv_c[i * conv_dim..(i + 1) * conv_dim],
-                        );
-                        crate::model::ops::matvec_st(in_z, vt, d, xt, &mut z_c[i * vt..(i + 1) * vt]);
+                        match q8_mats {
+                            Some((q_qkv, q_z, _)) => {
+                                q_qkv.matvec_st(xt, &mut qkv_c[i * conv_dim..(i + 1) * conv_dim]);
+                                q_z.matvec_st(xt, &mut z_c[i * vt..(i + 1) * vt]);
+                            }
+                            None => {
+                                crate::model::ops::matvec_st(
+                                    in_qkv,
+                                    conv_dim,
+                                    d,
+                                    xt,
+                                    &mut qkv_c[i * conv_dim..(i + 1) * conv_dim],
+                                );
+                                crate::model::ops::matvec_st(
+                                    in_z,
+                                    vt,
+                                    d,
+                                    xt,
+                                    &mut z_c[i * vt..(i + 1) * vt],
+                                );
+                            }
+                        }
                         crate::model::ops::matvec_st(
                             in_b,
                             heads,
@@ -2315,13 +2430,18 @@ fn lin_attn_prefill(
                                 c.norm_eps as f32,
                             );
                         }
-                        crate::model::ops::matvec_st(
-                            out_proj,
-                            d,
-                            vt,
-                            &mixed,
-                            &mut out_c[i * d..(i + 1) * d],
-                        );
+                        match q8_mats {
+                            Some((_, _, q_out)) => {
+                                q_out.matvec_st(&mixed, &mut out_c[i * d..(i + 1) * d])
+                            }
+                            None => crate::model::ops::matvec_st(
+                                out_proj,
+                                d,
+                                vt,
+                                &mixed,
+                                &mut out_c[i * d..(i + 1) * d],
+                            ),
+                        }
                     }
                 });
             }
@@ -2337,6 +2457,7 @@ fn lin_attn_prefill(
 fn full_attn_prefill(
     data: &[u8],
     w: &QwenFullW,
+    q8: Option<&LayerQ8>,
     c: &QwenConfig,
     normed: &[f32],
     t_count: usize,
@@ -2344,6 +2465,10 @@ fn full_attn_prefill(
     cache: &mut FullCache,
     attn_out: &mut [f32],
 ) {
+    let q8_mats = q8.map(|q| match q {
+        LayerQ8::Full { q_proj, k_proj, v_proj, o_proj } => (q_proj, k_proj, v_proj, o_proj),
+        LayerQ8::Linear { .. } => unreachable!("q8 layer kind mismatch"),
+    });
     let d = c.d;
     let hd = c.head_dim;
     let q_width = c.n_heads * hd;
@@ -2384,11 +2509,20 @@ fn full_attn_prefill(
                     for i in 0..n {
                         let xt = &x[i * d..(i + 1) * d];
                         let pos = base_pos + t0 + i;
-                        crate::model::ops::matvec_st(q_proj, q_width * 2, d, xt, &mut qg);
                         let k = &mut k_c[i * kv_width..(i + 1) * kv_width];
                         let v = &mut v_c[i * kv_width..(i + 1) * kv_width];
-                        crate::model::ops::matvec_st(k_proj, kv_width, d, xt, k);
-                        crate::model::ops::matvec_st(v_proj, kv_width, d, xt, v);
+                        match q8_mats {
+                            Some((qq, qk, qv, _)) => {
+                                qq.matvec_st(xt, &mut qg);
+                                qk.matvec_st(xt, k);
+                                qv.matvec_st(xt, v);
+                            }
+                            None => {
+                                crate::model::ops::matvec_st(q_proj, q_width * 2, d, xt, &mut qg);
+                                crate::model::ops::matvec_st(k_proj, kv_width, d, xt, k);
+                                crate::model::ops::matvec_st(v_proj, kv_width, d, xt, v);
+                            }
+                        }
                         let q = &mut q_c[i * q_width..(i + 1) * q_width];
                         let gate = &mut g_c[i * q_width..(i + 1) * q_width];
                         for h in 0..c.n_heads {
@@ -2462,7 +2596,18 @@ fn full_attn_prefill(
                         for (j, value) in mixed.iter_mut().enumerate() {
                             *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
                         }
-                        crate::model::ops::matvec_st(o_proj, d, q_width, &mixed, &mut out_c[i * d..(i + 1) * d]);
+                        match q8_mats {
+                            Some((_, _, _, qo)) => {
+                                qo.matvec_st(&mixed, &mut out_c[i * d..(i + 1) * d])
+                            }
+                            None => crate::model::ops::matvec_st(
+                                o_proj,
+                                d,
+                                q_width,
+                                &mixed,
+                                &mut out_c[i * d..(i + 1) * d],
+                            ),
+                        }
                     }
                 });
             }
@@ -2717,8 +2862,16 @@ impl QwenModel {
                     let mut b_raw = vec![vec![0.0f32; heads]; n];
                     let mut a_raw = vec![vec![0.0f32; heads]; n];
                     let xs: Vec<&[f32]> = normed.iter().map(|v| v.as_slice()).collect();
-                    multi(tensor(data, &w.in_qkv), conv_dim, d, &xs, &mut qkv);
-                    multi(tensor(data, &w.in_z), vt, d, &xs, &mut z);
+                    match self.q8_spine[l].as_ref() {
+                        Some(LayerQ8::Linear { in_qkv, in_z, .. }) => {
+                            multi_q8(in_qkv, &xs, &mut qkv);
+                            multi_q8(in_z, &xs, &mut z);
+                        }
+                        _ => {
+                            multi(tensor(data, &w.in_qkv), conv_dim, d, &xs, &mut qkv);
+                            multi(tensor(data, &w.in_z), vt, d, &xs, &mut z);
+                        }
+                    }
                     multi(tensor(data, &w.in_b), heads, d, &xs, &mut b_raw);
                     multi(tensor(data, &w.in_a), heads, d, &xs, &mut a_raw);
                     let conv_w = tensor(data, &w.conv);
@@ -2738,10 +2891,14 @@ impl QwenModel {
                                 unreachable!("lane cache kind mismatch");
                             };
                             let cfg = &c;
+                            let q8_out = match self.q8_spine[l].as_ref() {
+                                Some(LayerQ8::Linear { out_proj, .. }) => Some(out_proj),
+                                _ => None,
+                            };
                             scope.spawn(move || {
                                 lin_attn_tail(
                                     cfg, qkv_i, z_i, b_i, a_i, conv_w, a_log, dt_bias, norm_w,
-                                    out_proj, cache, out_i,
+                                    out_proj, q8_out, cache, out_i,
                                 );
                             });
                         }
@@ -2755,9 +2912,18 @@ impl QwenModel {
                     let mut k = vec![vec![0.0f32; kv_width]; n];
                     let mut v = vec![vec![0.0f32; kv_width]; n];
                     let xs: Vec<&[f32]> = normed.iter().map(|x| x.as_slice()).collect();
-                    multi(tensor(data, &w.q_proj), q_width * 2, d, &xs, &mut qg);
-                    multi(tensor(data, &w.k_proj), kv_width, d, &xs, &mut k);
-                    multi(tensor(data, &w.v_proj), kv_width, d, &xs, &mut v);
+                    match self.q8_spine[l].as_ref() {
+                        Some(LayerQ8::Full { q_proj, k_proj, v_proj, .. }) => {
+                            multi_q8(q_proj, &xs, &mut qg);
+                            multi_q8(k_proj, &xs, &mut k);
+                            multi_q8(v_proj, &xs, &mut v);
+                        }
+                        _ => {
+                            multi(tensor(data, &w.q_proj), q_width * 2, d, &xs, &mut qg);
+                            multi(tensor(data, &w.k_proj), kv_width, d, &xs, &mut k);
+                            multi(tensor(data, &w.v_proj), kv_width, d, &xs, &mut v);
+                        }
+                    }
                     let q_norm = tensor(data, &w.q_norm);
                     let k_norm = tensor(data, &w.k_norm);
                     let mut mixed = vec![vec![0.0f32; q_width]; n];
@@ -2779,7 +2945,10 @@ impl QwenModel {
                         }
                     });
                     let ms: Vec<&[f32]> = mixed.iter().map(|x| x.as_slice()).collect();
-                    multi(tensor(data, &w.o_proj), d, q_width, &ms, &mut attn_out);
+                    match self.q8_spine[l].as_ref() {
+                        Some(LayerQ8::Full { o_proj, .. }) => multi_q8(o_proj, &ms, &mut attn_out),
+                        _ => multi(tensor(data, &w.o_proj), d, q_width, &ms, &mut attn_out),
+                    }
                 }
             }
             for i in 0..n {
@@ -2890,6 +3059,12 @@ fn multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [Vec<f32
     crate::model::ops::matvec_multi(w, rows, cols, xs, &mut refs);
 }
 
+/// q8 multi-lane matvec over Vec<Vec<f32>> outputs (spine q8 mode).
+fn multi_q8(w: &crate::model::Q8Head, xs: &[&[f32]], outs: &mut [Vec<f32>]) {
+    let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|o| o.as_mut_slice()).collect();
+    w.matvec_multi(xs, &mut refs);
+}
+
 /// Post-projection tail of one linear-attention step for one lane:
 /// exactly the ops of `lin_attn_step` after its four matvecs.
 #[allow(clippy::too_many_arguments)]
@@ -2904,6 +3079,7 @@ fn lin_attn_tail(
     dt_bias: &[f32],
     norm_w: &[f32],
     out_proj: &[f32],
+    q8_out: Option<&crate::model::Q8Head>,
     cache: &mut LinCache,
     out: &mut [f32],
 ) {
@@ -2942,7 +3118,10 @@ fn lin_attn_tail(
         let (a, b) = (h * vd, (h + 1) * vd);
         rmsnorm_gated(&mut mixed[a..b], norm_w, &z[a..b], c.norm_eps as f32);
     }
-    crate::model::ops::matvec_st(out_proj, c.d, vt, &mixed, out);
+    match q8_out {
+        Some(q) => q.matvec_st(&mixed, out),
+        None => crate::model::ops::matvec_st(out_proj, c.d, vt, &mixed, out),
+    }
 }
 
 /// Post-projection tail of one full-attention step for one lane: exactly
@@ -3646,6 +3825,54 @@ mod model_tests {
             std::fs::remove_file(other_path).ok();
             std::fs::remove_file(mem_path).ok();
         }
+    }
+
+    #[test]
+    fn q8_spine_paths_agree_and_differ_from_f32() {
+        let c = bin_tiny_dense();
+        let path = checkpoint_fixture(&c);
+        let tokens = [3u32, 5, 7, 11, 2];
+
+        // reference f32 logits
+        let mut f32_model = QwenModel::load(&path);
+        let f32_logits = f32_model.prefill(&tokens);
+
+        unsafe { std::env::set_var("MICROKIMI_Q8_SPINE", "1") };
+        let mut q8_model = QwenModel::load(&path);
+        let mut q8_forward = QwenModel::load(&path);
+        let mut q8_lanes_model = QwenModel::load(&path);
+        unsafe { std::env::remove_var("MICROKIMI_Q8_SPINE") };
+        assert!(q8_model.q8_spine.iter().all(|x| x.is_some()));
+
+        // prefill vs forward (delegated) agree exactly
+        let q8_logits = q8_model.prefill(&tokens);
+        let mut fwd_logits = Vec::new();
+        for &t in &tokens {
+            fwd_logits = q8_forward.forward(t);
+        }
+        assert_eq!(q8_logits, fwd_logits, "q8 forward diverges from q8 prefill");
+
+        // lanes agree with single-stream under q8
+        let mut lane = DecodeLane::new(&q8_lanes_model);
+        q8_lanes_model.prefill_lane(&mut lane, &tokens[..4]);
+        let mut refs = vec![&mut lane];
+        let lane_logits = q8_lanes_model.forward_lanes(&mut refs, &tokens[4..5]);
+        let mut single = QwenModel::load(&path);
+        // fresh f32 model for shape only; rebuild a q8 single-stream ref
+        drop(single);
+        unsafe { std::env::set_var("MICROKIMI_Q8_SPINE", "1") };
+        let mut q8_single = QwenModel::load(&path);
+        unsafe { std::env::remove_var("MICROKIMI_Q8_SPINE") };
+        q8_single.prefill(&tokens[..4]);
+        let single_logits = q8_single.forward(tokens[4]);
+        assert_eq!(lane_logits[0], single_logits, "q8 lanes diverge from single-stream");
+
+        // and the mode is actually active: q8 output differs from f32
+        assert_ne!(q8_logits, f32_logits, "q8 spine produced f32-identical logits");
+        assert!(q8_logits.iter().all(|v| v.is_finite()));
+
+        drop((f32_model, q8_model, q8_forward, q8_lanes_model, q8_single));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

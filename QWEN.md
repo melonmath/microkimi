@@ -226,6 +226,30 @@ token stream. Requests are served one at a time against the single
 stateful decoder; the default bind is 127.0.0.1 and there is no
 authentication layer - put a reverse proxy in front for anything else.
 
+## Q8 spine
+
+`MICROKIMI_Q8_SPINE=1` quantizes every large attention matrix (the
+linear layers' in_qkv / in_z / out_proj, the full layers' q / k / v / o)
+to q8 at load, the same trade llama.cpp makes everywhere: the f32 spine
+dominates per-token weight traffic, and q8 cuts it about 4x on the
+covered matrices. Norms, the convolution, the small b/a projections, and
+the MTP head stay f32; the packed MLP was already 4-bit. All three
+execution paths route through the same q8 copies (the single-token
+forward delegates to the batched prefill), and their agreement is
+tested; the mode is NOT bit-identical to the f32 spine and is off by
+default.
+
+Measured on the real 0.8B: decode 36 vs 57-73 ms/token in paired runs
+(about 1.6x, 27.8 tok/s single-stream on this shared container), and
+held-out NLL 2.7952 vs 2.7961 - a -0.0009 delta, indistinguishable from
+the exact spine on this corpus. Combined with lane batching, eight q8
+lanes reached 84.1 aggregate tok/s (2.98x median over the q8
+single-stream in in-process A/B rounds). Session baseline was 9 tok/s:
+the q8 spine plus the batched prefill closed most of the gap to
+integer-kernel engines; what remains is their hand-tuned micro-kernels
+and 4-bit spines, both open follow-ups (the MXFP4 machinery already in
+the engine is the natural next step for the spine).
+
 ## Chained drafting and lane-batched decoding
 
 Two throughput mechanisms, both bit-identical to plain decoding and both
