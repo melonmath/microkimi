@@ -123,6 +123,31 @@ DeltaNet output norm uses direct multipliers. The runtime preserves this
 distinction, Qwen's per-head query/gate interleave, grouped-query cache layout,
 and the exact full-softmax then top-k renormalization order.
 
+## Calibrated quantization (dense variant)
+
+The dense MLP is traversed by every token of every layer, so its MXFP4
+error costs more than a routed expert's. `microkimi calibrate` runs a
+corpus through a converted dense model and accumulates the mean squared
+input of each packed matrix per column (the hidden stream for
+`gate_proj`/`up_proj`, the SiLU-gated activation for `down_proj`);
+`convert-qwen --imatrix` then makes the per-group scale search minimize
+the importance-weighted error instead of the plain one:
+
+```bash
+./target/release/microkimi calibrate --model qwen.bin \
+  --text calibration.txt --out qwen.imx --max-tokens 8192
+./target/release/microkimi convert-qwen \
+  --source /path/to/checkpoint --out qwen-imx.bin --imatrix qwen.imx
+```
+
+Nibble assignment stays nearest-level and the byte layout is unchanged,
+so the weighted file runs everywhere an unweighted one does. Uniform
+importances reproduce the unweighted bytes exactly, and the weighted
+search never loses on its own metric (both unit-tested). The calibration
+runs on an already-converted model, so the statistics see MXFP4 rather
+than bf16 activations upstream; this is the standard imatrix compromise.
+MTP tensors stay unweighted (their activations are not in the pass).
+
 ## Adapter packs
 
 The generic `MKADAPT1` format works on Qwen float spine matrices. Convert an

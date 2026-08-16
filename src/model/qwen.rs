@@ -1045,9 +1045,13 @@ fn packed_dense_mlp(
     down: &PackedT,
     c: &QwenConfig,
     x: &[f32],
+    imatrix_layer: Option<usize>,
 ) -> Vec<f32> {
     let inter = c.dense_inter;
     let threads = crate::model::pool::pool().workers.max(1);
+    if let Some(l) = imatrix_layer {
+        crate::quant::imatrix::record_hidden(l, x);
+    }
     let mut h_gate = vec![0.0f32; inter];
     let mut h_up = vec![0.0f32; inter];
     let (pg, sg) = packed_parts(data, gate);
@@ -1056,6 +1060,9 @@ fn packed_dense_mlp(
     crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, x, &mut h_up, threads);
     for i in 0..inter {
         h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+    }
+    if let Some(l) = imatrix_layer {
+        crate::quant::imatrix::record_inter(l, &h_gate);
     }
     let mut out = vec![0.0f32; c.d];
     let (pd, sd) = packed_parts(data, down);
@@ -1463,7 +1470,7 @@ impl QwenModel {
             x[i] += attn_out[i];
         }
         rmsnorm(&x, tensor(data, &mtp.post_norm), c.norm_eps as f32, &mut normed);
-        let mlp = packed_dense_mlp(data, &mtp.mlp_gate, &mtp.mlp_up, &mtp.mlp_down, &c, &normed);
+        let mlp = packed_dense_mlp(data, &mtp.mlp_gate, &mtp.mlp_up, &mtp.mlp_down, &c, &normed, None);
         for i in 0..d {
             x[i] += mlp[i];
         }
@@ -1561,7 +1568,7 @@ impl QwenModel {
                     shared_gate,
                 } => packed_moe(data, router, experts, shared, shared_gate, c, &normed),
                 QwenMlpW::Dense { gate, up, down } => {
-                    packed_dense_mlp(data, gate, up, down, c, &normed)
+                    packed_dense_mlp(data, gate, up, down, c, &normed, Some(l))
                 }
             };
             for i in 0..d {
@@ -2449,6 +2456,13 @@ pub fn dump_cmd(args: &[String]) {
     println!("Qwen logits: {}", out_path);
 }
 
+/// Test-only checkpoint builder shared with the converter tests: writes a
+/// deterministic MKIM0002 fixture for `c` and returns its path.
+#[cfg(test)]
+pub fn test_fixture(c: &QwenConfig) -> String {
+    model_tests::checkpoint_fixture(c)
+}
+
 #[cfg(test)]
 mod model_tests {
     use super::*;
@@ -2473,7 +2487,7 @@ mod model_tests {
         c
     }
 
-    fn checkpoint_fixture(c: &QwenConfig) -> String {
+    pub(super) fn checkpoint_fixture(c: &QwenConfig) -> String {
         let path = std::env::temp_dir()
             .join(format!(
                 "microkimi_qwen_fixture_{}_{}_{}l_{}d_{}m.bin",

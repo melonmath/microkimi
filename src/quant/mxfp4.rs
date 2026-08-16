@@ -36,24 +36,38 @@ pub fn dequant(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f3
 /// error; each value → nearest e2m1 level to v/2^scale_exp (midpoint
 /// cutoffs). Returns (packed, scales).
 pub fn quantize(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
-    quantize_impl(w, rows, cols, true)
+    quantize_impl(w, rows, cols, true, None)
+}
+
+/// Importance-weighted quantization: the per-group scale search minimizes
+/// the squared error weighted by `col_imp` (one weight per input column,
+/// e.g. the mean squared activation from a calibration run). The nibble
+/// assignment stays nearest-level - per element the nearest grid point is
+/// optimal under any positive weight - so only the scale choice moves.
+/// Byte layout and dtype are unchanged: the runtime cannot tell a weighted
+/// blob from an unweighted one.
+pub fn quantize_weighted(w: &[f32], rows: usize, cols: usize, col_imp: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(col_imp.len(), cols, "one importance weight per column");
+    quantize_impl(w, rows, cols, true, Some(col_imp))
 }
 
 /// The pre-search scale rule (naive e = ceil(log2(maxabs/6)) verbatim, no
 /// candidate search). Kept for the A/B measurement in test_cmd and for the
 /// never-worse unit test.
 pub fn quantize_naive(w: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
-    quantize_impl(w, rows, cols, false)
+    quantize_impl(w, rows, cols, false, None)
 }
 
 /// Squared quantization error of one 32-value group at scale exponent e,
 /// under the same nearest-level e2m1 assignment quantize_impl packs with.
-fn group_sse(group: &[f32], e: i32) -> f64 {
+/// With `imp`, each element's squared error is weighted by its column
+/// importance.
+fn group_sse(group: &[f32], e: i32, imp: Option<&[f32]>) -> f64 {
     const BOUNDS: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
     let inv = 1.0 / exp2_i(e);
     let s = exp2_i(e) as f64;
     let mut sse = 0f64;
-    for &v in group {
+    for (j, &v) in group.iter().enumerate() {
         let q = (v * inv).clamp(-6.0, 6.0);
         let mag = q.abs();
         let mut idx = 0usize;
@@ -63,7 +77,7 @@ fn group_sse(group: &[f32], e: i32) -> f64 {
         let lvl = E2M1[idx] as f64;
         let dq = (if q.is_sign_negative() { -lvl } else { lvl }) * s;
         let d = v as f64 - dq;
-        sse += d * d;
+        sse += d * d * imp.map_or(1.0, |w| w[j] as f64);
     }
     sse
 }
@@ -75,14 +89,19 @@ fn group_sse(group: &[f32], e: i32) -> f64 {
 /// e is scored first and wins ties, candidates outside [-127, 128] are
 /// skipped, so the returned exponent is never worse than e on the group.
 pub fn search_mx_scale(group: &[f32], e: i32) -> i32 {
+    search_mx_scale_weighted(group, e, None)
+}
+
+/// `search_mx_scale` under an optional per-column importance weighting.
+fn search_mx_scale_weighted(group: &[f32], e: i32, imp: Option<&[f32]>) -> i32 {
     debug_assert_eq!(group.len(), 32);
     let mut best = e;
-    let mut best_sse = group_sse(group, e);
+    let mut best_sse = group_sse(group, e, imp);
     for cand in [e - 1, e + 1] {
         if !(-127..=128).contains(&cand) {
             continue;
         }
-        let sse = group_sse(group, cand);
+        let sse = group_sse(group, cand, imp);
         if sse < best_sse {
             best_sse = sse;
             best = cand;
@@ -91,7 +110,13 @@ pub fn search_mx_scale(group: &[f32], e: i32) -> i32 {
     best
 }
 
-fn quantize_impl(w: &[f32], rows: usize, cols: usize, search: bool) -> (Vec<u8>, Vec<u8>) {
+fn quantize_impl(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    search: bool,
+    col_imp: Option<&[f32]>,
+) -> (Vec<u8>, Vec<u8>) {
     assert!(cols % 32 == 0);
     let mut packed = vec![0u8; rows * cols / 2];
     let mut scales = vec![0u8; rows * cols / 32];
@@ -110,7 +135,8 @@ fn quantize_impl(w: &[f32], rows: usize, cols: usize, search: bool) -> (Vec<u8>,
             .max(-127)
             .min(128);
             if search && maxabs != 0.0 {
-                e = search_mx_scale(group, e);
+                let imp = col_imp.map(|imp| &imp[g * 32..(g + 1) * 32]);
+                e = search_mx_scale_weighted(group, e, imp);
             }
             scales[r * cols / 32 + g] = (e + 127).clamp(0, 255) as u8;
             let inv = 1.0 / exp2_i(e);
@@ -542,6 +568,41 @@ pub fn matvec_packed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_quantization_never_loses_on_the_weighted_metric() {
+        let (rows, cols) = (8usize, 64usize);
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 61 + 17) % 509) as f32 - 254.0) * 0.003)
+            .collect();
+        // strongly skewed importances: a few hot columns dominate
+        let imp: Vec<f32> = (0..cols)
+            .map(|c| if c % 16 == 0 { 40.0 } else { 0.2 })
+            .collect();
+        let weighted_err = |packed: &[u8], scales: &[u8]| -> f64 {
+            let dq = dequant(packed, scales, rows, cols);
+            (0..rows * cols)
+                .map(|i| {
+                    let d = (w[i] - dq[i]) as f64;
+                    d * d * imp[i % cols] as f64
+                })
+                .sum()
+        };
+        let (p0, s0) = quantize(&w, rows, cols);
+        let (p1, s1) = quantize_weighted(&w, rows, cols, &imp);
+        assert_eq!(p1.len(), p0.len());
+        assert_eq!(s1.len(), s0.len());
+        let (e0, e1) = (weighted_err(&p0, &s0), weighted_err(&p1, &s1));
+        assert!(
+            e1 <= e0,
+            "weighted search must not lose on its own metric: {} vs {}",
+            e1,
+            e0
+        );
+        // uniform weights reproduce the unweighted bytes exactly
+        let (pu, su) = quantize_weighted(&w, rows, cols, &vec![1.0; cols]);
+        assert_eq!((pu, su), (p0, s0));
+    }
 
     /// Per-32-group squared errors between w and dequant(packed, scales).
     fn block_errors(w: &[f32], rows: usize, cols: usize, packed: &[u8], scales: &[u8]) -> Vec<f64> {

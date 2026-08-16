@@ -250,9 +250,10 @@ fn main() {
             println!("Build & slice:");
             println!("  microkimi build                      builds microkimi-debug.bin (K3 fetch + generation)");
             println!("  microkimi build-ds                   builds microdeepseek-debug.bin (DeepSeek-V4 fetch + generation)");
-            println!("  microkimi convert-qwen --source DIR --out MODEL.bin [--audit-only]");
-            println!("                                         converts a local Qwen3.5-MoE text checkpoint;");
-            println!("                                         f32 spine + per-expert MXFP4, bounded conversion RAM");
+            println!("  microkimi convert-qwen --source DIR --out MODEL.bin [--audit-only] [--imatrix F]");
+            println!("                                         converts a local Qwen3.5-family text checkpoint (MoE or dense);");
+            println!("                                         f32 spine + MXFP4 experts or dense MLP, bounded conversion RAM;");
+            println!("                                         --imatrix: calibration-weighted MXFP4 scales (dense, see calibrate)");
             println!("  microkimi complete-batch --model X.bin --input REQUESTS.jsonl --out RESULTS.jsonl");
             println!("                        deterministic greedy completions, one model load; --chat optional;");
             println!("  microkimi slice --model X.bin --out Y.bin [--hidden N] [--experts N] [--layers \"0-11\"]");

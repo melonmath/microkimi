@@ -60,20 +60,23 @@ static ACC: Mutex<Option<Imatrix>> = Mutex::new(None);
 
 /// Arms the accumulator (calibration start). `moe_layers` ascending.
 pub fn start(cfg: &crate::config::Config, moe_layers: Vec<u32>) {
-    let im = Imatrix {
-        n_layers: cfg.n_layers,
-        routed_hidden: cfg.routed_hidden,
-        moe_inter: cfg.moe_inter,
-        tokens: 0,
-        layers: moe_layers,
-        hidden: Vec::new(),
-        inter: Vec::new(),
-    };
-    let n = im.layers.len();
+    start_dims(cfg.n_layers, cfg.routed_hidden, cfg.moe_inter, moe_layers);
+}
+
+/// Dimension-explicit accumulator start. The K3 MoE path stores the routed
+/// expert input width and expert intermediate width; the Qwen dense path
+/// stores the hidden size (gate/up input) and the dense MLP width (down
+/// input) in the same two slots.
+pub fn start_dims(n_layers: usize, hidden_w: usize, inter_w: usize, layers: Vec<u32>) {
+    let n = layers.len();
     *ACC.lock().unwrap() = Some(Imatrix {
-        hidden: vec![vec![0.0; cfg.routed_hidden]; n],
-        inter: vec![vec![0.0; cfg.moe_inter]; n],
-        ..im
+        n_layers,
+        routed_hidden: hidden_w,
+        moe_inter: inter_w,
+        tokens: 0,
+        layers,
+        hidden: vec![vec![0.0; hidden_w]; n],
+        inter: vec![vec![0.0; inter_w]; n],
     });
     ACTIVE.store(true, Ordering::Relaxed);
 }
@@ -182,8 +185,11 @@ pub fn calibrate_cmd(args: &[String]) {
     };
     let mp = crate::model_flag(args).unwrap_or_else(crate::bin_path);
     if crate::quant::weights::read_config(&mp).ds.is_some() {
-        eprintln!("error: calibrate is only supported for K3 models (not DeepSeek-V4)");
+        eprintln!("error: calibrate is only supported for K3 and Qwen models (not DeepSeek-V4)");
         std::process::exit(1);
+    }
+    if let Some(qcfg) = crate::quant::weights::read_config(&mp).qwen.clone() {
+        return calibrate_qwen(args, &mp, &qcfg, &text_path, &text, &out, tl);
     }
     let tok = crate::load_any_tokenizer(&mp, crate::vocab_flag(args), crate::quant::weights::read_config(&mp).vocab);
     let mut model = crate::model::Model::load(&mp);
@@ -242,6 +248,83 @@ pub fn calibrate_cmd(args: &[String]) {
         std::process::exit(1);
     }
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "calibrate: {} tokens in {:.1?} (load {:.1?}) - imatrix saved to {} ({:.1} KB)",
+        ids.len(),
+        tp.elapsed(),
+        tl.elapsed(),
+        out,
+        size as f64 / 1024.0
+    );
+}
+
+/// Qwen dense calibration: raw-encodes the corpus with the Qwen tokenizer
+/// and forwards it token by token; the packed_dense_mlp hooks accumulate
+/// the per-layer input moments of the MLP matrices (gate/up input = hidden
+/// stream, down input = SiLU-gated activation). MoE Qwen decoders are
+/// rejected: their per-expert activations are not accumulated.
+fn calibrate_qwen(
+    args: &[String],
+    mp: &str,
+    qcfg: &crate::config::QwenConfig,
+    text_path: &str,
+    text: &str,
+    out: &str,
+    tl: std::time::Instant,
+) {
+    if !qcfg.is_dense() {
+        eprintln!("error: calibrate supports the dense Qwen variant only (routed experts are not accumulated)");
+        std::process::exit(1);
+    }
+    let tok = crate::load_qwen_any_tokenizer(mp, crate::vocab_flag(args), qcfg.vocab);
+    let mut model = crate::model::qwen::QwenModel::load(mp);
+    let text_owned = match crate::value_flag(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if text.len() > n * 6 => {
+            let mut cap = n * 6;
+            while !text.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            text[..cap].to_string()
+        }
+        _ => text.to_string(),
+    };
+    let mut ids = tok.encode_raw(&text_owned);
+    if let Some(n) = crate::value_flag(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()) {
+        ids.truncate(n);
+    }
+    println!(
+        "calibrate: {} ({} bytes -> {} tokens), {} dense layers x ({} hidden + {} inter)",
+        text_path,
+        text_owned.len(),
+        ids.len(),
+        qcfg.n_layers,
+        qcfg.d,
+        qcfg.dense_inter
+    );
+    start_dims(
+        qcfg.n_layers,
+        qcfg.d,
+        qcfg.dense_inter,
+        (0..qcfg.n_layers as u32).collect(),
+    );
+    model.reset();
+    let tp = std::time::Instant::now();
+    let chunk: usize = crate::value_flag(args, "--chunk").and_then(|s| s.parse().ok()).unwrap_or(512);
+    for (done, &id) in ids.iter().enumerate() {
+        if done > 0 && done % chunk == 0 {
+            model.reset();
+        }
+        model.forward(id);
+        tick();
+        if (done + 1) % 2000 == 0 {
+            println!("  {} tokens ({:.1?})", done + 1, tp.elapsed());
+        }
+    }
+    if let Err(e) = stop_and_save(out) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     println!(
         "calibrate: {} tokens in {:.1?} (load {:.1?}) - imatrix saved to {} ({:.1} KB)",
         ids.len(),

@@ -892,11 +892,27 @@ fn write_f32_tensor(
     }
 }
 
-fn quantize_parallel(values: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+fn quantize_parallel(
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+    imp: Option<&[f32]>,
+) -> (Vec<u8>, Vec<u8>) {
+    fn quantize_rows(
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+        imp: Option<&[f32]>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        match imp {
+            Some(weights) => crate::quant::mxfp4::quantize_weighted(values, rows, cols, weights),
+            None => crate::quant::mxfp4::quantize(values, rows, cols),
+        }
+    }
     let workers = crate::model::pool::pool().workers;
     let jobs_count = workers.min(rows).min((rows * cols).div_ceil(16_384)).max(1);
     if jobs_count == 1 {
-        return crate::quant::mxfp4::quantize(values, rows, cols);
+        return quantize_rows(values, rows, cols, imp);
     }
     let rows_per_job = rows.div_ceil(jobs_count);
     let mut packed = vec![0u8; rows * cols / 2];
@@ -904,6 +920,7 @@ fn quantize_parallel(values: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<
     let vp = crate::model::pool::SPtr(values.as_ptr());
     let pp = crate::model::pool::MPtrU8(packed.as_mut_ptr());
     let sp = crate::model::pool::MPtrU8(scales.as_mut_ptr());
+    let ip = imp.map(|w| crate::model::pool::SPtr(w.as_ptr()));
     let mut jobs: Vec<crate::model::pool::Job> = Vec::with_capacity(jobs_count);
     for job in 0..jobs_count {
         let row0 = job * rows_per_job;
@@ -912,11 +929,11 @@ fn quantize_parallel(values: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<
             break;
         }
         jobs.push(Box::new(move || {
-            let (vp, pp, sp) = (vp, pp, sp);
+            let (vp, pp, sp, ip) = (vp, pp, sp, ip);
             unsafe {
                 let input = std::slice::from_raw_parts(vp.0.add(row0 * cols), (row1 - row0) * cols);
-                let (local_packed, local_scales) =
-                    crate::quant::mxfp4::quantize(input, row1 - row0, cols);
+                let imp = ip.map(|w| std::slice::from_raw_parts(w.0, cols));
+                let (local_packed, local_scales) = quantize_rows(input, row1 - row0, cols, imp);
                 std::ptr::copy_nonoverlapping(
                     local_packed.as_ptr(),
                     pp.0.add(row0 * cols / 2),
@@ -937,6 +954,7 @@ fn quantize_parallel(values: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<
 /// Quantizes one whole source matrix to MXFP4 in bounded row blocks. The
 /// output blob is all packed nibbles then all scales, so each block lands
 /// at two computed offsets.
+#[allow(clippy::too_many_arguments)]
 fn write_packed_streamed(
     source: &StSource,
     source_name: &str,
@@ -944,11 +962,13 @@ fn write_packed_streamed(
     cols: usize,
     file: &mut std::fs::File,
     offset: u64,
+    imp: Option<&[f32]>,
 ) {
     let rows_per_block = (CHUNK_BYTES / (cols * 4)).max(1);
-    write_packed_blocks(source, source_name, rows, cols, file, offset, rows_per_block);
+    write_packed_blocks(source, source_name, rows, cols, file, offset, rows_per_block, imp);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_packed_blocks(
     source: &StSource,
     source_name: &str,
@@ -957,13 +977,14 @@ fn write_packed_blocks(
     file: &mut std::fs::File,
     offset: u64,
     rows_per_block: usize,
+    imp: Option<&[f32]>,
 ) {
     let scales_base = offset + (rows * cols / 2) as u64;
     let mut row = 0usize;
     while row < rows {
         let n = (rows - row).min(rows_per_block);
         let values = source.read_f32(source_name, row * cols, n * cols);
-        let (packed, scales) = quantize_parallel(&values, n, cols);
+        let (packed, scales) = quantize_parallel(&values, n, cols, imp);
         file.seek(SeekFrom::Start(offset + (row * cols / 2) as u64))
             .unwrap();
         file.write_all(&packed).unwrap();
@@ -998,13 +1019,28 @@ fn write_expert(
         ),
         PlanSource::F32(_) | PlanSource::Packed(_) => unreachable!(),
     };
-    let (packed, scales) = quantize_parallel(&values, rows, cols);
+    let (packed, scales) = quantize_parallel(&values, rows, cols, None);
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&packed).unwrap();
     file.write_all(&scales).unwrap();
 }
 
-/// `microkimi convert-qwen --source DIR --out MODEL.bin`.
+/// Column weights for one packed dense-MLP tensor from a calibration
+/// imatrix: gate/up read the hidden stream (hidden sums), down reads the
+/// SiLU-gated activation (inter sums). MTP tensors stay unweighted (their
+/// activations are not part of the calibration pass).
+fn imatrix_col_weights(im: &crate::quant::imatrix::Imatrix, name: &str) -> Option<Vec<f32>> {
+    let rest = name.strip_prefix("model.language_model.layers.")?;
+    let (layer, kind) = rest.split_once('.')?;
+    let layer: usize = layer.parse().ok()?;
+    match kind {
+        "mlp.gate_proj.weight" | "mlp.up_proj.weight" => im.col_weights(layer, "w1"),
+        "mlp.down_proj.weight" => im.col_weights(layer, "w2"),
+        _ => None,
+    }
+}
+
+/// `microkimi convert-qwen --source DIR --out MODEL.bin [--imatrix F]`.
 pub fn run(args: &[String]) {
     let value = |flag: &str| {
         args.iter()
@@ -1031,6 +1067,26 @@ pub fn run(args: &[String]) {
         c.mtp_layers = 1;
         println!("multi-token-prediction head found: converting the draft layer");
     }
+    let imatrix = value("--imatrix").map(|path| {
+        let im = crate::quant::imatrix::load(&path)
+            .unwrap_or_else(|e| panic!("--imatrix: {}", e));
+        assert!(
+            c.is_dense(),
+            "--imatrix weighting is supported for the dense variant only"
+        );
+        assert!(
+            im.n_layers == c.n_layers
+                && im.routed_hidden == c.d
+                && im.moe_inter == c.dense_inter
+                && im.tokens > 0,
+            "--imatrix: calibration dimensions do not match this checkpoint"
+        );
+        println!(
+            "importance matrix: {} ({} calibration tokens)",
+            path, im.tokens
+        );
+        im
+    });
     let expected = expected_sources(&c);
     for (name, shape) in &expected {
         source.expect(name, shape);
@@ -1107,6 +1163,9 @@ pub fn run(args: &[String]) {
                 write_f32_tensor(&source, source_name, elements, &mut file, offset);
             }
             PlanSource::Packed(source_name) => {
+                let imp = imatrix
+                    .as_ref()
+                    .and_then(|im| imatrix_col_weights(im, source_name));
                 write_packed_streamed(
                     &source,
                     source_name,
@@ -1114,6 +1173,7 @@ pub fn run(args: &[String]) {
                     item.dims[1] as usize,
                     &mut file,
                     offset,
+                    imp.as_deref(),
                 );
             }
             PlanSource::Gate { .. } | PlanSource::Down { .. } => {
@@ -1304,6 +1364,59 @@ mod tests {
     }
 
     #[test]
+    fn dense_imatrix_roundtrip_yields_column_weights() {
+        let mut c = QwenConfig::qwen38_dense();
+        c.n_layers = 4;
+        c.d = 32;
+        c.vocab = 64;
+        c.n_heads = 2;
+        c.n_kv_heads = 1;
+        c.head_dim = 16;
+        c.lin_k_heads = 1;
+        c.lin_v_heads = 1;
+        c.lin_k_dim = 32;
+        c.lin_v_dim = 32;
+        c.dense_inter = 64;
+        let bin_path = crate::model::qwen::test_fixture(&c);
+        let mut model = crate::model::qwen::QwenModel::load(&bin_path);
+        crate::quant::imatrix::start_dims(
+            c.n_layers,
+            c.d,
+            c.dense_inter,
+            (0..c.n_layers as u32).collect(),
+        );
+        for &t in &[3u32, 5, 7] {
+            model.forward(t);
+            crate::quant::imatrix::tick();
+        }
+        let im_path = std::env::temp_dir()
+            .join(format!("microkimi_qwen_imatrix_{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        crate::quant::imatrix::stop_and_save(&im_path).unwrap();
+        let im = crate::quant::imatrix::load(&im_path).unwrap();
+        assert_eq!(im.tokens, 3);
+        assert_eq!((im.routed_hidden, im.moe_inter), (c.d, c.dense_inter));
+
+        let gate = imatrix_col_weights(&im, "model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("gate weights");
+        assert_eq!(gate.len(), c.d);
+        assert!(gate.iter().any(|&w| w > 0.0));
+        let down = imatrix_col_weights(&im, "model.language_model.layers.2.mlp.down_proj.weight")
+            .expect("down weights");
+        assert_eq!(down.len(), c.dense_inter);
+        assert!(imatrix_col_weights(&im, "mtp.layers.0.mlp.gate_proj.weight").is_none());
+        assert!(
+            imatrix_col_weights(&im, "model.language_model.layers.0.self_attn.q_proj.weight")
+                .is_none()
+        );
+
+        drop(model);
+        std::fs::remove_file(bin_path).ok();
+        std::fs::remove_file(im_path).ok();
+    }
+
+    #[test]
     fn streamed_packed_write_matches_one_shot_quantization() {
         let (rows, cols) = (7usize, 64usize);
         let values: Vec<f32> = (0..rows * cols)
@@ -1324,7 +1437,7 @@ mod tests {
         ));
         let mut file = std::fs::File::create(&out_path).unwrap();
         // three rows per block: exercises full blocks plus a short tail
-        write_packed_blocks(&source, "m", rows, cols, &mut file, 0, 3);
+        write_packed_blocks(&source, "m", rows, cols, &mut file, 0, 3, None);
         file.sync_all().unwrap();
         let written = std::fs::read(&out_path).unwrap();
         let (packed, scales) = crate::quant::mxfp4::quantize(&values, rows, cols);
@@ -1340,7 +1453,7 @@ mod tests {
             .map(|i| (((i * 37 + 11) % 257) as f32 - 128.0) * 0.0007)
             .collect();
         let serial = crate::quant::mxfp4::quantize(&values, rows, cols);
-        let parallel = quantize_parallel(&values, rows, cols);
+        let parallel = quantize_parallel(&values, rows, cols, None);
         assert_eq!(parallel, serial);
     }
 }
