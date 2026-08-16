@@ -166,6 +166,15 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
     p.run(jobs);
 }
 
+/// Single-threaded f32 matrix × vector for callers that already own a
+/// worker thread (batched prefill): per-row results are bit-identical to
+/// the pooled `matvec`, which chunks whole rows across jobs.
+pub fn matvec_st(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) {
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = dot(&w[r * cols..(r + 1) * cols], x);
+    }
+}
+
 // ── q8_0 lm_head (runtime copy, built once at load) ──
 //
 // The final logits projection re-reads the whole f32 lm_head tensor every

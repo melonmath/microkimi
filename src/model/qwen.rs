@@ -1377,7 +1377,597 @@ impl QwenModel {
     }
 }
 
-/// Shared generation loop for the Qwen runtime.
+// ───────────────────────── batched layers-outer prefill ─────────────────────────
+
+/// Number of prefill worker threads (the shared pool size; prefill phases
+/// use scoped threads over contiguous token or head ranges).
+fn prefill_workers(items: usize) -> usize {
+    crate::model::pool::pool().workers.max(1).min(items.max(1))
+}
+
+/// Splits `items` into per-worker contiguous ranges.
+fn ranges(items: usize, workers: usize) -> Vec<(usize, usize)> {
+    let per = items.div_ceil(workers.max(1));
+    (0..workers)
+        .map(|w| (w * per, ((w + 1) * per).min(items)))
+        .filter(|(a, b)| a < b)
+        .collect()
+}
+
+/// Per-position output of a batched prefill.
+pub struct QwenPrefillOut {
+    /// Logits per requested position (all positions, or only the last).
+    pub logits: Vec<Vec<f32>>,
+    /// Final-norm hidden state per position (the lm_head input; the MTP
+    /// drafter consumes these).
+    pub hidden: Vec<Vec<f32>>,
+}
+
+impl QwenModel {
+    /// Ingests `tokens` and returns the logits after the last one,
+    /// bit-identical to the same sequence of `forward` calls. The prompt is
+    /// processed layer-by-layer (layers-outer): each weight region is
+    /// traversed once per chunk instead of once per token, and
+    /// token-independent work fans out over scoped worker threads.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.prefill_collect(tokens, false)
+            .logits
+            .pop()
+            .expect("prefill requires at least one token")
+    }
+
+    /// Batched ingestion that also returns per-position final-norm hiddens
+    /// and, with `all_logits`, the logits of every position (speculative
+    /// verification). `logits` holds one entry per position, or only the
+    /// last position's entry when `all_logits` is false.
+    pub fn prefill_collect(&mut self, tokens: &[u32], all_logits: bool) -> QwenPrefillOut {
+        assert!(!tokens.is_empty(), "prefill requires at least one token");
+        let c = self.cfg.clone();
+        let t_count = tokens.len();
+        let d = c.d;
+        for &token in tokens {
+            assert!(
+                (token as usize) < c.vocab,
+                "token {} is outside the Qwen vocabulary",
+                token
+            );
+        }
+
+        // hidden stream for every position, token-major
+        let mut hidden = vec![0.0f32; t_count * d];
+        {
+            let embed = tensor(&self.bin.data, &self.embed);
+            for (t, &token) in tokens.iter().enumerate() {
+                hidden[t * d..(t + 1) * d]
+                    .copy_from_slice(&embed[token as usize * d..(token as usize + 1) * d]);
+            }
+        }
+        let mut normed = vec![0.0f32; t_count * d];
+        let mut attn_out = vec![0.0f32; t_count * d];
+
+        for l in 0..c.n_layers {
+            let layer = &self.layers[l];
+            let data = &self.bin.data;
+            {
+                let w = tensor(data, &layer.input_norm);
+                for t in 0..t_count {
+                    let (h, n) = (&hidden[t * d..(t + 1) * d], &mut normed[t * d..(t + 1) * d]);
+                    rmsnorm(h, w, c.norm_eps as f32, n);
+                }
+            }
+            match (&layer.attn, &mut self.caches[l]) {
+                (QwenAttnW::Linear(w), QwenCache::Linear(cache)) => {
+                    lin_attn_prefill(data, w, &c, &normed, t_count, cache, &mut attn_out);
+                }
+                (QwenAttnW::Full(w), QwenCache::Full(cache)) => {
+                    full_attn_prefill(data, w, &c, &normed, t_count, self.pos, cache, &mut attn_out);
+                }
+                _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
+            }
+            for i in 0..t_count * d {
+                hidden[i] += attn_out[i];
+            }
+            {
+                let w = tensor(data, &layer.post_norm);
+                for t in 0..t_count {
+                    let (h, n) = (&hidden[t * d..(t + 1) * d], &mut normed[t * d..(t + 1) * d]);
+                    rmsnorm(h, w, c.norm_eps as f32, n);
+                }
+            }
+            mlp_prefill(data, &layer.mlp, &c, &normed, t_count, &mut attn_out);
+            for i in 0..t_count * d {
+                hidden[i] += attn_out[i];
+            }
+        }
+
+        let mut out = QwenPrefillOut {
+            logits: Vec::new(),
+            hidden: Vec::with_capacity(t_count),
+        };
+        let data = &self.bin.data;
+        let norm_w = tensor(data, &self.norm_f);
+        for t in 0..t_count {
+            let mut n = vec![0.0f32; d];
+            rmsnorm(&hidden[t * d..(t + 1) * d], norm_w, c.norm_eps as f32, &mut n);
+            out.hidden.push(n);
+        }
+        for t in 0..t_count {
+            if !all_logits && t + 1 != t_count {
+                continue;
+            }
+            let mut logits = vec![0.0f32; c.vocab];
+            match &self.lm_head_q8 {
+                Some(head) => head.matvec(&out.hidden[t], &mut logits),
+                None => crate::model::ops::matvec(
+                    tensor(data, &self.lm_head),
+                    c.vocab,
+                    d,
+                    &out.hidden[t],
+                    &mut logits,
+                ),
+            }
+            out.logits.push(logits);
+        }
+        self.pos += t_count;
+        out
+    }
+}
+
+/// Prefill for one gated delta-rule layer. Projections fan out over token
+/// ranges, the convolution is the cheap sequential scan, the recurrence
+/// fans out over heads (each head replays its own token sequence), and the
+/// gated norm plus output projection fan out over tokens again. Per-token
+/// float operations are exactly those of `lin_attn_step`.
+fn lin_attn_prefill(
+    data: &[u8],
+    w: &QwenLinW,
+    c: &QwenConfig,
+    normed: &[f32],
+    t_count: usize,
+    cache: &mut LinCache,
+    attn_out: &mut [f32],
+) {
+    let d = c.d;
+    let (kt, vt) = (c.lin_key_total(), c.lin_value_total());
+    let conv_dim = kt * 2 + vt;
+    let heads = c.lin_v_heads;
+    let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
+    let rep = heads / c.lin_k_heads.max(1);
+
+    let in_qkv = tensor(data, &w.in_qkv);
+    let in_z = tensor(data, &w.in_z);
+    let in_b = tensor(data, &w.in_b);
+    let in_a = tensor(data, &w.in_a);
+    let conv = tensor(data, &w.conv);
+    let a_log = tensor(data, &w.a_log);
+    let dt_bias = tensor(data, &w.dt_bias);
+    let norm = tensor(data, &w.norm);
+    let out_proj = tensor(data, &w.out_proj);
+
+    // projections, parallel over token ranges
+    let mut qkv = vec![0.0f32; t_count * conv_dim];
+    let mut z = vec![0.0f32; t_count * vt];
+    let mut b_raw = vec![0.0f32; t_count * heads];
+    let mut a_raw = vec![0.0f32; t_count * heads];
+    {
+        let workers = prefill_workers(t_count);
+        std::thread::scope(|s| {
+            let mut qkv_rest = qkv.as_mut_slice();
+            let mut z_rest = z.as_mut_slice();
+            let mut b_rest = b_raw.as_mut_slice();
+            let mut a_rest = a_raw.as_mut_slice();
+            for (t0, t1) in ranges(t_count, workers) {
+                let n = t1 - t0;
+                let (qkv_c, qr) = qkv_rest.split_at_mut(n * conv_dim);
+                let (z_c, zr) = z_rest.split_at_mut(n * vt);
+                let (b_c, br) = b_rest.split_at_mut(n * heads);
+                let (a_c, ar) = a_rest.split_at_mut(n * heads);
+                qkv_rest = qr;
+                z_rest = zr;
+                b_rest = br;
+                a_rest = ar;
+                let x = &normed[t0 * d..t1 * d];
+                s.spawn(move || {
+                    for i in 0..n {
+                        let xt = &x[i * d..(i + 1) * d];
+                        crate::model::ops::matvec_st(
+                            in_qkv,
+                            conv_dim,
+                            d,
+                            xt,
+                            &mut qkv_c[i * conv_dim..(i + 1) * conv_dim],
+                        );
+                        crate::model::ops::matvec_st(in_z, vt, d, xt, &mut z_c[i * vt..(i + 1) * vt]);
+                        crate::model::ops::matvec_st(
+                            in_b,
+                            heads,
+                            d,
+                            xt,
+                            &mut b_c[i * heads..(i + 1) * heads],
+                        );
+                        crate::model::ops::matvec_st(
+                            in_a,
+                            heads,
+                            d,
+                            xt,
+                            &mut a_c[i * heads..(i + 1) * heads],
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    // causal convolution: the sequential scan (cheap, carries cache.conv)
+    let mut conved = vec![0.0f32; t_count * conv_dim];
+    for t in 0..t_count {
+        conv_step(
+            &qkv[t * conv_dim..(t + 1) * conv_dim],
+            conv,
+            c.conv_kernel,
+            &mut cache.conv,
+            &mut conved[t * conv_dim..(t + 1) * conv_dim],
+        );
+    }
+
+    // recurrence, parallel over heads: each head replays its own tokens in
+    // order against its private state slice (head-major mixed buffer)
+    let mut mixed_hm = vec![0.0f32; heads * t_count * vd];
+    {
+        std::thread::scope(|s| {
+            let mut state_rest = cache.state.as_mut_slice();
+            let mut mixed_rest = mixed_hm.as_mut_slice();
+            let conved = &conved;
+            let b_raw = &b_raw;
+            let a_raw = &a_raw;
+            for h in 0..heads {
+                let (state_h, sr) = state_rest.split_at_mut(kd * vd);
+                let (mixed_h, mr) = mixed_rest.split_at_mut(t_count * vd);
+                state_rest = sr;
+                mixed_rest = mr;
+                s.spawn(move || {
+                    let kh = h / rep.max(1);
+                    for t in 0..t_count {
+                        let row = &conved[t * conv_dim..(t + 1) * conv_dim];
+                        let mut q: Vec<f32> = row[kh * kd..(kh + 1) * kd].to_vec();
+                        let mut k: Vec<f32> = row[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+                        let v = &row[2 * kt + h * vd..2 * kt + (h + 1) * vd];
+                        l2norm(&mut q, 1e-6);
+                        l2norm(&mut k, 1e-6);
+                        let scale = 1.0 / (kd as f32).sqrt();
+                        for value in q.iter_mut() {
+                            *value *= scale;
+                        }
+                        let beta = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
+                        let sp = {
+                            let arg = a_raw[t * heads + h] + dt_bias[h];
+                            if arg > 20.0 {
+                                arg
+                            } else {
+                                (1.0 + arg.exp()).ln()
+                            }
+                        };
+                        let g = -a_log[h].exp() * sp;
+                        delta_step(
+                            state_h,
+                            &q,
+                            &k,
+                            v,
+                            g,
+                            beta,
+                            &mut mixed_h[t * vd..(t + 1) * vd],
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    // gated norm + output projection, parallel over token ranges
+    {
+        let workers = prefill_workers(t_count);
+        std::thread::scope(|s| {
+            let mut out_rest = &mut attn_out[..t_count * d];
+            let mixed_hm = &mixed_hm;
+            let z = &z;
+            for (t0, t1) in ranges(t_count, workers) {
+                let n = t1 - t0;
+                let (out_c, or) = out_rest.split_at_mut(n * d);
+                out_rest = or;
+                s.spawn(move || {
+                    let mut mixed = vec![0.0f32; vt];
+                    for i in 0..n {
+                        let t = t0 + i;
+                        for h in 0..heads {
+                            mixed[h * vd..(h + 1) * vd]
+                                .copy_from_slice(&mixed_hm[(h * t_count + t) * vd..(h * t_count + t + 1) * vd]);
+                        }
+                        for h in 0..heads {
+                            let (a, b) = (h * vd, (h + 1) * vd);
+                            rmsnorm_gated(
+                                &mut mixed[a..b],
+                                norm,
+                                &z[t * vt + a..t * vt + b],
+                                c.norm_eps as f32,
+                            );
+                        }
+                        crate::model::ops::matvec_st(
+                            out_proj,
+                            d,
+                            vt,
+                            &mixed,
+                            &mut out_c[i * d..(i + 1) * d],
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Prefill for one full-attention layer: projections and per-head norms and
+/// rotary fan out over tokens, the key/value block is appended once, then
+/// each position attends over its causal prefix in parallel. Per-token
+/// float operations are exactly those of `full_attn_step`.
+#[allow(clippy::too_many_arguments)]
+fn full_attn_prefill(
+    data: &[u8],
+    w: &QwenFullW,
+    c: &QwenConfig,
+    normed: &[f32],
+    t_count: usize,
+    base_pos: usize,
+    cache: &mut FullCache,
+    attn_out: &mut [f32],
+) {
+    let d = c.d;
+    let hd = c.head_dim;
+    let q_width = c.n_heads * hd;
+    let kv_width = c.n_kv_heads * hd;
+    assert_eq!(cache.len, base_pos, "full-attention cache position mismatch");
+
+    let q_proj = tensor(data, &w.q_proj);
+    let k_proj = tensor(data, &w.k_proj);
+    let v_proj = tensor(data, &w.v_proj);
+    let o_proj = tensor(data, &w.o_proj);
+    let q_norm = tensor(data, &w.q_norm);
+    let k_norm = tensor(data, &w.k_norm);
+
+    let mut q_all = vec![0.0f32; t_count * q_width];
+    let mut gate_all = vec![0.0f32; t_count * q_width];
+    let mut k_all = vec![0.0f32; t_count * kv_width];
+    let mut v_all = vec![0.0f32; t_count * kv_width];
+    {
+        let workers = prefill_workers(t_count);
+        std::thread::scope(|s| {
+            let mut q_rest = q_all.as_mut_slice();
+            let mut g_rest = gate_all.as_mut_slice();
+            let mut k_rest = k_all.as_mut_slice();
+            let mut v_rest = v_all.as_mut_slice();
+            for (t0, t1) in ranges(t_count, workers) {
+                let n = t1 - t0;
+                let (q_c, qr) = q_rest.split_at_mut(n * q_width);
+                let (g_c, gr) = g_rest.split_at_mut(n * q_width);
+                let (k_c, kr) = k_rest.split_at_mut(n * kv_width);
+                let (v_c, vr) = v_rest.split_at_mut(n * kv_width);
+                q_rest = qr;
+                g_rest = gr;
+                k_rest = kr;
+                v_rest = vr;
+                let x = &normed[t0 * d..t1 * d];
+                s.spawn(move || {
+                    let mut qg = vec![0.0f32; q_width * 2];
+                    for i in 0..n {
+                        let xt = &x[i * d..(i + 1) * d];
+                        let pos = base_pos + t0 + i;
+                        crate::model::ops::matvec_st(q_proj, q_width * 2, d, xt, &mut qg);
+                        let k = &mut k_c[i * kv_width..(i + 1) * kv_width];
+                        let v = &mut v_c[i * kv_width..(i + 1) * kv_width];
+                        crate::model::ops::matvec_st(k_proj, kv_width, d, xt, k);
+                        crate::model::ops::matvec_st(v_proj, kv_width, d, xt, v);
+                        let q = &mut q_c[i * q_width..(i + 1) * q_width];
+                        let gate = &mut g_c[i * q_width..(i + 1) * q_width];
+                        for h in 0..c.n_heads {
+                            let src = h * hd * 2;
+                            q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
+                            gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
+                            let old = q[h * hd..(h + 1) * hd].to_vec();
+                            rmsnorm(&old, q_norm, c.norm_eps as f32, &mut q[h * hd..(h + 1) * hd]);
+                            rope_partial(&mut q[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+                        }
+                        for h in 0..c.n_kv_heads {
+                            let old = k[h * hd..(h + 1) * hd].to_vec();
+                            rmsnorm(&old, k_norm, c.norm_eps as f32, &mut k[h * hd..(h + 1) * hd]);
+                            rope_partial(&mut k[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+                        }
+                    }
+                });
+            }
+        });
+    }
+    cache.k.extend_from_slice(&k_all);
+    cache.v.extend_from_slice(&v_all);
+    cache.len += t_count;
+
+    // each position attends over its causal prefix, parallel over tokens
+    {
+        let workers = prefill_workers(t_count);
+        let groups = c.n_heads / c.n_kv_heads;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        std::thread::scope(|s| {
+            let mut out_rest = &mut attn_out[..t_count * d];
+            let cache_k = &cache.k;
+            let cache_v = &cache.v;
+            let q_all = &q_all;
+            let gate_all = &gate_all;
+            for (t0, t1) in ranges(t_count, workers) {
+                let n = t1 - t0;
+                let (out_c, or) = out_rest.split_at_mut(n * d);
+                out_rest = or;
+                s.spawn(move || {
+                    for i in 0..n {
+                        let t = t0 + i;
+                        let window = base_pos + t + 1;
+                        let mut mixed = vec![0.0f32; q_width];
+                        let mut scores = vec![0.0f32; window];
+                        for h in 0..c.n_heads {
+                            let kh = h / groups;
+                            let qh = &q_all[t * q_width + h * hd..t * q_width + (h + 1) * hd];
+                            let mut max_score = f32::NEG_INFINITY;
+                            for u in 0..window {
+                                let off = u * kv_width + kh * hd;
+                                let sc =
+                                    crate::model::ops::dot(qh, &cache_k[off..off + hd]) * scale;
+                                scores[u] = sc;
+                                max_score = max_score.max(sc);
+                            }
+                            let mut denom = 0.0f32;
+                            for sc in scores.iter_mut() {
+                                *sc = (*sc - max_score).exp();
+                                denom += *sc;
+                            }
+                            let dst = &mut mixed[h * hd..(h + 1) * hd];
+                            for u in 0..window {
+                                let off = u * kv_width + kh * hd;
+                                let a = scores[u] / denom;
+                                for j in 0..hd {
+                                    dst[j] += a * cache_v[off + j];
+                                }
+                            }
+                        }
+                        for (j, value) in mixed.iter_mut().enumerate() {
+                            *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
+                        }
+                        crate::model::ops::matvec_st(o_proj, d, q_width, &mixed, &mut out_c[i * d..(i + 1) * d]);
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Prefill MLP dispatch: every token is independent, so tokens fan out over
+/// worker ranges and each token runs the exact single-token math (routed
+/// experts sequentially inside its worker for the MoE variant).
+fn mlp_prefill(
+    data: &[u8],
+    mlp: &QwenMlpW,
+    c: &QwenConfig,
+    normed: &[f32],
+    t_count: usize,
+    out: &mut [f32],
+) {
+    let d = c.d;
+    let workers = prefill_workers(t_count);
+    std::thread::scope(|s| {
+        let mut out_rest = &mut out[..t_count * d];
+        for (t0, t1) in ranges(t_count, workers) {
+            let n = t1 - t0;
+            let (out_c, or) = out_rest.split_at_mut(n * d);
+            out_rest = or;
+            let x_all = &normed[t0 * d..t1 * d];
+            s.spawn(move || {
+                for i in 0..n {
+                    let x = &x_all[i * d..(i + 1) * d];
+                    let value = match mlp {
+                        QwenMlpW::Moe {
+                            router,
+                            experts,
+                            shared,
+                            shared_gate,
+                        } => moe_token_serial(data, router, experts, shared, shared_gate, c, x),
+                        QwenMlpW::Dense { gate, up, down } => {
+                            dense_token_serial(data, gate, up, down, c, x)
+                        }
+                    };
+                    out_c[i * d..(i + 1) * d].copy_from_slice(&value);
+                }
+            });
+        }
+    });
+}
+
+/// Single-token MoE block with the routed experts evaluated sequentially
+/// (the prefill worker already owns a core). Float operations and the
+/// mixing order match `packed_moe` exactly.
+fn moe_token_serial(
+    data: &[u8],
+    router: &T,
+    experts: &[[PackedT; 3]],
+    shared: &[T; 3],
+    shared_gate: &T,
+    c: &QwenConfig,
+    x: &[f32],
+) -> Vec<f32> {
+    let mut logits = vec![0.0f32; c.n_experts];
+    crate::model::ops::matvec_st(tensor(data, router), c.n_experts, c.d, x, &mut logits);
+    let selected = route_topk(&logits, c.top_k);
+    let mut out = vec![0.0f32; c.d];
+    let mut routed = vec![0.0f32; c.d];
+    let mut gate_buf = vec![0.0f32; c.moe_inter];
+    let mut up_buf = vec![0.0f32; c.moe_inter];
+    for &(expert, weight) in &selected {
+        let weights = &experts[expert];
+        let (p1, s1) = packed_parts(data, &weights[0]);
+        let (p3, s3) = packed_parts(data, &weights[2]);
+        crate::quant::mxfp4::matvec_packed(p1, s1, c.moe_inter, c.d, x, &mut gate_buf, 1);
+        crate::quant::mxfp4::matvec_packed(p3, s3, c.moe_inter, c.d, x, &mut up_buf, 1);
+        for i in 0..c.moe_inter {
+            gate_buf[i] = (gate_buf[i] / (1.0 + (-gate_buf[i]).exp())) * up_buf[i];
+        }
+        let (p2, s2) = packed_parts(data, &weights[1]);
+        crate::quant::mxfp4::matvec_packed(p2, s2, c.d, c.moe_inter, &gate_buf, &mut routed, 1);
+        for i in 0..c.d {
+            out[i] += weight * routed[i];
+        }
+    }
+    let sg = crate::model::ops::dot(tensor(data, shared_gate), x);
+    let shared_scale = 1.0 / (1.0 + (-sg).exp());
+    let mut shared_out = vec![0.0f32; c.d];
+    ffn(
+        x,
+        tensor(data, &shared[0]),
+        tensor(data, &shared[2]),
+        tensor(data, &shared[1]),
+        c.shared_inter,
+        c.d,
+        &mut shared_out,
+    );
+    for i in 0..c.d {
+        out[i] += shared_scale * shared_out[i];
+    }
+    out
+}
+
+/// Single-token dense MLP on one worker thread (single-threaded packed
+/// matvecs; identical row results to the row-parallel decode path).
+fn dense_token_serial(
+    data: &[u8],
+    gate: &PackedT,
+    up: &PackedT,
+    down: &PackedT,
+    c: &QwenConfig,
+    x: &[f32],
+) -> Vec<f32> {
+    let inter = c.dense_inter;
+    let mut h_gate = vec![0.0f32; inter];
+    let mut h_up = vec![0.0f32; inter];
+    let (pg, sg) = packed_parts(data, gate);
+    crate::quant::mxfp4::matvec_packed(pg, sg, inter, c.d, x, &mut h_gate, 1);
+    let (pu, su) = packed_parts(data, up);
+    crate::quant::mxfp4::matvec_packed(pu, su, inter, c.d, x, &mut h_up, 1);
+    for i in 0..inter {
+        h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+    }
+    let mut out = vec![0.0f32; c.d];
+    let (pd, sd) = packed_parts(data, down);
+    crate::quant::mxfp4::matvec_packed(pd, sd, c.d, inter, &h_gate, &mut out, 1);
+    out
+}
+
+/// Shared generation loop for the Qwen runtime. The prompt is ingested in
+/// one batched prefill (bit-identical to sequential forwards); decoding
+/// then advances one token at a time.
 pub fn qwen_run_turn(
     ids: &[u32],
     max_new: usize,
@@ -1389,14 +1979,15 @@ pub fn qwen_run_turn(
     sampler: &mut super::Sampler,
 ) -> String {
     model.reset();
-    super::run_turn_core(
+    super::run_turn_core_batch(
         ids,
         max_new,
         tok,
-        &mut |id| model.forward(id),
+        &mut |batch: &[u32]| model.prefill(batch),
         debug,
         debug_routing,
         stop_id,
+        None,
         sampler,
     )
 }
@@ -1538,6 +2129,40 @@ mod model_tests {
         assert_eq!(first, replay);
         drop(model);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn batched_prefill_is_bit_identical_to_sequential_forwards() {
+        for c in [bin_tiny(), bin_tiny_dense()] {
+            let path = checkpoint_fixture(&c);
+            let tokens = [3u32, 5, 7, 11, 2, 9, 13];
+
+            let mut sequential = QwenModel::load(&path);
+            let mut seq_logits = Vec::new();
+            for &t in &tokens {
+                seq_logits.push(sequential.forward(t));
+            }
+
+            let mut batched = QwenModel::load(&path);
+            let out = batched.prefill_collect(&tokens, true);
+            assert_eq!(out.logits.len(), tokens.len());
+            for (a, b) in seq_logits.iter().zip(&out.logits) {
+                assert_eq!(a, b, "prefill logits diverge from sequential forwards");
+            }
+            assert_eq!(batched.pos, sequential.pos);
+
+            // caches must be equivalent: continued decoding stays identical
+            for &t in &[4u32, 6, 8] {
+                assert_eq!(sequential.forward(t), batched.forward(t));
+            }
+
+            // the last-logits wrapper takes the same path
+            let mut wrapper = QwenModel::load(&path);
+            assert_eq!(wrapper.prefill(&tokens), *seq_logits.last().unwrap());
+
+            drop((sequential, batched, wrapper));
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]
