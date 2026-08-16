@@ -98,6 +98,24 @@ fn avx2_available() -> bool {
     *ON.get_or_init(|| is_x86_feature_detected!("avx2"))
 }
 
+/// Chunk size for dynamically scheduled row loops: ~8 pulls per worker
+/// bound the straggler tail, a 16-row floor keeps the atomic traffic
+/// negligible, and the multiple-of-4 rounding feeds the quad-row kernels.
+/// MICROKIMI_NO_DYNROWS=1 is the A/B arm: one pull per worker, which
+/// degenerates to the old fixed contiguous chunking.
+#[inline]
+pub(crate) fn dyn_step(rows: usize, workers: usize) -> usize {
+    static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pulls = if *FIXED.get_or_init(|| {
+        std::env::var("MICROKIMI_NO_DYNROWS").map(|v| v == "1").unwrap_or(false)
+    }) {
+        1
+    } else {
+        8
+    };
+    (rows.div_ceil(workers.max(1) * pulls).max(16) + 3) & !3
+}
+
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -140,16 +158,16 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
         }
         return;
     }
-    let chunk = rows.div_ceil(njobs);
+    // dynamic row scheduling (see Q8Head::matvec): fine chunks off a
+    // shared counter, bit-identical per row.
+    let step = dyn_step(rows, njobs);
+    let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wp = crate::model::pool::SPtr(w.as_ptr());
     let xp = crate::model::pool::SPtr(x.as_ptr());
     let op = crate::model::pool::MPtr(out.as_mut_ptr());
     let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
-    for j in 0..njobs {
-        let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
-        if r0 >= r1 {
-            break;
-        }
+    for _ in 0..njobs {
+        let ctr = ctr.clone();
         jobs.push(Box::new(move || {
             // rebind → capture whole structs (Send), not fields
             let (wp, xp, op) = (wp, xp, op);
@@ -157,8 +175,14 @@ pub fn matvec_cpu(w: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32
                 let w = std::slice::from_raw_parts(wp.0, rows * cols);
                 let x = std::slice::from_raw_parts(xp.0, cols);
                 let out = std::slice::from_raw_parts_mut(op.0, rows);
-                for r in r0..r1 {
-                    out[r] = dot(&w[r * cols..(r + 1) * cols], x);
+                loop {
+                    let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                    if r0 >= rows {
+                        break;
+                    }
+                    for r in r0..(r0 + step).min(rows) {
+                        out[r] = dot(&w[r * cols..(r + 1) * cols], x);
+                    }
                 }
             }
         }));
@@ -210,7 +234,10 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
         }
         return;
     }
-    let chunk = rows.div_ceil(njobs);
+    // dynamic row scheduling (see Q8Head::matvec): fine chunks off a
+    // shared counter, bit-identical per row.
+    let step = dyn_step(rows, njobs);
+    let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wp = crate::model::pool::SPtr(w.as_ptr());
     let xps: Vec<crate::model::pool::SPtr> =
         xs.iter().map(|x| crate::model::pool::SPtr(x.as_ptr())).collect();
@@ -219,22 +246,25 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
         .map(|o| crate::model::pool::MPtr(o.as_mut_ptr()))
         .collect();
     let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
-    for j in 0..njobs {
-        let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
-        if r0 >= r1 {
-            break;
-        }
+    for _ in 0..njobs {
         let xps = xps.clone();
         let ops = ops.clone();
+        let ctr = ctr.clone();
         jobs.push(Box::new(move || {
             let (wp, xps, ops) = (wp, xps, ops);
             unsafe {
                 let w = std::slice::from_raw_parts(wp.0, rows * cols);
-                for r in r0..r1 {
-                    let row = &w[r * cols..(r + 1) * cols];
-                    for l in 0..xps.len() {
-                        let x = std::slice::from_raw_parts(xps[l].0, cols);
-                        *ops[l].0.add(r) = dot(row, x);
+                loop {
+                    let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                    if r0 >= rows {
+                        break;
+                    }
+                    for r in r0..(r0 + step).min(rows) {
+                        let row = &w[r * cols..(r + 1) * cols];
+                        for l in 0..xps.len() {
+                            let x = std::slice::from_raw_parts(xps[l].0, cols);
+                            *ops[l].0.add(r) = dot(row, x);
+                        }
                     }
                 }
             }
@@ -383,22 +413,28 @@ impl Q8Head {
             }
             return;
         }
-        let chunk = rows.div_ceil(njobs);
+        // dynamic row scheduling (see Q8Head::matvec): fine chunks off a
+        // shared counter, bit-identical per row.
+        let step = dyn_step(rows, njobs);
+        let ctr = std::sync::atomic::AtomicUsize::new(0);
         let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
         std::thread::scope(|scope| {
-            for j in 0..njobs {
-                let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
-                if r0 >= r1 {
-                    break;
-                }
+            for _ in 0..njobs {
                 let this = &*self;
                 let xqs = &xqs;
+                let ctr = &ctr;
                 let out_ptrs = out_ptrs.clone();
                 scope.spawn(move || {
-                    for r in r0..r1 {
-                        for l in 0..xqs.len() {
-                            let v = this.row_dot(r, &xqs[l]);
-                            unsafe { *(out_ptrs[l] as *mut f32).add(r) = v };
+                    loop {
+                        let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                        if r0 >= rows {
+                            break;
+                        }
+                        for r in r0..(r0 + step).min(rows) {
+                            for l in 0..xqs.len() {
+                                let v = this.row_dot(r, &xqs[l]);
+                                unsafe { *(out_ptrs[l] as *mut f32).add(r) = v };
+                            }
                         }
                     }
                 });
@@ -420,18 +456,20 @@ impl Q8Head {
             }
             return;
         }
-        let chunk = rows.div_ceil(njobs);
+        // dynamic row scheduling: the workers pull fine chunks from a
+        // shared counter instead of owning one fixed range each, so a
+        // straggler (E-core, interrupt) delays one chunk, not a quarter of
+        // the matrix. Per-row math unchanged - bit-identical results.
+        let step = dyn_step(rows, njobs);
+        let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let qp = crate::model::pool::SPtrU8(self.q.as_ptr() as *const u8);
         let sp = crate::model::pool::SPtr(self.scales.as_ptr());
         let xp = crate::model::pool::SPtrU8(xq.q.as_ptr() as *const u8);
         let xsp = crate::model::pool::SPtr(xq.scales.as_ptr());
         let op = crate::model::pool::MPtr(out.as_mut_ptr());
         let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
-        for j in 0..njobs {
-            let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
-            if r0 >= r1 {
-                break;
-            }
+        for _ in 0..njobs {
+            let ctr = ctr.clone();
             jobs.push(Box::new(move || {
                 // rebind → capture whole structs (Send), not fields
                 let (qp, sp, xp, xsp, op) = (qp, sp, xp, xsp, op);
@@ -441,7 +479,14 @@ impl Q8Head {
                     let xq8 = std::slice::from_raw_parts(xp.0 as *const i8, cols);
                     let xs = std::slice::from_raw_parts(xsp.0, nb);
                     let out = std::slice::from_raw_parts_mut(op.0, rows);
-                    q8_rows_dot(q, ws, cols, r0, r1 - r0, xq8, xs, &mut out[r0..r1]);
+                    loop {
+                        let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                        if r0 >= rows {
+                            break;
+                        }
+                        let r1 = (r0 + step).min(rows);
+                        q8_rows_dot(q, ws, cols, r0, r1 - r0, xq8, xs, &mut out[r0..r1]);
+                    }
                 }
             }));
         }

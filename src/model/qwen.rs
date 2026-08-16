@@ -2168,6 +2168,31 @@ fn ranges(items: usize, workers: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Splits `items` into contiguous ranges of ~equal CAUSAL cost: token t
+/// attends over base+t+1 positions, so uniform ranges make the last
+/// worker do about twice the work of the first at base=0. Cuts are placed
+/// on the prefix sums of the per-token cost instead; the per-token math
+/// is untouched, so the result stays bit-identical to `ranges`.
+fn causal_ranges(items: usize, workers: usize, base: usize) -> Vec<(usize, usize)> {
+    let w = workers.max(1).min(items.max(1));
+    let total: f64 = (0..items).map(|t| (base + t + 1) as f64).sum();
+    let mut out = Vec::with_capacity(w);
+    let (mut start, mut acc) = (0usize, 0f64);
+    let mut next_cut = total / w as f64;
+    for t in 0..items {
+        acc += (base + t + 1) as f64;
+        if acc >= next_cut - 1e-9 && out.len() + 1 < w {
+            out.push((start, t + 1));
+            start = t + 1;
+            next_cut = total * (out.len() + 1) as f64 / w as f64;
+        }
+    }
+    if start < items {
+        out.push((start, items));
+    }
+    out
+}
+
 /// Per-position output of a batched prefill.
 pub struct QwenPrefillOut {
     /// Logits per requested position (all positions, or only the last).
@@ -2444,16 +2469,48 @@ fn lin_attn_prefill(
         crate::model::ops::matvec_multi(in_a, heads, d, &xs, &mut outs);
     }
 
-    // causal convolution: the sequential scan (cheap, carries cache.conv)
+    // causal convolution: sequential over time but channel-separable
+    // (each channel owns its (k-1)-tap state), so channels fan out over
+    // workers and each replays all tokens for its slice - bit-identical
+    // to the former token-major conv_step loop.
     let mut conved = vec![0.0f32; t_count * conv_dim];
-    for t in 0..t_count {
-        conv_step(
-            &qkv[t * conv_dim..(t + 1) * conv_dim],
-            conv,
-            c.conv_kernel,
-            &mut cache.conv,
-            &mut conved[t * conv_dim..(t + 1) * conv_dim],
-        );
+    {
+        let k = c.conv_kernel;
+        let workers = prefill_workers(conv_dim);
+        let out_ptr = crate::model::pool::MPtr(conved.as_mut_ptr());
+        std::thread::scope(|s| {
+            let qkv = &qkv;
+            let mut state_rest = cache.conv.as_mut_slice();
+            for (c0, c1) in ranges(conv_dim, workers) {
+                let (state_c, sr) = state_rest.split_at_mut((c1 - c0) * (k - 1));
+                state_rest = sr;
+                s.spawn(move || {
+                    let out_ptr = out_ptr;
+                    for t in 0..t_count {
+                        let x = &qkv[t * conv_dim..(t + 1) * conv_dim];
+                        for i in c0..c1 {
+                            let st = &mut state_c[(i - c0) * (k - 1)..(i - c0 + 1) * (k - 1)];
+                            let wt = &conv[i * k..(i + 1) * k];
+                            let mut acc = 0.0f32;
+                            for j in 0..k - 1 {
+                                acc += st[j] * wt[j];
+                            }
+                            acc += x[i] * wt[k - 1];
+                            // SAFETY: column i is owned by this worker alone
+                            // (disjoint channel ranges), the barrier is the
+                            // scope end.
+                            unsafe {
+                                *out_ptr.0.add(t * conv_dim + i) = acc / (1.0 + (-acc).exp());
+                            }
+                            for j in 0..k.saturating_sub(2) {
+                                st[j] = st[j + 1];
+                            }
+                            st[k - 2] = x[i];
+                        }
+                    }
+                });
+            }
+        });
     }
 
     // recurrence, parallel over heads: each head replays its own tokens in
@@ -2769,7 +2826,7 @@ fn full_attn_prefill(
             let cache_v = &cache.v;
             let q_all = &q_all;
             let gate_all = &gate_all;
-            for (t0, t1) in ranges(t_count, workers) {
+            for (t0, t1) in causal_ranges(t_count, workers, base_pos) {
                 let n = t1 - t0;
                 let (mixed_c, mr) = mixed_rest.split_at_mut(n * q_width);
                 mixed_rest = mr;
@@ -2853,8 +2910,26 @@ fn mlp_prefill(
                 let mut outs: Vec<&mut [f32]> = h_up.chunks_mut(inter).collect();
                 crate::quant::mxfp4::matvec_packed_multi(pu, su, inter, d, &xs, &mut outs, threads);
             }
-            for i in 0..t_count * inter {
-                h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+            // SiLU(gate) * up, parallel over token ranges: 3M exp calls per
+            // layer at 1k tokens were a serial hotspot. Element-wise, so the
+            // split is bit-identical to the serial loop.
+            {
+                let workers = prefill_workers(t_count);
+                std::thread::scope(|s| {
+                    let mut g_rest = h_gate.as_mut_slice();
+                    let h_up = &h_up;
+                    for (t0, t1) in ranges(t_count, workers) {
+                        let n = (t1 - t0) * inter;
+                        let (g_c, gr) = g_rest.split_at_mut(n);
+                        g_rest = gr;
+                        let u_c = &h_up[t0 * inter..t1 * inter];
+                        s.spawn(move || {
+                            for (g, u) in g_c.iter_mut().zip(u_c) {
+                                *g = (*g / (1.0 + (-*g).exp())) * u;
+                            }
+                        });
+                    }
+                });
             }
             let hs: Vec<&[f32]> = h_gate.chunks(inter).collect();
             let (pd, sd) = packed_parts(data, down);

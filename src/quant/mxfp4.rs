@@ -444,19 +444,30 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
         }
         return;
     }
-    let chunk = rows.div_ceil(nt);
+    // dynamic row scheduling: fine chunks off a shared counter so a
+    // straggler thread delays one chunk, not rows/nt of them. Per-row
+    // math unchanged - bit-identical. Scoped threads (not the pool):
+    // this kernel runs inside pool jobs for MoE experts.
+    let step = crate::model::dyn_step(rows, nt);
+    let ctr = std::sync::atomic::AtomicUsize::new(0);
+    let out_base = crate::model::pool::MPtr(out.as_mut_ptr());
     std::thread::scope(|s| {
-        let mut p_rest = packed;
-        let mut sc_rest = scales;
-        for out_chunk in out.chunks_mut(chunk) {
-            let nrows = out_chunk.len();
-            let p_chunk = &p_rest[..nrows * cols / 2];
-            let s_chunk = &sc_rest[..nrows * cols / 32];
-            p_rest = &p_rest[nrows * cols / 2..];
-            sc_rest = &sc_rest[nrows * cols / 32..];
+        for _ in 0..nt {
+            let ctr = &ctr;
             s.spawn(move || {
-                for (r, o) in out_chunk.iter_mut().enumerate() {
-                    *o = row(&p_chunk[r * cols / 2..(r + 1) * cols / 2], &s_chunk[r * cols / 32..(r + 1) * cols / 32], cols, xq);
+                let out_base = out_base;
+                loop {
+                    let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                    if r0 >= rows {
+                        break;
+                    }
+                    for r in r0..(r0 + step).min(rows) {
+                        let v = row(&packed[r * cols / 2..(r + 1) * cols / 2], &scales[r * cols / 32..(r + 1) * cols / 32], cols, xq);
+                        // SAFETY: each row index is visited exactly once
+                        // across the scope (disjoint writes), and the scope
+                        // outlives no borrow of `out`.
+                        unsafe { *out_base.0.add(r) = v };
+                    }
                 }
             });
         }
