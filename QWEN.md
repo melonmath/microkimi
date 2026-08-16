@@ -265,70 +265,43 @@ spot on the 0.8B; the fp4 mode stays available because its traffic
 argument returns on bandwidth-starved hosts (a 27B paging from disk),
 where it must be re-measured before use.
 
-On bare metal (Apple M5, 4P/6E, 16 GB, AC power) the same binary
-measured q8 decode at 52.6 tok/s single-stream (19 ms/token, medians
-over 5 rounds) and batched prefill at 14.5 ms/token, and the llama.cpp
-head-to-head on the same machine and checkpoint (ggml-org Q8_0 GGUF,
-llama-bench -p 1024 -n 64) put their **Metal GPU** backend at 109.8
-tok/s tg64 and 4548 tok/s pp1024 - CPU decode within 2.1x of the GPU,
-prefill ~66x behind it. The full protocol, the fair `-ngl 0`
-CPU-versus-CPU row, and the reading are in [BENCH.md](BENCH.md); the
-structural conclusion is that parity on Apple silicon runs through a
-Metal backend for this runtime, not through more CPU kernels.
+Bare-metal numbers against llama.cpp are in
+[RESULTS.md](RESULTS.md); the protocol is in [BENCH.md](BENCH.md).
 
 ## GPU prefill offload (macOS)
 
-`MICROKIMI_QWEN_GPU=1` routes every batched-prefill matmul through one
-MPSMatrixMultiplication GEMM per weight matrix (still zero crates: the
-Metal Performance Shaders framework is reached over the same
-objc_msgSend FFI as the K3 Metal path). The regime argument decides
-what moves: a Metal dispatch costs ~0.25 ms of sync latency, so decode
-(~100 matvecs per token) stays on the CPU kernels where it belongs,
-while prefill pays one dispatch per weight matrix for the WHOLE prompt
-- the latency amortizes to ~0.03 ms/token at 1k tokens and the
-arithmetic runs on the GPU. The nonlinear tissue between matmuls
-(norms, the conv, the delta scan, softmax attention, activations)
-stays on the CPU, with activations crossing through unified memory.
-MXFP4 MLP weights are dequantized to f32 once at first use and cached
-on device (~1 GB for the 0.8B stack); f32 attention matrices upload
-as-is and are cached too. The offload is NOT bit-exact against the
-CPU path (no q8 activation quantization, GPU reassociation) - the
-qwengpubench arm prints the measured last-position logits disagreement
-next to the timing, and every failure path falls back to the CPU
-kernels rather than erroring. Gated off by default; lane-batched
-decode and small batches never take this route (16-lane minimum,
-1M-element minimum per matrix).
+`MICROKIMI_QWEN_GPU=1` runs the batched prefill on the GPU, still with
+zero crates: Metal and MPS are reached over raw `objc_msgSend` FFI.
+What moves and why:
 
-First bare-metal measurement (Apple M5, AC power): 3.64 vs 13.61
-ms/token against the CPU batched prefill in paired in-process rounds -
-3.74x, with the offloaded GEMMs matching a CPU recompute to 1.9e-7 and
-the last-position logits within 1.4e-2 of the CPU path (the expected
-dequant-versus-q8-activation delta). qwengpubench also reports the
-GEMM-versus-CPU-tissue split per token, which is the sizing datum for
-porting the remaining ops in later phases; llama.cpp's full-Metal
-graph runs the same prefill at ~4700 tok/s on this machine, so the
-ceiling is known and far.
+- **Projections and MLP**: one MPSMatrixMultiplication GEMM per weight
+  matrix for the whole prompt. Weights upload once and stay cached on
+  device (MXFP4 dequantized at first use).
+- **Attention**: scores = scale·Q·Kᵀ and mix = P·V as batched GEMMs
+  (all heads in one encode each), causal softmax on the CPU between
+  the two. `MICROKIMI_QWEN_GPU_NOATTN=1` pins attention back to CPU.
+- **Delta scan**: the recurrence itself runs as one GPU thread per
+  (head, value column) - column-separable, so no barriers. State stays
+  f32. `MICROKIMI_QWEN_GPU_NOSCAN=1` pins it back to CPU.
+- **Precision**: GEMM operands are stored f16 by default (weights
+  convert once, activations at the staging boundary via fcvtn/fcvtl
+  inline asm); accumulation is wider. `MICROKIMI_QWEN_GPU_F32=1`
+  restores f32 storage. The scan is always f32.
+- **Decode stays on CPU**: a Metal dispatch costs ~0.25 ms of sync
+  latency and a single token walks ~100 matvecs - per-op offload would
+  cost more than the whole CPU token.
 
-Phase 2 moved the full-attention layers onto the same machinery:
-scores = scale·Q·Kᵀ and mix = P·V run as BATCHED GEMMs (every head in
-one encode each, the GQA kv-heads expanded across their group), with
-the causal softmax on the CPU between the two and the masked tail
-zeroed so the P·V product runs over the full cache width.
-MICROKIMI_QWEN_GPU_NOATTN=1 is the kill switch that keeps the
-projection GEMMs offloaded while returning attention to the CPU loop;
-prompts whose scores stack would exceed the 256 MB staging ceiling
-fall back automatically. The CPU tissue itself also lost its serial
-spots in the same pass (measured on the container at ~27% of the
-batched prefill): the SiLU merge and the causal convolution now fan
-out over workers, attention token ranges are cut on causal cost
-rather than uniformly, and every pooled row kernel pulls fine chunks
-from a shared counter (MICROKIMI_NO_DYNROWS=1 for the A/B) so an
-E-core straggler delays one chunk instead of a quarter of the matrix.
-The delta-scan recurrence is the one block still CPU-bound by design:
-its GPU port is sized by the qwengpubench split line before being
-written. Not offloaded on the arithmetic: f16 GEMMs and paired
-command buffers (both under 0.05 ms/token at 1k tokens - the GEMM
-slice is ~0.2-0.3 ms/token; the tissue is where the time lives).
+The offload is not bit-exact against the CPU path (GPU reassociation,
+no q8 activation quantization); `qwengpubench` prints the measured
+last-position logits disagreement next to the timing, plus the
+gpu-versus-cpu-tissue split. Every failure path falls back to the CPU
+kernels. Off by default; small batches and lane decode never take this
+route. Numbers in [RESULTS.md](RESULTS.md).
+
+The CPU prefill itself is fully parallel (SiLU merge, causal
+convolution, causally weighted token ranges), and the pooled row
+kernels use dynamic chunk scheduling (`MICROKIMI_NO_DYNROWS=1` for the
+A/B) so a straggler core delays one chunk, not a fixed range.
 
 ## Chained drafting and lane-batched decoding
 

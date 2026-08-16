@@ -1,10 +1,17 @@
 # microkimi
 
-A zero-dependency Rust engine for modern large-model architectures - **Kimi K3**, **DeepSeek-V4-Flash-0731**, and the **Qwen3.5-family text decoders** (Qwen3.5/Qwen3.6-MoE, Qwen3.8-2.4T-A95B, and the dense Qwen3.8-27B and Qwen3.5-0.8B) - verified against their reference implementations and measured on real weights (see [QWEN.md](QWEN.md)): batched prefill at 8.9x sequential ingestion, MTP self-speculative decoding at 73-98% draft acceptance with bit-identical output, and an OpenAI-compatible `microkimi serve` endpoint with cross-request prefix caching and **conversation version control**: every answer commits a content-addressed state, and the API forks any past state bit-exactly, diffs two states on one prompt, and three-way-merges branches through their common ancestor - the delta-rule states are linear objects, so `S_a + S_b - S_ancestor` is a real merge (measured live: two facts taught in different branches, both recalled by the merged mind).
+**A large-model engine in pure Rust. Zero dependencies. Measured, not promised.**
 
-The Python side under `nano/graft/` adds architecture-agnostic instruments: compatibility scans between two models, per-expert utility measurement, paired evaluation with bootstrap intervals, and closed-form feed-forward transfer. Those read and write **Qwen3.5-MoE** (`qwen3_5_moe`, routed and shared experts), **Qwen3.5 dense**, **DeepSeek-V4**, **Gemma 3** and llama-style checkpoints in addition to the engine's own format - see `nano/graft/README.md`.
+One small binary runs Kimi K3, DeepSeek-V4, and the Qwen3.5 family. No Python. No CUDA. No crates. `cargo build`, point it at a model, go.
 
-**This is a framework for developers, including an end-to-end engine and a test model - not a model for end-users.**
+- **Fast.** On an Apple M5, microkimi ingests prompts at over 1,000 tokens per second - ahead of llama.cpp on CPU, on the same machine and model. [The numbers.](RESULTS.md)
+- **Exact.** The default path is bit-exact f32. Every speed mode is measured against it and quoted honestly.
+- **Time travel.** Conversations are version-controlled. Fork any past state. Diff two answers. Merge two branches back into one mind.
+- **Serve it.** An OpenAI-compatible API lives in the same binary: `microkimi serve`.
+
+A Python toolkit under `nano/graft/` handles model surgery - compatibility scans, expert utility measurement, feed-forward transfer - across Qwen, DeepSeek, Gemma and llama-style checkpoints. See `nano/graft/README.md`.
+
+**This is a framework for developers - an engine and a test model, not a product for end-users.**
 
 > _Almost all of the code was written by Kimi K3 itself - the quiet beauty of an LLM giving birth to another._
 
@@ -16,60 +23,41 @@ The Python side under `nano/graft/` adds architecture-agnostic instruments: comp
 >
 > - nanokimi-0.2b, running on microkimi
 
-## Quickstart
+## Get started
 
-You need nothing but a Rust toolchain (`rustup`). The GitHub Releases ship only the trained **nano** models (`nanokimi-0.2b.bin` + `vocab_nano.json`) - the debug models are generated locally with `microkimi build` (they are architecture demos, not shipped).
+All you need is Rust (`rustup`). Download `nanokimi-0.2b.bin` + `vocab_nano.json` from [Releases](https://github.com/microkimi/microkimi/releases) into the repo root, then:
 
 ```bash
 cargo build --release
-# download nanokimi-0.2b.bin + vocab_nano.json from the GitHub Releases page
-# into the repo root, then:
 ./target/release/microkimi run "Once upon a time, a kind dragon lived in a cave. Every morning, he" \
   --model nanokimi-0.2b.bin --max-new 12 --raw
 # answer:  would go to the park and play with his friends.
 
-./target/release/microkimi chat --model nanokimi-0.2b.bin --raw      # interactive stories
-./target/release/microkimi run "One day, a cat found a ball." \
-  --model nanokimi-0.2b.bin --max-new 10 --raw --debug-routing       # watch the MoE router pick experts
+./target/release/microkimi chat --model nanokimi-0.2b.bin --raw
+```
+
+To run a real Qwen checkpoint:
+
+```bash
+./target/release/microkimi convert-qwen --source /path/to/Qwen3.5-0.8B --out qwen.bin
+./target/release/microkimi chat --model qwen.bin
 ```
 
 ## Models
 
-Naming rule: **nano** models are trained from scratch here; **micro** models are pruned from the real weights; **-debug** files are synthetic fixtures for parity tests and engine tracing.
-
-| model | what it is | how to get it |
+| model | what it is | guide |
 |---|---|---|
-| **nanokimi-0.2b** | 0.2B Kimi K3 model, trained from scratch | [Releases](https://github.com/microkimi/microkimi/releases) - see [KIMI.md](KIMI.md) |
-| **microkimi-debug** | full 93-layer K3 skeleton, synthetic weights | `microkimi build` - see [KIMI.md](KIMI.md) |
-| **microdeepseek-debug** | DeepSeek-V4 skeleton, synthetic weights | `microkimi build --arch dsv4` - see [DEEPSEEK.md](DEEPSEEK.md) |
-| **converted Qwen3.5/3.6/3.8 (MoE or dense)** | text checkpoint converted to f32 spine + MXFP4 routed experts (MoE) or MXFP4 MLP (dense, e.g. Qwen3.8-27B) | `microkimi convert-qwen` - see [QWEN.md](QWEN.md) |
+| **nanokimi-0.2b** | 0.2B Kimi K3, trained from scratch | [KIMI.md](KIMI.md) |
+| **converted Qwen3.5 / 3.6 / 3.8** | any Qwen3.5-family text checkpoint, MoE or dense | [QWEN.md](QWEN.md) |
+| **microkimi-debug / microdeepseek-debug** | synthetic architecture demos for parity tests | [KIMI.md](KIMI.md), [DEEPSEEK.md](DEEPSEEK.md) |
 
-## Commands
+## Go deeper
 
-| task | Kimi K3 | DeepSeek-V4-Flash-0731 | Qwen3.5 family (MoE + dense) |
-|---|---|---|---|
-| assemble or convert weights | `microkimi build` | `microkimi build --arch dsv4` | `microkimi convert-qwen --source DIR --out qwen.bin` |
-| verify vs reference code | `microkimi paritytest` | `microkimi parity --arch dsv4` | `python3 ref/qwen_parity.py --out DIR` + `qwen-dump` |
-| mechanism self-tests | `microkimi selftest` | `microkimi selftest` | `cargo test qwen` |
-| generate | `microkimi run "..." --model microkimi-debug.bin` | `microkimi run "..." --model microdeepseek-debug.bin` | `microkimi run "..." --model qwen.bin` |
-| interactive | `microkimi chat --model nanokimi-0.2b.bin --raw` | `microkimi chat --model microdeepseek-debug.bin` | `microkimi chat --model qwen.bin` |
-
-`build-ds` and `dsparity` remain as aliases of `build --arch dsv4` / `parity --arch dsv4`.
-
-## Engine features
-
-| feature | what it does (measured, not promised) |
-|---|---|
-| MoE expert streaming | `--stream` keeps expert blobs on disk and fetches on demand (LRU + rollover in RAM), offset-sorted reads, direct I/O auto-detected: O_DIRECT on Linux, F_NOCACHE on macOS (`MICROKIMI_NO_ODIRECT=1` to A/B) |
-| Markov prefetch | `--stream-predict N` pre-fetches the experts the router is likely to pick next; `microkimi cachereplay <trace>` replays a recorded request trace offline under LRU / LFU / ARC / Belady / Markov policies (record with `MICROKIMI_TRACE=trace.bin`); the live eviction policy is selected with `MICROKIMI_CACHE=arc|lru|lfu` (default lfu) |
-| shadow fallback | `--stream-fallback` (default OFF, DEGRADED latency mode): on an expert cache miss, serve the resident 0.5-bit VQ1 shadow of the expert immediately (`microkimi shadow --model X.bin` builds the `<model>.shadows` sidecar) and refill full precision in the background - the decode never blocks on the disk, but shadow-served tokens are not bit-identical; the stream report counts them |
-| mmap demand-paging | models are mapped, not loaded: the kernel pages weights on demand, so a model larger than RAM still runs (`MICROKIMI_NO_MMAP=1` for the old full-load path) |
-| microquant | `microkimi slice --cold-vq N` keeps all experts but requantizes the coldest to 0.5-bit VQ - measured better than deleting them (30.6% vs 19.1% top-1 parity with the full model) |
-| structural slicing | `microkimi slice` prunes layers / hidden channels / experts (`--layers --hidden --experts`) and vocabulary (`--vocab-top`) from a .bin or straight from remote safetensors; crash-safe resume (`.sliceckpt`) and a persistent expert-score cache |
-| evaluation | `microkimi eval --model X.bin` - deterministic scorecard: 40 factual QA probes (2 phrasings) + perplexity, `--json` for archiving |
-| batch completion | `microkimi complete-batch` evaluates JSONL prompts with one model and adapter load, resetting caches between prompts and atomically writing JSONL results |
-| model adapter packs | K3 and Qwen f32 spine tensors: `nano/adapter_pack.py` turns all or an explicitly selected subset of a standard exact-same-base PEFT LoRA into a hash-bound `.mkap`, optionally with a scale multiplier; repeat `--adapter skill.mkap` to compose packs without changing the base `.bin` |
-| memory packs | K3 only: `microkimi absorb doc.txt --out pack.mkmem` snapshots the fixed-size KDA state; `run --memory pack.mkmem` resumes it. A video-game save state - details in [KIMI.md](KIMI.md#memory-packs-save-states-for-a-neural-network) |
+- [RESULTS.md](RESULTS.md) - benchmarks vs llama.cpp, same machine, same model.
+- [BENCH.md](BENCH.md) - how to reproduce every number.
+- [QWEN.md](QWEN.md) - the Qwen runtime: conversion, GPU offload, speculative decoding, serving, conversation version control.
+- [KIMI.md](KIMI.md) - the K3 engine: expert streaming, memory packs, slicing, adapters.
+- [DEEPSEEK.md](DEEPSEEK.md) - the DeepSeek-V4 runtime.
 
 ## License
 
