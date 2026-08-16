@@ -3071,15 +3071,59 @@ pub fn lanebench_cmd(args: &[String]) {
         model.prefill_lane(lane, &prompt);
     }
     let mut tokens: Vec<u32> = (0..lanes_n).map(|i| (5 + i as u32 * 13) % vocab.min(50_000)).collect();
-    let t0 = std::time::Instant::now();
-    for _ in 0..steps {
-        let mut refs: Vec<&mut DecodeLane> = lanes.iter_mut().collect();
-        let logits = model.forward_lanes(&mut refs, &tokens);
-        for (i, l) in logits.iter().enumerate() {
-            tokens[i] = crate::model::top_k_probs(l, 5)[0].0 as u32;
+
+    let mut run_phase = |model: &QwenModel, lanes: &mut [DecodeLane], tokens: &mut [u32], steps: usize| -> f64 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..steps {
+            let n = tokens.len();
+            let mut refs: Vec<&mut DecodeLane> = lanes.iter_mut().take(n).collect();
+            let logits = model.forward_lanes(&mut refs, tokens);
+            for (i, l) in logits.iter().enumerate() {
+                tokens[i] = crate::model::top_k_probs(l, 5)[0].0 as u32;
+            }
         }
+        t0.elapsed().as_secs_f64()
+    };
+
+    // --ab: alternate single-lane and N-lane phases in the SAME process
+    // (no reload, no page-in between arms), report per-round aggregate
+    // throughput ratios and their median - the noise-robust comparison.
+    if args.iter().any(|a| a == "--ab") {
+        let rounds: usize = value("--rounds").and_then(|v| v.parse().ok()).unwrap_or(6);
+        // warm both shapes once
+        let mut single_tok = vec![tokens[0]];
+        run_phase(&model, &mut lanes[..1], &mut single_tok, 2);
+        run_phase(&model, &mut lanes, &mut tokens.clone(), 2);
+        let mut ratios: Vec<f64> = Vec::new();
+        for round in 0..rounds {
+            let dt1 = run_phase(&model, &mut lanes[..1], &mut single_tok, steps);
+            let mut multi_tok = tokens.clone();
+            let dtn = run_phase(&model, &mut lanes, &mut multi_tok, steps);
+            let single_rate = steps as f64 / dt1;
+            let multi_rate = (lanes_n * steps) as f64 / dtn;
+            let ratio = multi_rate / single_rate;
+            ratios.push(ratio);
+            println!(
+                "round {}: 1 lane {:6.1} tok/s | {} lanes {:6.1} tok/s | ratio {:.2}x",
+                round + 1,
+                single_rate,
+                lanes_n,
+                multi_rate,
+                ratio
+            );
+        }
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "median aggregate speedup at {} lanes: {:.2}x (min {:.2}, max {:.2})",
+            lanes_n,
+            ratios[ratios.len() / 2],
+            ratios[0],
+            ratios[ratios.len() - 1]
+        );
+        return;
     }
-    let dt = t0.elapsed().as_secs_f64();
+
+    let dt = run_phase(&model, &mut lanes, &mut tokens, steps);
     let total = lanes_n * steps;
     println!(
         "lanes {:2}: {} tokens in {:.2} s -> {:.1} tok/s aggregate ({:.0} ms/step)",

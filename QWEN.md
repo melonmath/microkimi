@@ -253,11 +253,14 @@ together: the multi-lane kernels (f32, q8 head, packed MXFP4) read every
 weight row ONCE and dot it against each lane's input, so n lanes cost
 close to one in weight traffic. Per-lane results are bit-identical to
 single-stream decoding (tested on both variants). `microkimi lanebench
---lanes N` measures aggregate throughput; on the real 0.8B this
-container produced 33.9 aggregate tok/s at 4 lanes against 9 tok/s
-single-stream (3.7x) in a quiet window, with a 1.5x median across a
-noisy shared host - treat the ceiling, not the median, as the
-mechanism's value, and re-measure on dedicated hardware. Wiring lanes
+--lanes N [--ab]` measures aggregate throughput; `--ab` alternates
+single-lane and N-lane phases in the same process, which removes reload
+noise and is the number to trust. On the real 0.8B in this shared
+container: median 1.95x aggregate at 4 lanes (never below 1.64x over
+six rounds) and median 2.68x at 8 lanes, peaking at 47.6 aggregate
+tok/s against 17.5 single-stream in the same window. Scaling is
+sublinear here because parts of the step are compute-bound on this
+host; the weight-traffic sharing grows with model size. Wiring lanes
 into serve and complete-batch is the designated next step.
 
 ## Timelines: version control for conversations
