@@ -5,3 +5,4 @@
 pub mod memory_pack;
 pub mod prefix_cache;
 pub mod qwen_state;
+pub mod timeline;

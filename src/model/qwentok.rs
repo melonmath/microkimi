@@ -581,6 +581,30 @@ impl QwenTokenizer {
         (self.map_out(ids), split)
     }
 
+    /// One additional user turn on top of an existing conversation state:
+    /// closes the open assistant message (`<|im_end|>\n` - generation
+    /// stops before ingesting the stop token, so the state is mid-turn),
+    /// then renders the user block and the assistant priming. Used by the
+    /// timeline fork and diff paths.
+    pub fn continuation_turn(&self, question: &str, thinking: bool) -> Vec<u32> {
+        let mut ids = vec![QWEN_IM_END];
+        ids.extend(self.encode_full("\n"));
+        ids.push(QWEN_IM_START);
+        ids.extend(self.encode_full("user\n"));
+        ids.extend(self.encode_full(question.trim()));
+        ids.push(QWEN_IM_END);
+        ids.extend(self.encode_full("\n"));
+        ids.push(QWEN_IM_START);
+        ids.extend(self.encode_full("assistant\n"));
+        if thinking {
+            ids.push(QWEN_THINK);
+            ids.extend(self.encode_full("\n"));
+        } else {
+            self.push_disabled_think(&mut ids);
+        }
+        self.map_out(ids)
+    }
+
     /// The template's disabled reasoning block `<think>\n\n</think>\n\n`.
     fn push_disabled_think(&self, ids: &mut Vec<u32>) {
         ids.push(QWEN_THINK);

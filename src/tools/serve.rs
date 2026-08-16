@@ -151,6 +151,9 @@ pub struct GenRequest {
     /// Index where the final assistant priming begins (chat requests):
     /// the prefix before it is what a future turn re-renders verbatim.
     pub conversation_split: usize,
+    /// Fork source: continue from this stored timeline state instead of
+    /// ingesting the full conversation ("state_id" in the request).
+    pub fork_from: Option<String>,
     pub max_new: usize,
     pub temperature: f32,
     pub top_p: f32,
@@ -227,6 +230,10 @@ fn parse_request(
     }
     let json = std::panic::catch_unwind(|| crate::json::parse_complete(body))
         .map_err(|_| "malformed JSON body".to_string())?;
+    let fork_from = json
+        .get("state_id")
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
     let (prompt_ids, conversation_split) = if chat {
         let (system, history, question) = parse_messages(&json)?;
         let AnyTokenizer::Qwen(qtok) = tok else {
@@ -235,7 +242,21 @@ fn parse_request(
         // "enable_thinking": false renders the disabled think block, so a
         // small model spends its budget on the visible answer
         let thinking = !matches!(json.get("enable_thinking"), Some(crate::json::Json::Bool(false)));
-        qtok.encode_chat_split(system.as_deref(), &history, &question, thinking)
+        if fork_from.is_some() {
+            // the forked state already contains the whole conversation:
+            // the request carries exactly the next user turn
+            if system.is_some() || !history.is_empty() {
+                return Err(
+                    "with state_id, send exactly one user message (the state carries the history)"
+                        .to_string(),
+                );
+            }
+            let ids = qtok.continuation_turn(&question, thinking);
+            let split = ids.len();
+            (ids, split)
+        } else {
+            qtok.encode_chat_split(system.as_deref(), &history, &question, thinking)
+        }
     } else {
         let prompt = json
             .get("prompt")
@@ -252,6 +273,7 @@ fn parse_request(
     Ok(GenRequest {
         prompt_ids,
         conversation_split,
+        fork_from,
         max_new,
         temperature: number(&json, "temperature", 0.0) as f32,
         top_p: number(&json, "top_p", 1.0) as f32,
@@ -348,6 +370,7 @@ struct Server {
     model: QwenModel,
     tok: AnyTokenizer,
     pck: Option<crate::memory::prefix_cache::Pck>,
+    timelines: Option<crate::memory::timeline::TimelineStore>,
     model_name: String,
     default_max_new: usize,
     mtp: bool,
@@ -366,6 +389,9 @@ impl Server {
             }
             ("POST", "/v1/completions") => self.completion(request, stream, false),
             ("POST", "/v1/chat/completions") => self.completion(request, stream, true),
+            ("GET", "/v1/timelines") => self.timelines_list(stream),
+            ("POST", "/v1/timelines/diff") => self.timelines_diff(request, stream),
+            ("POST", "/v1/timelines/merge") => self.timelines_merge(request, stream),
             _ => respond_error(stream, "404 Not Found", "unknown route"),
         }
     }
@@ -394,9 +420,33 @@ impl Server {
             if parsed.seed == 0 { created ^ id } else { parsed.seed },
         );
 
-        // MTP speculative decoding: greedy, non-streaming requests only
-        // (streaming emits per committed token; the plain loop does that).
-        if self.mtp && sampler.temp <= 0.0 && !parsed.stream && self.model.has_mtp() {
+        // fork: restore the requested state and remember its token stream
+        // (the commit below records the full covering stream)
+        let mut base_tokens: Vec<u32> = Vec::new();
+        if let Some(state_id) = &parsed.fork_from {
+            let Some(store) = &self.timelines else {
+                return respond_error(stream, "400 Bad Request", "timeline store unavailable");
+            };
+            let node = match store.get(state_id) {
+                Ok(node) => node,
+                Err(e) => return respond_error(stream, "400 Bad Request", &e),
+            };
+            if let Err(e) =
+                crate::memory::qwen_state::load_slice(&mut self.model, &node.payload, "fork")
+            {
+                return respond_error(stream, "400 Bad Request", &e);
+            }
+            base_tokens = node.tokens;
+        }
+
+        // MTP speculative decoding: greedy, non-streaming, non-fork
+        // requests only (a forked state has no valid draft cache).
+        if self.mtp
+            && sampler.temp <= 0.0
+            && !parsed.stream
+            && self.model.has_mtp()
+            && parsed.fork_from.is_none()
+        {
             self.model.reset();
             let (ids, _passes, _accepted) = crate::model::qwen::mtp_generate(
                 &mut self.model,
@@ -408,15 +458,20 @@ impl Server {
             );
             let finish = if ids.len() >= parsed.max_new { "length" } else { "stop" };
             self.store_conversation(&parsed.prompt_ids, &ids);
-            return self.respond_full(stream, &parsed, &ids, finish, id, created, chat);
+            let state_id = self.commit_state(&parsed, &[], &ids, chat);
+            return self.respond_full(stream, &parsed, &ids, finish, id, created, chat, state_id);
         }
 
         // prompt ingestion through the prefix cache when available. The
         // lookup and store happen at the conversation prefix (before the
         // generation priming): that prefix is what the next turn extends,
-        // so it is the entry that can hit across turns.
+        // so it is the entry that can hit across turns. A fork skips the
+        // cache: its state is already loaded.
         let split = parsed.conversation_split.min(parsed.prompt_ids.len());
-        let logits = match &self.pck {
+        let logits = if parsed.fork_from.is_some() {
+            self.model.prefill(&parsed.prompt_ids)
+        } else {
+        match &self.pck {
             Some(pck) if split > 0 => {
                 let prefix_logits = crate::memory::prefix_cache::qwen_cached_prefill(
                     pck,
@@ -433,6 +488,7 @@ impl Server {
                 self.model.reset();
                 self.model.prefill(&parsed.prompt_ids)
             }
+        }
         };
 
         if parsed.stream {
@@ -474,6 +530,7 @@ impl Server {
             let _ = stream.flush();
             if chat {
                 self.store_conversation(&parsed.prompt_ids, &all_ids);
+                self.commit_state(&parsed, &base_tokens, &all_ids, chat);
             }
             return;
         }
@@ -482,7 +539,163 @@ impl Server {
         if chat {
             self.store_conversation(&parsed.prompt_ids, &generated.ids);
         }
-        self.respond_full(stream, &parsed, &generated.ids, generated.finish, id, created, chat);
+        let state_id = self.commit_state(&parsed, &base_tokens, &generated.ids, chat);
+        self.respond_full(stream, &parsed, &generated.ids, generated.finish, id, created, chat, state_id);
+    }
+
+    /// Commits the post-generation state as a timeline node (chat only).
+    /// The node's parent is the forked state when the request forked, and
+    /// its token stream covers everything the state has ingested.
+    fn commit_state(
+        &mut self,
+        parsed: &GenRequest,
+        base_tokens: &[u32],
+        generated: &[u32],
+        chat: bool,
+    ) -> Option<String> {
+        if !chat || generated.is_empty() {
+            return None;
+        }
+        let store = self.timelines.as_ref()?;
+        let mut tokens = base_tokens.to_vec();
+        tokens.extend_from_slice(&parsed.prompt_ids);
+        tokens.extend_from_slice(generated);
+        let payload = match crate::memory::qwen_state::serialize(&self.model) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("timelines: state not committed ({})", e);
+                return None;
+            }
+        };
+        match store.put(parsed.fork_from.as_deref(), &tokens, &payload) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("timelines: {}", e);
+                None
+            }
+        }
+    }
+
+    fn timelines_list(&self, stream: &mut TcpStream) {
+        let Some(store) = &self.timelines else {
+            return respond_error(stream, "400 Bad Request", "timeline store unavailable");
+        };
+        let mut rows: Vec<String> = store
+            .list()
+            .into_iter()
+            .map(|meta| {
+                format!(
+                    "{{\"id\":\"{}\",\"parent\":{},\"tokens\":{}}}",
+                    meta.id,
+                    meta.parent
+                        .map(|p| format!("\"{}\"", p))
+                        .unwrap_or_else(|| "null".to_string()),
+                    meta.n_tokens
+                )
+            })
+            .collect();
+        rows.sort();
+        respond(
+            stream,
+            "200 OK",
+            "application/json",
+            &format!("{{\"object\":\"list\",\"data\":[{}]}}", rows.join(",")),
+        );
+    }
+
+    /// Runs one prompt greedily from two states and reports where the two
+    /// universes diverge. Deterministic by construction (greedy over
+    /// bit-exact restored states), so a zero-diff means the states are
+    /// behaviorally identical on this probe.
+    fn timelines_diff(&mut self, request: &HttpRequest, stream: &mut TcpStream) {
+        let json = match std::panic::catch_unwind(|| crate::json::parse_complete(&request.body)) {
+            Ok(json) => json,
+            Err(_) => return respond_error(stream, "400 Bad Request", "malformed JSON body"),
+        };
+        let (Some(a), Some(b), Some(prompt)) = (
+            json.get("a").and_then(|x| x.as_str()),
+            json.get("b").and_then(|x| x.as_str()),
+            json.get("prompt").and_then(|x| x.as_str()),
+        ) else {
+            return respond_error(stream, "400 Bad Request", "diff needs a, b, prompt");
+        };
+        let max_new = number(&json, "max_tokens", 64.0) as usize;
+        let AnyTokenizer::Qwen(qtok) = &self.tok else {
+            return respond_error(stream, "400 Bad Request", "serve requires a Qwen model");
+        };
+        let continuation = qtok.continuation_turn(prompt, false);
+        let stop_id = self.tok.end_of_msg();
+        let mut outputs: Vec<Vec<u32>> = Vec::new();
+        for state_id in [a, b] {
+            let node = match self.timelines.as_ref().unwrap_or_else(|| unreachable!()).get(state_id) {
+                Ok(node) => node,
+                Err(e) => return respond_error(stream, "400 Bad Request", &e),
+            };
+            if let Err(e) =
+                crate::memory::qwen_state::load_slice(&mut self.model, &node.payload, "diff")
+            {
+                return respond_error(stream, "400 Bad Request", &e);
+            }
+            let logits = self.model.prefill(&continuation);
+            let mut sampler = Sampler::greedy();
+            let generated = generate(&mut self.model, logits, stop_id, max_new, &mut sampler, |_| true);
+            outputs.push(generated.ids);
+        }
+        let divergence = outputs[0]
+            .iter()
+            .zip(&outputs[1])
+            .position(|(x, y)| x != y)
+            .map(|i| i as i64)
+            .unwrap_or_else(|| {
+                if outputs[0].len() == outputs[1].len() {
+                    -1
+                } else {
+                    outputs[0].len().min(outputs[1].len()) as i64
+                }
+            });
+        let shared: Vec<u32> = match divergence {
+            -1 => outputs[0].clone(),
+            n => outputs[0][..n as usize].to_vec(),
+        };
+        let body = format!(
+            "{{\"a_text\":\"{}\",\"b_text\":\"{}\",\"divergence_token\":{},\"shared_prefix\":\"{}\"}}",
+            json_escape(&self.tok.decode(&outputs[0])),
+            json_escape(&self.tok.decode(&outputs[1])),
+            divergence,
+            json_escape(&self.tok.decode(&shared))
+        );
+        respond(stream, "200 OK", "application/json", &body);
+    }
+
+    /// Three-way merge of two branches through their lowest common
+    /// ancestor (see src/memory/timeline.rs for the semantics and the
+    /// declared approximations).
+    fn timelines_merge(&mut self, request: &HttpRequest, stream: &mut TcpStream) {
+        let json = match std::panic::catch_unwind(|| crate::json::parse_complete(&request.body)) {
+            Ok(json) => json,
+            Err(_) => return respond_error(stream, "400 Bad Request", "malformed JSON body"),
+        };
+        let (Some(a), Some(b)) = (
+            json.get("a").and_then(|x| x.as_str()),
+            json.get("b").and_then(|x| x.as_str()),
+        ) else {
+            return respond_error(stream, "400 Bad Request", "merge needs a, b");
+        };
+        let Some(store) = &self.timelines else {
+            return respond_error(stream, "400 Bad Request", "timeline store unavailable");
+        };
+        match crate::memory::timeline::merge_nodes(store, &mut self.model, a, b) {
+            Ok(id) => {
+                let tokens = store.get(&id).map(|n| n.tokens.len()).unwrap_or(0);
+                respond(
+                    stream,
+                    "200 OK",
+                    "application/json",
+                    &format!("{{\"state_id\":\"{}\",\"tokens\":{}}}", id, tokens),
+                );
+            }
+            Err(e) => respond_error(stream, "400 Bad Request", &e),
+        }
     }
 
     /// Stores the post-generation state as a prefix-cache entry covering
@@ -513,6 +726,7 @@ impl Server {
         id: u64,
         created: u64,
         chat: bool,
+        state_id: Option<String>,
     ) {
         let text = self.tok.decode(ids);
         let usage = format!(
@@ -526,13 +740,17 @@ impl Server {
             let reasoning_field = reasoning
                 .map(|r| format!("\"reasoning_content\":\"{}\",", json_escape(&r)))
                 .unwrap_or_default();
+            let state_field = state_id
+                .map(|sid| format!("\"state_id\":\"{}\",", sid))
+                .unwrap_or_default();
             format!(
-                "{{\"id\":\"chatcmpl-{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",\
+                "{{\"id\":\"chatcmpl-{}\",\"object\":\"chat.completion\",\"created\":{},\"model\":\"{}\",{}\
                  \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",{}\"content\":\"{}\"}},\
                  \"finish_reason\":\"{}\"}}],\"usage\":{}}}",
                 id,
                 created,
                 json_escape(&self.model_name),
+                state_field,
                 reasoning_field,
                 json_escape(&visible),
                 finish,
@@ -611,6 +829,7 @@ pub fn run(args: &[String]) {
         eprintln!("warning: --mtp ignored, the model was converted without its MTP head");
     }
     let pck = crate::memory::prefix_cache::open(&model_path);
+    let timelines = crate::memory::timeline::TimelineStore::open(&model_path);
     let model_name = std::path::Path::new(&model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -621,6 +840,7 @@ pub fn run(args: &[String]) {
         model,
         tok,
         pck,
+        timelines,
         model_name,
         default_max_new,
     };

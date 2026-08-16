@@ -226,6 +226,49 @@ token stream. Requests are served one at a time against the single
 stateful decoder; the default bind is 127.0.0.1 and there is no
 authentication layer - put a reverse proxy in front for anything else.
 
+## Timelines: version control for conversations
+
+A conversation state is a commit. `serve` content-addresses every
+post-answer state (SHA-256, verified on read) into `<model>.timelines/`
+and returns its id in the chat response; the DAG this builds supports
+the operations version control taught us to want, on model minds:
+
+- **fork**: pass `"state_id"` with a single user message to continue
+  from ANY past state. The engine is bit-exact, so a fork is a real
+  checkout, not an approximation - a state diffed against itself
+  generates byte-identical text (measured: divergence `-1`).
+- **diff** (`POST /v1/timelines/diff {a, b, prompt}`): run one prompt
+  greedily from two states and get both answers plus the first token
+  where the universes diverge.
+- **merge** (`POST /v1/timelines/merge {a, b}`): three-way merge through
+  the lowest common ancestor. This is only possible on this
+  architecture: 18 of 24 layers hold gated delta-rule states, which are
+  sums of decayed outer products - linear objects - so the merge is
+  literal arithmetic, `S = S_a + S_b - S_ancestor`, the
+  inclusion-exclusion that counts shared history once. The six
+  full-attention layers keep the ancestor prefix and append both branch
+  suffixes (B's keys stay at their original rotary positions: a declared
+  approximation), and the MTP cache is cleared.
+
+Live on the real Qwen3.5-0.8B, first attempt: a root state memorized
+"project codename Falcon"; branch A additionally learned "database
+password mango42", branch B "deploy day Thursday". Asked for both facts,
+branch A knew only its own (it invented a date), branch B only its own
+(it guessed "Falcon" as the password). The merged state answered
+`Database password: mango42 / Deploy day: Thursday` - both facts, each
+learned in a different branch - and still recalled the ancestor's
+"Falcon" once. Diffing the two branches on "list every fact you
+remember" put the divergence exactly at the token where their universes
+differ.
+
+Limits, measured rather than hidden: merging two branches that
+contradict each other (region "eu-west" vs "us-east") resolved silently
+to branch A's value - the merge has an ordering bias (A's convolution
+window and key/value precedence) and no conflict detection; the
+positional overlap of B's appended keys is unprincipled for long
+suffixes; and all of this is demonstrated at 0.8B scale on short
+factual probes, nothing more is claimed.
+
 ## Measured on Qwen3.5-0.8B (real weights)
 
 All of the above is fixture-verified; the numbers below are measured on
