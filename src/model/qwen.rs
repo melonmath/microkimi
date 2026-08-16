@@ -853,22 +853,86 @@ struct QwenMtpW {
 /// quality delta is measured, not promised.
 pub(crate) enum LayerQ8 {
     Linear {
-        in_qkv: crate::model::Q8Head,
-        in_z: crate::model::Q8Head,
-        out_proj: crate::model::Q8Head,
+        in_qkv: SpineMat,
+        in_z: SpineMat,
+        out_proj: SpineMat,
     },
     Full {
-        q_proj: crate::model::Q8Head,
-        k_proj: crate::model::Q8Head,
-        v_proj: crate::model::Q8Head,
-        o_proj: crate::model::Q8Head,
+        q_proj: SpineMat,
+        k_proj: SpineMat,
+        v_proj: SpineMat,
+        o_proj: SpineMat,
     },
 }
 
-/// MICROKIMI_Q8_SPINE=1 enables the q8 spine at load (read per load so
-/// tests can exercise both modes in one process).
-fn q8_spine_enabled() -> bool {
-    std::env::var("MICROKIMI_Q8_SPINE").map(|v| v == "1").unwrap_or(false)
+/// One quantized spine matrix: q8 rows (llama.cpp's Q8_0 trade) or MXFP4
+/// nibbles (half the traffic again, the same format as the packed MLP).
+pub(crate) enum SpineMat {
+    Q8(crate::model::Q8Head),
+    Fp4(PackedMat),
+}
+
+/// An owned MXFP4 matrix quantized at load (packed nibbles + e8m0 row
+/// scales), driven by the same kernels as the on-disk packed MLP.
+pub(crate) struct PackedMat {
+    packed: Vec<u8>,
+    scales: Vec<u8>,
+    rows: usize,
+    cols: usize,
+}
+
+impl PackedMat {
+    fn from_f32(w: &[f32], rows: usize, cols: usize) -> PackedMat {
+        let (packed, scales) = crate::quant::mxfp4::quantize(w, rows, cols);
+        PackedMat { packed, scales, rows, cols }
+    }
+}
+
+impl SpineMat {
+    fn build(w: &[f32], rows: usize, cols: usize, fp4: bool) -> SpineMat {
+        if fp4 {
+            SpineMat::Fp4(PackedMat::from_f32(w, rows, cols))
+        } else {
+            SpineMat::Q8(crate::model::Q8Head::from_f32(w, rows, cols))
+        }
+    }
+
+    pub(crate) fn matvec_st(&self, x: &[f32], out: &mut [f32]) {
+        match self {
+            SpineMat::Q8(head) => head.matvec_st(x, out),
+            SpineMat::Fp4(m) => crate::quant::mxfp4::matvec_packed(
+                &m.packed, &m.scales, m.rows, m.cols, x, out, 1,
+            ),
+        }
+    }
+
+    pub(crate) fn matvec_multi(&self, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
+        match self {
+            SpineMat::Q8(head) => head.matvec_multi(xs, outs),
+            SpineMat::Fp4(m) => crate::quant::mxfp4::matvec_packed_multi(
+                &m.packed,
+                &m.scales,
+                m.rows,
+                m.cols,
+                xs,
+                outs,
+                crate::model::pool::pool().workers.max(1),
+            ),
+        }
+    }
+}
+
+/// Spine quantization at load: MICROKIMI_FP4_SPINE=1 selects MXFP4 (wins
+/// when both are set), MICROKIMI_Q8_SPINE=1 selects q8, neither keeps the
+/// exact f32 spine. Read per load so tests can exercise every mode.
+fn spine_mode() -> Option<bool> {
+    if std::env::var("MICROKIMI_FP4_SPINE").map(|v| v == "1").unwrap_or(false) {
+        return Some(true);
+    }
+    if std::env::var("MICROKIMI_Q8_SPINE").map(|v| v == "1").unwrap_or(false) {
+        return Some(false);
+    }
+    None
 }
 
 /// Frequency-sliced draft head for chained MTP proposals. BPE vocabulary
@@ -1610,7 +1674,7 @@ impl QwenModel {
             })
             .collect();
         let mtp_cache = FullCache::new(&c);
-        let q8_spine: Vec<Option<LayerQ8>> = if q8_spine_enabled() {
+        let q8_spine: Vec<Option<LayerQ8>> = if let Some(fp4) = spine_mode() {
             let conv_dim = c.lin_key_total() * 2 + c.lin_value_total();
             let full_width = c.n_heads * c.head_dim;
             let kvw = c.n_kv_heads * c.head_dim;
@@ -1619,42 +1683,39 @@ impl QwenModel {
                 .map(|layer| {
                     Some(match &layer.attn {
                         QwenAttnW::Linear(w) => LayerQ8::Linear {
-                            in_qkv: crate::model::Q8Head::from_f32(
+                            in_qkv: SpineMat::build(
                                 tensor(&bin.data, &w.in_qkv),
                                 conv_dim,
                                 c.d,
+                                fp4,
                             ),
-                            in_z: crate::model::Q8Head::from_f32(
+                            in_z: SpineMat::build(
                                 tensor(&bin.data, &w.in_z),
                                 c.lin_value_total(),
                                 c.d,
+                                fp4,
                             ),
-                            out_proj: crate::model::Q8Head::from_f32(
+                            out_proj: SpineMat::build(
                                 tensor(&bin.data, &w.out_proj),
                                 c.d,
                                 c.lin_value_total(),
+                                fp4,
                             ),
                         },
                         QwenAttnW::Full(w) => LayerQ8::Full {
-                            q_proj: crate::model::Q8Head::from_f32(
+                            q_proj: SpineMat::build(
                                 tensor(&bin.data, &w.q_proj),
                                 full_width * 2,
                                 c.d,
+                                fp4,
                             ),
-                            k_proj: crate::model::Q8Head::from_f32(
-                                tensor(&bin.data, &w.k_proj),
-                                kvw,
-                                c.d,
-                            ),
-                            v_proj: crate::model::Q8Head::from_f32(
-                                tensor(&bin.data, &w.v_proj),
-                                kvw,
-                                c.d,
-                            ),
-                            o_proj: crate::model::Q8Head::from_f32(
+                            k_proj: SpineMat::build(tensor(&bin.data, &w.k_proj), kvw, c.d, fp4),
+                            v_proj: SpineMat::build(tensor(&bin.data, &w.v_proj), kvw, c.d, fp4),
+                            o_proj: SpineMat::build(
                                 tensor(&bin.data, &w.o_proj),
                                 c.d,
                                 full_width,
+                                fp4,
                             ),
                         },
                     })
@@ -3059,8 +3120,8 @@ fn multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [Vec<f32
     crate::model::ops::matvec_multi(w, rows, cols, xs, &mut refs);
 }
 
-/// q8 multi-lane matvec over Vec<Vec<f32>> outputs (spine q8 mode).
-fn multi_q8(w: &crate::model::Q8Head, xs: &[&[f32]], outs: &mut [Vec<f32>]) {
+/// Quantized-spine multi-lane matvec over Vec<Vec<f32>> outputs.
+fn multi_q8(w: &SpineMat, xs: &[&[f32]], outs: &mut [Vec<f32>]) {
     let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|o| o.as_mut_slice()).collect();
     w.matvec_multi(xs, &mut refs);
 }
@@ -3079,7 +3140,7 @@ fn lin_attn_tail(
     dt_bias: &[f32],
     norm_w: &[f32],
     out_proj: &[f32],
-    q8_out: Option<&crate::model::Q8Head>,
+    q8_out: Option<&SpineMat>,
     cache: &mut LinCache,
     out: &mut [f32],
 ) {
@@ -3872,6 +3933,31 @@ mod model_tests {
         assert!(q8_logits.iter().all(|v| v.is_finite()));
 
         drop((f32_model, q8_model, q8_forward, q8_lanes_model, q8_single));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fp4_spine_paths_agree_and_stay_finite() {
+        let c = bin_tiny_dense();
+        let path = checkpoint_fixture(&c);
+        let tokens = [3u32, 5, 7, 11, 2];
+        unsafe { std::env::set_var("MICROKIMI_FP4_SPINE", "1") };
+        let mut fp4_prefill = QwenModel::load(&path);
+        let mut fp4_forward = QwenModel::load(&path);
+        unsafe { std::env::remove_var("MICROKIMI_FP4_SPINE") };
+        assert!(fp4_prefill
+            .q8_spine
+            .iter()
+            .all(|x| matches!(x, Some(LayerQ8::Linear { in_qkv: SpineMat::Fp4(_), .. })
+                | Some(LayerQ8::Full { q_proj: SpineMat::Fp4(_), .. }))));
+        let a = fp4_prefill.prefill(&tokens);
+        let mut b = Vec::new();
+        for &t in &tokens {
+            b = fp4_forward.forward(t);
+        }
+        assert_eq!(a, b, "fp4 forward diverges from fp4 prefill");
+        assert!(a.iter().all(|v| v.is_finite()));
+        drop((fp4_prefill, fp4_forward));
         std::fs::remove_file(path).ok();
     }
 

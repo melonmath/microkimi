@@ -255,10 +255,15 @@ multiply-accumulate pair. Integer sums are exact whatever the
 accumulation shape, so the kernel swap is bit-identical -
 `MICROKIMI_NO_SDOT=1` is the A/B toggle, and paired runs measured about
 5% end-to-end on this memory-bound decode (34 vs 36 ms/token median);
-the gap to hand-tuned engines that remains is their 4-bit spines - the
-engine's own MXFP4 machinery applied to the attention matrices would
-roughly halve the remaining spine traffic (0.24 to 0.12 GB/token on the
-0.8B), at a quality cost that must be measured before it ships.
+`MICROKIMI_FP4_SPINE=1` applies the engine's own MXFP4 machinery to the
+same attention matrices - and the measurement rejected it at this
+scale, on both axes: paired decode ran SLOWER than q8 (45 vs 34
+ms/token median: the nibble decode costs more compute than the halved
+traffic saves on a partly compute-bound host) and held-out NLL degraded
+by +0.0695 against q8's -0.0009. The q8 spine is the measured sweet
+spot on the 0.8B; the fp4 mode stays available because its traffic
+argument returns on bandwidth-starved hosts (a 27B paging from disk),
+where it must be re-measured before use.
 
 ## Chained drafting and lane-batched decoding
 
