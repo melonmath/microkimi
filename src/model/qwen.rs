@@ -216,6 +216,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunked_scan_matches_sequential_delta_steps() {
+        // sizes crossing chunk boundaries and a remainder, two dims
+        for (kd, vd, t_count) in [(8usize, 8usize, 70usize), (128, 128, 45), (16, 8, 32)] {
+            let f = |i: usize, m: usize| ((i * 37 + 11) % m) as f32 / m as f32 - 0.4;
+            let qn: Vec<f32> = (0..t_count * kd).map(|i| f(i, 19)).collect();
+            let kn: Vec<f32> = (0..t_count * kd).map(|i| f(i + 5, 23)).collect();
+            let vn: Vec<f32> = (0..t_count * vd).map(|i| f(i + 9, 29)).collect();
+            let beta: Vec<f32> = (0..t_count).map(|i| 0.2 + 0.7 * f(i, 13).abs()).collect();
+            // include BRUTAL decays (down to ~1e-3): cumulative products
+            // underflow over a chunk, which the division form got wrong
+            let gamma: Vec<f32> = (0..t_count)
+                .map(|i| if i % 7 == 3 { 0.001 } else { 0.85 + 0.14 * f(i + 3, 17).abs() })
+                .collect();
+            let mut s_seq = vec![0.05f32; kd * vd];
+            let mut s_chk = s_seq.clone();
+            let mut out_seq = vec![0.0f32; t_count * vd];
+            let mut out_chk = vec![0.0f32; t_count * vd];
+            for t in 0..t_count {
+                // delta_step takes g with decay = exp(g)
+                let g = gamma[t].ln();
+                delta_step(
+                    &mut s_seq,
+                    &qn[t * kd..(t + 1) * kd],
+                    &kn[t * kd..(t + 1) * kd],
+                    &vn[t * vd..(t + 1) * vd],
+                    g,
+                    beta[t],
+                    &mut out_seq[t * vd..(t + 1) * vd],
+                );
+            }
+            chunked_scan_head(
+                &mut s_chk, &mut out_chk, &qn, &kn, &vn, &beta, &gamma, t_count, kd, vd,
+            );
+            let tol = 2e-4f32;
+            for (a, b) in out_seq.iter().zip(&out_chk) {
+                assert!(
+                    (a - b).abs() <= tol * (1.0 + a.abs()),
+                    "output diverges: {} vs {} (kd {} vd {} t {})",
+                    a, b, kd, vd, t_count
+                );
+            }
+            for (a, b) in s_seq.iter().zip(&s_chk) {
+                assert!(
+                    (a - b).abs() <= tol * (1.0 + a.abs()),
+                    "state diverges: {} vs {}",
+                    a, b
+                );
+            }
+        }
+    }
+
+    #[test]
     fn delta_rule_writes_then_reads() {
         // one key/value pair written with beta 1 must be read back by the
         // same key: the delta rule is an associative memory
@@ -2334,6 +2386,17 @@ pub fn dprof_print() {
     );
 }
 
+/// MICROKIMI_CHUNKED_SCAN=1 opts the spine prefill into the WY chunked
+/// scan. Default OFF: the same-window A/B measured the scalar chunked
+/// form SLOWER than the fused sequential scan (median 6.1 vs 4.2
+/// ms/token) - it earns its place only with tiled kernels behind it.
+fn chunked_scan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MICROKIMI_CHUNKED_SCAN").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 fn prefill_workers(items: usize) -> usize {
     crate::model::pool::pool().workers.max(1).min(items.max(1))
 }
@@ -2782,6 +2845,7 @@ fn lin_attn_prefill(
             let conved = &conved;
             let b_raw = &b_raw;
             let a_raw = &a_raw;
+            let use_chunked = q8.is_some() && t_count >= 32 && chunked_scan_on();
             for h0 in (0..heads).step_by(hchunk.max(1)) {
                 let h1 = (h0 + hchunk).min(heads);
                 let (state_c, sr) = state_rest.split_at_mut((h1 - h0) * kd * vd);
@@ -2793,12 +2857,58 @@ fn lin_attn_prefill(
                     // per (head, token) was a measurable slice of the scan
                     let mut q = vec![0.0f32; kd];
                     let mut k = vec![0.0f32; kd];
+                    // chunked-scan prep buffers (spine modes): normalized
+                    // q/k, contiguous v, per-token beta and decay
+                    let (mut qb, mut kb, mut vb, mut bb, mut gb) = if use_chunked {
+                        (
+                            vec![0.0f32; t_count * kd],
+                            vec![0.0f32; t_count * kd],
+                            vec![0.0f32; t_count * vd],
+                            vec![0.0f32; t_count],
+                            vec![0.0f32; t_count],
+                        )
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    };
                     for h in h0..h1 {
                         let state_h =
                             &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
                         let mixed_h =
                             &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
                         let kh = h / rep.max(1);
+                        if use_chunked {
+                            // WY chunked scan: identical math, GEMM-shaped;
+                            // reassociation-level numerics, spine-only
+                            let scale = 1.0 / (kd as f32).sqrt();
+                            for t in 0..t_count {
+                                let row = &conved[t * conv_dim..(t + 1) * conv_dim];
+                                let qd = &mut qb[t * kd..(t + 1) * kd];
+                                qd.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
+                                l2norm(qd, 1e-6);
+                                for value in qd.iter_mut() {
+                                    *value *= scale;
+                                }
+                                let kdst = &mut kb[t * kd..(t + 1) * kd];
+                                kdst.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
+                                l2norm(kdst, 1e-6);
+                                vb[t * vd..(t + 1) * vd]
+                                    .copy_from_slice(&row[2 * kt + h * vd..2 * kt + (h + 1) * vd]);
+                                bb[t] = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
+                                let sp = {
+                                    let arg = a_raw[t * heads + h] + dt_bias[h];
+                                    if arg > 20.0 { arg } else { (1.0 + arg.exp()).ln() }
+                                };
+                                gb[t] = (-a_log[h].exp() * sp).exp();
+                            }
+                            let state_h =
+                                &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
+                            let mixed_h =
+                                &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
+                            chunked_scan_head(
+                                state_h, mixed_h, &qb, &kb, &vb, &bb, &gb, t_count, kd, vd,
+                            );
+                            continue;
+                        }
                         for t in 0..t_count {
                             let row = &conved[t * conv_dim..(t + 1) * conv_dim];
                             q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
@@ -5073,5 +5183,158 @@ mod model_tests {
         assert_eq!(first, replay);
         drop(model);
         std::fs::remove_file(path).ok();
+    }
+}
+
+/// Chunked delta-rule scan for one head (WY-style): within a chunk of C
+/// tokens the recurrence unrolls to
+///   u_t = beta_t*v_t - beta_t*G(1..t)*S0'k_t - sum_{s<t} beta_t*G(s+1..t)*(k_s'k_t)*u_s
+/// solved by forward substitution, then outputs and the end-of-chunk
+/// state come from GEMM-shaped sums - no per-token dependency chain
+/// except the short substitution. Mathematically identical to
+/// delta_step folded over the chunk; floating-point reassociation
+/// differs (~1e-5 relative), so this path only runs under the
+/// quantized spine modes whose contract is already tolerance-based.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chunked_scan_head(
+    state: &mut [f32],
+    mixed: &mut [f32],
+    qn: &[f32],
+    kn: &[f32],
+    vn: &[f32],
+    beta: &[f32],
+    gamma: &[f32],
+    t_count: usize,
+    kd: usize,
+    vd: usize,
+) {
+    const C: usize = 32;
+    let mut c0 = 0usize;
+    let mut u = vec![0.0f32; C * vd];
+    let mut b = vec![0.0f32; C * vd];
+    let mut s0k = vec![0.0f32; C * vd];
+    let mut s0q = vec![0.0f32; C * vd];
+    let mut kk = vec![0.0f32; C * C];
+    let mut qk = vec![0.0f32; C * C];
+    let mut grel = vec![0.0f32; C * C];
+    let mut gcum = [0.0f32; C];
+    while c0 < t_count {
+        let c1 = (c0 + C).min(t_count);
+        let n = c1 - c0;
+        // cumulative decay products G(1..t) within the chunk
+        let mut acc = 1.0f32;
+        for (i, g) in gamma[c0..c1].iter().enumerate() {
+            acc *= g;
+            gcum[i] = acc;
+        }
+        // gram matrices (GEMM-shaped, kd shared)
+        for t in 0..n {
+            let kt = &kn[(c0 + t) * kd..(c0 + t + 1) * kd];
+            let qt = &qn[(c0 + t) * kd..(c0 + t + 1) * kd];
+            for s in 0..=t {
+                let ks = &kn[(c0 + s) * kd..(c0 + s + 1) * kd];
+                if s < t {
+                    kk[t * C + s] = crate::model::ops::dot(ks, kt);
+                }
+                qk[t * C + s] = crate::model::ops::dot(ks, qt);
+            }
+        }
+        // S0-side terms: s0k[t] = S0' k_t, s0q[t] = S0' q_t (row-weighted
+        // sums over the state's kd rows; k/q weights are per-row scalars)
+        s0k[..n * vd].fill(0.0);
+        s0q[..n * vd].fill(0.0);
+        for i in 0..kd {
+            let row = &state[i * vd..(i + 1) * vd];
+            for t in 0..n {
+                let kw = kn[(c0 + t) * kd + i];
+                let qw = qn[(c0 + t) * kd + i];
+                let dk = &mut s0k[t * vd..(t + 1) * vd];
+                if kw != 0.0 {
+                    for j in 0..vd {
+                        dk[j] += kw * row[j];
+                    }
+                }
+                if qw != 0.0 {
+                    let dq = &mut s0q[t * vd..(t + 1) * vd];
+                    for j in 0..vd {
+                        dq[j] += qw * row[j];
+                    }
+                }
+            }
+        }
+        // relative decay products G(s+1..t), built multiplicatively per
+        // row (never by dividing cumulative products: real decays reach
+        // ~1e-2 per token and 32-token cumulatives underflow)
+        for t in 0..n {
+            grel[t * C + t] = 1.0;
+            let mut p = 1.0f32;
+            for s in (0..t).rev() {
+                p *= gamma[c0 + s + 1];
+                grel[t * C + s] = p;
+            }
+        }
+        // b_t and forward substitution for u
+        for t in 0..n {
+            let bt = beta[c0 + t];
+            let g1t = gcum[t];
+            let vt = &vn[(c0 + t) * vd..(c0 + t + 1) * vd];
+            let (bu, sk) = (&mut b[t * vd..(t + 1) * vd], &s0k[t * vd..(t + 1) * vd]);
+            for j in 0..vd {
+                bu[j] = bt * (vt[j] - g1t * sk[j]);
+            }
+        }
+        for t in 0..n {
+            let (ready, ut_row) = u.split_at_mut(t * vd);
+            let ut = &mut ut_row[..vd];
+            ut.copy_from_slice(&b[t * vd..(t + 1) * vd]);
+            let bt = beta[c0 + t];
+            for s in 0..t {
+                let a = bt * grel[t * C + s] * kk[t * C + s];
+                if a != 0.0 {
+                    let us = &ready[s * vd..(s + 1) * vd];
+                    for j in 0..vd {
+                        ut[j] -= a * us[j];
+                    }
+                }
+            }
+        }
+        // outputs: out_t = G(1..t) s0q[t] + sum_{s<=t} G(s+1..t) qk[t][s] u_s
+        for t in 0..n {
+            let out = &mut mixed[(c0 + t) * vd..(c0 + t + 1) * vd];
+            let g1t = gcum[t];
+            let sq = &s0q[t * vd..(t + 1) * vd];
+            for j in 0..vd {
+                out[j] = g1t * sq[j];
+            }
+            for s in 0..=t {
+                let w = grel[t * C + s] * qk[t * C + s];
+                if w != 0.0 {
+                    let us = &u[s * vd..(s + 1) * vd];
+                    for j in 0..vd {
+                        out[j] += w * us[j];
+                    }
+                }
+            }
+        }
+        // state update: S = G(1..C) S0 + sum_s G(s+1..C) k_s (x) u_s
+        let gtot = gcum[n - 1];
+        for x in state.iter_mut() {
+            *x *= gtot;
+        }
+        for s in 0..n {
+            let w = grel[(n - 1) * C + s];
+            let ks = &kn[(c0 + s) * kd..(c0 + s + 1) * kd];
+            let us = &u[s * vd..(s + 1) * vd];
+            for i in 0..kd {
+                let f = w * ks[i];
+                if f != 0.0 {
+                    let row = &mut state[i * vd..(i + 1) * vd];
+                    for j in 0..vd {
+                        row[j] += f * us[j];
+                    }
+                }
+            }
+        }
+        c0 = c1;
     }
 }
