@@ -1923,6 +1923,29 @@ impl QwenModel {
             mq.up.prebuild_gemm();
             mq.down.prebuild_gemm();
         }
+        // spine modes: touch the mapped f32 tensors the prefill still reads
+        // (norms, conv, small projections, embeddings) so the first measured
+        // prefill pays no page faults - llama-bench warms before timing
+        if spine_mode().is_some() {
+            let mut sink = 0.0f32;
+            for layer in &layers {
+                for t in [&layer.input_norm, &layer.post_norm] {
+                    sink += tensor(&bin.data, t).iter().step_by(1024).sum::<f32>();
+                }
+                if let QwenAttnW::Linear(w) = &layer.attn {
+                    for t in [&w.conv, &w.in_b, &w.in_a, &w.norm, &w.a_log, &w.dt_bias] {
+                        sink += tensor(&bin.data, t).iter().step_by(1024).sum::<f32>();
+                    }
+                }
+                if let QwenAttnW::Full(w) = &layer.attn {
+                    for t in [&w.q_norm, &w.k_norm] {
+                        sink += tensor(&bin.data, t).iter().step_by(1024).sum::<f32>();
+                    }
+                }
+            }
+            sink += tensor(&bin.data, &embed).iter().step_by(1024).sum::<f32>();
+            std::hint::black_box(sink);
+        }
         let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
             layers
                 .iter()
