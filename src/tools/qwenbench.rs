@@ -166,7 +166,8 @@ pub fn run(args: &[String]) {
     let sequential = prefill_ms(&run_self(&pre, &[("MICROKIMI_NO_QWEN_BATCH", "1")]));
     // the q8 spine runs prefill attention and the MLP on the int8 tile
     // kernels - the fastest CPU prompt-reading mode
-    let q8pre = prefill_ms(&run_self(&pre, &[("MICROKIMI_Q8_SPINE", "1")]));
+    let q8out = run_self(&pre, &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_PROF", "1")]);
+    let q8pre = prefill_ms(&q8out);
     println!("prefill (~1k-token prompt):");
     match (batched, sequential) {
         (Some(b), Some(s)) => println!(
@@ -179,6 +180,18 @@ pub fn run(args: &[String]) {
     }
     if let Some(q) = q8pre {
         println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
+        for line in q8out.lines() {
+            if line.starts_with("prof:") {
+                println!("  {}", line);
+            }
+        }
+    }
+    // kernel ceiling on this host (GMAC/s): the number that says whether
+    // a prompt-reading gap lives in the GEMM or in the tissue
+    for line in run_self(&["kernbench"], &[]).lines() {
+        if line.contains("GMAC/s") {
+            println!("  kern: {}", line.trim());
+        }
     }
 
     // ── GPU prefill (macOS: MPS GEMM offload, in-process paired child) ──

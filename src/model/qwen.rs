@@ -210,18 +210,6 @@ fn push_k_mirror(cache: &mut FullCache, k_new: &[f32]) {
     cache.kqs.extend_from_slice(&xq.scales);
 }
 
-/// One q8 attention score: integer block dots against the cache mirror,
-/// fused block-sequential scale application (the shared q8 order).
-#[inline]
-fn q8_score_row(qq: &crate::quant::q8::Q8Vec, kq: &[i8], ks: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
-    for g in 0..ks.len() {
-        let idot =
-            crate::quant::q8::block_dot_i8(&kq[g * 32..(g + 1) * 32], &qq.q[g * 32..(g + 1) * 32]);
-        acc = (idot as f32).mul_add(ks[g] * qq.scales[g], acc);
-    }
-    acc
-}
 
 #[cfg(test)]
 mod tests {
@@ -3122,17 +3110,17 @@ fn full_attn_prefill(
                             // K mirror (the f32 default stays bit-exact)
                             if q8_scores {
                                 crate::quant::q8::quantize_q8_into(qh, &mut qq);
-                                let nbh = hd / 32;
-                                for (u, sc_slot) in scores[..window].iter_mut().enumerate() {
-                                    let off = u * kv_width + kh * hd;
-                                    let sc = q8_score_row(
-                                        &qq,
-                                        &cache_kq[off..off + hd],
-                                        &cache_kqs[off / 32..off / 32 + nbh],
-                                    ) * scale;
-                                    *sc_slot = sc;
-                                    max_score = max_score.max(sc);
-                                }
+                                max_score = crate::quant::q8::score_window(
+                                    &qq,
+                                    cache_kq,
+                                    cache_kqs,
+                                    kv_width,
+                                    kh * hd,
+                                    hd / 32,
+                                    window,
+                                    scale,
+                                    &mut scores,
+                                );
                             } else {
                             for u in 0..window {
                                 let off = u * kv_width + kh * hd;
@@ -4036,17 +4024,17 @@ fn full_attn_tail(
         // (bit-identical to the batch path's q8 branch)
         if q8_scores {
             crate::quant::q8::quantize_q8_into(qh, &mut qq);
-            let nbh = hd / 32;
-            for (u, slot) in scores[..cache.len].iter_mut().enumerate() {
-                let off = u * kv_width + kh * hd;
-                let sc = q8_score_row(
-                    &qq,
-                    &cache.kq[off..off + hd],
-                    &cache.kqs[off / 32..off / 32 + nbh],
-                ) * scale;
-                *slot = sc;
-                max_score = max_score.max(sc);
-            }
+            max_score = crate::quant::q8::score_window(
+                &qq,
+                &cache.kq,
+                &cache.kqs,
+                kv_width,
+                kh * hd,
+                hd / 32,
+                cache.len,
+                scale,
+                &mut scores,
+            );
         } else {
         for t in 0..cache.len {
             let off = t * kv_width + kh * hd;
