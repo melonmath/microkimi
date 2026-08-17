@@ -1142,6 +1142,7 @@ pub struct QwenModel {
     skip_bounds: Vec<Option<SkipBounds>>,
     /// Q8 spine copies (spine q8 mode only; empty otherwise).
     pub(crate) q8_spine: Vec<Option<LayerQ8>>,
+    pub(crate) mlp_q8: Vec<Option<MlpQ8>>,
     pub(crate) mtp_cache: FullCache,
     pub(crate) pos: usize,
     /// Logits after the last ingested token (state snapshots resume from
@@ -1312,6 +1313,36 @@ fn packed_moe(
 /// Dense-variant MLP: down(silu(gate(x)) * up(x)) over MXFP4-packed
 /// matrices. The three matvecs dominate a dense layer, so each one runs
 /// row-parallel across the worker pool.
+/// Single-token dense MLP through the unpacked-i8 copies when the q8
+/// spine carries them (and no block budget is active); the packed path
+/// otherwise. Same math, pure-SDOT kernels.
+fn packed_dense_mlp_q8(
+    data: &[u8],
+    gate: &PackedT,
+    up: &PackedT,
+    down: &PackedT,
+    q8m: Option<&MlpQ8>,
+    c: &QwenConfig,
+    x: &[f32],
+    bounds: Option<&SkipBounds>,
+) -> Vec<f32> {
+    if let Some(mq) = q8m {
+        if bounds.is_none() || mlp_budget() == 0.0 {
+            let inter = c.dense_inter;
+            let mut h_gate = vec![0.0f32; inter];
+            let mut h_up = vec![0.0f32; inter];
+            crate::model::Q8Head::matvec2(&mq.gate, &mq.up, x, &mut h_gate, &mut h_up);
+            for i in 0..inter {
+                h_gate[i] = (h_gate[i] / (1.0 + (-h_gate[i]).exp())) * h_up[i];
+            }
+            let mut value = vec![0.0f32; c.d];
+            mq.down.matvec(&h_gate, &mut value);
+            return value;
+        }
+    }
+    packed_dense_mlp(data, gate, up, down, c, x, None, bounds)
+}
+
 fn packed_dense_mlp(
     data: &[u8],
     gate: &PackedT,
@@ -1421,6 +1452,35 @@ pub fn mlp_skip_stats() -> (u64, u64) {
 }
 
 /// Builds the quantized spine copies for every layer (q8 or fp4).
+/// Load-time i8 copies of the dense MLP matrices (q8 spine mode): the
+/// exact LUT2 transfer of Q8Head::from_packed_fp4, so the decode and
+/// prefill MLPs run pure-SDOT kernels instead of unpacking nibbles on
+/// every matvec.
+pub(crate) struct MlpQ8 {
+    pub(crate) gate: Q8Head,
+    pub(crate) up: Q8Head,
+    pub(crate) down: Q8Head,
+}
+
+fn build_mlp_q8(layers: &[QwenLayerW], bin: &BinFile, c: &QwenConfig) -> Vec<Option<MlpQ8>> {
+    layers
+        .iter()
+        .map(|layer| match &layer.mlp {
+            QwenMlpW::Dense { gate, up, down } => {
+                let (pg, sg) = packed_parts(&bin.data, gate);
+                let (pu, su) = packed_parts(&bin.data, up);
+                let (pd, sd) = packed_parts(&bin.data, down);
+                Some(MlpQ8 {
+                    gate: Q8Head::from_packed_fp4(pg, sg, c.dense_inter, c.d),
+                    up: Q8Head::from_packed_fp4(pu, su, c.dense_inter, c.d),
+                    down: Q8Head::from_packed_fp4(pd, sd, c.d, c.dense_inter),
+                })
+            }
+            QwenMlpW::Moe { .. } => None,
+        })
+        .collect()
+}
+
 fn build_spine(
     layers: &[QwenLayerW],
     bin: &BinFile,
@@ -1741,6 +1801,12 @@ impl QwenModel {
             Some(fp4) => build_spine(&layers, &bin, &c, fp4),
             None => (0..c.n_layers).map(|_| None).collect(),
         };
+        // q8 mode also unpacks the dense MLP to i8 (exact transfer);
+        // the fp4 spine keeps the packed MLP it exists to exercise.
+        let mlp_q8: Vec<Option<MlpQ8>> = match spine_mode() {
+            Some(false) if c.is_dense() => build_mlp_q8(&layers, &bin, &c),
+            _ => (0..c.n_layers).map(|_| None).collect(),
+        };
         let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
             layers
                 .iter()
@@ -1767,6 +1833,7 @@ impl QwenModel {
             draft_head: None,
             skip_bounds,
             q8_spine,
+            mlp_q8,
             mtp_cache,
             pos: 0,
             last_logits: Vec::new(),
@@ -1805,6 +1872,10 @@ impl QwenModel {
         self.q8_spine = match mode {
             Some(fp4) => build_spine(&self.layers, &self.bin, &self.cfg, fp4),
             None => (0..self.cfg.n_layers).map(|_| None).collect(),
+        };
+        self.mlp_q8 = match mode {
+            Some(false) if self.cfg.is_dense() => build_mlp_q8(&self.layers, &self.bin, &self.cfg),
+            _ => (0..self.cfg.n_layers).map(|_| None).collect(),
         };
     }
 
@@ -2155,6 +2226,44 @@ fn no_batch_prefill() -> bool {
     })
 }
 
+/// Decode/prefill phase profiler (MICROKIMI_PROF=1): accumulates wall
+/// micros per phase (0 lin attn, 1 full attn, 2 mlp, 3 lm_head) and
+/// prints once at process exit via dprof_print (called by `run`).
+static DPROF: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn dprof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+#[inline]
+fn dprof_add(phase: usize, d: std::time::Duration) {
+    if dprof_on() {
+        DPROF[phase].fetch_add(d.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Prints the accumulated phase profile (best interpreted per token by
+/// the caller's own token count).
+pub fn dprof_print() {
+    if !dprof_on() {
+        return;
+    }
+    let v: Vec<u64> = DPROF.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    println!(
+        "prof: lin_attn {:.1} ms | full_attn {:.1} ms | mlp {:.1} ms | lm_head {:.1} ms",
+        v[0] as f64 / 1000.0,
+        v[1] as f64 / 1000.0,
+        v[2] as f64 / 1000.0,
+        v[3] as f64 / 1000.0
+    );
+}
+
 fn prefill_workers(items: usize) -> usize {
     crate::model::pool::pool().workers.max(1).min(items.max(1))
 }
@@ -2275,14 +2384,17 @@ impl QwenModel {
                 }
             }
             let q8 = self.q8_spine[l].as_ref();
+            let t_attn = std::time::Instant::now();
             match (&layer.attn, &mut self.caches[l]) {
                 (QwenAttnW::Linear(w), QwenCache::Linear(cache)) => {
                     lin_attn_prefill(data, w, q8, &c, &normed, t_count, cache, &mut attn_out);
+                    dprof_add(0, t_attn.elapsed());
                 }
                 (QwenAttnW::Full(w), QwenCache::Full(cache)) => {
                     full_attn_prefill(
                         data, w, q8, &c, &normed, t_count, self.pos, cache, &mut attn_out,
                     );
+                    dprof_add(1, t_attn.elapsed());
                 }
                 _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
             }
@@ -2296,19 +2408,23 @@ impl QwenModel {
                     rmsnorm(h, w, c.norm_eps as f32, n);
                 }
             }
+            let t_mlp = std::time::Instant::now();
             mlp_prefill(
                 data,
                 &layer.mlp,
+                self.mlp_q8[l].as_ref(),
                 &c,
                 &normed,
                 t_count,
                 self.skip_bounds[l].as_ref(),
                 &mut attn_out,
             );
+            dprof_add(2, t_mlp.elapsed());
             for i in 0..t_count * d {
                 hidden[i] += attn_out[i];
             }
         }
+        let t_head = std::time::Instant::now();
 
         let mut out = QwenPrefillOut {
             logits: Vec::new(),
@@ -2338,6 +2454,7 @@ impl QwenModel {
             }
             out.logits.push(logits);
         }
+        dprof_add(3, t_head.elapsed());
         self.pos += t_count;
         if let Some(last) = out.logits.last() {
             self.last_logits = last.clone();
@@ -2382,6 +2499,10 @@ fn lin_attn_prefill(
         let mut a_raw = vec![0.0f32; heads];
         let x = &normed[..d];
         match q8_mats {
+            // both q8: one activation quantization, one pool barrier
+            Some((SpineMat::Q8(hq), SpineMat::Q8(hz), _)) => {
+                crate::model::Q8Head::matvec2(hq, hz, x, &mut qkv, &mut z);
+            }
             Some((q_qkv, q_z, _)) => {
                 q_qkv.matvec(x, &mut qkv);
                 q_z.matvec(x, &mut z);
@@ -3122,9 +3243,11 @@ fn gpu_full_attention(
 /// Prefill MLP dispatch: every token is independent, so tokens fan out over
 /// worker ranges and each token runs the exact single-token math (routed
 /// experts sequentially inside its worker for the MoE variant).
+#[allow(clippy::too_many_arguments)]
 fn mlp_prefill(
     data: &[u8],
     mlp: &QwenMlpW,
+    q8m: Option<&MlpQ8>,
     c: &QwenConfig,
     normed: &[f32],
     t_count: usize,
@@ -3132,6 +3255,10 @@ fn mlp_prefill(
     out: &mut [f32],
 ) {
     let d = c.d;
+    // the unpacked-i8 MLP wins on CPU; on macOS the GPU offload keeps
+    // priority (its hook lives inside the packed multi kernels)
+    #[cfg(target_os = "macos")]
+    let q8m = if crate::model::metal::qwen_gpu_on() { None } else { q8m };
     // dense batch without a budget: three multi-kernel passes stream the
     // packed weights once for ALL tokens
     if t_count > 1 && bounds.is_none() {
@@ -3141,7 +3268,12 @@ fn mlp_prefill(
             let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
             let mut h_gate = vec![0.0f32; t_count * inter];
             let mut h_up = vec![0.0f32; t_count * inter];
-            {
+            if let Some(mq) = q8m {
+                let mut outs: Vec<&mut [f32]> = h_gate.chunks_mut(inter).collect();
+                mq.gate.matvec_multi(&xs, &mut outs);
+                let mut outs: Vec<&mut [f32]> = h_up.chunks_mut(inter).collect();
+                mq.up.matvec_multi(&xs, &mut outs);
+            } else {
                 let (pg, sg) = packed_parts(data, gate);
                 let mut outs: Vec<&mut [f32]> = h_gate.chunks_mut(inter).collect();
                 crate::quant::mxfp4::matvec_packed_multi(pg, sg, inter, d, &xs, &mut outs, threads);
@@ -3171,9 +3303,13 @@ fn mlp_prefill(
                 });
             }
             let hs: Vec<&[f32]> = h_gate.chunks(inter).collect();
-            let (pd, sd) = packed_parts(data, down);
             let mut outs: Vec<&mut [f32]> = out[..t_count * d].chunks_mut(d).collect();
-            crate::quant::mxfp4::matvec_packed_multi(pd, sd, d, inter, &hs, &mut outs, threads);
+            if let Some(mq) = q8m {
+                mq.down.matvec_multi(&hs, &mut outs);
+            } else {
+                let (pd, sd) = packed_parts(data, down);
+                crate::quant::mxfp4::matvec_packed_multi(pd, sd, d, inter, &hs, &mut outs, threads);
+            }
             return;
         }
     }
@@ -3189,7 +3325,7 @@ fn mlp_prefill(
                 shared_gate,
             } => packed_moe(data, router, experts, shared, shared_gate, c, &normed[..d]),
             QwenMlpW::Dense { gate, up, down } => {
-                packed_dense_mlp(data, gate, up, down, c, &normed[..d], None, bounds)
+                packed_dense_mlp_q8(data, gate, up, down, q8m, c, &normed[..d], bounds)
             }
         };
         out[..d].copy_from_slice(&value);

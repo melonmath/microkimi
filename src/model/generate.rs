@@ -425,6 +425,7 @@ pub fn run_turn_core_batch(ids: &[u32], max_new: usize, tok: &AnyTokenizer, fwd:
     } else {
         println!("Bot > {}", answer);
     }
+    crate::model::qwen::dprof_print();
     if !gen_times.is_empty() {
         let moy = gen_times.iter().sum::<f64>() / gen_times.len() as f64;
         if debug {

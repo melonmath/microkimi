@@ -427,15 +427,10 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
     assert_eq!(xq.q.len(), cols);
     assert_eq!(xq.scales.len(), cols / 32);
     #[inline]
-    fn row(prow: &[u8], srow: &[u8], cols: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
-        let mut sum = 0f32;
-        for g in 0..cols / 32 {
-            let idot = crate::quant::q8::block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
-            // 2^(sb-128) folds the LUT2 = E2M1 x 2 convention (see q8.rs);
-            // the i32 -> f32 conversion is exact (|idot| <= 32*127*12 < 2^24)
-            sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
-        }
-        sum
+    fn row(prow: &[u8], srow: &[u8], _cols: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
+        // the shared row kernel keeps every q8-activation packed path
+        // bit-identical (see q8::row_dot_fp4)
+        crate::quant::q8::row_dot_fp4(prow, srow, xq)
     }
     let nt = n_threads.min(rows);
     if nt <= 1 {
@@ -443,6 +438,54 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
             *o = row(&packed[r * cols / 2..(r + 1) * cols / 2], &scales[r * cols / 32..(r + 1) * cols / 32], cols, xq);
         }
         return;
+    }
+    // From the main thread, run on the PERSISTENT pool: the scoped-thread
+    // path below spawns nt OS threads per call, and the dense decode
+    // makes 72 of these calls per token - the spawns alone were measured
+    // at ~8 ms/token (13 GB/s effective on the MLP against ~45 elsewhere).
+    // Inside a pool job (MoE experts) the pool barrier cannot nest, so
+    // the scoped path remains.
+    if !crate::model::pool::in_pool_worker() {
+        let p = crate::model::pool::pool();
+        let njobs = nt.min(p.workers);
+        if njobs > 1 {
+            let step = crate::model::dyn_step(rows, njobs);
+            let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let pp = crate::model::pool::SPtrU8(packed.as_ptr());
+            let sp = crate::model::pool::SPtrU8(scales.as_ptr());
+            let xqp = xq as *const crate::quant::q8::Q8Vec as usize;
+            let op = crate::model::pool::MPtr(out.as_mut_ptr());
+            let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+            for _ in 0..njobs {
+                let ctr = ctr.clone();
+                jobs.push(Box::new(move || {
+                    let (pp, sp, op) = (pp, sp, op);
+                    // SAFETY: the pool barrier in run() outlives every
+                    // borrow captured here; each row is written once.
+                    unsafe {
+                        let packed = std::slice::from_raw_parts(pp.0, rows * cols / 2);
+                        let scales = std::slice::from_raw_parts(sp.0, rows * cols / 32);
+                        let xq = &*(xqp as *const crate::quant::q8::Q8Vec);
+                        loop {
+                            let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                            if r0 >= rows {
+                                break;
+                            }
+                            for r in r0..(r0 + step).min(rows) {
+                                *op.0.add(r) = row(
+                                    &packed[r * cols / 2..(r + 1) * cols / 2],
+                                    &scales[r * cols / 32..(r + 1) * cols / 32],
+                                    cols,
+                                    xq,
+                                );
+                            }
+                        }
+                    }
+                }));
+            }
+            p.run(jobs);
+            return;
+        }
     }
     // dynamic row scheduling: fine chunks off a shared counter so a
     // straggler thread delays one chunk, not rows/nt of them. Per-row
@@ -579,15 +622,7 @@ pub fn matvec_packed_multi(
         let xqs: Vec<crate::quant::q8::Q8Vec> =
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
         let row_dot = |prow: &[u8], srow: &[u8], xq: &crate::quant::q8::Q8Vec| -> f32 {
-            let mut sum = 0f32;
-            for g in 0..cols / 32 {
-                let idot = crate::quant::q8::block_dot(
-                    &prow[g * 16..(g + 1) * 16],
-                    &xq.q[g * 32..(g + 1) * 32],
-                );
-                sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
-            }
-            sum
+            crate::quant::q8::row_dot_fp4(prow, srow, xq)
         };
         let nt = n_threads.min(rows).max(1);
         if nt <= 1 {

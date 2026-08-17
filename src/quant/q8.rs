@@ -480,3 +480,194 @@ mod q8_tests {
         assert!(xq.q.iter().all(|&v| v == 0));
     }
 }
+
+// ── the shared MXFP4-row × q8-activation kernel ──
+
+type RowDotFp4 = unsafe fn(&[u8], &[u8], &Q8Vec) -> f32;
+
+/// One MXFP4 row against one q8 activation - THE row kernel behind every
+/// q8-activation packed path (single-token decode, batch prefill lanes,
+/// full colblock rows), so those paths stay bit-identical to each other.
+/// Four blocks per round: nibble LUT decode + SDOT per block, then ONE
+/// pairwise reduction and ONE vector FMA apply the four block sums - the
+/// per-block horizontal add, scalar scale multiply and dispatch call of
+/// the old shape are gone. The no-dotprod fallback mirrors the reduction
+/// order exactly (integer block sums are exact on every kernel, the f32
+/// lane math uses the same fused multiply-add and the same
+/// ((l0+l1)+(l2+l3)) collapse), so the MICROKIMI_NO_SDOT toggle remains
+/// bit-identical.
+pub fn row_dot_fp4(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
+    static F: std::sync::OnceLock<RowDotFp4> = std::sync::OnceLock::new();
+    fn pick() -> RowDotFp4 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") && !no_sdot() {
+                return row_dot_fp4_sdot;
+            }
+        }
+        row_dot_fp4_generic
+    }
+    let f = F.get_or_init(pick);
+    // SAFETY: the sdot variant is only selected when dotprod is present.
+    unsafe { f(prow, srow, xq) }
+}
+
+/// Reduction-order reference: 4 f32 lane accumulators, fused
+/// multiply-add per block, pairwise collapse - the exact shape of the
+/// vector kernel below.
+unsafe fn row_dot_fp4_generic(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
+    let nb = srow.len();
+    let mut lanes = [0.0f32; 4];
+    let mut g = 0usize;
+    while g + 4 <= nb {
+        for (b, lane) in lanes.iter_mut().enumerate() {
+            let i = g + b;
+            let idot = block_dot(&prow[i * 16..(i + 1) * 16], &xq.q[i * 32..(i + 1) * 32]);
+            let s = crate::quant::mxfp4::exp2_i(srow[i] as i32 - 128) * xq.scales[i];
+            *lane = (idot as f32).mul_add(s, *lane);
+        }
+        g += 4;
+    }
+    let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    while g < nb {
+        let idot = block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
+        total += idot as f32 * (crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+        g += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn row_dot_fp4_sdot(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
+    use std::arch::aarch64::*;
+    let nb = srow.len();
+    // SAFETY: caller slices are exactly nb blocks wide (16 packed bytes,
+    // 32 activation bytes, one scale byte and one f32 activation scale
+    // per block); dotprod presence is guaranteed by the dispatcher.
+    unsafe {
+        let lut = vld1q_s8(E2M1_X2.as_ptr());
+        let mask = vdupq_n_u8(0x0F);
+        let mut accf = vdupq_n_f32(0.0);
+        let mut g = 0usize;
+        while g + 4 <= nb {
+            let mut lanes = [vdupq_n_s32(0); 4];
+            for (b, lane) in lanes.iter_mut().enumerate() {
+                let i = g + b;
+                let bytes = vld1q_u8(prow.as_ptr().add(i * 16));
+                let lo = vqtbl1q_s8(lut, vandq_u8(bytes, mask));
+                let hi = vqtbl1q_s8(lut, vshrq_n_u8::<4>(bytes));
+                let w0 = vzip1q_s8(lo, hi);
+                let w1 = vzip2q_s8(lo, hi);
+                let x0 = vld1q_s8(xq.q.as_ptr().add(i * 32));
+                let x1 = vld1q_s8(xq.q.as_ptr().add(i * 32 + 16));
+                let mut acc = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension dotprod",
+                    "sdot {acc:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {acc:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    acc = inout(vreg) acc,
+                    w0 = in(vreg) w0,
+                    w1 = in(vreg) w1,
+                    x0 = in(vreg) x0,
+                    x1 = in(vreg) x1,
+                    options(pure, nomem, nostack)
+                );
+                *lane = acc;
+            }
+            // [sumA, sumB, sumC, sumD] in two pairwise adds
+            let p01 = vpaddq_s32(lanes[0], lanes[1]);
+            let p23 = vpaddq_s32(lanes[2], lanes[3]);
+            let sums = vcvtq_f32_s32(vpaddq_s32(p01, p23));
+            let ws = [
+                crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128),
+                crate::quant::mxfp4::exp2_i(srow[g + 1] as i32 - 128),
+                crate::quant::mxfp4::exp2_i(srow[g + 2] as i32 - 128),
+                crate::quant::mxfp4::exp2_i(srow[g + 3] as i32 - 128),
+            ];
+            let sv = vmulq_f32(vld1q_f32(ws.as_ptr()), vld1q_f32(xq.scales.as_ptr().add(g)));
+            accf = vfmaq_f32(accf, sums, sv);
+            g += 4;
+        }
+        let mut total = (vgetq_lane_f32::<0>(accf) + vgetq_lane_f32::<1>(accf))
+            + (vgetq_lane_f32::<2>(accf) + vgetq_lane_f32::<3>(accf));
+        while g < nb {
+            let idot = block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
+            total += idot as f32 * (crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+            g += 1;
+        }
+        total
+    }
+}
+
+/// Four full rows against one q8 activation, block-fused: SDOT per
+/// (row, half-block), the four rows' block sums collapse with two
+/// pairwise adds, and ONE vector FMA per block applies the four row
+/// scales times the activation scale - no horizontal reduction until
+/// the very end, no per-row scalar scale chain. The f32 order per row
+/// is fma(block_sum, wscale*xscale) sequentially over blocks, which
+/// the scalar mirror in the callers reproduces exactly.
+///
+/// SAFETY: caller guarantees dotprod, `w[k]`/`s[k]` hold nb blocks
+/// (32 i8 / one f32 each), and xq_q/xq_scales hold nb blocks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn rows4_dot_fma(
+    w: [&[i8]; 4],
+    s: [&[f32]; 4],
+    xq_q: &[i8],
+    xq_scales: &[f32],
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let nb = xq_scales.len();
+    unsafe {
+        let mut accf = vdupq_n_f32(0.0);
+        for g in 0..nb {
+            let x0 = vld1q_s8(xq_q.as_ptr().add(g * 32));
+            let x1 = vld1q_s8(xq_q.as_ptr().add(g * 32 + 16));
+            let mut a0 = vdupq_n_s32(0);
+            let mut a1 = vdupq_n_s32(0);
+            let mut a2 = vdupq_n_s32(0);
+            let mut a3 = vdupq_n_s32(0);
+            let w00 = vld1q_s8(w[0].as_ptr().add(g * 32));
+            let w01 = vld1q_s8(w[0].as_ptr().add(g * 32 + 16));
+            let w10 = vld1q_s8(w[1].as_ptr().add(g * 32));
+            let w11 = vld1q_s8(w[1].as_ptr().add(g * 32 + 16));
+            let w20 = vld1q_s8(w[2].as_ptr().add(g * 32));
+            let w21 = vld1q_s8(w[2].as_ptr().add(g * 32 + 16));
+            let w30 = vld1q_s8(w[3].as_ptr().add(g * 32));
+            let w31 = vld1q_s8(w[3].as_ptr().add(g * 32 + 16));
+            std::arch::asm!(
+                ".arch_extension dotprod",
+                "sdot {a0:v}.4s, {w00:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {w10:v}.16b, {x0:v}.16b",
+                "sdot {a2:v}.4s, {w20:v}.16b, {x0:v}.16b",
+                "sdot {a3:v}.4s, {w30:v}.16b, {x0:v}.16b",
+                "sdot {a0:v}.4s, {w01:v}.16b, {x1:v}.16b",
+                "sdot {a1:v}.4s, {w11:v}.16b, {x1:v}.16b",
+                "sdot {a2:v}.4s, {w21:v}.16b, {x1:v}.16b",
+                "sdot {a3:v}.4s, {w31:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0,
+                a1 = inout(vreg) a1,
+                a2 = inout(vreg) a2,
+                a3 = inout(vreg) a3,
+                w00 = in(vreg) w00, w01 = in(vreg) w01,
+                w10 = in(vreg) w10, w11 = in(vreg) w11,
+                w20 = in(vreg) w20, w21 = in(vreg) w21,
+                w30 = in(vreg) w30, w31 = in(vreg) w31,
+                x0 = in(vreg) x0, x1 = in(vreg) x1,
+                options(pure, nomem, nostack)
+            );
+            // [row0, row1, row2, row3] block sums in two pairwise adds
+            let p01 = vpaddq_s32(a0, a1);
+            let p23 = vpaddq_s32(a2, a3);
+            let sums = vcvtq_f32_s32(vpaddq_s32(p01, p23));
+            let ws = [s[0][g], s[1][g], s[2][g], s[3][g]];
+            let sv = vmulq_f32(vld1q_f32(ws.as_ptr()), vdupq_n_f32(xq_scales[g]));
+            accf = vfmaq_f32(accf, sums, sv);
+        }
+        let mut out = [0.0f32; 4];
+        vst1q_f32(out.as_mut_ptr(), accf);
+        out
+    }
+}

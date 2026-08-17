@@ -291,25 +291,30 @@ pub(super) fn q8_rows_dot(
 ) {
     let nb = cols / 32;
     let mut r = 0usize;
+    #[cfg(target_arch = "aarch64")]
     if crate::quant::q8::sdot4_available() {
         while r + 4 <= n {
             let base = r0 + r;
-            let mut sums = [0f32; 4];
-            for g in 0..nb {
-                let x_block = &xq_q[g * 32..(g + 1) * 32];
-                let idots = unsafe {
-                    crate::quant::q8::dot_i8_sdot4(
-                        &q[base * cols + g * 32..base * cols + (g + 1) * 32],
-                        &q[(base + 1) * cols + g * 32..(base + 1) * cols + (g + 1) * 32],
-                        &q[(base + 2) * cols + g * 32..(base + 2) * cols + (g + 1) * 32],
-                        &q[(base + 3) * cols + g * 32..(base + 3) * cols + (g + 1) * 32],
-                        x_block,
-                    )
-                };
-                for k in 0..4 {
-                    sums[k] += idots[k] as f32 * (scales[(base + k) * nb + g] * xq_scales[g]);
-                }
-            }
+            // SAFETY: dotprod checked above; the row and scale slices
+            // hold exactly nb blocks each.
+            let sums = unsafe {
+                crate::quant::q8::rows4_dot_fma(
+                    [
+                        &q[base * cols..(base + 1) * cols],
+                        &q[(base + 1) * cols..(base + 2) * cols],
+                        &q[(base + 2) * cols..(base + 3) * cols],
+                        &q[(base + 3) * cols..(base + 4) * cols],
+                    ],
+                    [
+                        &scales[base * nb..(base + 1) * nb],
+                        &scales[(base + 1) * nb..(base + 2) * nb],
+                        &scales[(base + 2) * nb..(base + 3) * nb],
+                        &scales[(base + 3) * nb..(base + 4) * nb],
+                    ],
+                    xq_q,
+                    xq_scales,
+                )
+            };
             out[r..r + 4].copy_from_slice(&sums);
             r += 4;
         }
@@ -322,7 +327,8 @@ pub(super) fn q8_rows_dot(
                 &q[row * cols + g * 32..row * cols + (g + 1) * 32],
                 &xq_q[g * 32..(g + 1) * 32],
             );
-            sum += idot as f32 * (scales[row * nb + g] * xq_scales[g]);
+            // fused, block-sequential: the exact order of rows4_dot_fma
+            sum = (idot as f32).mul_add(scales[row * nb + g] * xq_scales[g], sum);
         }
         out[r] = sum;
         r += 1;
@@ -493,6 +499,120 @@ impl Q8Head {
         p.run(jobs);
     }
 
+    /// Exact i8 transfer of an MXFP4 matrix: the e2m1 nibbles decode to
+    /// the LUT2 integers (E2M1 x 2) and the per-block scale absorbs the
+    /// halving (2^(sb-128)), so integer dots and scales are IDENTICAL to
+    /// the packed kernels' - only the nibble unpacking moves from every
+    /// matvec to this one load-time pass. Rows convert in parallel.
+    pub(crate) fn from_packed_fp4(packed: &[u8], scales_b: &[u8], rows: usize, cols: usize) -> Q8Head {
+        assert!(cols % 32 == 0, "q8 blocks are 32 wide");
+        let nb = cols / 32;
+        let mut q = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows * nb];
+        let workers = crate::model::pool::pool().workers.max(1).min(rows.max(1));
+        let chunk = rows.div_ceil(workers);
+        std::thread::scope(|s| {
+            let mut q_rest = q.as_mut_slice();
+            let mut s_rest = scales.as_mut_slice();
+            let mut r0 = 0usize;
+            while r0 < rows {
+                let r1 = (r0 + chunk).min(rows);
+                let (q_c, qr) = q_rest.split_at_mut((r1 - r0) * cols);
+                let (s_c, sr) = s_rest.split_at_mut((r1 - r0) * nb);
+                q_rest = qr;
+                s_rest = sr;
+                s.spawn(move || {
+                    for (i, r) in (r0..r1).enumerate() {
+                        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+                        for c in 0..cols {
+                            let byte = prow[c / 2];
+                            let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                            q_c[i * cols + c] = crate::quant::q8::E2M1_X2[nib as usize];
+                        }
+                        for g in 0..nb {
+                            s_c[i * nb + g] =
+                                crate::quant::mxfp4::exp2_i(scales_b[r * nb + g] as i32 - 128);
+                        }
+                    }
+                });
+                r0 = r1;
+            }
+        });
+        Q8Head { q, scales, rows, cols }
+    }
+
+    /// Two heads, one input: the activation is quantized ONCE and both
+    /// matrices run under ONE pool barrier (a shared dynamic counter
+    /// walks a's rows then b's). Per-row math is row_dot/q8_rows_dot
+    /// exactly, so results are bit-identical to two separate matvecs -
+    /// only the sync and the quantization are halved. Callers: the
+    /// gate/up MLP pair and the in_qkv/in_z projection pair.
+    pub(crate) fn matvec2(a: &Q8Head, b: &Q8Head, x: &[f32], out_a: &mut [f32], out_b: &mut [f32]) {
+        debug_assert_eq!(a.cols, b.cols);
+        let xq = crate::quant::q8::quantize_q8(x);
+        let p = crate::model::pool::pool();
+        let total = a.rows + b.rows;
+        let njobs = ((a.rows * a.cols + b.rows * b.cols) / 60_000).clamp(1, p.workers).min(total);
+        if njobs <= 1 {
+            for (r, o) in out_a.iter_mut().enumerate() {
+                *o = a.row_dot(r, &xq);
+            }
+            for (r, o) in out_b.iter_mut().enumerate() {
+                *o = b.row_dot(r, &xq);
+            }
+            return;
+        }
+        let step = dyn_step(total, njobs);
+        let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (nba, nbb) = (a.cols / 32, b.cols / 32);
+        let aq = crate::model::pool::SPtrU8(a.q.as_ptr() as *const u8);
+        let asc = crate::model::pool::SPtr(a.scales.as_ptr());
+        let bq = crate::model::pool::SPtrU8(b.q.as_ptr() as *const u8);
+        let bsc = crate::model::pool::SPtr(b.scales.as_ptr());
+        let xp = crate::model::pool::SPtrU8(xq.q.as_ptr() as *const u8);
+        let xsp = crate::model::pool::SPtr(xq.scales.as_ptr());
+        let oa = crate::model::pool::MPtr(out_a.as_mut_ptr());
+        let ob = crate::model::pool::MPtr(out_b.as_mut_ptr());
+        let (ar, ac, br, bc) = (a.rows, a.cols, b.rows, b.cols);
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for _ in 0..njobs {
+            let ctr = ctr.clone();
+            jobs.push(Box::new(move || {
+                let (aq, asc, bq, bsc, xp, xsp, oa, ob) = (aq, asc, bq, bsc, xp, xsp, oa, ob);
+                // SAFETY: the pool barrier outlives every borrow; row
+                // ranges are disjoint across pulls.
+                unsafe {
+                    let qa = std::slice::from_raw_parts(aq.0 as *const i8, ar * ac);
+                    let sa = std::slice::from_raw_parts(asc.0, ar * nba);
+                    let qb = std::slice::from_raw_parts(bq.0 as *const i8, br * bc);
+                    let sb = std::slice::from_raw_parts(bsc.0, br * nbb);
+                    let xq8 = std::slice::from_raw_parts(xp.0 as *const i8, ac);
+                    let xs = std::slice::from_raw_parts(xsp.0, nba);
+                    loop {
+                        let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                        if r0 >= total {
+                            break;
+                        }
+                        let r1 = (r0 + step).min(total);
+                        // the range may straddle the a/b boundary
+                        if r0 < ar {
+                            let ra1 = r1.min(ar);
+                            let out = std::slice::from_raw_parts_mut(oa.0, ar);
+                            q8_rows_dot(qa, sa, ac, r0, ra1 - r0, xq8, xs, &mut out[r0..ra1]);
+                        }
+                        if r1 > ar {
+                            let rb0 = r0.max(ar) - ar;
+                            let rb1 = r1 - ar;
+                            let out = std::slice::from_raw_parts_mut(ob.0, br);
+                            q8_rows_dot(qb, sb, bc, rb0, rb1 - rb0, xq8, xs, &mut out[rb0..rb1]);
+                        }
+                    }
+                }
+            }));
+        }
+        p.run(jobs);
+    }
+
     fn row_dot(&self, r: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
         let nb = self.cols / 32;
         let wq = &self.q[r * self.cols..(r + 1) * self.cols];
@@ -500,7 +620,9 @@ impl Q8Head {
         let mut acc = 0f32;
         for g in 0..nb {
             let idot = crate::quant::q8::block_dot_i8(&wq[g * 32..g * 32 + 32], &xq.q[g * 32..g * 32 + 32]);
-            acc += ws[g] * xq.scales[g] * idot as f32;
+            // fused, block-sequential: the exact order of rows4_dot_fma,
+            // so every q8 path (pooled quad, st, multi) stays bit-equal
+            acc = (idot as f32).mul_add(ws[g] * xq.scales[g], acc);
         }
         acc
     }
