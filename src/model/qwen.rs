@@ -2374,7 +2374,8 @@ fn no_batch_prefill() -> bool {
 /// Decode/prefill phase profiler (MICROKIMI_PROF=1): accumulates wall
 /// micros per phase (0 lin attn, 1 full attn, 2 mlp, 3 lm_head) and
 /// prints once at process exit via dprof_print (called by `run`).
-pub(crate) static DPROF: [std::sync::atomic::AtomicU64; 8] = [
+pub(crate) static DPROF: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2413,10 +2414,11 @@ pub fn dprof_print() {
         v[3] as f64 / 1000.0
     );
     println!(
-        "prof2: mv_quant {:.1} ms | mv_pack {:.1} ms | mv_pool {:.1} ms (inside every multi-lane q8 GEMM call)",
+        "prof2: mv_quant {:.1} ms | mv_pack {:.1} ms | mv_pool {:.1} ms (inside every multi-lane q8 GEMM call) | scan {:.1} ms",
         v[5] as f64 / 1000.0,
         v[6] as f64 / 1000.0,
-        v[7] as f64 / 1000.0
+        v[7] as f64 / 1000.0,
+        v[8] as f64 / 1000.0
     );
 }
 
@@ -3012,6 +3014,7 @@ fn lin_attn_prefill(
             heads, rep, kd, vd, kt, conv_dim, t_count, &mut mixed_hm,
         );
     }
+    let t_scan = std::time::Instant::now();
     if !scan_done {
         // heads chunk across workers - one spawn per worker rather than
         // one per head (32 spawns/layer dominated small verify batches);
@@ -3102,6 +3105,7 @@ fn lin_attn_prefill(
         });
     }
 
+    dprof_add(8, t_scan.elapsed());
     // gated norm per token (token-major gather), then ONE multi-lane
     // output projection over all tokens
     let mut mixed_tm = vec![0.0f32; t_count * vt];
