@@ -189,6 +189,19 @@ pub fn run(args: &[String]) {
     )) {
         println!("  accel    {:>5.1} ms/token ({:.0} tok/s)", a, 1000.0 / a);
     }
+    // the combination: q8 attention (integer scores, q8 projections)
+    // with the MLP on Accelerate's AMX sgemm
+    #[cfg(target_os = "macos")]
+    if let Some(c) = prefill_ms(&run_self(
+        &pre,
+        &[
+            ("MICROKIMI_ACCEL", "1"),
+            ("MICROKIMI_Q8_SPINE", "1"),
+            ("MICROKIMI_SPIN", "200"),
+        ],
+    )) {
+        println!("  accel+q8 {:>4.1} ms/token ({:.0} tok/s)", c, 1000.0 / c);
+    }
     if let Some(q) = q8pre {
         println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
         for line in q8out.lines() {
