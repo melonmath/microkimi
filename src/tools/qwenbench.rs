@@ -435,7 +435,9 @@ pub fn prefill_bench_cmd(args: &[String]) {
     let vocab = (model.cfg.vocab as u32).min(50_000);
     let prompt: Vec<u32> = (0..n_tokens as u32).map(|i| (i * 7 + 3) % vocab).collect();
     let snap = model.snapshot();
-    // warm-up
+    // two warm-ups (llama-bench warms too; the second settles the pool)
+    let _ = model.prefill_collect(&prompt, false);
+    model.restore(&snap);
     let _ = model.prefill_collect(&prompt, false);
     let mut times = Vec::new();
     for _ in 0..reps {

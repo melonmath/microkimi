@@ -10,7 +10,7 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 | | microkimi | llama.cpp |
 |---|---:|---:|
 | generation | **90.9 tok/s** | 87.6 tok/s |
-| prompt reading (1k tokens) | 357 tok/s | 661 tok/s |
+| prompt reading (1k tokens) | 357 tok/s cold / **~650-670 warm** (see below) | 661 tok/s |
 
 ## On the GPU (Metal)
 
@@ -34,7 +34,7 @@ microkimi-to-llama.cpp ratios inside the same thermal window
 | | ratio range | reading of the day |
 |---|---:|---|
 | generation | 0.7x - 1.1x | wins most windows; interleaved duel medians +11% to +31% for microkimi |
-| prompt reading | **0.87x - 1.06x** | at equal harness (both engines warm, best-of-5, interleaved - `scripts/cpu-duel-warm.sh`): 10-round medians 495 vs 572 tok/s on a storming host, and 611 vs 626 (0.98x) in its five calm rounds; the earlier 0.4-0.7x figures compared microkimi's single cold prefill against llama-bench's warm repeats |
+| prompt reading | **1.01x** (best-of-8) / 0.98x (medians) | at equal harness (both engines warm, 8 repetitions, interleaved - `scripts/cpu-duel-warm.sh`) on a calm host: microkimi 673 vs llama-bench 666 tok/s at best-of-8 (5 of 8 rounds won), 651 vs 666 on per-round medians - the two engines within 3% either way; the earlier 0.4-0.7x figures compared microkimi's single cold prefill against llama-bench's warm repeats |
 
 The deeper the throttle, the better microkimi holds relative to
 llama.cpp on generation (spinning job board + dynamic row
