@@ -1426,6 +1426,125 @@ pub fn kernbench_cmd(_args: &[String]) {
         );
     }
 
+    // SMMLA (i8mm) verifier + speed probe: compares the 2x throughput
+    // kernel against the SDOT tile on synthetic data. It only wires
+    // into the engine after this prints MATCH on real silicon.
+    #[cfg(target_arch = "aarch64")]
+    if crate::quant::q8::smmla_available() {
+        let nb = cols / 32;
+        let quads = rows / 4;
+        let head2 = Q8Head::from_f32(&w[..quads * 4 * cols], quads * 4, cols);
+        let xqs: Vec<crate::quant::q8::Q8Vec> =
+            xs_data[..8].iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let lanes: Vec<(&[i8], &[f32])> =
+            xqs.iter().map(|x| (&x.q[..], &x.scales[..])).collect();
+        let xscales: Vec<&[f32]> = xqs.iter().map(|x| &x.scales[..]).collect();
+        // pair-interleaved packs
+        let mut wp = vec![0i8; quads * nb * 128];
+        let mut wsq = vec![0.0f32; quads * nb * 4];
+        for qd in 0..quads {
+            for g in 0..nb {
+                let dst = (qd * nb + g) * 128;
+                for pair in 0..2 {
+                    for seg in 0..4 {
+                        for r in 0..2 {
+                            let row = qd * 4 + pair * 2 + r;
+                            let src = row * cols + g * 32 + seg * 8;
+                            let d = dst + pair * 64 + seg * 16 + r * 8;
+                            for b in 0..8 {
+                                wp[d + b] = head2.q[src + b];
+                            }
+                        }
+                    }
+                }
+                for r in 0..4 {
+                    wsq[(qd * nb + g) * 4 + r] = head2.scales[(qd * 4 + r) * nb + g];
+                }
+            }
+        }
+        let mut xp = vec![0i8; 4 * nb * 64];
+        for p in 0..4 {
+            for g in 0..nb {
+                for seg in 0..4 {
+                    for l in 0..2 {
+                        let src = &xqs[p * 2 + l].q[g * 32 + seg * 8..g * 32 + seg * 8 + 8];
+                        let d = (p * nb + g) * 64 + seg * 16 + l * 8;
+                        xp[d..d + 8].copy_from_slice(src);
+                    }
+                }
+            }
+        }
+        // correctness vs the SDOT tile
+        let mut ok = true;
+        let mut tile_ref = [[0.0f32; 4]; 8];
+        let mut tile_mm = [[0.0f32; 4]; 8];
+        for qd in [0usize, 7, quads - 1] {
+            let r = qd * 4;
+            let w4 = [
+                &head2.q[r * cols..(r + 1) * cols],
+                &head2.q[(r + 1) * cols..(r + 2) * cols],
+                &head2.q[(r + 2) * cols..(r + 3) * cols],
+                &head2.q[(r + 3) * cols..(r + 4) * cols],
+            ];
+            let s4 = [
+                &head2.scales[r * nb..(r + 1) * nb],
+                &head2.scales[(r + 1) * nb..(r + 2) * nb],
+                &head2.scales[(r + 2) * nb..(r + 3) * nb],
+                &head2.scales[(r + 3) * nb..(r + 4) * nb],
+            ];
+            // SAFETY: dotprod/i8mm checked; slices sized above.
+            let tr = unsafe { crate::quant::q8::rows4_dot_fma_x4(w4, s4, &lanes) };
+            tile_ref = tr;
+            unsafe {
+                crate::quant::q8::rows4_x8_smmla(
+                    &wp[qd * nb * 128..(qd + 1) * nb * 128],
+                    &wsq[qd * nb * 4..(qd + 1) * nb * 4],
+                    &xp,
+                    &xscales,
+                    4,
+                    nb,
+                    &mut tile_mm,
+                );
+            }
+            for l in 0..8 {
+                for k in 0..4 {
+                    if tile_ref[l][k].to_bits() != tile_mm[l][k].to_bits() {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        println!(
+            "smmla check: {}",
+            if ok { "MATCH (bit-identical to the SDOT tile)" } else { "MISMATCH - do not wire" }
+        );
+        // speed: whole synthetic matrix, 8 lanes, single thread
+        let t0 = std::time::Instant::now();
+        for qd in 0..quads {
+            // SAFETY: as above.
+            unsafe {
+                crate::quant::q8::rows4_x8_smmla(
+                    &wp[qd * nb * 128..(qd + 1) * nb * 128],
+                    &wsq[qd * nb * 4..(qd + 1) * nb * 4],
+                    &xp,
+                    &xscales,
+                    4,
+                    nb,
+                    &mut tile_mm,
+                );
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "smmla tile (single thread) : {:>7.1} GMAC/s  ({:.1} ms, sink {:.3})",
+            (quads * 4 * cols * 8) as f64 / dt / 1e9,
+            dt * 1000.0,
+            tile_mm[0][0]
+        );
+    } else {
+        println!("smmla: i8mm not exposed on this host");
+    }
+
     // single-lane pooled matvec (the decode shape)
     let mut out1 = vec![0.0f32; rows];
     let t0 = std::time::Instant::now();

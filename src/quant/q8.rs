@@ -1098,3 +1098,112 @@ pub unsafe fn rows4_dot_fma_x4_packed(
         out
     }
 }
+
+/// True when the i8mm extension (SMMLA) is available and not disabled.
+pub fn smmla_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ON.get_or_init(|| {
+            std::arch::is_aarch64_feature_detected!("i8mm")
+                && !no_sdot()
+                && std::env::var("MICROKIMI_NO_SMMLA").map(|v| v != "1").unwrap_or(true)
+        });
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
+/// Four rows x eight lanes through SMMLA (i8mm): one instruction
+/// multiplies a 2x8 row-pair block by an 8x2 lane-pair block - 32 MACs,
+/// twice SDOT's throughput. Operands come PAIR-INTERLEAVED:
+///   weights `wp`, per block: [r0[0..8] r1[0..8] r0[8..16] r1[8..16]
+///   ... r2/r3 likewise] (128 bytes per (quad, block));
+///   activations `xp`, per lane-pair, per block: [lA[0..8] lB[0..8]
+///   lA[8..16] ...] (64 bytes per (pair, block)).
+/// Scales apply per block with one fused multiply-add per accumulator
+/// element in block order - the same per-(row, lane) arithmetic as
+/// rows4_dot_fma, so results are bit-identical to the SDOT kernels.
+///
+/// SAFETY: caller guarantees i8mm; `wp` holds nb*128 bytes, `ws` nb*4
+/// scales, `xp` holds `pairs`*nb*64 bytes, `xs` per-lane nb scales.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rows4_x8_smmla(
+    wp: &[i8],
+    ws: &[f32],
+    xp: &[i8],
+    xs: &[&[f32]],
+    pairs: usize,
+    nb: usize,
+    out: &mut [[f32; 4]; 8],
+) {
+    use std::arch::aarch64::*;
+    debug_assert!(pairs <= 4);
+    unsafe {
+        // acc[pair][0] = rows(0,1) x lanes(A,B) tile, acc[pair][1] = rows(2,3)
+        let mut acc = [[vdupq_n_f32(0.0); 2]; 4];
+        for g in 0..nb {
+            let wb = wp.as_ptr().add(g * 128);
+            let a01_0 = vld1q_s8(wb);
+            let a01_1 = vld1q_s8(wb.add(16));
+            let a01_2 = vld1q_s8(wb.add(32));
+            let a01_3 = vld1q_s8(wb.add(48));
+            let a23_0 = vld1q_s8(wb.add(64));
+            let a23_1 = vld1q_s8(wb.add(80));
+            let a23_2 = vld1q_s8(wb.add(96));
+            let a23_3 = vld1q_s8(wb.add(112));
+            let wsv = [ws[g * 4], ws[g * 4 + 1], ws[g * 4 + 2], ws[g * 4 + 3]];
+            for p in 0..pairs {
+                let xb = xp.as_ptr().add((p * nb + g) * 64);
+                let b0 = vld1q_s8(xb);
+                let b1 = vld1q_s8(xb.add(16));
+                let b2 = vld1q_s8(xb.add(32));
+                let b3 = vld1q_s8(xb.add(48));
+                let mut t01 = vdupq_n_s32(0);
+                let mut t23 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension i8mm",
+                    "smmla {t01:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "smmla {t01:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    "smmla {t01:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                    "smmla {t01:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                    "smmla {t23:v}.4s, {a4:v}.16b, {b0:v}.16b",
+                    "smmla {t23:v}.4s, {a5:v}.16b, {b1:v}.16b",
+                    "smmla {t23:v}.4s, {a6:v}.16b, {b2:v}.16b",
+                    "smmla {t23:v}.4s, {a7:v}.16b, {b3:v}.16b",
+                    t01 = inout(vreg) t01,
+                    t23 = inout(vreg) t23,
+                    a0 = in(vreg) a01_0, a1 = in(vreg) a01_1,
+                    a2 = in(vreg) a01_2, a3 = in(vreg) a01_3,
+                    a4 = in(vreg) a23_0, a5 = in(vreg) a23_1,
+                    a6 = in(vreg) a23_2, a7 = in(vreg) a23_3,
+                    b0 = in(vreg) b0, b1 = in(vreg) b1,
+                    b2 = in(vreg) b2, b3 = in(vreg) b3,
+                    options(pure, nomem, nostack)
+                );
+                // tile layout [C(r0,lA) C(r0,lB) C(r1,lA) C(r1,lB)]
+                let xa = xs[p * 2][g];
+                let xbs = xs[p * 2 + 1][g];
+                let s01 = [wsv[0] * xa, wsv[0] * xbs, wsv[1] * xa, wsv[1] * xbs];
+                let s23 = [wsv[2] * xa, wsv[2] * xbs, wsv[3] * xa, wsv[3] * xbs];
+                acc[p][0] = vfmaq_f32(acc[p][0], vcvtq_f32_s32(t01), vld1q_f32(s01.as_ptr()));
+                acc[p][1] = vfmaq_f32(acc[p][1], vcvtq_f32_s32(t23), vld1q_f32(s23.as_ptr()));
+            }
+        }
+        for p in 0..pairs {
+            let mut t = [0.0f32; 4];
+            vst1q_f32(t.as_mut_ptr(), acc[p][0]);
+            out[p * 2][0] = t[0];
+            out[p * 2 + 1][0] = t[1];
+            out[p * 2][1] = t[2];
+            out[p * 2 + 1][1] = t[3];
+            vst1q_f32(t.as_mut_ptr(), acc[p][1]);
+            out[p * 2][2] = t[0];
+            out[p * 2 + 1][2] = t[1];
+            out[p * 2][3] = t[2];
+            out[p * 2 + 1][3] = t[3];
+        }
+    }
+}
