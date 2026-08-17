@@ -32,6 +32,9 @@ accelerates prompt reading only (for now).
 - Every number is the median of paired rounds on the same day,
   measured plugged in; battery runs are read as within-window ratios
   only (the bench script brackets for that).
+- Under sustained throttle the gap WIDENS in microkimi's favor on
+  generation: interleaved duels on a throttled host measured medians
+  of 62.0 vs 55.8 and 53.0 vs 40.6 tok/s (`scripts/cpu-duel.sh`).
 - 8 concurrent streams reach 3.7x the single-stream aggregate
   (lane-batched decoding), about 280 tok/s served from the CPU.
 

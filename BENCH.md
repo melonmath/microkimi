@@ -31,6 +31,21 @@ Trap: on macOS llama-bench uses the Metal GPU **by default** (backend
 column `MTL`). The CPU row needs `-ngl 0`. Read `pp1024` against the
 prefill lines and `tg64` against the decode lines.
 
+## Paired duel (the fair protocol on a throttling host)
+
+On battery the host throttles between runs, so serial comparisons lie.
+`scripts/cpu-duel.sh` runs N interleaved rounds - microkimi decode,
+llama-bench tg32, microkimi prefill, llama-bench pp1024, each engine
+at its best thread count - so every comparison lives inside one
+thermal window. Quote medians over rounds:
+
+```bash
+WORK=/path/with/q08.bin+q08.gguf+llama.cpp bash scripts/cpu-duel.sh 7
+```
+
+The macOS runner script also brackets its qwenbench battery with two
+llama.cpp CPU rows for the same reason.
+
 ## Honesty notes
 
 - microkimi's MLP is MXFP4 (4-bit) while Q8_0 is 8-bit everywhere, so
