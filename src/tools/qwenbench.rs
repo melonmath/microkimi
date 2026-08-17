@@ -209,6 +209,19 @@ pub fn run(args: &[String]) {
     )) {
         println!("  q8 seq-scan {:>4.1} ms/token ({:.0} tok/s)  [A/B arm]", sq, 1000.0 / sq);
     }
+    // all cores for the prefill: the E-cluster lost under the old condvar
+    // pool but the dynamic job board changed the calculus (the all-cores
+    // DECODE arm now wins on the M5); the prefill has never been measured
+    // there
+    if all_cores > 0 {
+        let all_s = all_cores.to_string();
+        if let Some(a) = prefill_ms(&run_self(
+            &pre,
+            &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", &all_s)],
+        )) {
+            println!("  q8 {}-thread {:>4.1} ms/token ({:.0} tok/s)", all_cores, a, 1000.0 / a);
+        }
+    }
     if let Some(q) = q8pre {
         println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
         for line in q8out.lines() {
