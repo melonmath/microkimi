@@ -164,6 +164,9 @@ pub fn run(args: &[String]) {
     ];
     let batched = prefill_ms(&run_self(&pre, &[]));
     let sequential = prefill_ms(&run_self(&pre, &[("MICROKIMI_NO_QWEN_BATCH", "1")]));
+    // the q8 spine runs prefill attention and the MLP on the int8 tile
+    // kernels - the fastest CPU prompt-reading mode
+    let q8pre = prefill_ms(&run_self(&pre, &[("MICROKIMI_Q8_SPINE", "1")]));
     println!("prefill (~1k-token prompt):");
     match (batched, sequential) {
         (Some(b), Some(s)) => println!(
@@ -173,6 +176,9 @@ pub fn run(args: &[String]) {
             s / b
         ),
         _ => println!("  unavailable"),
+    }
+    if let Some(q) = q8pre {
+        println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
     }
 
     // ── GPU prefill (macOS: MPS GEMM offload, in-process paired child) ──

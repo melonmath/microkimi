@@ -443,7 +443,39 @@ impl Q8Head {
                         #[cfg(target_arch = "aarch64")]
                         if crate::quant::q8::sdot4_available() {
                             while r + 4 <= r1 {
-                                for (l, xq) in xqs.iter().enumerate() {
+                                // 4x4 register tile: weights load once per
+                                // block for four lanes at a time
+                                let mut l0 = 0usize;
+                                while l0 + 4 <= xqs.len() {
+                                    // SAFETY: dotprod checked; slices hold nb blocks
+                                    let tile = unsafe {
+                                        crate::quant::q8::rows4_dot_fma_x4(
+                                            [
+                                                &this.q[r * cols..(r + 1) * cols],
+                                                &this.q[(r + 1) * cols..(r + 2) * cols],
+                                                &this.q[(r + 2) * cols..(r + 3) * cols],
+                                                &this.q[(r + 3) * cols..(r + 4) * cols],
+                                            ],
+                                            [
+                                                &this.scales[r * nb..(r + 1) * nb],
+                                                &this.scales[(r + 1) * nb..(r + 2) * nb],
+                                                &this.scales[(r + 2) * nb..(r + 3) * nb],
+                                                &this.scales[(r + 3) * nb..(r + 4) * nb],
+                                            ],
+                                            [&xqs[l0], &xqs[l0 + 1], &xqs[l0 + 2], &xqs[l0 + 3]],
+                                        )
+                                    };
+                                    for (dl, lane_out) in tile.iter().enumerate() {
+                                        for k in 0..4 {
+                                            unsafe {
+                                                *(out_ptrs[l0 + dl] as *mut f32).add(r + k) =
+                                                    lane_out[k];
+                                            }
+                                        }
+                                    }
+                                    l0 += 4;
+                                }
+                                for (l, xq) in xqs.iter().enumerate().skip(l0) {
                                     // SAFETY: dotprod checked; slices hold nb blocks
                                     let sums = unsafe {
                                         crate::quant::q8::rows4_dot_fma(

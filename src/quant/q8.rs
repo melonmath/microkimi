@@ -783,3 +783,76 @@ unsafe fn row_dot_fp4_multi_sdot(prow: &[u8], srow: &[u8], xqs: &[&Q8Vec], out: 
         }
     }
 }
+
+/// Four rows x four lanes, register-tiled: each block's eight weight
+/// vectors load ONCE and serve all four activations. Per lane the
+/// instruction sequence is rows4_dot_fma exactly (same sdot pairs, same
+/// pairwise collapse, same scale-vector FMA, block-sequential), so each
+/// lane's four results are bit-identical to the narrower kernels.
+/// Returns [lane][row].
+///
+/// SAFETY: caller guarantees dotprod; every slice holds nb full blocks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn rows4_dot_fma_x4(
+    w: [&[i8]; 4],
+    s: [&[f32]; 4],
+    xqs: [&Q8Vec; 4],
+) -> [[f32; 4]; 4] {
+    use std::arch::aarch64::*;
+    let nb = xqs[0].scales.len();
+    unsafe {
+        let mut acc = [vdupq_n_f32(0.0); 4]; // per lane, rows in vector lanes
+        for g in 0..nb {
+            let w00 = vld1q_s8(w[0].as_ptr().add(g * 32));
+            let w01 = vld1q_s8(w[0].as_ptr().add(g * 32 + 16));
+            let w10 = vld1q_s8(w[1].as_ptr().add(g * 32));
+            let w11 = vld1q_s8(w[1].as_ptr().add(g * 32 + 16));
+            let w20 = vld1q_s8(w[2].as_ptr().add(g * 32));
+            let w21 = vld1q_s8(w[2].as_ptr().add(g * 32 + 16));
+            let w30 = vld1q_s8(w[3].as_ptr().add(g * 32));
+            let w31 = vld1q_s8(w[3].as_ptr().add(g * 32 + 16));
+            let ws = [s[0][g], s[1][g], s[2][g], s[3][g]];
+            let wsv = vld1q_f32(ws.as_ptr());
+            for (l, xq) in xqs.iter().enumerate() {
+                let x0 = vld1q_s8(xq.q.as_ptr().add(g * 32));
+                let x1 = vld1q_s8(xq.q.as_ptr().add(g * 32 + 16));
+                let mut a0 = vdupq_n_s32(0);
+                let mut a1 = vdupq_n_s32(0);
+                let mut a2 = vdupq_n_s32(0);
+                let mut a3 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension dotprod",
+                    "sdot {a0:v}.4s, {w00:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w10:v}.16b, {x0:v}.16b",
+                    "sdot {a2:v}.4s, {w20:v}.16b, {x0:v}.16b",
+                    "sdot {a3:v}.4s, {w30:v}.16b, {x0:v}.16b",
+                    "sdot {a0:v}.4s, {w01:v}.16b, {x1:v}.16b",
+                    "sdot {a1:v}.4s, {w11:v}.16b, {x1:v}.16b",
+                    "sdot {a2:v}.4s, {w21:v}.16b, {x1:v}.16b",
+                    "sdot {a3:v}.4s, {w31:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0,
+                    a1 = inout(vreg) a1,
+                    a2 = inout(vreg) a2,
+                    a3 = inout(vreg) a3,
+                    w00 = in(vreg) w00, w01 = in(vreg) w01,
+                    w10 = in(vreg) w10, w11 = in(vreg) w11,
+                    w20 = in(vreg) w20, w21 = in(vreg) w21,
+                    w30 = in(vreg) w30, w31 = in(vreg) w31,
+                    x0 = in(vreg) x0, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack)
+                );
+                let p01 = vpaddq_s32(a0, a1);
+                let p23 = vpaddq_s32(a2, a3);
+                let sums = vcvtq_f32_s32(vpaddq_s32(p01, p23));
+                let sv = vmulq_f32(wsv, vdupq_n_f32(xq.scales[g]));
+                acc[l] = vfmaq_f32(acc[l], sums, sv);
+            }
+        }
+        let mut out = [[0.0f32; 4]; 4];
+        for l in 0..4 {
+            vst1q_f32(out[l].as_mut_ptr(), acc[l]);
+        }
+        out
+    }
+}
