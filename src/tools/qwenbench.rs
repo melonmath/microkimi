@@ -180,8 +180,13 @@ pub fn run(args: &[String]) {
     }
     // Accelerate/AMX arm (macOS): sgemm prefill, the answer to
     // llama.cpp's BLAS-backed CPU pp rows
+    // low spin: the pool is mostly idle while Accelerate's own threads
+    // feed the AMX, so parked workers beat spinning ones here
     #[cfg(target_os = "macos")]
-    if let Some(a) = prefill_ms(&run_self(&pre, &[("MICROKIMI_ACCEL", "1")])) {
+    if let Some(a) = prefill_ms(&run_self(
+        &pre,
+        &[("MICROKIMI_ACCEL", "1"), ("MICROKIMI_SPIN", "200")],
+    )) {
         println!("  accel    {:>5.1} ms/token ({:.0} tok/s)", a, 1000.0 / a);
     }
     if let Some(q) = q8pre {

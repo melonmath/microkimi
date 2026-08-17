@@ -76,18 +76,29 @@ fn sgemm_xwt(x: &[f32], w: &[f32], t: usize, rows: usize, cols: usize, y: &mut [
     }
 }
 
-/// Packs the lanes, runs the GEMM, scatters the rows back.
+/// Packs the lanes, runs the GEMM, scatters the rows back. The staging
+/// buffers are thread-local and reused: ~150 GEMMs per prompt at 4 MB
+/// of fresh allocation each added up to over half a gigabyte of
+/// alloc traffic per prompt.
 fn run(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
+    std::thread_local! {
+        static STAGE: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
     let t = xs.len();
-    let mut x = vec![0.0f32; t * cols];
-    for (l, lane) in xs.iter().enumerate() {
-        x[l * cols..(l + 1) * cols].copy_from_slice(lane);
-    }
-    let mut y = vec![0.0f32; t * rows];
-    sgemm_xwt(&x, w, t, rows, cols, &mut y);
-    for (l, out) in outs.iter_mut().enumerate() {
-        out.copy_from_slice(&y[l * rows..(l + 1) * rows]);
-    }
+    STAGE.with(|stage| {
+        let mut stage = stage.borrow_mut();
+        let (x, y) = &mut *stage;
+        x.resize(t * cols, 0.0);
+        y.resize(t * rows, 0.0);
+        for (l, lane) in xs.iter().enumerate() {
+            x[l * cols..(l + 1) * cols].copy_from_slice(lane);
+        }
+        sgemm_xwt(x, w, t, rows, cols, y);
+        for (l, out) in outs.iter_mut().enumerate() {
+            out.copy_from_slice(&y[l * rows..(l + 1) * rows]);
+        }
+    });
 }
 
 /// f32 multi-lane matvec through AMX. False = caller keeps its kernels.
