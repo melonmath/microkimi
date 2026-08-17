@@ -1025,3 +1025,76 @@ unsafe fn score_window_sdot(
         vmaxvq_f32(maxv)
     }
 }
+
+/// The packed-quad GEMM kernel: same math and reduction order as
+/// rows4_dot_fma_x4, but the four rows' bytes are interleaved per block
+/// (8 consecutive 16-byte vectors) and the four scales sit together -
+/// one address stream instead of four plus a scalar gather. Layout per
+/// (quad, block): [r0lo r0hi r1lo r1hi r2lo r2hi r3lo r3hi], scales
+/// [quad][block][4].
+///
+/// SAFETY: caller guarantees dotprod; `wq` holds nb*128 bytes, `ws`
+/// nb*4 scales, every lane nb blocks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn rows4_dot_fma_x4_packed(
+    wq: &[i8],
+    ws: &[f32],
+    xqs: &[(&[i8], &[f32])],
+) -> [[f32; 4]; 8] {
+    use std::arch::aarch64::*;
+    debug_assert!(xqs.len() <= 8, "lane tile is at most 8 wide");
+    let nb = xqs[0].1.len();
+    unsafe {
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        for g in 0..nb {
+            let wp = wq.as_ptr().add(g * 128);
+            let w00 = vld1q_s8(wp);
+            let w01 = vld1q_s8(wp.add(16));
+            let w10 = vld1q_s8(wp.add(32));
+            let w11 = vld1q_s8(wp.add(48));
+            let w20 = vld1q_s8(wp.add(64));
+            let w21 = vld1q_s8(wp.add(80));
+            let w30 = vld1q_s8(wp.add(96));
+            let w31 = vld1q_s8(wp.add(112));
+            let wsv = vld1q_f32(ws.as_ptr().add(g * 4));
+            for (l, xq) in xqs.iter().enumerate() {
+                let x0 = vld1q_s8(xq.0.as_ptr().add(g * 32));
+                let x1 = vld1q_s8(xq.0.as_ptr().add(g * 32 + 16));
+                let mut b0 = vdupq_n_s32(0);
+                let mut b1 = vdupq_n_s32(0);
+                let mut b2 = vdupq_n_s32(0);
+                let mut b3 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension dotprod",
+                    "sdot {b0:v}.4s, {w00:v}.16b, {x0:v}.16b",
+                    "sdot {b1:v}.4s, {w10:v}.16b, {x0:v}.16b",
+                    "sdot {b2:v}.4s, {w20:v}.16b, {x0:v}.16b",
+                    "sdot {b3:v}.4s, {w30:v}.16b, {x0:v}.16b",
+                    "sdot {b0:v}.4s, {w01:v}.16b, {x1:v}.16b",
+                    "sdot {b1:v}.4s, {w11:v}.16b, {x1:v}.16b",
+                    "sdot {b2:v}.4s, {w21:v}.16b, {x1:v}.16b",
+                    "sdot {b3:v}.4s, {w31:v}.16b, {x1:v}.16b",
+                    b0 = inout(vreg) b0, b1 = inout(vreg) b1,
+                    b2 = inout(vreg) b2, b3 = inout(vreg) b3,
+                    w00 = in(vreg) w00, w01 = in(vreg) w01,
+                    w10 = in(vreg) w10, w11 = in(vreg) w11,
+                    w20 = in(vreg) w20, w21 = in(vreg) w21,
+                    w30 = in(vreg) w30, w31 = in(vreg) w31,
+                    x0 = in(vreg) x0, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack)
+                );
+                let p01 = vpaddq_s32(b0, b1);
+                let p23 = vpaddq_s32(b2, b3);
+                let sums = vcvtq_f32_s32(vpaddq_s32(p01, p23));
+                let sv = vmulq_f32(wsv, vdupq_n_f32(xq.1[g]));
+                acc[l] = vfmaq_f32(acc[l], sums, sv);
+            }
+        }
+        let mut out = [[0.0f32; 4]; 8];
+        for l in 0..xqs.len() {
+            vst1q_f32(out[l].as_mut_ptr(), acc[l]);
+        }
+        out
+    }
+}

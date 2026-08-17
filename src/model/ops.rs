@@ -274,6 +274,89 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
 }
 
 
+/// Packed-quad variant of `multi_rows_q8`: full row quads read the
+/// interleaved GEMM layout (one address stream), remainder rows fall
+/// back to the row-major kernels. Same math, same order - bit-identical.
+///
+/// SAFETY: same contract as `multi_rows_q8`, plus `pq`/`ps` hold the
+/// quad-interleaved copy of the same matrix.
+#[allow(clippy::too_many_arguments)]
+unsafe fn multi_rows_q8_packed(
+    q: &[i8],
+    scales: &[f32],
+    pq: &[i8],
+    ps: &[f32],
+    rows: usize,
+    cols: usize,
+    r0: usize,
+    r1: usize,
+    lanes: &[(&[i8], &[f32])],
+    out_ptrs: &[usize],
+) {
+    let nb = cols / 32;
+    // L2 lane-blocking as in multi_rows_q8
+    if lanes.len() > 64 {
+        let mut l0 = 0usize;
+        while l0 < lanes.len() {
+            let l1 = (l0 + 64).min(lanes.len());
+            // SAFETY: forwarded contract; lane blocks are disjoint.
+            unsafe {
+                multi_rows_q8_packed(
+                    q, scales, pq, ps, rows, cols, r0, r1, &lanes[l0..l1], &out_ptrs[l0..l1],
+                );
+            }
+            l0 = l1;
+        }
+        return;
+    }
+    let mut r = r0;
+    #[cfg(target_arch = "aarch64")]
+    if crate::quant::q8::sdot4_available() && r % 4 == 0 {
+        while r + 4 <= r1 {
+            let qd = r / 4;
+            let wq = &pq[qd * nb * 128..(qd + 1) * nb * 128];
+            let wsq = &ps[qd * nb * 4..(qd + 1) * nb * 4];
+            let mut l0 = 0usize;
+            while l0 + 2 <= lanes.len() {
+                let width = (lanes.len() - l0).min(8);
+                let tile = unsafe {
+                    crate::quant::q8::rows4_dot_fma_x4_packed(wq, wsq, &lanes[l0..l0 + width])
+                };
+                for (dl, lane_out) in tile.iter().take(width).enumerate() {
+                    for k in 0..4 {
+                        unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
+                    }
+                }
+                l0 += width;
+            }
+            for (l, lane) in lanes.iter().enumerate().skip(l0) {
+                let w4 = [
+                    &q[r * cols..(r + 1) * cols],
+                    &q[(r + 1) * cols..(r + 2) * cols],
+                    &q[(r + 2) * cols..(r + 3) * cols],
+                    &q[(r + 3) * cols..(r + 4) * cols],
+                ];
+                let s4 = [
+                    &scales[r * nb..(r + 1) * nb],
+                    &scales[(r + 1) * nb..(r + 2) * nb],
+                    &scales[(r + 2) * nb..(r + 3) * nb],
+                    &scales[(r + 3) * nb..(r + 4) * nb],
+                ];
+                let sums = unsafe { crate::quant::q8::rows4_dot_fma(w4, s4, lane.0, lane.1) };
+                for k in 0..4 {
+                    unsafe { *(out_ptrs[l] as *mut f32).add(r + k) = sums[k] };
+                }
+            }
+            r += 4;
+        }
+    }
+    if r < r1 {
+        // remainder rows (or misaligned chunk start): row-major path
+        // SAFETY: forwarded contract.
+        unsafe { multi_rows_q8(q, scales, rows, cols, r, r1, lanes, out_ptrs) };
+    }
+}
+
 /// One row range against every lane, shared by the pooled and scoped
 /// multi paths: 4x4 register tiles, then rows4 per remaining lane, then
 /// q8_rows_dot single rows - the same kernels and order everywhere.
@@ -435,6 +518,49 @@ pub struct Q8Head {
     scales: Vec<f32>, // rows x cols/32
     rows: usize,
     cols: usize,
+    /// Quad-interleaved GEMM layout, built lazily on the first pooled
+    /// multi-lane call: per (row-quad, block) the four rows' 32 bytes sit
+    /// consecutively and their four scales together - one address stream
+    /// for the tile kernel instead of four plus a scalar scale gather.
+    gemm_pack: std::sync::OnceLock<(Vec<i8>, Vec<f32>)>,
+}
+
+/// Builds the quad-interleaved copy (rows past the last full quad stay
+/// on the row-major path).
+fn build_gemm_pack(q: &[i8], scales: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    let nb = cols / 32;
+    let quads = rows / 4;
+    let mut wq = vec![0i8; quads * nb * 128];
+    let mut ws = vec![0.0f32; quads * nb * 4];
+    let workers = crate::model::pool::pool().workers.max(1).min(quads.max(1));
+    let chunk = quads.div_ceil(workers.max(1)).max(1);
+    std::thread::scope(|s| {
+        let mut wq_rest = wq.as_mut_slice();
+        let mut ws_rest = ws.as_mut_slice();
+        let mut q0 = 0usize;
+        while q0 < quads {
+            let q1 = (q0 + chunk).min(quads);
+            let (wq_c, wr) = wq_rest.split_at_mut((q1 - q0) * nb * 128);
+            let (ws_c, sr) = ws_rest.split_at_mut((q1 - q0) * nb * 4);
+            wq_rest = wr;
+            ws_rest = sr;
+            s.spawn(move || {
+                for qd in q0..q1 {
+                    for g in 0..nb {
+                        let dst = (qd - q0) * nb + g;
+                        for r in 0..4 {
+                            let row = qd * 4 + r;
+                            wq_c[dst * 128 + r * 32..dst * 128 + (r + 1) * 32]
+                                .copy_from_slice(&q[row * cols + g * 32..row * cols + (g + 1) * 32]);
+                            ws_c[dst * 4 + r] = scales[row * nb + g];
+                        }
+                    }
+                }
+            });
+            q0 = q1;
+        }
+    });
+    (wq, ws)
 }
 
 /// MICROKIMI_Q8HEAD=0 disables the q8 lm_head copy (exact f32 fallback).
@@ -454,7 +580,7 @@ impl Q8Head {
             q[r * cols..(r + 1) * cols].copy_from_slice(&scratch.q);
             scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
         }
-        Q8Head { q, scales, rows, cols }
+        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new() }
     }
 
     /// Single-threaded q8 matvec for callers that already own a worker
@@ -510,6 +636,12 @@ impl Q8Head {
             let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let qp = crate::model::pool::SPtrU8(self.q.as_ptr() as *const u8);
             let sp = crate::model::pool::SPtr(self.scales.as_ptr());
+            let (pack_q, pack_s) = self
+                .gemm_pack
+                .get_or_init(|| build_gemm_pack(&self.q, &self.scales, rows, cols));
+            let pqp = crate::model::pool::SPtrU8(pack_q.as_ptr() as *const u8);
+            let psp = crate::model::pool::SPtr(pack_s.as_ptr());
+            let (pq_len, ps_len) = (pack_q.len(), pack_s.len());
             let lane_ptrs: Vec<(usize, usize, usize)> = xqs
                 .iter()
                 .map(|x| (x.q.as_ptr() as usize, x.scales.as_ptr() as usize, x.scales.len()))
@@ -522,7 +654,7 @@ impl Q8Head {
                 let lane_ptrs = lane_ptrs.clone();
                 let out_ptrs = out_ptrs.clone();
                 jobs.push(Box::new(move || {
-                    let (qp, sp) = (qp, sp);
+                    let (qp, sp, pqp, psp) = (qp, sp, pqp, psp);
                     // SAFETY: the pool barrier outlives every borrow; each
                     // (row, lane) cell is written exactly once.
                     unsafe {
@@ -537,13 +669,17 @@ impl Q8Head {
                                 )
                             })
                             .collect();
+                        let pq = std::slice::from_raw_parts(pqp.0 as *const i8, pq_len);
+                        let ps = std::slice::from_raw_parts(psp.0, ps_len);
                         loop {
                             let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
                             if r0 >= rows {
                                 break;
                             }
                             let r1 = (r0 + step).min(rows);
-                            multi_rows_q8(q, sc, rows, cols, r0, r1, &lanes_v, &out_ptrs);
+                            multi_rows_q8_packed(
+                                q, sc, pq, ps, rows, cols, r0, r1, &lanes_v, &out_ptrs,
+                            );
                         }
                     }
                 }));
@@ -742,7 +878,7 @@ impl Q8Head {
                 r0 = r1;
             }
         });
-        Q8Head { q, scales, rows, cols }
+        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new() }
     }
 
     /// Two heads, one input: the activation is quantized ONCE and both
