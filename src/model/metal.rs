@@ -2059,45 +2059,56 @@ const DELTA_SCAN_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// One thread per (head, value column). Layouts:
-//   q, k   [t, heads, kd]   (kv-heads pre-expanded across their group)
-//   v      [t, heads, vd]
-//   beta,g [t, heads]
-//   state  [heads, kd, vd]  (read-write, f32 - the recurrent object)
-//   out    [heads, t, vd]
-// Per token, matching the CPU delta_step order: decay the column, read
-// the prediction, apply the beta-scaled delta, emit the q readout.
+// One threadgroup per head, one thread per value column. Layouts:
+//   q, k    [t, heads, kd]   (kv-heads pre-expanded across their group)
+//   v       [t, heads, vd]
+//   beta    [t, heads]
+//   decay   [t, heads]       (exp(g), precomputed on the CPU)
+//   state   [heads, kd, vd]  (read-write, f32 - the recurrent object)
+//   out     [heads, t, vd]
+// Per token the group cooperatively stages k and q in threadgroup
+// memory (one device read per value instead of one per thread), then
+// each thread runs the CPU delta_step order on its private state
+// column: decay, prediction, beta-scaled delta, q readout. The host
+// dispatches EXACT threadgroups (heads x vd threads), so every thread
+// reaches every barrier.
 kernel void delta_scan(device const float* q     [[buffer(0)]],
                        device const float* k     [[buffer(1)]],
                        device const float* v     [[buffer(2)]],
                        device const float* beta  [[buffer(3)]],
-                       device const float* g     [[buffer(4)]],
+                       device const float* decay [[buffer(4)]],
                        device float*       state [[buffer(5)]],
                        device float*       out   [[buffer(6)]],
                        constant uint4&     dims  [[buffer(7)]],
-                       uint tid [[thread_position_in_grid]]) {
+                       uint j     [[thread_position_in_threadgroup]],
+                       uint h     [[threadgroup_position_in_grid]],
+                       uint lanes [[threads_per_threadgroup]]) {
     uint t_count = dims.x, heads = dims.y, kd = dims.z, vd = dims.w;
-    uint h = tid / vd;
-    uint j = tid % vd;
-    if (h >= heads) { return; }
+    threadgroup float kq[256];
     float s[128];
     device float* scol = state + (size_t)h * kd * vd + j;
     for (uint i = 0; i < kd; i++) { s[i] = scol[i * vd]; }
     for (uint t = 0; t < t_count; t++) {
-        float decay = exp(g[t * heads + h]);
-        float bet = beta[t * heads + h];
-        float vj = v[(size_t)(t * heads + h) * vd + j];
         device const float* kt = k + (size_t)(t * heads + h) * kd;
         device const float* qt = q + (size_t)(t * heads + h) * kd;
+        for (uint i = j; i < kd; i += lanes) {
+            kq[i] = kt[i];
+            kq[kd + i] = qt[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float dec = decay[t * heads + h];
+        float bet = beta[t * heads + h];
+        float vj = v[(size_t)(t * heads + h) * vd + j];
         float pred = 0.0f;
-        for (uint i = 0; i < kd; i++) { s[i] *= decay; pred += kt[i] * s[i]; }
+        for (uint i = 0; i < kd; i++) { s[i] *= dec; pred += kq[i] * s[i]; }
         float delta = (vj - pred) * bet;
         float o = 0.0f;
         for (uint i = 0; i < kd; i++) {
-            s[i] += kt[i] * delta;
-            o += qt[i] * s[i];
+            s[i] += kq[i] * delta;
+            o += kq[kd + i] * s[i];
         }
         out[((size_t)h * t_count + t) * vd + j] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint i = 0; i < kd; i++) { scol[i * vd] = s[i]; }
 }
@@ -2182,7 +2193,7 @@ pub fn gpu_delta_scan(
     k: &[f32],
     v: &[f32],
     beta: &[f32],
-    g: &[f32],
+    decay: &[f32],
     state: &mut [f32],
     out: &mut [f32],
     t_count: usize,
@@ -2190,14 +2201,14 @@ pub fn gpu_delta_scan(
     kd: usize,
     vd: usize,
 ) -> bool {
-    if kd > 128 {
-        return false;
+    if kd > 128 || vd > 128 {
+        return false; // thread-private column and threadgroup staging budgets
     }
     assert_eq!(q.len(), t_count * heads * kd);
     assert_eq!(k.len(), t_count * heads * kd);
     assert_eq!(v.len(), t_count * heads * vd);
     assert_eq!(beta.len(), t_count * heads);
-    assert_eq!(g.len(), t_count * heads);
+    assert_eq!(decay.len(), t_count * heads);
     assert_eq!(state.len(), heads * kd * vd);
     assert_eq!(out.len(), heads * t_count * vd);
     let Some((base, scan)) = scan_ctx() else {
@@ -2205,7 +2216,7 @@ pub fn gpu_delta_scan(
     };
     let t_start = std::time::Instant::now();
     // one staging buffer for the five read-only inputs, offset-addressed
-    let sizes = [q.len(), k.len(), v.len(), beta.len(), g.len()];
+    let sizes = [q.len(), k.len(), v.len(), beta.len(), decay.len()];
     let mut offs = [0usize; 5];
     let mut total = 0usize;
     for (i, len) in sizes.iter().enumerate() {
@@ -2226,7 +2237,7 @@ pub fn gpu_delta_scan(
             msg_void(pool, sel("drain"));
             return false;
         }
-        for (src, off) in [(q, offs[0]), (k, offs[1]), (v, offs[2]), (beta, offs[3]), (g, offs[4])] {
+        for (src, off) in [(q, offs[0]), (k, offs[1]), (v, offs[2]), (beta, offs[3]), (decay, offs[4])] {
             std::ptr::copy_nonoverlapping(src.as_ptr(), (in_ptr as *mut f32).add(off), src.len());
         }
         std::ptr::copy_nonoverlapping(state.as_ptr(), st_ptr as *mut f32, state.len());
@@ -2258,9 +2269,9 @@ pub fn gpu_delta_scan(
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
             f(
                 encoder,
-                sel("dispatchThreads:threadsPerThreadgroup:"),
-                MTLSize { width: (heads * vd) as u64, height: 1, depth: 1 },
-                MTLSize { width: 64, height: 1, depth: 1 },
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MTLSize { width: heads as u64, height: 1, depth: 1 },
+                MTLSize { width: vd as u64, height: 1, depth: 1 },
             );
         }
         msg_void(encoder, sel("endEncoding"));

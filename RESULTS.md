@@ -9,15 +9,15 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | 62.5 tok/s | 87.2 tok/s |
-| prompt reading (1k tokens) | 85 tok/s | 685 tok/s |
+| generation | 62.5 tok/s | 88.8 tok/s |
+| prompt reading (1k tokens) | 96 tok/s | 689 tok/s |
 
 ## On the GPU (Metal)
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | 62.5 tok/s * | 110.5 tok/s |
-| prompt reading (1k tokens) | **1042 tok/s** | 4643 tok/s |
+| generation | 62.5 tok/s * | 114.2 tok/s |
+| prompt reading (1k tokens) | **980 tok/s** | 4771 tok/s |
 
 \* microkimi generates on the CPU in both columns: its GPU path
 accelerates prompt reading only (for now).

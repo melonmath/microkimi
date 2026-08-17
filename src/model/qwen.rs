@@ -2976,7 +2976,8 @@ fn gpu_lin_scan(
                                 (1.0 + arg.exp()).ln()
                             }
                         };
-                        g_c[i * heads + h] = -a_log[h].exp() * sp;
+                        // decay = exp(g), the exact factor the CPU delta_step applies
+                        g_c[i * heads + h] = (-a_log[h].exp() * sp).exp();
                     }
                 }
             });
