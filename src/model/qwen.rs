@@ -3446,6 +3446,15 @@ fn gpu_full_attention(
         }
     });
 
+    // fused path: scores GEMM + causal softmax + P.V GEMM in one
+    // command buffer, scores resident on the GPU (f16 mode)
+    let mut mixed_try = vec![0.0f32; heads * t_count * hd];
+    if crate::model::metal::gpu_attention_fused(
+        &q_hm, &k_hm, &v_hm, heads, t_count, l, hd, base_pos, scale, &mut mixed_try,
+    ) {
+        gather_gate(&mixed_try, gate_all, heads, t_count, hd, q_width, mixed_all);
+        return true;
+    }
     let mut scores = vec![0.0f32; heads * t_count * l];
     if !crate::model::metal::gpu_gemm_batched(&q_hm, &k_hm, heads, t_count, l, hd, true, scale, &mut scores) {
         return false;
@@ -3485,32 +3494,43 @@ fn gpu_full_attention(
     if !crate::model::metal::gpu_gemm_batched(&scores, &v_hm, heads, t_count, hd, l, false, 1.0, &mut mixed_hm) {
         return false;
     }
-    // token-major gather + the sigmoid output gate (as the CPU loop)
-    {
-        let workers = prefill_workers(t_count);
-        std::thread::scope(|s| {
-            let mut rest = &mut mixed_all[..t_count * q_width];
-            let mixed_hm = &mixed_hm;
-            for (t0, t1) in ranges(t_count, workers) {
-                let (chunk, r) = rest.split_at_mut((t1 - t0) * q_width);
-                rest = r;
-                s.spawn(move || {
-                    for (i, t) in (t0..t1).enumerate() {
-                        let m = &mut chunk[i * q_width..(i + 1) * q_width];
-                        for h in 0..heads {
-                            m[h * hd..(h + 1) * hd].copy_from_slice(
-                                &mixed_hm[(h * t_count + t) * hd..(h * t_count + t + 1) * hd],
-                            );
-                        }
-                        for (j, value) in m.iter_mut().enumerate() {
-                            *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
-                        }
-                    }
-                });
-            }
-        });
-    }
+    gather_gate(&mixed_hm, gate_all, heads, t_count, hd, q_width, mixed_all);
     true
+}
+
+/// Token-major gather of a head-major mix plus the sigmoid output gate
+/// (the tail both GPU attention paths share).
+#[cfg(target_os = "macos")]
+fn gather_gate(
+    mixed_hm: &[f32],
+    gate_all: &[f32],
+    heads: usize,
+    t_count: usize,
+    hd: usize,
+    q_width: usize,
+    mixed_all: &mut [f32],
+) {
+    let workers = prefill_workers(t_count);
+    std::thread::scope(|s| {
+        let mut rest = &mut mixed_all[..t_count * q_width];
+        for (t0, t1) in ranges(t_count, workers) {
+            let (chunk, r) = rest.split_at_mut((t1 - t0) * q_width);
+            rest = r;
+            s.spawn(move || {
+                for (i, t) in (t0..t1).enumerate() {
+                    let m = &mut chunk[i * q_width..(i + 1) * q_width];
+                    for h in 0..heads {
+                        m[h * hd..(h + 1) * hd].copy_from_slice(
+                            &mixed_hm[(h * t_count + t) * hd..(h * t_count + t + 1) * hd],
+                        );
+                    }
+                    for (j, value) in m.iter_mut().enumerate() {
+                        *value *= 1.0 / (1.0 + (-gate_all[t * q_width + j]).exp());
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Prefill MLP dispatch: every token is independent, so tokens fan out over

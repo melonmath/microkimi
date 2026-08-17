@@ -2286,3 +2286,271 @@ pub fn gpu_delta_scan(
     gemm_account(t_start.elapsed().as_micros() as u64);
     true
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fused attention: GEMM1 -> causal softmax (MSL) -> GEMM2, one command
+// buffer, scores never leave the GPU
+// ════════════════════════════════════════════════════════════════════════════
+
+const CAUSAL_SOFTMAX_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// In-place causal softmax over f16 score rows laid out [head][row][L].
+// One threadgroup per (head, row); lanes reduce max and sum with the
+// same simd pattern as the matvec kernels; the tail past the causal
+// window zeroes so the following P.V GEMM can run the full width.
+kernel void causal_softmax_f16(device half* s      [[buffer(0)]],
+                               constant uint4& dims [[buffer(1)]],
+                               uint tg    [[threadgroup_position_in_grid]],
+                               uint lane  [[thread_position_in_threadgroup]],
+                               uint lanes [[threads_per_threadgroup]]) {
+    uint t_count = dims.x, l = dims.y, base = dims.z;
+    uint row = tg % t_count;
+    uint window = base + row + 1;
+    device half* p = s + (size_t)tg * l;
+    threadgroup float partial[32];
+    // max over the window
+    float m = -INFINITY;
+    for (uint i = lane; i < window; i += lanes) { m = max(m, float(p[i])); }
+    m = simd_max(m);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) {
+        float v = (lane < nsg) ? partial[lane] : -INFINITY;
+        v = simd_max(v);
+        if (lane == 0u) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = partial[0];
+    // exp and sum
+    float acc = 0.0f;
+    for (uint i = lane; i < window; i += lanes) {
+        float e = exp(float(p[i]) - m);
+        p[i] = half(e);
+        acc += e;
+    }
+    acc = simd_sum(acc);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 32u) {
+        float v = (lane < nsg) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = 1.0f / partial[0];
+    for (uint i = lane; i < window; i += lanes) { p[i] = half(float(p[i]) * inv); }
+    for (uint i = window + lane; i < l; i += lanes) { p[i] = half(0.0f); }
+}
+"#;
+
+static SOFTMAX: std::sync::OnceLock<Option<ScanCtx>> = std::sync::OnceLock::new();
+
+fn softmax_ctx() -> Option<(&'static MetalCtx, &'static ScanCtx)> {
+    let base = ctx()?;
+    let sm = SOFTMAX
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(CAUSAL_SOFTMAX_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: softmax shader error: {} - attention stays two-step", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let function = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library, sel("newFunctionWithName:"), ns_string("causal_softmax_f16"))
+                };
+                let mut perr: Id = std::ptr::null_mut();
+                let pipeline = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                };
+                if pipeline.is_null() {
+                    println!("gpu: softmax pipeline error: {} - attention stays two-step", err_desc(perr));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                retain(pipeline);
+                retain(function);
+                retain(library);
+                msg_void(pool, sel("drain"));
+                Some(ScanCtx { pipeline })
+            }
+        })
+        .as_ref()?;
+    Some((base, sm))
+}
+
+/// Whole attention for one layer in ONE command buffer: batched
+/// scores GEMM, in-place causal softmax, batched P.V GEMM. Only in the
+/// f16 storage mode (the kernel is written for half rows); refusals
+/// fall back to the caller's two-step path. Layout as gpu_gemm_batched:
+/// q [heads, t, hd], k/v [heads, l, hd], out [heads, t, hd].
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_attention_fused(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    heads: usize,
+    t: usize,
+    l: usize,
+    hd: usize,
+    base_pos: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    if !gemm_f16_on() {
+        return false;
+    }
+    let scores_len = heads * t * l;
+    if scores_len * 2 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
+    let Some((base, sm)) = softmax_ctx() else {
+        return false;
+    };
+    let Some((_, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some(k1) = gemm_kernel(base, mps, t, l, hd, true, scale) else {
+        return false;
+    };
+    let Some(k2) = gemm_kernel(base, mps, t, hd, l, false, 1.0) else {
+        return false;
+    };
+    let t_start = std::time::Instant::now();
+    // SAFETY: same invariants as the other offload paths - io mutex held
+    // across encode/wait/readback, one autorelease pool, explicit
+    // releases of the alloc/init-owned MPSMatrix wrappers. Encoders in
+    // one command buffer execute in order with tracked-resource hazards.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (q_ptr, buf_q) = ensure_buf(base, &mut io.x, q.len() * 2);
+        let kv_off = k.len(); // halves: [K | V] in one staging buffer
+        let (kv_ptr, buf_kv) = ensure_buf(base, &mut io.z, (k.len() + v.len()) * 2);
+        let out_off = scores_len; // halves: [scores | out]
+        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, (scores_len + out.len()) * 2);
+        if buf_q.is_null() || buf_kv.is_null() || buf_y.is_null() || q_ptr.is_null() || kv_ptr.is_null() || y_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        f32s_to_f16s(q, std::slice::from_raw_parts_mut(q_ptr as *mut u16, q.len()));
+        f32s_to_f16s(k, std::slice::from_raw_parts_mut(kv_ptr as *mut u16, k.len()));
+        f32s_to_f16s(v, std::slice::from_raw_parts_mut((kv_ptr as *mut u16).add(kv_off), v.len()));
+
+        let bdesc = |rows: usize, cols: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                class("MPSMatrixDescriptor"),
+                sel("matrixDescriptorWithRows:columns:matrices:rowBytes:matrixBytes:dataType:"),
+                rows as u64,
+                cols as u64,
+                heads as u64,
+                (cols * 2) as u64,
+                (rows * cols * 2) as u64,
+                MPS_FLOAT16,
+            )
+        };
+        let matrix_at = |buf: Id, off_bytes: usize, d: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                msg_id(class("MPSMatrix"), sel("alloc")),
+                sel("initWithBuffer:offset:descriptor:"),
+                buf,
+                off_bytes as u64,
+                d,
+            )
+        };
+        let mq = matrix_at(buf_q, 0, bdesc(t, hd));
+        let mk = matrix_at(buf_kv, 0, bdesc(l, hd));
+        let mv = matrix_at(buf_kv, kv_off * 2, bdesc(l, hd));
+        let ms = matrix_at(buf_y, 0, bdesc(t, l));
+        let mo = matrix_at(buf_y, out_off * 2, bdesc(t, hd));
+        if [mq, mk, mv, ms, mo].iter().any(|m| m.is_null()) {
+            for m in [mq, mk, mv, ms, mo] {
+                if !m.is_null() {
+                    msg_void(m, sel("release"));
+                }
+            }
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        {
+            let responds: extern "C" fn(Id, Sel, Sel) -> bool =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            if responds(k1, sel("respondsToSelector:"), sel("setBatchSize:")) {
+                let f: extern "C" fn(Id, Sel, u64) =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(k1, sel("setBatchSize:"), heads as u64);
+                f(k2, sel("setBatchSize:"), heads as u64);
+            }
+        }
+        {
+            let f: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(k1, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mq, mk, ms);
+        }
+        {
+            // the softmax between the two GEMMs, same command buffer
+            let encoder = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            let f1: extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f1(encoder, sel("setComputePipelineState:"), sm.pipeline);
+            let f2: extern "C" fn(Id, Sel, Id, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_y, 0, 0);
+            let dims: [u32; 4] = [t as u32, l as u32, base_pos as u32, heads as u32];
+            let f3: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f3(encoder, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 16, 1);
+            let f4: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f4(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MTLSize { width: (heads * t) as u64, height: 1, depth: 1 },
+                MTLSize { width: 64, height: 1, depth: 1 },
+            );
+            msg_void(encoder, sel("endEncoding"));
+        }
+        {
+            let f: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(k2, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, ms, mv, mo);
+        }
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        f16s_to_f32s(
+            std::slice::from_raw_parts((y_ptr as *const u16).add(out_off), out.len()),
+            out,
+        );
+        for m in [mq, mk, mv, ms, mo] {
+            msg_void(m, sel("release"));
+        }
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
+}
