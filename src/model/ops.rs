@@ -680,6 +680,7 @@ impl Q8Head {
             return;
         }
         let (rows, cols) = (self.rows, self.cols);
+        let t_quant = std::time::Instant::now();
         // lane quantization in parallel: ~1k lanes per call ran on one
         // thread and added up across the ~66 GEMM calls of a prefill
         let xqs: Vec<crate::quant::q8::Q8Vec> = if lanes >= 64
@@ -709,6 +710,7 @@ impl Q8Head {
         } else {
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect()
         };
+        crate::model::qwen::dprof_add(5, t_quant.elapsed());
         let p = crate::model::pool::pool();
         let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
         if njobs <= 1 {
@@ -774,6 +776,8 @@ impl Q8Head {
             };
             let xpp = crate::model::pool::SPtrU8(xp.as_ptr() as *const u8);
             let xp_len = xp.len();
+            crate::model::qwen::dprof_add(6, t_quant.elapsed());
+            let t_pool = std::time::Instant::now();
             let lane_ptrs: Vec<(usize, usize, usize)> = xqs
                 .iter()
                 .map(|x| (x.q.as_ptr() as usize, x.scales.as_ptr() as usize, x.scales.len()))
@@ -818,6 +822,7 @@ impl Q8Head {
                 }));
             }
             p.run(jobs);
+            crate::model::qwen::dprof_add(7, t_pool.elapsed());
             return;
         }
         // dynamic row scheduling (see Q8Head::matvec): fine chunks off a

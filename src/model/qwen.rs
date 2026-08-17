@@ -2351,7 +2351,10 @@ fn no_batch_prefill() -> bool {
 /// Decode/prefill phase profiler (MICROKIMI_PROF=1): accumulates wall
 /// micros per phase (0 lin attn, 1 full attn, 2 mlp, 3 lm_head) and
 /// prints once at process exit via dprof_print (called by `run`).
-static DPROF: [std::sync::atomic::AtomicU64; 5] = [
+pub(crate) static DPROF: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2365,7 +2368,7 @@ fn dprof_on() -> bool {
 }
 
 #[inline]
-fn dprof_add(phase: usize, d: std::time::Duration) {
+pub(crate) fn dprof_add(phase: usize, d: std::time::Duration) {
     if dprof_on() {
         DPROF[phase].fetch_add(d.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2385,6 +2388,12 @@ pub fn dprof_print() {
         v[2] as f64 / 1000.0,
         v[4] as f64 / 1000.0,
         v[3] as f64 / 1000.0
+    );
+    println!(
+        "prof2: mv_quant {:.1} ms | mv_pack {:.1} ms | mv_pool {:.1} ms (inside every multi-lane q8 GEMM call)",
+        v[5] as f64 / 1000.0,
+        v[6] as f64 / 1000.0,
+        v[7] as f64 / 1000.0
     );
 }
 
