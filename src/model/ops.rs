@@ -1710,3 +1710,55 @@ pub fn kernbench_cmd(_args: &[String]) {
         dt * 1000.0
     );
 }
+
+/// `microkimi scanbench`: same-process A/B of the sequential delta scan
+/// against the WY chunked scan on one synthetic head shape (kd=vd=128,
+/// 1024 tokens), alternating arms so a host storm hits both. The datum
+/// that decides whether the chunked scan enters the spine prefill.
+pub fn scanbench_cmd(_args: &[String]) {
+    let (kd, vd, t) = (128usize, 128usize, 1024usize);
+    let f = |i: usize, m: usize| ((i * 37 + 11) % m) as f32 / m as f32 - 0.4;
+    let qn: Vec<f32> = (0..t * kd).map(|i| f(i, 19) * 0.09).collect();
+    let kn: Vec<f32> = (0..t * kd).map(|i| f(i + 5, 23) * 0.09).collect();
+    let vn: Vec<f32> = (0..t * vd).map(|i| f(i + 9, 29)).collect();
+    let beta: Vec<f32> = (0..t).map(|i| 0.2 + 0.7 * f(i, 13).abs()).collect();
+    let gamma: Vec<f32> = (0..t).map(|i| 0.9 + 0.09 * f(i + 3, 17).abs()).collect();
+    let mut best_seq = f64::MAX;
+    let mut best_chk = f64::MAX;
+    for _ in 0..5 {
+        let mut s = vec![0.0f32; kd * vd];
+        let mut out = vec![0.0f32; t * vd];
+        let t0 = std::time::Instant::now();
+        for i in 0..t {
+            crate::model::qwen::delta_step(
+                &mut s,
+                &qn[i * kd..(i + 1) * kd],
+                &kn[i * kd..(i + 1) * kd],
+                &vn[i * vd..(i + 1) * vd],
+                gamma[i].ln(),
+                beta[i],
+                &mut out[i * vd..(i + 1) * vd],
+            );
+        }
+        best_seq = best_seq.min(t0.elapsed().as_secs_f64() * 1000.0);
+        let mut s2 = vec![0.0f32; kd * vd];
+        let mut out2 = vec![0.0f32; t * vd];
+        let t1 = std::time::Instant::now();
+        crate::model::qwen::chunked_scan_head(&mut s2, &mut out2, &qn, &kn, &vn, &beta, &gamma, t, kd, vd);
+        best_chk = best_chk.min(t1.elapsed().as_secs_f64() * 1000.0);
+        let mut md = 0.0f32;
+        for (a, b) in out.iter().zip(&out2) {
+            md = md.max((a - b).abs());
+        }
+        std::hint::black_box((md, &s, &s2));
+    }
+    println!(
+        "scanbench (one head, {}x{}, {} tokens, best of 5): sequential {:.2} ms | chunked {:.2} ms | {:.2}x",
+        kd,
+        vd,
+        t,
+        best_seq,
+        best_chk,
+        best_seq / best_chk
+    );
+}

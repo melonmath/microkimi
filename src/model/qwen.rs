@@ -2994,16 +2994,10 @@ fn lin_attn_prefill(
                 s.spawn(move || {
                     // chunked-scan prep buffers (spine modes): normalized
                     // q/k, contiguous v, per-token beta and decay
-                    let (mut qb, mut kb, mut vb, mut bb, mut gb) = if use_chunked {
-                        (
-                            vec![0.0f32; t_count * kd],
-                            vec![0.0f32; t_count * kd],
-                            vec![0.0f32; t_count * vd],
-                            vec![0.0f32; t_count],
-                            vec![0.0f32; t_count],
-                        )
+                    let (mut vb, mut bb, mut gb) = if use_chunked {
+                        (vec![0.0f32; t_count * vd], vec![0.0f32; t_count], vec![0.0f32; t_count])
                     } else {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                        (Vec::new(), Vec::new(), Vec::new())
                     };
                     for h in h0..h1 {
                         let state_h =
@@ -3012,20 +3006,12 @@ fn lin_attn_prefill(
                             &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
                         let kh = h / rep.max(1);
                         if use_chunked {
-                            // WY chunked scan: identical math, GEMM-shaped;
-                            // reassociation-level numerics, spine-only
-                            let scale = 1.0 / (kd as f32).sqrt();
+                            // WY chunked scan over the hoisted normalized q/k
+                            // (per KV head, strided): only v/beta/decay are
+                            // gathered per value head. Reassociation-level
+                            // numerics, spine-only.
                             for t in 0..t_count {
                                 let row = &conved[t * conv_dim..(t + 1) * conv_dim];
-                                let qd = &mut qb[t * kd..(t + 1) * kd];
-                                qd.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
-                                l2norm(qd, 1e-6);
-                                for value in qd.iter_mut() {
-                                    *value *= scale;
-                                }
-                                let kdst = &mut kb[t * kd..(t + 1) * kd];
-                                kdst.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
-                                l2norm(kdst, 1e-6);
                                 vb[t * vd..(t + 1) * vd]
                                     .copy_from_slice(&row[2 * kt + h * vd..2 * kt + (h + 1) * vd]);
                                 bb[t] = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
@@ -3039,8 +3025,20 @@ fn lin_attn_prefill(
                                 &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
                             let mixed_h =
                                 &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
-                            chunked_scan_head(
-                                state_h, mixed_h, &qb, &kb, &vb, &bb, &gb, t_count, kd, vd,
+                            // q/k read strided from the hoisted per-KV-head arrays
+                            chunked_scan_head_strided(
+                                state_h,
+                                mixed_h,
+                                &qn_all[kh * kd..],
+                                kvh * kd,
+                                &kn_all[kh * kd..],
+                                kvh * kd,
+                                &vb,
+                                &bb,
+                                &gb,
+                                t_count,
+                                kd,
+                                vd,
                             );
                             continue;
                         }
@@ -5373,6 +5371,26 @@ pub(crate) fn chunked_scan_head(
     kd: usize,
     vd: usize,
 ) {
+    chunked_scan_head_strided(state, mixed, qn, kd, kn, kd, vn, beta, gamma, t_count, kd, vd);
+}
+
+/// `chunked_scan_head` over q/k rows read with a caller stride (element
+/// units), so per-KV-head hoisted arrays feed the scan without copies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chunked_scan_head_strided(
+    state: &mut [f32],
+    mixed: &mut [f32],
+    qn: &[f32],
+    q_stride: usize,
+    kn: &[f32],
+    k_stride: usize,
+    vn: &[f32],
+    beta: &[f32],
+    gamma: &[f32],
+    t_count: usize,
+    kd: usize,
+    vd: usize,
+) {
     const C: usize = 32;
     let mut c0 = 0usize;
     let mut u = vec![0.0f32; C * vd];
@@ -5394,10 +5412,10 @@ pub(crate) fn chunked_scan_head(
         }
         // gram matrices (GEMM-shaped, kd shared)
         for t in 0..n {
-            let kt = &kn[(c0 + t) * kd..(c0 + t + 1) * kd];
-            let qt = &qn[(c0 + t) * kd..(c0 + t + 1) * kd];
+            let kt = &kn[(c0 + t) * k_stride..(c0 + t) * k_stride + kd];
+            let qt = &qn[(c0 + t) * q_stride..(c0 + t) * q_stride + kd];
             for s in 0..=t {
-                let ks = &kn[(c0 + s) * kd..(c0 + s + 1) * kd];
+                let ks = &kn[(c0 + s) * k_stride..(c0 + s) * k_stride + kd];
                 if s < t {
                     kk[t * C + s] = crate::model::ops::dot(ks, kt);
                 }
@@ -5411,8 +5429,8 @@ pub(crate) fn chunked_scan_head(
         for i in 0..kd {
             let row = &state[i * vd..(i + 1) * vd];
             for t in 0..n {
-                let kw = kn[(c0 + t) * kd + i];
-                let qw = qn[(c0 + t) * kd + i];
+                let kw = kn[(c0 + t) * k_stride + i];
+                let qw = qn[(c0 + t) * q_stride + i];
                 let dk = &mut s0k[t * vd..(t + 1) * vd];
                 if kw != 0.0 {
                     for j in 0..vd {
@@ -5488,7 +5506,7 @@ pub(crate) fn chunked_scan_head(
         }
         for s in 0..n {
             let w = grel[(n - 1) * C + s];
-            let ks = &kn[(c0 + s) * kd..(c0 + s + 1) * kd];
+            let ks = &kn[(c0 + s) * k_stride..(c0 + s) * k_stride + kd];
             let us = &u[s * vd..(s + 1) * vd];
             for i in 0..kd {
                 let f = w * ks[i];

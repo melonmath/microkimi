@@ -59,6 +59,7 @@ fn main() {
         "qwenbench" => tools::qwenbench::run(&args),
         "qwengpubench" => tools::qwenbench::gpu_prefill_cmd(&args),
         "kernbench" => model::kernbench_cmd(&args),
+        "scanbench" => model::scanbench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
         "gpubench" => gpubench_cmd(&args),
         "paritytest" | "parity" => {
