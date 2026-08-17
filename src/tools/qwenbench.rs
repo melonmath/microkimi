@@ -142,19 +142,19 @@ pub fn run(args: &[String]) {
     // The decode is bandwidth-bound; on big.LITTLE parts the E-cluster
     // adds aggregate bandwidth but also adds barrier stragglers - which
     // effect wins is machine-specific, so measure it.
+    // the default is now all cores; the P-core arm (4 threads) is the A/B
     let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    if all_cores > 0 {
-        let all_s = all_cores.to_string();
-        let mut allcore_ms = Vec::new();
+    {
+        let mut pcore_ms = Vec::new();
         for _ in 0..rounds {
             if let Some(v) = ms_per_token(&run_self(
                 &base,
-                &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", &all_s)],
+                &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", "4")],
             )) {
-                allcore_ms.push(v);
+                pcore_ms.push(v);
             }
         }
-        report_decode(&format!("q8 {}-thread", all_cores), &allcore_ms);
+        report_decode("q8 4-thread", &pcore_ms);
     }
 
     // ── prefill A/B ──
@@ -214,12 +214,11 @@ pub fn run(args: &[String]) {
     // DECODE arm now wins on the M5); the prefill has never been measured
     // there
     if all_cores > 0 {
-        let all_s = all_cores.to_string();
         if let Some(a) = prefill_ms(&run_self(
             &pre,
-            &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", &all_s)],
+            &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_THREADS", "4")],
         )) {
-            println!("  q8 {}-thread {:>4.1} ms/token ({:.0} tok/s)", all_cores, a, 1000.0 / a);
+            println!("  q8 4-thread {:>4.1} ms/token ({:.0} tok/s)  [A/B arm]", a, 1000.0 / a);
         }
     }
     if let Some(q) = q8pre {

@@ -37,7 +37,9 @@ use crate::quant::weights::{BinFile, Entry};
 use std::time::Instant;
 
 // The public surface stays crate::model::*; submodules are private.
-pub use ops::{attn_res, dot, dot2, gemm_batch, matvec, rmsnorm, situ, Q8Head};
+pub use ops::{attn_res, dot, gemm_batch, matvec, rmsnorm, situ, Q8Head};
+#[allow(unused_imports)]
+pub use ops::dot2;
 #[allow(unused_imports)] // only metal.rs (macOS) calls it, through crate::model::
 pub use ops::matvec_cpu;
 pub use ops::kernbench_cmd;
@@ -92,22 +94,12 @@ pub fn n_threads() -> usize {
         {
             return n;
         }
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(out) = std::process::Command::new("sysctl")
-                .args(["-n", "hw.perflevel0.logicalcpu"])
-                .output()
-            {
-                if let Some(n) = String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|&n| n >= 1)
-                {
-                    return n;
-                }
-            }
-        }
+        // All cores everywhere. The macOS P-core-only default dated from
+        // the condvar pool, where efficiency cores were barrier
+        // stragglers; the dynamic job board changed that measurably (M5
+        // decode: 10 threads 11 ms/token vs 4 threads 13; prefill jobs
+        // are long enough that six extra cores are pure compute).
+        // MICROKIMI_THREADS=4 restores the P-core arm.
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     })
 }
