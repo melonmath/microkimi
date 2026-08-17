@@ -98,6 +98,19 @@ fn avx2_available() -> bool {
     *ON.get_or_init(|| is_x86_feature_detected!("avx2"))
 }
 
+/// L2 lane block for the multi-lane GEMM paths (MICROKIMI_LANE_BLOCK,
+/// default 256, multiple of 16 for the SMMLA tiles).
+pub(crate) fn lane_block() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MICROKIMI_LANE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| (v.max(16) / 16) * 16)
+            .unwrap_or(256)
+    })
+}
+
 /// Chunk size for dynamically scheduled row loops: ~8 pulls per worker
 /// bound the straggler tail, a 16-row floor keeps the atomic traffic
 /// negligible, and the multiple-of-4 rounding feeds the quad-row kernels.
@@ -356,10 +369,11 @@ unsafe fn multi_rows_q8_packed(
 ) {
     let nb = cols / 32;
     // L2 lane-blocking as in multi_rows_q8
-    if lanes.len() > 256 {
+    let lb = lane_block();
+    if lanes.len() > lb {
         let mut l0 = 0usize;
         while l0 < lanes.len() {
-            let l1 = (l0 + 256).min(lanes.len());
+            let l1 = (l0 + lb).min(lanes.len());
             let xp_slice = if xp.is_empty() {
                 xp
             } else {
@@ -483,10 +497,11 @@ unsafe fn multi_rows_q8(
     // matrix at 1k lanes). A 256-lane block stays cache-resident while
     // the rows stream past it, so activations are read from DRAM once
     // and weights once per block (256 lanes = 4 weight passes per 1k prompt instead of 15 at the old 64).
-    if lanes.len() > 256 {
+    let lb = lane_block();
+    if lanes.len() > lb {
         let mut l0 = 0usize;
         while l0 < lanes.len() {
-            let l1 = (l0 + 256).min(lanes.len());
+            let l1 = (l0 + lb).min(lanes.len());
             // SAFETY: forwarded contract; lane blocks are disjoint.
             unsafe {
                 multi_rows_q8(q, scales, _rows, cols, r0, r1, &lanes[l0..l1], &out_ptrs[l0..l1]);
