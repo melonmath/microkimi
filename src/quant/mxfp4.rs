@@ -625,8 +625,33 @@ pub fn matvec_packed_multi(
         return;
     }
     if crate::quant::q8::q8_enabled() {
-        let xqs: Vec<crate::quant::q8::Q8Vec> =
-            xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let xqs: Vec<crate::quant::q8::Q8Vec> = if lanes >= 64
+            && !crate::model::pool::in_pool_worker()
+        {
+            let mut out: Vec<crate::quant::q8::Q8Vec> =
+                (0..lanes).map(|_| crate::quant::q8::Q8Vec::new()).collect();
+            let workers = crate::model::pool::pool().workers.max(1).min(lanes);
+            let chunk = lanes.div_ceil(workers);
+            std::thread::scope(|sc| {
+                let mut rest = out.as_mut_slice();
+                let mut l0 = 0usize;
+                while l0 < lanes {
+                    let l1 = (l0 + chunk).min(lanes);
+                    let (c, r) = rest.split_at_mut(l1 - l0);
+                    rest = r;
+                    let xs_c = &xs[l0..l1];
+                    sc.spawn(move || {
+                        for (dst, x) in c.iter_mut().zip(xs_c) {
+                            crate::quant::q8::quantize_q8_into(x, dst);
+                        }
+                    });
+                    l0 = l1;
+                }
+            });
+            out
+        } else {
+            xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect()
+        };
         let xrefs: Vec<&crate::quant::q8::Q8Vec> = xqs.iter().collect();
         // per-lane raw output pointers shared across the scoped rows
         let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
