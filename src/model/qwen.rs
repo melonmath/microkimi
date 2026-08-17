@@ -2895,6 +2895,44 @@ fn lin_attn_prefill(
         });
     }
 
+    // normalized q/k hoisted out of the scan: computed once per KV head
+    // (the per-value-head scan re-derived them rep times), parallel over
+    // token ranges; values are identical, so the scan stays bit-identical
+    let kvh = heads / rep.max(1);
+    let mut qn_all = vec![0.0f32; t_count * kvh * kd];
+    let mut kn_all = vec![0.0f32; t_count * kvh * kd];
+    {
+        let workers = prefill_workers(t_count);
+        std::thread::scope(|s| {
+            let mut q_rest = qn_all.as_mut_slice();
+            let mut k_rest = kn_all.as_mut_slice();
+            let conved = &conved;
+            for (t0, t1) in ranges(t_count, workers) {
+                let n = t1 - t0;
+                let (q_c, qr) = q_rest.split_at_mut(n * kvh * kd);
+                let (k_c, kr) = k_rest.split_at_mut(n * kvh * kd);
+                q_rest = qr;
+                k_rest = kr;
+                s.spawn(move || {
+                    let scale = 1.0 / (kd as f32).sqrt();
+                    for i in 0..n {
+                        let row = &conved[(t0 + i) * conv_dim..(t0 + i + 1) * conv_dim];
+                        for kh in 0..kvh {
+                            let q = &mut q_c[(i * kvh + kh) * kd..(i * kvh + kh + 1) * kd];
+                            q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
+                            l2norm(q, 1e-6);
+                            for value in q.iter_mut() {
+                                *value *= scale;
+                            }
+                            let k = &mut k_c[(i * kvh + kh) * kd..(i * kvh + kh + 1) * kd];
+                            k.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
+                            l2norm(k, 1e-6);
+                        }
+                    }
+                });
+            }
+        });
+    }
     // recurrence, parallel over heads: each head replays its own tokens in
     // order against its private state slice (head-major mixed buffer)
     let mut mixed_hm = vec![0.0f32; heads * t_count * vd];
@@ -2929,11 +2967,9 @@ fn lin_attn_prefill(
                 let (mixed_c, mr) = mixed_rest.split_at_mut((h1 - h0) * t_count * vd);
                 state_rest = sr;
                 mixed_rest = mr;
+                let qn_all = &qn_all;
+                let kn_all = &kn_all;
                 s.spawn(move || {
-                    // reusable per-worker q/k scratch: a heap allocation
-                    // per (head, token) was a measurable slice of the scan
-                    let mut q = vec![0.0f32; kd];
-                    let mut k = vec![0.0f32; kd];
                     // chunked-scan prep buffers (spine modes): normalized
                     // q/k, contiguous v, per-token beta and decay
                     let (mut qb, mut kb, mut vb, mut bb, mut gb) = if use_chunked {
@@ -2988,15 +3024,9 @@ fn lin_attn_prefill(
                         }
                         for t in 0..t_count {
                             let row = &conved[t * conv_dim..(t + 1) * conv_dim];
-                            q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
-                            k.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
+                            let q = &qn_all[(t * kvh + kh) * kd..(t * kvh + kh + 1) * kd];
+                            let k = &kn_all[(t * kvh + kh) * kd..(t * kvh + kh + 1) * kd];
                             let v = &row[2 * kt + h * vd..2 * kt + (h + 1) * vd];
-                            l2norm(&mut q, 1e-6);
-                            l2norm(&mut k, 1e-6);
-                            let scale = 1.0 / (kd as f32).sqrt();
-                            for value in q.iter_mut() {
-                                *value *= scale;
-                            }
                             let beta = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
                             let sp = {
                                 let arg = a_raw[t * heads + h] + dt_bias[h];
@@ -3009,8 +3039,8 @@ fn lin_attn_prefill(
                             let g = -a_log[h].exp() * sp;
                             delta_step(
                                 state_h,
-                                &q,
-                                &k,
+                                q,
+                                k,
                                 v,
                                 g,
                                 beta,
