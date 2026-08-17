@@ -420,10 +420,12 @@ impl Q8Head {
             return;
         }
         // dynamic row scheduling (see Q8Head::matvec): fine chunks off a
-        // shared counter, bit-identical per row.
+        // shared counter. Row quads run the same rows4_dot_fma as the
+        // pooled matvec, so every path stays bit-identical per row.
         let step = dyn_step(rows, njobs);
         let ctr = std::sync::atomic::AtomicUsize::new(0);
         let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        let nb = cols / 32;
         std::thread::scope(|scope| {
             for _ in 0..njobs {
                 let this = &*self;
@@ -436,11 +438,44 @@ impl Q8Head {
                         if r0 >= rows {
                             break;
                         }
-                        for r in r0..(r0 + step).min(rows) {
+                        let r1 = (r0 + step).min(rows);
+                        let mut r = r0;
+                        #[cfg(target_arch = "aarch64")]
+                        if crate::quant::q8::sdot4_available() {
+                            while r + 4 <= r1 {
+                                for (l, xq) in xqs.iter().enumerate() {
+                                    // SAFETY: dotprod checked; slices hold nb blocks
+                                    let sums = unsafe {
+                                        crate::quant::q8::rows4_dot_fma(
+                                            [
+                                                &this.q[r * cols..(r + 1) * cols],
+                                                &this.q[(r + 1) * cols..(r + 2) * cols],
+                                                &this.q[(r + 2) * cols..(r + 3) * cols],
+                                                &this.q[(r + 3) * cols..(r + 4) * cols],
+                                            ],
+                                            [
+                                                &this.scales[r * nb..(r + 1) * nb],
+                                                &this.scales[(r + 1) * nb..(r + 2) * nb],
+                                                &this.scales[(r + 2) * nb..(r + 3) * nb],
+                                                &this.scales[(r + 3) * nb..(r + 4) * nb],
+                                            ],
+                                            &xq.q,
+                                            &xq.scales,
+                                        )
+                                    };
+                                    for k in 0..4 {
+                                        unsafe { *(out_ptrs[l] as *mut f32).add(r + k) = sums[k] };
+                                    }
+                                }
+                                r += 4;
+                            }
+                        }
+                        while r < r1 {
                             for l in 0..xqs.len() {
                                 let v = this.row_dot(r, &xqs[l]);
                                 unsafe { *(out_ptrs[l] as *mut f32).add(r) = v };
                             }
+                            r += 1;
                         }
                     }
                 });

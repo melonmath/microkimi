@@ -621,48 +621,43 @@ pub fn matvec_packed_multi(
     if crate::quant::q8::q8_enabled() {
         let xqs: Vec<crate::quant::q8::Q8Vec> =
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
-        let row_dot = |prow: &[u8], srow: &[u8], xq: &crate::quant::q8::Q8Vec| -> f32 {
-            crate::quant::q8::row_dot_fp4(prow, srow, xq)
-        };
-        let nt = n_threads.min(rows).max(1);
-        if nt <= 1 {
-            for r in 0..rows {
+        let xrefs: Vec<&crate::quant::q8::Q8Vec> = xqs.iter().collect();
+        // per-lane raw output pointers shared across the scoped rows
+        let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        // one row against every lane, in tiles of 16: the nibble unpack
+        // happens once per 4-block group for the whole tile
+        // (q8::row_dot_fp4_multi), per-lane bits equal to row_dot_fp4
+        let do_rows = |r0: usize, r1: usize| {
+            let mut buf = [0f32; 16];
+            for r in r0..r1 {
                 let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
                 let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
-                for l in 0..lanes {
-                    outs[l][r] = row_dot(prow, srow, &xqs[l]);
+                let mut l0 = 0usize;
+                for tile in xrefs.chunks(16) {
+                    crate::quant::q8::row_dot_fp4_multi(prow, srow, tile, &mut buf[..tile.len()]);
+                    for (k, v) in buf[..tile.len()].iter().enumerate() {
+                        // SAFETY: (r, lane) cells are written exactly once;
+                        // the scope barrier below outlives the borrows.
+                        unsafe { *(out_ptrs[l0 + k] as *mut f32).add(r) = *v };
+                    }
+                    l0 += tile.len();
                 }
             }
+        };
+        let nt = n_threads.min(rows).max(1);
+        if nt <= 1 || crate::model::pool::in_pool_worker() {
+            do_rows(0, rows);
             return;
         }
         let chunk = rows.div_ceil(nt);
-        // per-lane raw output pointers shared across the scoped rows
-        let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
         std::thread::scope(|scope| {
             for j in 0..nt {
                 let (r0, r1) = (j * chunk, ((j + 1) * chunk).min(rows));
                 if r0 >= r1 {
                     break;
                 }
-                let xqs = &xqs;
-                let out_ptrs = out_ptrs.clone();
-                scope.spawn(move || {
-                    for r in r0..r1 {
-                        let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
-                        let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
-                        for l in 0..xqs.len() {
-                            let mut sum = 0f32;
-                            for g in 0..cols / 32 {
-                                let idot = crate::quant::q8::block_dot(
-                                    &prow[g * 16..(g + 1) * 16],
-                                    &xqs[l].q[g * 32..(g + 1) * 32],
-                                );
-                                sum += idot as f32 * (exp2_i(srow[g] as i32 - 128) * xqs[l].scales[g]);
-                            }
-                            unsafe { *(out_ptrs[l] as *mut f32).add(r) = sum };
-                        }
-                    }
-                });
+                let do_rows = &do_rows;
+                scope.spawn(move || do_rows(r0, r1));
             }
         });
         return;
