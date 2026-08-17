@@ -333,10 +333,11 @@ unsafe fn multi_rows_q8_packed(
             let wsq = &ps[qd * nb * 4..(qd + 1) * nb * 4];
             let mut l0 = 0usize;
             if smmla {
-                // pair layout in wq/xp: the SMMLA tile eats 8 lanes a time
-                let mut tile = [[0.0f32; 4]; 8];
+                // pair layout in wq/xp: the SMMLA tile eats up to 16 lanes
+                // a time (one weight-block load per 16 lanes)
+                let mut tile = [[0.0f32; 4]; 16];
                 while l0 + 2 <= lanes.len() {
-                    let width = (lanes.len() - l0).min(8);
+                    let width = (lanes.len() - l0).min(16);
                     let pairs = width / 2;
                     let xps = &xp[(l0 / 2) * nb * 64..(l0 / 2 + pairs) * nb * 64];
                     // SAFETY: i8mm checked inside smmla_available; slices
@@ -686,26 +687,36 @@ impl Q8Head {
         let xqs: Vec<crate::quant::q8::Q8Vec> = if lanes >= 64
             && !crate::model::pool::in_pool_worker()
         {
+            // on the persistent pool (scoped spawns per call were a
+            // measurable slice of every prefill GEMM)
             let mut out: Vec<crate::quant::q8::Q8Vec> =
                 (0..lanes).map(|_| crate::quant::q8::Q8Vec::new()).collect();
-            let workers = crate::model::pool::pool().workers.max(1).min(lanes);
+            let p = crate::model::pool::pool();
+            let workers = p.workers.max(1).min(lanes);
             let chunk = lanes.div_ceil(workers);
-            std::thread::scope(|sc| {
-                let mut rest = out.as_mut_slice();
-                let mut l0 = 0usize;
-                while l0 < lanes {
-                    let l1 = (l0 + chunk).min(lanes);
-                    let (c, r) = rest.split_at_mut(l1 - l0);
-                    rest = r;
-                    let xs_c = &xs[l0..l1];
-                    sc.spawn(move || {
-                        for (dst, x) in c.iter_mut().zip(xs_c) {
+            let out_ptr = out.as_mut_ptr() as usize;
+            let xs_ptr = xs.as_ptr() as usize;
+            let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+            let mut l0 = 0usize;
+            while l0 < lanes {
+                let l1 = (l0 + chunk).min(lanes);
+                jobs.push(Box::new(move || {
+                    // SAFETY: disjoint lane ranges; the pool barrier
+                    // outlives every borrow captured through the pointers.
+                    unsafe {
+                        let outs = std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut crate::quant::q8::Q8Vec).add(l0),
+                            l1 - l0,
+                        );
+                        let xs = std::slice::from_raw_parts((xs_ptr as *const &[f32]).add(l0), l1 - l0);
+                        for (dst, x) in outs.iter_mut().zip(xs) {
                             crate::quant::q8::quantize_q8_into(x, dst);
                         }
-                    });
-                    l0 = l1;
-                }
-            });
+                    }
+                }));
+                l0 = l1;
+            }
+            p.run(jobs);
             out
         } else {
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect()
@@ -743,22 +754,32 @@ impl Q8Head {
                 let mut xp = vec![0i8; pairs * nbx * 64];
                 // pack pairs in parallel (single-threaded this was a
                 // measurable slice of every prefill GEMM call)
-                let workers = crate::model::pool::pool().workers.max(1).min(pairs.max(1));
+                let pl = crate::model::pool::pool();
+                let workers = pl.workers.max(1).min(pairs.max(1));
                 let chunk = pairs.div_ceil(workers.max(1)).max(1);
-                std::thread::scope(|sc| {
-                    let mut rest = xp.as_mut_slice();
-                    let mut p0 = 0usize;
-                    while p0 < pairs {
-                        let p1 = (p0 + chunk).min(pairs);
-                        let (c, r) = rest.split_at_mut((p1 - p0) * nbx * 64);
-                        rest = r;
-                        let xqs_ref = &xqs;
-                        sc.spawn(move || {
+                let xp_ptr = xp.as_mut_ptr() as usize;
+                let xqs_ptr = xqs.as_ptr() as usize;
+                let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+                let mut p0 = 0usize;
+                while p0 < pairs {
+                    let p1 = (p0 + chunk).min(pairs);
+                    jobs.push(Box::new(move || {
+                        // SAFETY: disjoint pair ranges; the pool barrier
+                        // outlives the captured pointers.
+                        unsafe {
+                            let xqs_all = std::slice::from_raw_parts(
+                                xqs_ptr as *const crate::quant::q8::Q8Vec,
+                                p1 * 2,
+                            );
+                            let c = std::slice::from_raw_parts_mut(
+                                (xp_ptr as *mut i8).add(p0 * nbx * 64),
+                                (p1 - p0) * nbx * 64,
+                            );
                             for p in p0..p1 {
                                 for g in 0..nbx {
                                     for seg in 0..4 {
                                         for l in 0..2 {
-                                            let src = &xqs_ref[p * 2 + l].q
+                                            let src = &xqs_all[p * 2 + l].q
                                                 [g * 32 + seg * 8..g * 32 + seg * 8 + 8];
                                             let d = ((p - p0) * nbx + g) * 64 + seg * 16 + l * 8;
                                             c[d..d + 8].copy_from_slice(src);
@@ -766,10 +787,11 @@ impl Q8Head {
                                     }
                                 }
                             }
-                        });
-                        p0 = p1;
-                    }
-                });
+                        }
+                    }));
+                    p0 = p1;
+                }
+                pl.run(jobs);
                 xp
             } else {
                 Vec::new()
@@ -1608,7 +1630,7 @@ pub fn kernbench_cmd(_args: &[String]) {
         }
         // correctness vs the SDOT tile
         let mut ok = true;
-        let mut tile_mm = [[0.0f32; 4]; 8];
+        let mut tile_mm = [[0.0f32; 4]; 16];
         for qd in [0usize, 7, quads - 1] {
             let r = qd * 4;
             let w4 = [

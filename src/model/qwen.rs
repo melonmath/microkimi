@@ -2444,29 +2444,38 @@ fn par_add_norm(
         }
         return;
     }
+    // on the persistent pool: two of these per layer, scoped spawns per
+    // call were a fixed cost the pool absorbs for free
     let workers = prefill_workers(t_count);
-    std::thread::scope(|s| {
-        let mut h_rest = &mut hidden[..t_count * d];
-        let mut n_rest = &mut normed[..t_count * d];
-        for (t0, t1) in ranges(t_count, workers) {
-            let n = t1 - t0;
-            let (h_c, hr) = h_rest.split_at_mut(n * d);
-            let (n_c, nr) = n_rest.split_at_mut(n * d);
-            h_rest = hr;
-            n_rest = nr;
-            let a_c = add.map(|a| &a[t0 * d..t1 * d]);
-            s.spawn(move || {
-                if let Some(a) = a_c {
-                    for (hv, av) in h_c.iter_mut().zip(a) {
-                        *hv += av;
+    let p = crate::model::pool::pool();
+    let hp = crate::model::pool::MPtr(hidden.as_mut_ptr());
+    let np = crate::model::pool::MPtr(normed.as_mut_ptr());
+    let ap = crate::model::pool::SPtr(add.map(|a| a.as_ptr()).unwrap_or(std::ptr::null()));
+    let wp = crate::model::pool::SPtr(w.as_ptr());
+    let w_len = w.len();
+    let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+    for (t0, t1) in ranges(t_count, workers) {
+        jobs.push(Box::new(move || {
+            let (hp, np, ap, wp) = (hp, np, ap, wp);
+            // SAFETY: disjoint token ranges; the pool barrier outlives the
+            // captured pointers; `add` is read-only.
+            unsafe {
+                let w = std::slice::from_raw_parts(wp.0, w_len);
+                for t in t0..t1 {
+                    let h = std::slice::from_raw_parts_mut(hp.0.add(t * d), d);
+                    if !ap.0.is_null() {
+                        let a = std::slice::from_raw_parts(ap.0.add(t * d), d);
+                        for (hv, av) in h.iter_mut().zip(a) {
+                            *hv += av;
+                        }
                     }
+                    let n = std::slice::from_raw_parts_mut(np.0.add(t * d), d);
+                    rmsnorm(h, w, eps, n);
                 }
-                for t in 0..n {
-                    rmsnorm(&h_c[t * d..(t + 1) * d], w, eps, &mut n_c[t * d..(t + 1) * d]);
-                }
-            });
-        }
-    });
+            }
+        }));
+    }
+    p.run(jobs);
 }
 
 /// Tiled online-softmax attention for ONE query over its causal window
@@ -2911,36 +2920,40 @@ fn lin_attn_prefill(
     let mut qn_all = vec![0.0f32; t_count * kvh * kd];
     let mut kn_all = vec![0.0f32; t_count * kvh * kd];
     {
+        // on the persistent pool (a scoped spawn set per layer added up)
         let workers = prefill_workers(t_count);
-        std::thread::scope(|s| {
-            let mut q_rest = qn_all.as_mut_slice();
-            let mut k_rest = kn_all.as_mut_slice();
-            let conved = &conved;
-            for (t0, t1) in ranges(t_count, workers) {
-                let n = t1 - t0;
-                let (q_c, qr) = q_rest.split_at_mut(n * kvh * kd);
-                let (k_c, kr) = k_rest.split_at_mut(n * kvh * kd);
-                q_rest = qr;
-                k_rest = kr;
-                s.spawn(move || {
+        let p = crate::model::pool::pool();
+        let qp = crate::model::pool::MPtr(qn_all.as_mut_ptr());
+        let kp = crate::model::pool::MPtr(kn_all.as_mut_ptr());
+        let cp = crate::model::pool::SPtr(conved.as_ptr());
+        let conv_len = conved.len();
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for (t0, t1) in ranges(t_count, workers) {
+            jobs.push(Box::new(move || {
+                let (qp, kp, cp) = (qp, kp, cp);
+                // SAFETY: disjoint token ranges write disjoint slices; the
+                // pool barrier outlives the captured pointers.
+                unsafe {
+                    let conved = std::slice::from_raw_parts(cp.0, conv_len);
                     let scale = 1.0 / (kd as f32).sqrt();
-                    for i in 0..n {
-                        let row = &conved[(t0 + i) * conv_dim..(t0 + i + 1) * conv_dim];
+                    for t in t0..t1 {
+                        let row = &conved[t * conv_dim..(t + 1) * conv_dim];
                         for kh in 0..kvh {
-                            let q = &mut q_c[(i * kvh + kh) * kd..(i * kvh + kh + 1) * kd];
+                            let q = std::slice::from_raw_parts_mut(qp.0.add((t * kvh + kh) * kd), kd);
                             q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
                             l2norm(q, 1e-6);
                             for value in q.iter_mut() {
                                 *value *= scale;
                             }
-                            let k = &mut k_c[(i * kvh + kh) * kd..(i * kvh + kh + 1) * kd];
+                            let k = std::slice::from_raw_parts_mut(kp.0.add((t * kvh + kh) * kd), kd);
                             k.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
                             l2norm(k, 1e-6);
                         }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
+        p.run(jobs);
     }
     // recurrence, parallel over heads: each head replays its own tokens in
     // order against its private state slice (head-major mixed buffer)

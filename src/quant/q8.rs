@@ -1115,7 +1115,7 @@ pub fn smmla_available() -> bool {
     false
 }
 
-/// Four rows x eight lanes through SMMLA (i8mm): one instruction
+/// Four rows x up to sixteen lanes through SMMLA (i8mm): one instruction
 /// multiplies a 2x8 row-pair block by an 8x2 lane-pair block - 32 MACs,
 /// twice SDOT's throughput. Operands come PAIR-INTERLEAVED:
 ///   weights `wp`, per block: [r0[0..8] r1[0..8] r0[8..16] r1[8..16]
@@ -1138,13 +1138,14 @@ pub unsafe fn rows4_x8_smmla(
     xs: &[&[f32]],
     pairs: usize,
     nb: usize,
-    out: &mut [[f32; 4]; 8],
+    out: &mut [[f32; 4]; 16],
 ) {
     use std::arch::aarch64::*;
-    debug_assert!(pairs <= 4);
+    debug_assert!(pairs <= 8, "tile is at most 16 lanes (8 pairs)");
     unsafe {
-        // acc[pair][0] = rows(0,1) x lanes(A,B) tile, acc[pair][1] = rows(2,3)
-        let mut acc = [[vdupq_n_f32(0.0); 2]; 4];
+        // acc[pair][0] = rows(0,1) x lanes(A,B) tile, acc[pair][1] = rows(2,3);
+        // 8 pairs = 16 accumulators, one weight-block load per 16 lanes
+        let mut acc = [[vdupq_n_f32(0.0); 2]; 8];
         for g in 0..nb {
             let wb = wp.as_ptr().add(g * 128);
             let a01_0 = vld1q_s8(wb);
