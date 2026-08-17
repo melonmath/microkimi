@@ -22,6 +22,22 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 \* microkimi generates on the CPU in both columns: its GPU path
 accelerates prompt reading only (for now).
 
+## On battery (ratios, not absolutes)
+
+macOS throttles hard and unevenly on battery, so these read as
+microkimi-to-llama.cpp ratios inside the same thermal window
+(llama.cpp rows bracketing our battery, plus interleaved duels):
+
+| | ratio range | reading of the day |
+|---|---:|---|
+| generation | 0.7x - 1.1x | wins most windows, loses the deepest-throttle ones; interleaved duel medians +11% to +31% for microkimi |
+| prompt reading | 0.4x - 0.5x | consistently behind; the open front |
+
+The deeper the throttle, the better microkimi holds relative to
+llama.cpp on generation (spinning job board + dynamic row
+scheduling); prompt reading stays behind in every window pending the
+chunked-scan work.
+
 ## The fine print
 
 - Quantization differs: microkimi runs a 4-bit MLP with an 8-bit
