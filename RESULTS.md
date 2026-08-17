@@ -16,8 +16,11 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | 90.9 tok/s * | 103.3 tok/s |
-| prompt reading (1k tokens) | **952 tok/s** | 4571 tok/s |
+| generation | 90.9 tok/s * | 110-115 tok/s |
+| prompt reading (1k tokens) | **~1000 tok/s** | ~4700 tok/s |
+
+(The GPU rows barely move on battery - Apple throttles the CPU much
+harder than the GPU - so these hold across power states.)
 
 \* microkimi generates on the CPU in both columns: its GPU path
 accelerates prompt reading only (for now).
