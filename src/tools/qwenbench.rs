@@ -213,7 +213,7 @@ pub fn run(args: &[String]) {
     // kernel ceiling on this host (GMAC/s): the number that says whether
     // a prompt-reading gap lives in the GEMM or in the tissue
     for line in run_self(&["kernbench"], &[]).lines() {
-        if line.contains("GMAC/s") {
+        if line.contains("GMAC/s") || line.contains("smmla") {
             println!("  kern: {}", line.trim());
         }
     }
