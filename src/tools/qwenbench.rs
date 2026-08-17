@@ -221,8 +221,19 @@ pub fn run(args: &[String]) {
             println!("  q8 4-thread {:>4.1} ms/token ({:.0} tok/s)  [A/B arm]", a, 1000.0 / a);
         }
     }
+    // like-for-like against llama-bench pp: warm, repeated, best and median
+    for line in run_self(
+        &["prefillbench", "--model", &model, "--reps", "5"],
+        &[("MICROKIMI_Q8_SPINE", "1")],
+    )
+    .lines()
+    {
+        if line.starts_with("prefillbench:") {
+            println!("  warm q8 {}", line.trim_start_matches("prefillbench: "));
+        }
+    }
     if let Some(q) = q8pre {
-        println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
+        println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)  [cold, single prefill]", q, 1000.0 / q);
         for line in q8out.lines() {
             if line.starts_with("prof:") {
                 println!("  {}", line);
