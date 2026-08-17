@@ -2919,6 +2919,20 @@ fn lin_attn_prefill(
     let kvh = heads / rep.max(1);
     let mut qn_all = vec![0.0f32; t_count * kvh * kd];
     let mut kn_all = vec![0.0f32; t_count * kvh * kd];
+    // beta and decay for every (token, head), once per layer (the chunked
+    // path read them per head; sequential path keeps computing inline)
+    let mut beta_all = vec![0.0f32; t_count * heads];
+    let mut decay_all = vec![0.0f32; t_count * heads];
+    if q8.is_some() && t_count >= 32 && chunked_scan_on() {
+        for t in 0..t_count {
+            for h in 0..heads {
+                beta_all[t * heads + h] = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
+                let arg = a_raw[t * heads + h] + dt_bias[h];
+                let sp = if arg > 20.0 { arg } else { (1.0 + arg.exp()).ln() };
+                decay_all[t * heads + h] = (-a_log[h].exp() * sp).exp();
+            }
+        }
+    }
     {
         // on the persistent pool (a scoped spawn set per layer added up)
         let workers = prefill_workers(t_count);
@@ -2991,14 +3005,11 @@ fn lin_attn_prefill(
                 mixed_rest = mr;
                 let qn_all = &qn_all;
                 let kn_all = &kn_all;
+                let beta_all = &beta_all;
+                let decay_all = &decay_all;
                 s.spawn(move || {
                     // chunked-scan prep buffers (spine modes): normalized
                     // q/k, contiguous v, per-token beta and decay
-                    let (mut vb, mut bb, mut gb) = if use_chunked {
-                        (vec![0.0f32; t_count * vd], vec![0.0f32; t_count], vec![0.0f32; t_count])
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new())
-                    };
                     for h in h0..h1 {
                         let state_h =
                             &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
@@ -3006,26 +3017,14 @@ fn lin_attn_prefill(
                             &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
                         let kh = h / rep.max(1);
                         if use_chunked {
-                            // WY chunked scan over the hoisted normalized q/k
-                            // (per KV head, strided): only v/beta/decay are
-                            // gathered per value head. Reassociation-level
-                            // numerics, spine-only.
-                            for t in 0..t_count {
-                                let row = &conved[t * conv_dim..(t + 1) * conv_dim];
-                                vb[t * vd..(t + 1) * vd]
-                                    .copy_from_slice(&row[2 * kt + h * vd..2 * kt + (h + 1) * vd]);
-                                bb[t] = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
-                                let sp = {
-                                    let arg = a_raw[t * heads + h] + dt_bias[h];
-                                    if arg > 20.0 { arg } else { (1.0 + arg.exp()).ln() }
-                                };
-                                gb[t] = (-a_log[h].exp() * sp).exp();
-                            }
+                            // WY chunked scan, zero per-head copies: q/k from
+                            // the hoisted per-KV-head arrays, v straight from
+                            // the conv output, beta/decay from the per-layer
+                            // tables - all read with strides.
                             let state_h =
                                 &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
                             let mixed_h =
                                 &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
-                            // q/k read strided from the hoisted per-KV-head arrays
                             chunked_scan_head_strided(
                                 state_h,
                                 mixed_h,
@@ -3033,9 +3032,11 @@ fn lin_attn_prefill(
                                 kvh * kd,
                                 &kn_all[kh * kd..],
                                 kvh * kd,
-                                &vb,
-                                &bb,
-                                &gb,
+                                &conved[2 * kt + h * vd..],
+                                conv_dim,
+                                &beta_all[h..],
+                                &decay_all[h..],
+                                heads,
                                 t_count,
                                 kd,
                                 vd,
@@ -5371,7 +5372,7 @@ pub(crate) fn chunked_scan_head(
     kd: usize,
     vd: usize,
 ) {
-    chunked_scan_head_strided(state, mixed, qn, kd, kn, kd, vn, beta, gamma, t_count, kd, vd);
+    chunked_scan_head_strided(state, mixed, qn, kd, kn, kd, vn, vd, beta, gamma, 1, t_count, kd, vd);
 }
 
 /// `chunked_scan_head` over q/k rows read with a caller stride (element
@@ -5385,8 +5386,10 @@ pub(crate) fn chunked_scan_head_strided(
     kn: &[f32],
     k_stride: usize,
     vn: &[f32],
+    v_stride: usize,
     beta: &[f32],
     gamma: &[f32],
+    bg_stride: usize,
     t_count: usize,
     kd: usize,
     vd: usize,
@@ -5406,8 +5409,8 @@ pub(crate) fn chunked_scan_head_strided(
         let n = c1 - c0;
         // cumulative decay products G(1..t) within the chunk
         let mut acc = 1.0f32;
-        for (i, g) in gamma[c0..c1].iter().enumerate() {
-            acc *= g;
+        for i in 0..n {
+            acc *= gamma[(c0 + i) * bg_stride];
             gcum[i] = acc;
         }
         // gram matrices (GEMM-shaped, kd shared)
@@ -5452,15 +5455,15 @@ pub(crate) fn chunked_scan_head_strided(
             grel[t * C + t] = 1.0;
             let mut p = 1.0f32;
             for s in (0..t).rev() {
-                p *= gamma[c0 + s + 1];
+                p *= gamma[(c0 + s + 1) * bg_stride];
                 grel[t * C + s] = p;
             }
         }
         // b_t and forward substitution for u
         for t in 0..n {
-            let bt = beta[c0 + t];
+            let bt = beta[(c0 + t) * bg_stride];
             let g1t = gcum[t];
-            let vt = &vn[(c0 + t) * vd..(c0 + t + 1) * vd];
+            let vt = &vn[(c0 + t) * v_stride..(c0 + t) * v_stride + vd];
             let (bu, sk) = (&mut b[t * vd..(t + 1) * vd], &s0k[t * vd..(t + 1) * vd]);
             for j in 0..vd {
                 bu[j] = bt * (vt[j] - g1t * sk[j]);
@@ -5470,7 +5473,7 @@ pub(crate) fn chunked_scan_head_strided(
             let (ready, ut_row) = u.split_at_mut(t * vd);
             let ut = &mut ut_row[..vd];
             ut.copy_from_slice(&b[t * vd..(t + 1) * vd]);
-            let bt = beta[c0 + t];
+            let bt = beta[(c0 + t) * bg_stride];
             for s in 0..t {
                 let a = bt * grel[t * C + s] * kk[t * C + s];
                 if a != 0.0 {
