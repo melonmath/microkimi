@@ -302,10 +302,10 @@ unsafe fn multi_rows_q8_packed(
 ) {
     let nb = cols / 32;
     // L2 lane-blocking as in multi_rows_q8
-    if lanes.len() > 64 {
+    if lanes.len() > 256 {
         let mut l0 = 0usize;
         while l0 < lanes.len() {
-            let l1 = (l0 + 64).min(lanes.len());
+            let l1 = (l0 + 256).min(lanes.len());
             let xp_slice = if xp.is_empty() {
                 xp
             } else {
@@ -421,13 +421,13 @@ unsafe fn multi_rows_q8(
     let nb = cols / 32;
     // L2 lane-blocking: with lanes outermost the whole activation set
     // re-streamed from DRAM once per row quad (~740 MB per 3072-row
-    // matrix at 1k lanes). A 64-lane block stays cache-resident while
+    // matrix at 1k lanes). A 256-lane block stays cache-resident while
     // the rows stream past it, so activations are read from DRAM once
-    // and weights once per block.
-    if lanes.len() > 64 {
+    // and weights once per block (256 lanes = 4 weight passes per 1k prompt instead of 15 at the old 64).
+    if lanes.len() > 256 {
         let mut l0 = 0usize;
         while l0 < lanes.len() {
-            let l1 = (l0 + 64).min(lanes.len());
+            let l1 = (l0 + 256).min(lanes.len());
             // SAFETY: forwarded contract; lane blocks are disjoint.
             unsafe {
                 multi_rows_q8(q, scales, _rows, cols, r0, r1, &lanes[l0..l1], &out_ptrs[l0..l1]);

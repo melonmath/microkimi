@@ -664,7 +664,7 @@ pub fn matvec_packed_multi(
             // stays cache-resident while the rows stream past it
             let mut b0 = 0usize;
             while b0 < xrefs.len() {
-                let b1 = (b0 + 64).min(xrefs.len());
+                let b1 = (b0 + 256).min(xrefs.len());
                 for r in r0..r1 {
                     let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
                     let srow = &scales[r * cols / 32..(r + 1) * cols / 32];

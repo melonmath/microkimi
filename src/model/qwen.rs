@@ -2351,7 +2351,8 @@ fn no_batch_prefill() -> bool {
 /// Decode/prefill phase profiler (MICROKIMI_PROF=1): accumulates wall
 /// micros per phase (0 lin attn, 1 full attn, 2 mlp, 3 lm_head) and
 /// prints once at process exit via dprof_print (called by `run`).
-static DPROF: [std::sync::atomic::AtomicU64; 4] = [
+static DPROF: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2378,10 +2379,11 @@ pub fn dprof_print() {
     }
     let v: Vec<u64> = DPROF.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
     println!(
-        "prof: lin_attn {:.1} ms | full_attn {:.1} ms | mlp {:.1} ms | lm_head {:.1} ms",
+        "prof: lin_attn {:.1} ms | full_attn {:.1} ms | mlp {:.1} ms (gemm {:.1}) | lm_head {:.1} ms",
         v[0] as f64 / 1000.0,
         v[1] as f64 / 1000.0,
         v[2] as f64 / 1000.0,
+        v[4] as f64 / 1000.0,
         v[3] as f64 / 1000.0
     );
 }
@@ -3644,6 +3646,7 @@ fn mlp_prefill(
             let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
             let mut h_gate = vec![0.0f32; t_count * inter];
             let mut h_up = vec![0.0f32; t_count * inter];
+            let t_gemm = std::time::Instant::now();
             if let Some(mq) = q8m {
                 let mut outs: Vec<&mut [f32]> = h_gate.chunks_mut(inter).collect();
                 mq.gate.matvec_multi(&xs, &mut outs);
@@ -3678,14 +3681,17 @@ fn mlp_prefill(
                     }
                 });
             }
+            dprof_add(4, t_gemm.elapsed());
             let hs: Vec<&[f32]> = h_gate.chunks(inter).collect();
             let mut outs: Vec<&mut [f32]> = out[..t_count * d].chunks_mut(d).collect();
+            let t_gemm2 = std::time::Instant::now();
             if let Some(mq) = q8m {
                 mq.down.matvec_multi(&hs, &mut outs);
             } else {
                 let (pd, sd) = packed_parts(data, down);
                 crate::quant::mxfp4::matvec_packed_multi(pd, sd, d, inter, &hs, &mut outs, threads);
             }
+            dprof_add(4, t_gemm2.elapsed());
             return;
         }
     }
