@@ -797,10 +797,10 @@ unsafe fn row_dot_fp4_multi_sdot(prow: &[u8], srow: &[u8], xqs: &[&Q8Vec], out: 
 pub unsafe fn rows4_dot_fma_x4(
     w: [&[i8]; 4],
     s: [&[f32]; 4],
-    xqs: [&Q8Vec; 4],
+    xqs: [(&[i8], &[f32]); 4],
 ) -> [[f32; 4]; 4] {
     use std::arch::aarch64::*;
-    let nb = xqs[0].scales.len();
+    let nb = xqs[0].1.len();
     unsafe {
         let mut acc = [vdupq_n_f32(0.0); 4]; // per lane, rows in vector lanes
         for g in 0..nb {
@@ -815,8 +815,8 @@ pub unsafe fn rows4_dot_fma_x4(
             let ws = [s[0][g], s[1][g], s[2][g], s[3][g]];
             let wsv = vld1q_f32(ws.as_ptr());
             for (l, xq) in xqs.iter().enumerate() {
-                let x0 = vld1q_s8(xq.q.as_ptr().add(g * 32));
-                let x1 = vld1q_s8(xq.q.as_ptr().add(g * 32 + 16));
+                let x0 = vld1q_s8(xq.0.as_ptr().add(g * 32));
+                let x1 = vld1q_s8(xq.0.as_ptr().add(g * 32 + 16));
                 let mut a0 = vdupq_n_s32(0);
                 let mut a1 = vdupq_n_s32(0);
                 let mut a2 = vdupq_n_s32(0);
@@ -845,7 +845,7 @@ pub unsafe fn rows4_dot_fma_x4(
                 let p01 = vpaddq_s32(a0, a1);
                 let p23 = vpaddq_s32(a2, a3);
                 let sums = vcvtq_f32_s32(vpaddq_s32(p01, p23));
-                let sv = vmulq_f32(wsv, vdupq_n_f32(xq.scales[g]));
+                let sv = vmulq_f32(wsv, vdupq_n_f32(xq.1[g]));
                 acc[l] = vfmaq_f32(acc[l], sums, sv);
             }
         }

@@ -2688,49 +2688,61 @@ fn lin_attn_prefill(
         );
     }
     if !scan_done {
+        // heads chunk across workers - one spawn per worker rather than
+        // one per head (32 spawns/layer dominated small verify batches);
+        // per-head math unchanged, bit-identical.
+        let hworkers = prefill_workers(heads);
+        let hchunk = heads.div_ceil(hworkers);
         std::thread::scope(|s| {
             let mut state_rest = cache.state.as_mut_slice();
             let mut mixed_rest = mixed_hm.as_mut_slice();
             let conved = &conved;
             let b_raw = &b_raw;
             let a_raw = &a_raw;
-            for h in 0..heads {
-                let (state_h, sr) = state_rest.split_at_mut(kd * vd);
-                let (mixed_h, mr) = mixed_rest.split_at_mut(t_count * vd);
+            for h0 in (0..heads).step_by(hchunk.max(1)) {
+                let h1 = (h0 + hchunk).min(heads);
+                let (state_c, sr) = state_rest.split_at_mut((h1 - h0) * kd * vd);
+                let (mixed_c, mr) = mixed_rest.split_at_mut((h1 - h0) * t_count * vd);
                 state_rest = sr;
                 mixed_rest = mr;
                 s.spawn(move || {
-                    let kh = h / rep.max(1);
-                    for t in 0..t_count {
-                        let row = &conved[t * conv_dim..(t + 1) * conv_dim];
-                        let mut q: Vec<f32> = row[kh * kd..(kh + 1) * kd].to_vec();
-                        let mut k: Vec<f32> = row[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
-                        let v = &row[2 * kt + h * vd..2 * kt + (h + 1) * vd];
-                        l2norm(&mut q, 1e-6);
-                        l2norm(&mut k, 1e-6);
-                        let scale = 1.0 / (kd as f32).sqrt();
-                        for value in q.iter_mut() {
-                            *value *= scale;
-                        }
-                        let beta = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
-                        let sp = {
-                            let arg = a_raw[t * heads + h] + dt_bias[h];
-                            if arg > 20.0 {
-                                arg
-                            } else {
-                                (1.0 + arg.exp()).ln()
+                    for h in h0..h1 {
+                        let state_h =
+                            &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
+                        let mixed_h =
+                            &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
+                        let kh = h / rep.max(1);
+                        for t in 0..t_count {
+                            let row = &conved[t * conv_dim..(t + 1) * conv_dim];
+                            let mut q: Vec<f32> = row[kh * kd..(kh + 1) * kd].to_vec();
+                            let mut k: Vec<f32> = row[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+                            let v = &row[2 * kt + h * vd..2 * kt + (h + 1) * vd];
+                            l2norm(&mut q, 1e-6);
+                            l2norm(&mut k, 1e-6);
+                            let scale = 1.0 / (kd as f32).sqrt();
+                            for value in q.iter_mut() {
+                                *value *= scale;
                             }
-                        };
-                        let g = -a_log[h].exp() * sp;
-                        delta_step(
-                            state_h,
-                            &q,
-                            &k,
-                            v,
-                            g,
-                            beta,
-                            &mut mixed_h[t * vd..(t + 1) * vd],
-                        );
+                            let beta = 1.0 / (1.0 + (-b_raw[t * heads + h]).exp());
+                            let sp = {
+                                let arg = a_raw[t * heads + h] + dt_bias[h];
+                                if arg > 20.0 {
+                                    arg
+                                } else {
+                                    (1.0 + arg.exp()).ln()
+                                }
+                            };
+                            let g = -a_log[h].exp() * sp;
+                            delta_step(
+                                state_h,
+                                &q,
+                                &k,
+                                v,
+                                g,
+                                beta,
+                                &mut mixed_h[t * vd..(t + 1) * vd],
+                            );
+                        }
                     }
                 });
             }
@@ -4163,16 +4175,30 @@ pub(crate) fn mtp_generate(
     generated.push(first);
     let mut pending = true;
 
+    // adaptive chain depth (AIMD): a fully accepted pass grows the chain
+    // back toward --mtp-depth, a zero-acceptance pass shrinks it, and at
+    // depth 0 the loop degenerates to plain decoding (no drafts, no
+    // snapshot) with a periodic probe - so --mtp is never much worse
+    // than plain decoding on a prompt the draft head cannot predict.
+    let mut cur_depth = depth;
+    let mut cold_passes = 0usize;
+
     while pending && generated.len() < max_new {
         let n = *generated.last().unwrap();
-        let snap = model.snapshot();
+        if cur_depth == 0 {
+            cold_passes += 1;
+            if cold_passes >= 16 {
+                cur_depth = 1;
+                cold_passes = 0;
+            }
+        }
         let mtp_len = model.mtp_cache.len;
 
         // chain draft: n's pair first, then each proposal chained on its
         // own normed hidden; never draft the stop token or past max_new
         let mut batch = vec![n];
         let mut chain_hidden = hidden_prev.clone();
-        for _ in 0..depth {
+        for _ in 0..cur_depth {
             if generated.len() + batch.len() > max_new {
                 break;
             }
@@ -4183,6 +4209,9 @@ pub(crate) fn mtp_generate(
             batch.push(draft);
             chain_hidden = next_hidden;
         }
+        // the snapshot (a full clone of the linear states) is only needed
+        // when there are drafts to roll back
+        let snap = if batch.len() > 1 { Some(model.snapshot()) } else { None };
 
         let out = model.prefill_collect(&batch, true);
         passes += 1;
@@ -4205,6 +4234,16 @@ pub(crate) fn mtp_generate(
             committed += 1;
         }
         accepted += committed - 1;
+        {
+            let drafted = batch.len() - 1;
+            if drafted > 0 {
+                if committed - 1 == drafted {
+                    cur_depth = (cur_depth + 1).min(depth);
+                } else if committed == 1 {
+                    cur_depth = cur_depth.saturating_sub(1);
+                }
+            }
+        }
         if debug {
             println!(
                 "  mtp pass {}: drafted {}, accepted {}",
@@ -4216,7 +4255,7 @@ pub(crate) fn mtp_generate(
 
         // partial accept: exact trunk rollback + reingest of the prefix
         if committed < batch.len() {
-            model.restore(&snap);
+            model.restore(snap.as_ref().expect("drafted pass carries a snapshot"));
             model.prefill_collect(&batch[..committed], false);
         }
         // the MTP cache always rebuilds from verified trunk hiddens

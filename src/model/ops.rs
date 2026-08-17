@@ -273,6 +273,76 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
     p.run(jobs);
 }
 
+
+/// One row range against every lane, shared by the pooled and scoped
+/// multi paths: 4x4 register tiles, then rows4 per remaining lane, then
+/// q8_rows_dot single rows - the same kernels and order everywhere.
+///
+/// SAFETY: `out_ptrs[l] + r` cells are exclusive to the caller's row
+/// range; slices hold full rows/blocks.
+#[allow(clippy::too_many_arguments)]
+unsafe fn multi_rows_q8(
+    q: &[i8],
+    scales: &[f32],
+    _rows: usize,
+    cols: usize,
+    r0: usize,
+    r1: usize,
+    lanes: &[(&[i8], &[f32])],
+    out_ptrs: &[usize],
+) {
+    let nb = cols / 32;
+    let mut r = r0;
+    #[cfg(target_arch = "aarch64")]
+    if crate::quant::q8::sdot4_available() {
+        while r + 4 <= r1 {
+            let w4 = [
+                &q[r * cols..(r + 1) * cols],
+                &q[(r + 1) * cols..(r + 2) * cols],
+                &q[(r + 2) * cols..(r + 3) * cols],
+                &q[(r + 3) * cols..(r + 4) * cols],
+            ];
+            let s4 = [
+                &scales[r * nb..(r + 1) * nb],
+                &scales[(r + 1) * nb..(r + 2) * nb],
+                &scales[(r + 2) * nb..(r + 3) * nb],
+                &scales[(r + 3) * nb..(r + 4) * nb],
+            ];
+            let mut l0 = 0usize;
+            while l0 + 4 <= lanes.len() {
+                let tile = unsafe {
+                    crate::quant::q8::rows4_dot_fma_x4(
+                        w4,
+                        s4,
+                        [lanes[l0], lanes[l0 + 1], lanes[l0 + 2], lanes[l0 + 3]],
+                    )
+                };
+                for (dl, lane_out) in tile.iter().enumerate() {
+                    for k in 0..4 {
+                        unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
+                    }
+                }
+                l0 += 4;
+            }
+            for (l, lane) in lanes.iter().enumerate().skip(l0) {
+                let sums = unsafe { crate::quant::q8::rows4_dot_fma(w4, s4, lane.0, lane.1) };
+                for k in 0..4 {
+                    unsafe { *(out_ptrs[l] as *mut f32).add(r + k) = sums[k] };
+                }
+            }
+            r += 4;
+        }
+    }
+    while r < r1 {
+        for (l, lane) in lanes.iter().enumerate() {
+            let mut buf = [0f32; 1];
+            q8_rows_dot(q, scales, cols, r, 1, lane.0, lane.1, &mut buf);
+            unsafe { *(out_ptrs[l] as *mut f32).add(r) = buf[0] };
+        }
+        r += 1;
+    }
+}
+
 /// Row-range q8 dot against one quantized activation, four rows at a
 /// time through the fused SDOT kernel when available: the activation
 /// blocks are loaded once per quad and the four accumulator chains are
@@ -419,6 +489,55 @@ impl Q8Head {
             }
             return;
         }
+        // main thread: run on the PERSISTENT pool (the scoped path below
+        // spawns OS threads per call, which dominated small verify
+        // batches). Same kernels, same order - bit-identical.
+        if !crate::model::pool::in_pool_worker() {
+            let step = dyn_step(rows, njobs);
+            let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let qp = crate::model::pool::SPtrU8(self.q.as_ptr() as *const u8);
+            let sp = crate::model::pool::SPtr(self.scales.as_ptr());
+            let lane_ptrs: Vec<(usize, usize, usize)> = xqs
+                .iter()
+                .map(|x| (x.q.as_ptr() as usize, x.scales.as_ptr() as usize, x.scales.len()))
+                .collect();
+            let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+            let nb = cols / 32;
+            let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+            for _ in 0..njobs {
+                let ctr = ctr.clone();
+                let lane_ptrs = lane_ptrs.clone();
+                let out_ptrs = out_ptrs.clone();
+                jobs.push(Box::new(move || {
+                    let (qp, sp) = (qp, sp);
+                    // SAFETY: the pool barrier outlives every borrow; each
+                    // (row, lane) cell is written exactly once.
+                    unsafe {
+                        let q = std::slice::from_raw_parts(qp.0 as *const i8, rows * cols);
+                        let sc = std::slice::from_raw_parts(sp.0, rows * nb);
+                        let lanes_v: Vec<(&[i8], &[f32])> = lane_ptrs
+                            .iter()
+                            .map(|&(qq, ss, n)| {
+                                (
+                                    std::slice::from_raw_parts(qq as *const i8, n * 32),
+                                    std::slice::from_raw_parts(ss as *const f32, n),
+                                )
+                            })
+                            .collect();
+                        loop {
+                            let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                            if r0 >= rows {
+                                break;
+                            }
+                            let r1 = (r0 + step).min(rows);
+                            multi_rows_q8(q, sc, rows, cols, r0, r1, &lanes_v, &out_ptrs);
+                        }
+                    }
+                }));
+            }
+            p.run(jobs);
+            return;
+        }
         // dynamic row scheduling (see Q8Head::matvec): fine chunks off a
         // shared counter. Row quads run the same rows4_dot_fma as the
         // pooled matvec, so every path stays bit-identical per row.
@@ -462,7 +581,12 @@ impl Q8Head {
                                                 &this.scales[(r + 2) * nb..(r + 3) * nb],
                                                 &this.scales[(r + 3) * nb..(r + 4) * nb],
                                             ],
-                                            [&xqs[l0], &xqs[l0 + 1], &xqs[l0 + 2], &xqs[l0 + 3]],
+                                            [
+                                                (&xqs[l0].q[..], &xqs[l0].scales[..]),
+                                                (&xqs[l0 + 1].q[..], &xqs[l0 + 1].scales[..]),
+                                                (&xqs[l0 + 2].q[..], &xqs[l0 + 2].scales[..]),
+                                                (&xqs[l0 + 3].q[..], &xqs[l0 + 3].scales[..]),
+                                            ],
                                         )
                                     };
                                     for (dl, lane_out) in tile.iter().enumerate() {
