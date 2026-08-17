@@ -169,6 +169,11 @@ const MATVEC_FP4_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// e2m1 value table (sign x 8 magnitudes) - program scope: newer Metal
+// compilers reject constant-qualified automatic variables
+constant float FP4_LUT[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                              -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
 kernel void matvec_fp4(device const uchar* packed [[buffer(0)]],
                        device const uchar* scales [[buffer(1)]],
                        device const float* x      [[buffer(2)]],
@@ -177,9 +182,6 @@ kernel void matvec_fp4(device const uchar* packed [[buffer(0)]],
                        uint row  [[threadgroup_position_in_grid]],
                        uint lane [[thread_position_in_threadgroup]],
                        uint lanes [[threads_per_threadgroup]]) {
-    // e2m1 value table (sign × 8 magnitudes) — same as mxfp4::E2M1
-    constant float LUT[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                              -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
     threadgroup float partial[32];
     device const uchar* prow = packed + (size_t)row * (cols >> 1);
     device const uchar* srow = scales + (size_t)row * (cols >> 5);
@@ -191,7 +193,7 @@ kernel void matvec_fp4(device const uchar* packed [[buffer(0)]],
         // 2^(sb-127) as an exact bit pattern (exponent field = sb), no exp call;
         // sb == 0 → 2^-127 (subnormal 0x00400000), matching mxfp4::exp2_i.
         float s = (sb == 0) ? as_type<float>(0x00400000u) : as_type<float>(uint(sb) << 23);
-        acc += LUT[nib] * s * x[c];
+        acc += FP4_LUT[nib] * s * x[c];
     }
     acc = simd_sum(acc);
     if ((lane & 31u) == 0u) partial[lane / 32u] = acc;

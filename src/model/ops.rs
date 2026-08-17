@@ -292,6 +292,7 @@ unsafe fn multi_rows_q8_packed(
     scales: &[f32],
     pq: &[i8],
     ps: &[f32],
+    xp: &[i8],
     rows: usize,
     cols: usize,
     r0: usize,
@@ -305,16 +306,24 @@ unsafe fn multi_rows_q8_packed(
         let mut l0 = 0usize;
         while l0 < lanes.len() {
             let l1 = (l0 + 64).min(lanes.len());
+            let xp_slice = if xp.is_empty() {
+                xp
+            } else {
+                &xp[(l0 / 2) * nb * 64..(l1 / 2) * nb * 64]
+            };
             // SAFETY: forwarded contract; lane blocks are disjoint.
             unsafe {
                 multi_rows_q8_packed(
-                    q, scales, pq, ps, rows, cols, r0, r1, &lanes[l0..l1], &out_ptrs[l0..l1],
+                    q, scales, pq, ps, xp_slice, rows, cols, r0, r1, &lanes[l0..l1],
+                    &out_ptrs[l0..l1],
                 );
             }
             l0 = l1;
         }
         return;
     }
+    let smmla = crate::quant::q8::smmla_available() && !xp.is_empty();
+    let all_scales: Vec<&[f32]> = if smmla { lanes.iter().map(|l| l.1).collect() } else { Vec::new() };
     let mut r = r0;
     #[cfg(target_arch = "aarch64")]
     if crate::quant::q8::sdot4_available() && r % 4 == 0 {
@@ -323,6 +332,34 @@ unsafe fn multi_rows_q8_packed(
             let wq = &pq[qd * nb * 128..(qd + 1) * nb * 128];
             let wsq = &ps[qd * nb * 4..(qd + 1) * nb * 4];
             let mut l0 = 0usize;
+            if smmla {
+                // pair layout in wq/xp: the SMMLA tile eats 8 lanes a time
+                let mut tile = [[0.0f32; 4]; 8];
+                while l0 + 2 <= lanes.len() {
+                    let width = (lanes.len() - l0).min(8);
+                    let pairs = width / 2;
+                    let xps = &xp[(l0 / 2) * nb * 64..(l0 / 2 + pairs) * nb * 64];
+                    // SAFETY: i8mm checked inside smmla_available; slices
+                    // hold nb blocks in the pair layout.
+                    unsafe {
+                        crate::quant::q8::rows4_x8_smmla(
+                            wq,
+                            wsq,
+                            xps,
+                            &all_scales[l0..l0 + pairs * 2],
+                            pairs,
+                            nb,
+                            &mut tile,
+                        );
+                    }
+                    for (dl, lane_out) in tile.iter().take(pairs * 2).enumerate() {
+                        for k in 0..4 {
+                            unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
+                        }
+                    }
+                    l0 += pairs * 2;
+                }
+            } else {
             while l0 + 2 <= lanes.len() {
                 let width = (lanes.len() - l0).min(8);
                 let tile = unsafe {
@@ -334,6 +371,7 @@ unsafe fn multi_rows_q8_packed(
                     }
                 }
                 l0 += width;
+            }
             }
             for (l, lane) in lanes.iter().enumerate().skip(l0) {
                 let w4 = [
@@ -538,6 +576,7 @@ fn build_gemm_pack(q: &[i8], scales: &[f32], rows: usize, cols: usize) -> (Vec<i
     let quads = rows / 4;
     let mut wq = vec![0i8; quads * nb * 128];
     let mut ws = vec![0.0f32; quads * nb * 4];
+    let pair_layout = crate::quant::q8::smmla_available();
     let workers = crate::model::pool::pool().workers.max(1).min(quads.max(1));
     let chunk = quads.div_ceil(workers.max(1)).max(1);
     std::thread::scope(|s| {
@@ -554,10 +593,29 @@ fn build_gemm_pack(q: &[i8], scales: &[f32], rows: usize, cols: usize) -> (Vec<i
                 for qd in q0..q1 {
                     for g in 0..nb {
                         let dst = (qd - q0) * nb + g;
+                        if pair_layout {
+                            // SMMLA operand order: per block, row pairs at
+                            // 8-byte granularity ([r0[0..8] r1[0..8] ...])
+                            for pair in 0..2 {
+                                for seg in 0..4 {
+                                    for r in 0..2 {
+                                        let row = qd * 4 + pair * 2 + r;
+                                        let src = row * cols + g * 32 + seg * 8;
+                                        let d = dst * 128 + pair * 64 + seg * 16 + r * 8;
+                                        wq_c[d..d + 8].copy_from_slice(&q[src..src + 8]);
+                                    }
+                                }
+                            }
+                        } else {
+                            for r in 0..4 {
+                                let row = qd * 4 + r;
+                                wq_c[dst * 128 + r * 32..dst * 128 + (r + 1) * 32].copy_from_slice(
+                                    &q[row * cols + g * 32..row * cols + (g + 1) * 32],
+                                );
+                            }
+                        }
                         for r in 0..4 {
                             let row = qd * 4 + r;
-                            wq_c[dst * 128 + r * 32..dst * 128 + (r + 1) * 32]
-                                .copy_from_slice(&q[row * cols + g * 32..row * cols + (g + 1) * 32]);
                             ws_c[dst * 4 + r] = scales[row * nb + g];
                         }
                     }
@@ -648,6 +706,29 @@ impl Q8Head {
             let pqp = crate::model::pool::SPtrU8(pack_q.as_ptr() as *const u8);
             let psp = crate::model::pool::SPtr(pack_s.as_ptr());
             let (pq_len, ps_len) = (pack_q.len(), pack_s.len());
+            // SMMLA operands: activations pair-interleaved per block
+            // ([lA[0..8] lB[0..8] lA[8..16] ...], 64 bytes per (pair, block))
+            let nbx = cols / 32;
+            let xp: Vec<i8> = if crate::quant::q8::smmla_available() {
+                let pairs = lanes / 2;
+                let mut xp = vec![0i8; pairs * nbx * 64];
+                for p in 0..pairs {
+                    for g in 0..nbx {
+                        for seg in 0..4 {
+                            for l in 0..2 {
+                                let src = &xqs[p * 2 + l].q[g * 32 + seg * 8..g * 32 + seg * 8 + 8];
+                                let d = (p * nbx + g) * 64 + seg * 16 + l * 8;
+                                xp[d..d + 8].copy_from_slice(src);
+                            }
+                        }
+                    }
+                }
+                xp
+            } else {
+                Vec::new()
+            };
+            let xpp = crate::model::pool::SPtrU8(xp.as_ptr() as *const u8);
+            let xp_len = xp.len();
             let lane_ptrs: Vec<(usize, usize, usize)> = xqs
                 .iter()
                 .map(|x| (x.q.as_ptr() as usize, x.scales.as_ptr() as usize, x.scales.len()))
@@ -660,7 +741,7 @@ impl Q8Head {
                 let lane_ptrs = lane_ptrs.clone();
                 let out_ptrs = out_ptrs.clone();
                 jobs.push(Box::new(move || {
-                    let (qp, sp, pqp, psp) = (qp, sp, pqp, psp);
+                    let (qp, sp, pqp, psp, xpp) = (qp, sp, pqp, psp, xpp);
                     // SAFETY: the pool barrier outlives every borrow; each
                     // (row, lane) cell is written exactly once.
                     unsafe {
@@ -677,6 +758,7 @@ impl Q8Head {
                             .collect();
                         let pq = std::slice::from_raw_parts(pqp.0 as *const i8, pq_len);
                         let ps = std::slice::from_raw_parts(psp.0, ps_len);
+                        let xp = std::slice::from_raw_parts(xpp.0 as *const i8, xp_len);
                         loop {
                             let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
                             if r0 >= rows {
@@ -684,7 +766,7 @@ impl Q8Head {
                             }
                             let r1 = (r0 + step).min(rows);
                             multi_rows_q8_packed(
-                                q, sc, pq, ps, rows, cols, r0, r1, &lanes_v, &out_ptrs,
+                                q, sc, pq, ps, xp, rows, cols, r0, r1, &lanes_v, &out_ptrs,
                             );
                         }
                     }
