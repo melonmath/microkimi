@@ -1476,7 +1476,6 @@ pub fn kernbench_cmd(_args: &[String]) {
         }
         // correctness vs the SDOT tile
         let mut ok = true;
-        let mut tile_ref = [[0.0f32; 4]; 8];
         let mut tile_mm = [[0.0f32; 4]; 8];
         for qd in [0usize, 7, quads - 1] {
             let r = qd * 4;
@@ -1493,8 +1492,7 @@ pub fn kernbench_cmd(_args: &[String]) {
                 &head2.scales[(r + 3) * nb..(r + 4) * nb],
             ];
             // SAFETY: dotprod/i8mm checked; slices sized above.
-            let tr = unsafe { crate::quant::q8::rows4_dot_fma_x4(w4, s4, &lanes) };
-            tile_ref = tr;
+            let tile_ref = unsafe { crate::quant::q8::rows4_dot_fma_x4(w4, s4, &lanes) };
             unsafe {
                 crate::quant::q8::rows4_x8_smmla(
                     &wp[qd * nb * 128..(qd + 1) * nb * 128],

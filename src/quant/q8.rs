@@ -144,6 +144,7 @@ fn dot_i8_scalar(w32: &[i8], x32: &[i8]) -> i32 {
 /// exact, so the result equals four scalar dots.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[allow(dead_code)] // reference kernel; the fused tiles superseded it
 pub unsafe fn dot_i8_sdot4(
     w0: &[i8],
     w1: &[i8],
