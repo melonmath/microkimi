@@ -402,3 +402,47 @@ pub fn gpu_prefill_cmd(args: &[String]) {
         );
     }
 }
+
+/// `microkimi prefillbench --model X.bin [--tokens T] [--reps N]`
+///
+/// The like-for-like protocol against llama-bench's pp rows: one warm
+/// prefill (page-in, packs, caches), then N timed prefills of the same
+/// prompt from a restored snapshot, best and median reported. llama-bench
+/// warms and repeats too; `run --debug` times a single cold prefill.
+pub fn prefill_bench_cmd(args: &[String]) {
+    let model_path = crate::value_flag(args, "--model").unwrap_or_else(|| {
+        eprintln!("error: prefillbench requires --model MODEL.bin");
+        std::process::exit(2);
+    });
+    let n_tokens: usize = crate::value_flag(args, "--tokens")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let reps: usize = crate::value_flag(args, "--reps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let mut model = crate::model::qwen::QwenModel::load(&model_path);
+    let vocab = (model.cfg.vocab as u32).min(50_000);
+    let prompt: Vec<u32> = (0..n_tokens as u32).map(|i| (i * 7 + 3) % vocab).collect();
+    let snap = model.snapshot();
+    // warm-up
+    let _ = model.prefill_collect(&prompt, false);
+    let mut times = Vec::new();
+    for _ in 0..reps {
+        model.restore(&snap);
+        let t0 = std::time::Instant::now();
+        let out = model.prefill_collect(&prompt, false);
+        std::hint::black_box(&out.logits);
+        times.push(t0.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64);
+    }
+    let best = times.iter().cloned().fold(f64::MAX, f64::min);
+    let med = median(times.clone());
+    println!(
+        "prefillbench: {} tokens x {} reps (warm): best {:.2} ms/token ({:.0} tok/s) | median {:.2} ms/token ({:.0} tok/s)",
+        n_tokens,
+        reps,
+        best,
+        1000.0 / best,
+        med,
+        1000.0 / med
+    );
+}

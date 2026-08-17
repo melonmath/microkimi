@@ -58,6 +58,7 @@ fn main() {
         "lanebench" => model::qwen::lanebench_cmd(&args),
         "qwenbench" => tools::qwenbench::run(&args),
         "qwengpubench" => tools::qwenbench::gpu_prefill_cmd(&args),
+        "prefillbench" => tools::qwenbench::prefill_bench_cmd(&args),
         "kernbench" => model::kernbench_cmd(&args),
         "scanbench" => model::scanbench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
