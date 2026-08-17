@@ -9,15 +9,20 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | **90.9 tok/s** | 87.6 tok/s |
-| prompt reading (1k tokens) | 357 tok/s cold / **~650-670 warm** (see below) | 661 tok/s |
+| generation | **100 tok/s** | 86 tok/s |
+| prompt reading (1k tokens) | **742 tok/s** | 668 tok/s |
+
+Both rows from one bracketed run on the plugged-in M5 (2026-08-18):
+microkimi q8 spine, all cores; llama.cpp `-ngl 0`, brackets 651-682
+tok/s pp1024 and 85.6-86.9 tg64 before and after. Same warm,
+repeated protocol on both sides (`prefillbench` / `llama-bench -r`).
 
 ## On the GPU (Metal)
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | 90.9 tok/s * | 110-115 tok/s |
-| prompt reading (1k tokens) | **~1000 tok/s** | ~4700 tok/s |
+| generation | 100 tok/s * | 112 tok/s |
+| prompt reading (1k tokens) | **~1230 tok/s** | ~4650 tok/s |
 
 (The GPU rows barely move on battery - Apple throttles the CPU much
 harder than the GPU - so these hold across power states.)
@@ -33,8 +38,8 @@ microkimi-to-llama.cpp ratios inside the same thermal window
 
 | | ratio range | reading of the day |
 |---|---:|---|
-| generation | 0.7x - 1.1x | wins most windows; interleaved duel medians +11% to +31% for microkimi |
-| prompt reading | **1.01x** (best-of-8) / 0.98x (medians) | at equal harness (both engines warm, 8 repetitions, interleaved - `scripts/cpu-duel-warm.sh`) on a calm host: microkimi 673 vs llama-bench 666 tok/s at best-of-8 (5 of 8 rounds won), 651 vs 666 on per-round medians - the two engines within 3% either way; the earlier 0.4-0.7x figures compared microkimi's single cold prefill against llama-bench's warm repeats |
+| generation | 0.7x - 1.2x | wins most windows; interleaved duel medians +11% to +31% for microkimi |
+| prompt reading | 0.98x - 1.11x | at equal harness (both engines warm and repeating, interleaved - `scripts/cpu-duel-warm.sh`): 673 vs 666 tok/s at best-of-8 in the container, 742 vs 651-682 on the plugged M5; the earlier 0.4-0.7x figures compared microkimi's single cold prefill against llama-bench's warm repeats |
 
 The deeper the throttle, the better microkimi holds relative to
 llama.cpp on generation (spinning job board + dynamic row
