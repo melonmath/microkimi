@@ -236,6 +236,10 @@ pub fn run(args: &[String]) {
             {
                 println!("  {}", t);
                 shown = true;
+            } else if t.starts_with("gpu:") {
+                // shader/pipeline/context diagnostics: a silent fallback
+                // is worse than a noisy one
+                println!("  {}", t);
             }
         }
         if !shown {
