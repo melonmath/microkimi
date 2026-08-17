@@ -10,7 +10,7 @@ against llama.cpp (build 4df29be, Q8_0). Higher is better.
 | | microkimi | llama.cpp |
 |---|---:|---:|
 | generation | **90.9 tok/s** | 87.6 tok/s |
-| prompt reading (1k tokens) | 323 tok/s | 661 tok/s |
+| prompt reading (1k tokens) | 357 tok/s | 661 tok/s |
 
 ## On the GPU (Metal)
 
@@ -33,8 +33,8 @@ microkimi-to-llama.cpp ratios inside the same thermal window
 
 | | ratio range | reading of the day |
 |---|---:|---|
-| generation | 0.7x - 1.1x | wins most windows, loses the deepest-throttle ones; interleaved duel medians +11% to +31% for microkimi |
-| prompt reading | 0.4x - 0.5x | consistently behind; the open front |
+| generation | 0.7x - 1.1x | wins most windows; interleaved duel medians +11% to +31% for microkimi |
+| prompt reading | **0.83x - 0.93x** | within llama.cpp's own error bars since the flash-attention and SMMLA kernels landed (357 tok/s vs their bracketed 385-431 in the same windows; was 0.4-0.5x) |
 
 The deeper the throttle, the better microkimi holds relative to
 llama.cpp on generation (spinning job board + dynamic row
