@@ -38,6 +38,7 @@ use std::time::Instant;
 pub use ops::{attn_res, dot, gemm_batch, matvec, rmsnorm, situ, Q8Head};
 #[allow(unused_imports)] // only metal.rs (macOS) calls it, through crate::model::
 pub use ops::matvec_cpu;
+pub use ops::kernbench_cmd;
 pub(crate) use ops::dyn_step;
 pub(crate) use ops::matvec_packed_nt;
 use ops::{attn_res_refs, q8head_enabled, sigmoid, silu};

@@ -1205,3 +1205,86 @@ pub(crate) fn matvec_packed_nt(packed: &[u8], scales: &[u8], rows: usize, cols: 
         }
     }
 }
+
+/// `microkimi kernbench`: isolates the multi-lane q8 GEMM from the
+/// engine - synthetic 3072x1024 head against 256 lanes, plus the
+/// single-thread tile and the single-lane pooled matvec, in GMAC/s.
+/// The datum that decides whether a prompt-reading gap lives in the
+/// kernel, the threading, or the host.
+pub fn kernbench_cmd(_args: &[String]) {
+    let (rows, cols, lanes_n) = (3072usize, 1024usize, 256usize);
+    let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7 + 3) % 23) as f32 * 0.01 - 0.1).collect();
+    let head = Q8Head::from_f32(&w, rows, cols);
+    let xs_data: Vec<Vec<f32>> = (0..lanes_n)
+        .map(|l| (0..cols).map(|i| ((i * 5 + l * 11 + 1) % 13) as f32 * 0.02 - 0.1).collect())
+        .collect();
+    let macs_multi = (rows * cols * lanes_n) as f64;
+
+    // multi-lane pooled GEMM (the prefill path)
+    let mut outs_data: Vec<Vec<f32>> = vec![vec![0.0f32; rows]; lanes_n];
+    for round in 0..3 {
+        let xs: Vec<&[f32]> = xs_data.iter().map(|x| x.as_slice()).collect();
+        let mut outs: Vec<&mut [f32]> = outs_data.iter_mut().map(|o| o.as_mut_slice()).collect();
+        let t0 = std::time::Instant::now();
+        head.matvec_multi(&xs, &mut outs);
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "multi ({} lanes, pooled)   round {}: {:>7.1} GMAC/s  ({:.1} ms)",
+            lanes_n,
+            round,
+            macs_multi / dt / 1e9,
+            dt * 1000.0
+        );
+    }
+
+    // single-thread 4x8 tile (the raw kernel ceiling per core)
+    #[cfg(target_arch = "aarch64")]
+    if crate::quant::q8::sdot4_available() {
+        let nb = cols / 32;
+        let xqs: Vec<crate::quant::q8::Q8Vec> =
+            xs_data[..8].iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let lanes: Vec<(&[i8], &[f32])> =
+            xqs.iter().map(|x| (&x.q[..], &x.scales[..])).collect();
+        let mut sink = 0.0f32;
+        let t0 = std::time::Instant::now();
+        let mut r = 0usize;
+        while r + 4 <= rows {
+            let w4 = [
+                &head.q[r * cols..(r + 1) * cols],
+                &head.q[(r + 1) * cols..(r + 2) * cols],
+                &head.q[(r + 2) * cols..(r + 3) * cols],
+                &head.q[(r + 3) * cols..(r + 4) * cols],
+            ];
+            let s4 = [
+                &head.scales[r * nb..(r + 1) * nb],
+                &head.scales[(r + 1) * nb..(r + 2) * nb],
+                &head.scales[(r + 2) * nb..(r + 3) * nb],
+                &head.scales[(r + 3) * nb..(r + 4) * nb],
+            ];
+            // SAFETY: dotprod checked above; slices hold nb blocks each.
+            let tile = unsafe { crate::quant::q8::rows4_dot_fma_x4(w4, s4, &lanes) };
+            sink += tile[0][0];
+            r += 4;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "tile 4x8 (single thread)  : {:>7.1} GMAC/s  ({:.1} ms, sink {:.3})",
+            (rows * cols * 8) as f64 / dt / 1e9,
+            dt * 1000.0,
+            sink
+        );
+    }
+
+    // single-lane pooled matvec (the decode shape)
+    let mut out1 = vec![0.0f32; rows];
+    let t0 = std::time::Instant::now();
+    for _ in 0..64 {
+        head.matvec(&xs_data[0], &mut out1);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    println!(
+        "matvec x64 (pooled, 1 lane): {:>7.1} GMAC/s  ({:.1} ms total)",
+        (rows * cols * 64) as f64 / dt / 1e9,
+        dt * 1000.0
+    );
+}
