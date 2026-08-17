@@ -53,4 +53,5 @@ llama.cpp CPU rows for the same reason.
 - the q8 spine and the GPU prefill are opt-in; the default engine path
   is bit-exact f32. Quote the arm that matches the property you need,
   with the NLL deltas from [QWEN.md](QWEN.md) next to any speed claim.
-- run plugged in: on battery macOS throttles and the numbers are noise.
+- absolute numbers want a plugged-in host; on battery, use the paired
+  duel or the brackets and quote ratios.
