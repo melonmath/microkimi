@@ -629,19 +629,26 @@ pub fn matvec_packed_multi(
         // (q8::row_dot_fp4_multi), per-lane bits equal to row_dot_fp4
         let do_rows = |r0: usize, r1: usize| {
             let mut buf = [0f32; 16];
-            for r in r0..r1 {
-                let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
-                let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
-                let mut l0 = 0usize;
-                for tile in xrefs.chunks(16) {
-                    crate::quant::q8::row_dot_fp4_multi(prow, srow, tile, &mut buf[..tile.len()]);
-                    for (k, v) in buf[..tile.len()].iter().enumerate() {
-                        // SAFETY: (r, lane) cells are written exactly once;
-                        // the scope barrier below outlives the borrows.
-                        unsafe { *(out_ptrs[l0 + k] as *mut f32).add(r) = *v };
+            // L2 lane-blocking (see ops::multi_rows_q8): a 64-lane block
+            // stays cache-resident while the rows stream past it
+            let mut b0 = 0usize;
+            while b0 < xrefs.len() {
+                let b1 = (b0 + 64).min(xrefs.len());
+                for r in r0..r1 {
+                    let prow = &packed[r * cols / 2..(r + 1) * cols / 2];
+                    let srow = &scales[r * cols / 32..(r + 1) * cols / 32];
+                    let mut l0 = b0;
+                    for tile in xrefs[b0..b1].chunks(16) {
+                        crate::quant::q8::row_dot_fp4_multi(prow, srow, tile, &mut buf[..tile.len()]);
+                        for (k, v) in buf[..tile.len()].iter().enumerate() {
+                            // SAFETY: (r, lane) cells are written exactly once;
+                            // the scope barrier below outlives the borrows.
+                            unsafe { *(out_ptrs[l0 + k] as *mut f32).add(r) = *v };
+                        }
+                        l0 += tile.len();
                     }
-                    l0 += tile.len();
                 }
+                b0 = b1;
             }
         };
         let nt = n_threads.min(rows).max(1);
