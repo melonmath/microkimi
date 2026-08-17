@@ -61,12 +61,7 @@ pub fn delta_step(
     let kd = k.len();
     let vd = v.len();
     let decay = g.exp();
-    for x in s.iter_mut() {
-        *x *= decay;
-    }
-    // what the state already predicts for this key - stack scratch: this
-    // runs once per (head, token) and a heap allocation here was ~10% of
-    // the whole prefill scan (heap fallback for exotic value dims)
+    // stack scratch: a heap allocation here ran once per (head, token)
     let mut pred_stack = [0.0f32; 256];
     let mut pred_heap;
     let pred: &mut [f32] = if vd <= 256 {
@@ -75,36 +70,49 @@ pub fn delta_step(
         pred_heap = vec![0.0f32; vd];
         &mut pred_heap
     };
+    // TWO fused passes over the state instead of four (decay | predict |
+    // update | readout): each state row is decayed and dotted in one
+    // visit, then corrected and read out in one visit - half the state
+    // traffic. The per-element arithmetic and its order are exactly the
+    // former four-pass code's, so results are bit-identical.
     for i in 0..kd {
         let ki = k[i];
-        if ki == 0.0 {
-            continue;
-        }
-        let row = &s[i * vd..(i + 1) * vd];
-        for j in 0..vd {
-            pred[j] += ki * row[j];
-        }
-    }
-    for i in 0..kd {
-        let ki = k[i];
-        if ki == 0.0 {
-            continue;
-        }
         let row = &mut s[i * vd..(i + 1) * vd];
+        if ki == 0.0 {
+            for x in row.iter_mut() {
+                *x *= decay;
+            }
+            continue;
+        }
         for j in 0..vd {
-            row[j] += ki * (v[j] - pred[j]) * beta;
+            row[j] *= decay;
+            pred[j] += ki * row[j];
         }
     }
     for o in out.iter_mut() {
         *o = 0.0;
     }
     for i in 0..kd {
+        let ki = k[i];
         let qi = q[i];
-        if qi == 0.0 {
+        let row = &mut s[i * vd..(i + 1) * vd];
+        if ki == 0.0 {
+            if qi == 0.0 {
+                continue;
+            }
+            for j in 0..vd {
+                out[j] += qi * row[j];
+            }
             continue;
         }
-        let row = &s[i * vd..(i + 1) * vd];
+        if qi == 0.0 {
+            for j in 0..vd {
+                row[j] += ki * (v[j] - pred[j]) * beta;
+            }
+            continue;
+        }
         for j in 0..vd {
+            row[j] += ki * (v[j] - pred[j]) * beta;
             out[j] += qi * row[j];
         }
     }
