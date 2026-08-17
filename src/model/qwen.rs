@@ -1847,6 +1847,30 @@ impl QwenModel {
             Some(false) if c.is_dense() => build_mlp_q8(&layers, &bin, &c),
             _ => (0..c.n_layers).map(|_| None).collect(),
         };
+        // GEMM packs build at load, not inside the first measured prefill
+        for lq in q8_spine.iter().flatten() {
+            match lq {
+                LayerQ8::Linear { in_qkv, in_z, out_proj } => {
+                    for m in [in_qkv, in_z, out_proj] {
+                        if let SpineMat::Q8(h) = m {
+                            h.prebuild_gemm();
+                        }
+                    }
+                }
+                LayerQ8::Full { q_proj, k_proj, v_proj, o_proj } => {
+                    for m in [q_proj, k_proj, v_proj, o_proj] {
+                        if let SpineMat::Q8(h) = m {
+                            h.prebuild_gemm();
+                        }
+                    }
+                }
+            }
+        }
+        for mq in mlp_q8.iter().flatten() {
+            mq.gate.prebuild_gemm();
+            mq.up.prebuild_gemm();
+            mq.down.prebuild_gemm();
+        }
         let skip_bounds: Vec<Option<SkipBounds>> = if mlp_budget() > 0.0 && c.is_dense() {
             layers
                 .iter()

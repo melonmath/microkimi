@@ -953,6 +953,15 @@ impl Q8Head {
         p.run(jobs);
     }
 
+    /// Builds the GEMM pack eagerly (load time): the lazy build was
+    /// measured inside the first prefill - up to a second of interleaving
+    /// billed to prompt reading.
+    pub(crate) fn prebuild_gemm(&self) {
+        let _ = self
+            .gemm_pack
+            .get_or_init(|| build_gemm_pack(&self.q, &self.scales, self.rows, self.cols));
+    }
+
     fn row_dot(&self, r: usize, xq: &crate::quant::q8::Q8Vec) -> f32 {
         let nb = self.cols / 32;
         let wq = &self.q[r * self.cols..(r + 1) * self.cols];
