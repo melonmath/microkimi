@@ -223,6 +223,12 @@ pub fn matvec_multi(w: &[f32], rows: usize, cols: usize, xs: &[&[f32]], outs: &m
     {
         return;
     }
+    // Accelerate/AMX (MICROKIMI_ACCEL=1, macOS): fight BLAS with BLAS -
+    // llama.cpp's CPU pp rows run on the AMX coprocessor via Accelerate.
+    #[cfg(target_os = "macos")]
+    if crate::model::accel::gemm_f32(w, rows, cols, xs, outs) {
+        return;
+    }
     let p = crate::model::pool::pool();
     let njobs = (rows * cols / 60_000).clamp(1, p.workers).min(rows);
     if njobs <= 1 {

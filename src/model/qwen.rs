@@ -3528,10 +3528,14 @@ fn mlp_prefill(
     out: &mut [f32],
 ) {
     let d = c.d;
-    // the unpacked-i8 MLP wins on CPU; on macOS the GPU offload keeps
-    // priority (its hook lives inside the packed multi kernels)
+    // the unpacked-i8 MLP wins on CPU; on macOS the GPU and AMX offloads
+    // keep priority (their hooks live inside the packed multi kernels)
     #[cfg(target_os = "macos")]
-    let q8m = if crate::model::metal::qwen_gpu_on() { None } else { q8m };
+    let q8m = if crate::model::metal::qwen_gpu_on() || crate::model::accel::accel_on() {
+        None
+    } else {
+        q8m
+    };
     // dense batch without a budget: three multi-kernel passes stream the
     // packed weights once for ALL tokens
     if t_count > 1 && bounds.is_none() {

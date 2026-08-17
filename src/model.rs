@@ -25,6 +25,8 @@ mod seam;
 pub(crate) mod kda_chunk;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(target_os = "macos")]
+pub mod accel;
 pub mod pool;
 pub mod rosa;
 pub mod spec;

@@ -178,6 +178,12 @@ pub fn run(args: &[String]) {
         ),
         _ => println!("  unavailable"),
     }
+    // Accelerate/AMX arm (macOS): sgemm prefill, the answer to
+    // llama.cpp's BLAS-backed CPU pp rows
+    #[cfg(target_os = "macos")]
+    if let Some(a) = prefill_ms(&run_self(&pre, &[("MICROKIMI_ACCEL", "1")])) {
+        println!("  accel    {:>5.1} ms/token ({:.0} tok/s)", a, 1000.0 / a);
+    }
     if let Some(q) = q8pre {
         println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
         for line in q8out.lines() {

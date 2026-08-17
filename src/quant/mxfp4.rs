@@ -618,6 +618,12 @@ pub fn matvec_packed_multi(
     {
         return;
     }
+    // Accelerate/AMX (MICROKIMI_ACCEL=1): sgemm over a dequantized-once
+    // f32 copy - the CPU coprocessor answer to llama.cpp's BLAS pp path.
+    #[cfg(target_os = "macos")]
+    if crate::model::accel::gemm_fp4(packed, scales, rows, cols, xs, outs) {
+        return;
+    }
     if crate::quant::q8::q8_enabled() {
         let xqs: Vec<crate::quant::q8::Q8Vec> =
             xs.iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
