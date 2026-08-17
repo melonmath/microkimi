@@ -2397,14 +2397,15 @@ pub fn dprof_print() {
     );
 }
 
-/// MICROKIMI_CHUNKED_SCAN=1 opts the spine prefill into the WY chunked
-/// scan. Default OFF: the same-window A/B measured the scalar chunked
-/// form SLOWER than the fused sequential scan (median 6.1 vs 4.2
-/// ms/token) - it earns its place only with tiled kernels behind it.
+/// The WY chunked scan runs the spine prefill by default (kernel measured
+/// 1.22-1.9x faster than the fused sequential scan by scanbench, and
+/// winning paired end-to-end rounds once its per-head prep went
+/// zero-copy). MICROKIMI_CHUNKED_SCAN=0 pins the sequential scan (the
+/// A/B arm; the f32 default engine path never takes either).
 fn chunked_scan_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("MICROKIMI_CHUNKED_SCAN").map(|v| v == "1").unwrap_or(false)
+        std::env::var("MICROKIMI_CHUNKED_SCAN").map(|v| v != "0").unwrap_or(true)
     })
 }
 
@@ -5413,17 +5414,19 @@ pub(crate) fn chunked_scan_head_strided(
             acc *= gamma[(c0 + i) * bg_stride];
             gcum[i] = acc;
         }
-        // gram matrices (GEMM-shaped, kd shared)
+        // gram matrices, fused: one visit of k_s serves both k_t and q_t
+        // (the same key row feeds both products; two separate walks read
+        // it twice)
         for t in 0..n {
             let kt = &kn[(c0 + t) * k_stride..(c0 + t) * k_stride + kd];
             let qt = &qn[(c0 + t) * q_stride..(c0 + t) * q_stride + kd];
-            for s in 0..=t {
+            for s in 0..t {
                 let ks = &kn[(c0 + s) * k_stride..(c0 + s) * k_stride + kd];
-                if s < t {
-                    kk[t * C + s] = crate::model::ops::dot(ks, kt);
-                }
-                qk[t * C + s] = crate::model::ops::dot(ks, qt);
+                let (a, b) = crate::model::ops::dot2(ks, kt, qt);
+                kk[t * C + s] = a;
+                qk[t * C + s] = b;
             }
+            qk[t * C + t] = crate::model::ops::dot(kt, qt);
         }
         // S0-side terms: s0k[t] = S0' k_t, s0q[t] = S0' q_t (row-weighted
         // sums over the state's kd rows; k/q weights are per-row scalars)

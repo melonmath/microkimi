@@ -202,6 +202,13 @@ pub fn run(args: &[String]) {
     )) {
         println!("  accel+q8 {:>4.1} ms/token ({:.0} tok/s)", c, 1000.0 / c);
     }
+    // scan A/B under the q8 spine: chunked (default) vs sequential
+    if let Some(sq) = prefill_ms(&run_self(
+        &pre,
+        &[("MICROKIMI_Q8_SPINE", "1"), ("MICROKIMI_CHUNKED_SCAN", "0")],
+    )) {
+        println!("  q8 seq-scan {:>4.1} ms/token ({:.0} tok/s)  [A/B arm]", sq, 1000.0 / sq);
+    }
     if let Some(q) = q8pre {
         println!("  q8 spine {:>5.1} ms/token ({:.0} tok/s)", q, 1000.0 / q);
         for line in q8out.lines() {

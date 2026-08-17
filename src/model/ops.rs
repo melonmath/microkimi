@@ -116,6 +116,60 @@ pub(crate) fn dyn_step(rows: usize, workers: usize) -> usize {
     (rows.div_ceil(workers.max(1) * pulls).max(16) + 3) & !3
 }
 
+/// Two dots sharing the left operand in one pass: (a.b, a.c). Each result
+/// is bit-identical to `dot` (same 8-lane accumulation and reduction per
+/// output); the shared operand streams once.
+#[inline]
+pub fn dot2(a: &[f32], b: &[f32], c: &[f32]) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        return unsafe { dot2_neon(a, b, c) };
+    }
+    #[allow(unreachable_code)]
+    (dot(a, b), dot(a, c))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot2_neon(a: &[f32], b: &[f32], c: &[f32]) -> (f32, f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = a.len().min(b.len()).min(c.len());
+        let (pa, pb, pc) = (a.as_ptr(), b.as_ptr(), c.as_ptr());
+        let mut lo1 = vdupq_n_f32(0.0);
+        let mut hi1 = vdupq_n_f32(0.0);
+        let mut lo2 = vdupq_n_f32(0.0);
+        let mut hi2 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let a0 = vld1q_f32(pa.add(i));
+            let a1 = vld1q_f32(pa.add(i + 4));
+            lo1 = vaddq_f32(lo1, vmulq_f32(a0, vld1q_f32(pb.add(i))));
+            hi1 = vaddq_f32(hi1, vmulq_f32(a1, vld1q_f32(pb.add(i + 4))));
+            lo2 = vaddq_f32(lo2, vmulq_f32(a0, vld1q_f32(pc.add(i))));
+            hi2 = vaddq_f32(hi2, vmulq_f32(a1, vld1q_f32(pc.add(i + 4))));
+            i += 8;
+        }
+        let reduce = |lo: float32x4_t, hi: float32x4_t| -> f32 {
+            let mut acc = [0f32; 8];
+            vst1q_f32(acc.as_mut_ptr(), lo);
+            vst1q_f32(acc.as_mut_ptr().add(4), hi);
+            let (p01, p23) = (acc[0] + acc[1], acc[2] + acc[3]);
+            let (p45, p67) = (acc[4] + acc[5], acc[6] + acc[7]);
+            ((p01 + p23) + p45) + p67
+        };
+        let mut s1 = reduce(lo1, hi1);
+        let mut s2 = reduce(lo2, hi2);
+        while i < n {
+            s1 += *a.get_unchecked(i) * *b.get_unchecked(i);
+            s2 += *a.get_unchecked(i) * *c.get_unchecked(i);
+            i += 1;
+        }
+        (s1, s2)
+    }
+}
+
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]

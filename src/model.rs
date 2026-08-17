@@ -37,7 +37,7 @@ use crate::quant::weights::{BinFile, Entry};
 use std::time::Instant;
 
 // The public surface stays crate::model::*; submodules are private.
-pub use ops::{attn_res, dot, gemm_batch, matvec, rmsnorm, situ, Q8Head};
+pub use ops::{attn_res, dot, dot2, gemm_batch, matvec, rmsnorm, situ, Q8Head};
 #[allow(unused_imports)] // only metal.rs (macOS) calls it, through crate::model::
 pub use ops::matvec_cpu;
 pub use ops::kernbench_cmd;
