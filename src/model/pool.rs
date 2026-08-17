@@ -34,6 +34,16 @@ pub fn in_pool_worker() -> bool {
     IN_POOL.with(|c| c.get())
 }
 
+/// Idle spins before a worker parks (MICROKIMI_SPIN, default 6000
+/// ~= 0.5-1 ms). Low values trade barrier wakeup latency for freeing
+/// the cores during non-pool compute sections.
+fn spin_limit() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MICROKIMI_SPIN").ok().and_then(|v| v.parse().ok()).unwrap_or(6_000)
+    })
+}
+
 /// Cache-line-padded wrapper (128 B): keeps each hot shared counter on
 /// its own cache line - packed together they would ping-pong one line
 /// between every core on every claim and every completion.
@@ -140,7 +150,7 @@ impl Pool {
                         seen = tag;
                     } else {
                         idle += 1;
-                        if idle < 6_000 {
+                        if idle < spin_limit() {
                             if idle & 0x3F == 0 {
                                 std::thread::yield_now();
                             } else {
