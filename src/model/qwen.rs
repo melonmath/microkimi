@@ -2876,42 +2876,46 @@ fn lin_attn_prefill(
     // to the former token-major conv_step loop.
     let mut conved = vec![0.0f32; t_count * conv_dim];
     {
+        // on the persistent pool (a scoped spawn set per layer added up)
         let k = c.conv_kernel;
         let workers = prefill_workers(conv_dim);
+        let p = crate::model::pool::pool();
         let out_ptr = crate::model::pool::MPtr(conved.as_mut_ptr());
-        std::thread::scope(|s| {
-            let qkv = &qkv;
-            let mut state_rest = cache.conv.as_mut_slice();
-            for (c0, c1) in ranges(conv_dim, workers) {
-                let (state_c, sr) = state_rest.split_at_mut((c1 - c0) * (k - 1));
-                state_rest = sr;
-                s.spawn(move || {
-                    let out_ptr = out_ptr;
+        let st_ptr = crate::model::pool::MPtr(cache.conv.as_mut_ptr());
+        let qkv_ptr = crate::model::pool::SPtr(qkv.as_ptr());
+        let conv_ptr = crate::model::pool::SPtr(conv.as_ptr());
+        let (qkv_len, conv_len) = (qkv.len(), conv.len());
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for (c0, c1) in ranges(conv_dim, workers) {
+            jobs.push(Box::new(move || {
+                let (out_ptr, st_ptr, qkv_ptr, conv_ptr) = (out_ptr, st_ptr, qkv_ptr, conv_ptr);
+                // SAFETY: channel ranges are disjoint (state and output
+                // columns owned by this job); the pool barrier outlives the
+                // captured pointers.
+                unsafe {
+                    let qkv = std::slice::from_raw_parts(qkv_ptr.0, qkv_len);
+                    let conv = std::slice::from_raw_parts(conv_ptr.0, conv_len);
                     for t in 0..t_count {
                         let x = &qkv[t * conv_dim..(t + 1) * conv_dim];
                         for i in c0..c1 {
-                            let st = &mut state_c[(i - c0) * (k - 1)..(i - c0 + 1) * (k - 1)];
+                            let st = std::slice::from_raw_parts_mut(st_ptr.0.add(i * (k - 1)), k - 1);
                             let wt = &conv[i * k..(i + 1) * k];
                             let mut acc = 0.0f32;
                             for j in 0..k - 1 {
                                 acc += st[j] * wt[j];
                             }
                             acc += x[i] * wt[k - 1];
-                            // SAFETY: column i is owned by this worker alone
-                            // (disjoint channel ranges), the barrier is the
-                            // scope end.
-                            unsafe {
-                                *out_ptr.0.add(t * conv_dim + i) = acc / (1.0 + (-acc).exp());
-                            }
+                            *out_ptr.0.add(t * conv_dim + i) = acc / (1.0 + (-acc).exp());
                             for j in 0..k.saturating_sub(2) {
                                 st[j] = st[j + 1];
                             }
                             st[k - 2] = x[i];
                         }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
+        p.run(jobs);
     }
 
     // normalized q/k hoisted out of the scan: computed once per KV head
@@ -3079,19 +3083,27 @@ fn lin_attn_prefill(
     // output projection over all tokens
     let mut mixed_tm = vec![0.0f32; t_count * vt];
     {
+        // on the persistent pool
         let workers = prefill_workers(t_count);
-        std::thread::scope(|s| {
-            let mut rest = mixed_tm.as_mut_slice();
-            let mixed_hm = &mixed_hm;
-            let z = &z;
-            for (t0, t1) in ranges(t_count, workers) {
-                let n = t1 - t0;
-                let (chunk, r) = rest.split_at_mut(n * vt);
-                rest = r;
-                s.spawn(move || {
-                    for i in 0..n {
-                        let t = t0 + i;
-                        let mixed = &mut chunk[i * vt..(i + 1) * vt];
+        let p = crate::model::pool::pool();
+        let mt = crate::model::pool::MPtr(mixed_tm.as_mut_ptr());
+        let mh = crate::model::pool::SPtr(mixed_hm.as_ptr());
+        let zp = crate::model::pool::SPtr(z.as_ptr());
+        let np = crate::model::pool::SPtr(norm.as_ptr());
+        let (mh_len, z_len, norm_len) = (mixed_hm.len(), z.len(), norm.len());
+        let eps = c.norm_eps as f32;
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for (t0, t1) in ranges(t_count, workers) {
+            jobs.push(Box::new(move || {
+                let (mt, mh, zp, np) = (mt, mh, zp, np);
+                // SAFETY: disjoint token ranges write disjoint rows; the
+                // pool barrier outlives the captured pointers.
+                unsafe {
+                    let mixed_hm = std::slice::from_raw_parts(mh.0, mh_len);
+                    let z = std::slice::from_raw_parts(zp.0, z_len);
+                    let norm = std::slice::from_raw_parts(np.0, norm_len);
+                    for t in t0..t1 {
+                        let mixed = std::slice::from_raw_parts_mut(mt.0.add(t * vt), vt);
                         for h in 0..heads {
                             mixed[h * vd..(h + 1) * vd].copy_from_slice(
                                 &mixed_hm[(h * t_count + t) * vd..(h * t_count + t + 1) * vd],
@@ -3099,17 +3111,13 @@ fn lin_attn_prefill(
                         }
                         for h in 0..heads {
                             let (a, b) = (h * vd, (h + 1) * vd);
-                            rmsnorm_gated(
-                                &mut mixed[a..b],
-                                norm,
-                                &z[t * vt + a..t * vt + b],
-                                c.norm_eps as f32,
-                            );
+                            rmsnorm_gated(&mut mixed[a..b], norm, &z[t * vt + a..t * vt + b], eps);
                         }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
+        p.run(jobs);
     }
     {
         let xs: Vec<&[f32]> = mixed_tm.chunks(vt).collect();
@@ -3283,44 +3291,54 @@ fn full_attn_prefill(
         }
     }
     {
+        // on the persistent pool, with one reusable head scratch per job
+        // (the per-(head, token) to_vec allocations added up to ~24 per
+        // token)
         let workers = prefill_workers(t_count);
-        std::thread::scope(|s| {
-            let mut q_rest = q_all.as_mut_slice();
-            let mut g_rest = gate_all.as_mut_slice();
-            let mut k_rest = k_all.as_mut_slice();
-            let qg_all = &qg_all;
-            for (t0, t1) in ranges(t_count, workers) {
-                let n = t1 - t0;
-                let (q_c, qr) = q_rest.split_at_mut(n * q_width);
-                let (g_c, gr) = g_rest.split_at_mut(n * q_width);
-                let (k_c, kr) = k_rest.split_at_mut(n * kv_width);
-                q_rest = qr;
-                g_rest = gr;
-                k_rest = kr;
-                s.spawn(move || {
-                    for i in 0..n {
-                        let pos = base_pos + t0 + i;
-                        let qg = &qg_all[(t0 + i) * q_width * 2..(t0 + i + 1) * q_width * 2];
-                        let q = &mut q_c[i * q_width..(i + 1) * q_width];
-                        let gate = &mut g_c[i * q_width..(i + 1) * q_width];
-                        let k = &mut k_c[i * kv_width..(i + 1) * kv_width];
-                        for h in 0..c.n_heads {
+        let p = crate::model::pool::pool();
+        let qp = crate::model::pool::MPtr(q_all.as_mut_ptr());
+        let gp = crate::model::pool::MPtr(gate_all.as_mut_ptr());
+        let kp = crate::model::pool::MPtr(k_all.as_mut_ptr());
+        let qgp = crate::model::pool::SPtr(qg_all.as_ptr());
+        let qnp = crate::model::pool::SPtr(q_norm.as_ptr());
+        let knp = crate::model::pool::SPtr(k_norm.as_ptr());
+        let (qg_len, qn_len, kn_len) = (qg_all.len(), q_norm.len(), k_norm.len());
+        let (n_heads, n_kv, eps, rope_dim, theta) =
+            (c.n_heads, c.n_kv_heads, c.norm_eps as f32, c.rope_dim(), c.rope_theta);
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for (t0, t1) in ranges(t_count, workers) {
+            jobs.push(Box::new(move || {
+                let (qp, gp, kp, qgp, qnp, knp) = (qp, gp, kp, qgp, qnp, knp);
+                // SAFETY: disjoint token ranges; the pool barrier outlives
+                // the captured pointers.
+                unsafe {
+                    let qg_all = std::slice::from_raw_parts(qgp.0, qg_len);
+                    let q_norm = std::slice::from_raw_parts(qnp.0, qn_len);
+                    let k_norm = std::slice::from_raw_parts(knp.0, kn_len);
+                    let mut old = vec![0.0f32; hd];
+                    for t in t0..t1 {
+                        let pos = base_pos + t;
+                        let qg = &qg_all[t * q_width * 2..(t + 1) * q_width * 2];
+                        let q = std::slice::from_raw_parts_mut(qp.0.add(t * q_width), q_width);
+                        let gate = std::slice::from_raw_parts_mut(gp.0.add(t * q_width), q_width);
+                        let k = std::slice::from_raw_parts_mut(kp.0.add(t * kv_width), kv_width);
+                        for h in 0..n_heads {
                             let src = h * hd * 2;
-                            q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
                             gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
-                            let old = q[h * hd..(h + 1) * hd].to_vec();
-                            rmsnorm(&old, q_norm, c.norm_eps as f32, &mut q[h * hd..(h + 1) * hd]);
-                            rope_partial(&mut q[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+                            old.copy_from_slice(&qg[src..src + hd]);
+                            rmsnorm(&old, q_norm, eps, &mut q[h * hd..(h + 1) * hd]);
+                            rope_partial(&mut q[h * hd..(h + 1) * hd], pos, rope_dim, theta);
                         }
-                        for h in 0..c.n_kv_heads {
-                            let old = k[h * hd..(h + 1) * hd].to_vec();
-                            rmsnorm(&old, k_norm, c.norm_eps as f32, &mut k[h * hd..(h + 1) * hd]);
-                            rope_partial(&mut k[h * hd..(h + 1) * hd], pos, c.rope_dim(), c.rope_theta);
+                        for h in 0..n_kv {
+                            old.copy_from_slice(&k[h * hd..(h + 1) * hd]);
+                            rmsnorm(&old, k_norm, eps, &mut k[h * hd..(h + 1) * hd]);
+                            rope_partial(&mut k[h * hd..(h + 1) * hd], pos, rope_dim, theta);
                         }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
+        p.run(jobs);
     }
     cache.k.extend_from_slice(&k_all);
     cache.v.extend_from_slice(&v_all);
