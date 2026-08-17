@@ -2458,6 +2458,81 @@ fn par_add_norm(
     });
 }
 
+/// Tiled online-softmax attention for ONE query over its causal window
+/// (the CPU flash-attention core, spine modes only). KV walks in tiles
+/// of 32 positions: scores come from integer dots against the K mirror,
+/// the running max/denominator rescale the accumulated mix, and the V
+/// tile stays cache-hot across the whole update. Every caller (batched
+/// prefill, single-token tail, lanes) runs this exact per-query
+/// sequence, so their mutual bit-identity holds; numerics differ from
+/// the two-pass softmax at reassociation level, which the spine
+/// contract already covers.
+#[allow(clippy::too_many_arguments)]
+fn fa_query(
+    qq: &crate::quant::q8::Q8Vec,
+    kq_all: &[i8],
+    kqs_all: &[f32],
+    v_all: &[f32],
+    kv_width: usize,
+    off0: usize,
+    nbh: usize,
+    window: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let hd = nbh * 32;
+    let mut run_max = f32::NEG_INFINITY;
+    let mut denom = 0.0f32;
+    for x in out.iter_mut() {
+        *x = 0.0;
+    }
+    let mut scores = [0.0f32; 32];
+    let mut u0 = 0usize;
+    while u0 < window {
+        let u1 = (u0 + 32).min(window);
+        let n = u1 - u0;
+        // integer scores for the tile
+        let mut tile_max = f32::NEG_INFINITY;
+        for (i, slot) in scores[..n].iter_mut().enumerate() {
+            let off = (u0 + i) * kv_width + off0;
+            let mut acc = 0.0f32;
+            for g in 0..nbh {
+                let idot = crate::quant::q8::block_dot_i8(
+                    &kq_all[off + g * 32..off + (g + 1) * 32],
+                    &qq.q[g * 32..(g + 1) * 32],
+                );
+                acc = (idot as f32).mul_add(kqs_all[off / 32 + g] * qq.scales[g], acc);
+            }
+            let sc = acc * scale;
+            *slot = sc;
+            tile_max = tile_max.max(sc);
+        }
+        // online rescale
+        let new_max = run_max.max(tile_max);
+        let r = (run_max - new_max).exp();
+        if r != 1.0 {
+            for x in out.iter_mut() {
+                *x *= r;
+            }
+            denom *= r;
+        }
+        for (i, &sc) in scores[..n].iter().enumerate() {
+            let w = (sc - new_max).exp();
+            denom += w;
+            let v = &v_all[(u0 + i) * kv_width + off0..(u0 + i) * kv_width + off0 + hd];
+            for j in 0..hd {
+                out[j] += w * v[j];
+            }
+        }
+        run_max = new_max;
+        u0 = u1;
+    }
+    let inv = 1.0 / denom;
+    for x in out.iter_mut() {
+        *x *= inv;
+    }
+}
+
 /// Splits `items` into contiguous ranges of ~equal CAUSAL cost: token t
 /// attends over base+t+1 positions, so uniform ranges make the last
 /// worker do about twice the work of the first at base=0. Cuts are placed
@@ -3240,22 +3315,26 @@ fn full_attn_prefill(
                             let kh = h / groups;
                             let qh = &q_all[t * q_width + h * hd..t * q_width + (h + 1) * hd];
                             let mut max_score = f32::NEG_INFINITY;
-                            // quantized spine: integer score dots against the
-                            // K mirror (the f32 default stays bit-exact)
+                            // quantized spine: tiled online-softmax attention
+                            // (integer scores, V tiles cache-hot); the f32
+                            // default keeps the exact two-pass path
                             if q8_scores {
                                 crate::quant::q8::quantize_q8_into(qh, &mut qq);
-                                max_score = crate::quant::q8::score_window(
+                                fa_query(
                                     &qq,
                                     cache_kq,
                                     cache_kqs,
+                                    cache_v,
                                     kv_width,
                                     kh * hd,
                                     hd / 32,
                                     window,
                                     scale,
-                                    &mut scores,
+                                    &mut mixed[h * hd..(h + 1) * hd],
                                 );
-                            } else {
+                                continue;
+                            }
+                            {
                             for u in 0..window {
                                 let off = u * kv_width + kh * hd;
                                 let sc =
@@ -4181,19 +4260,23 @@ fn full_attn_tail(
         // quantized spine: integer score dots against the K mirror
         // (bit-identical to the batch path's q8 branch)
         if q8_scores {
+            // same tiled online-softmax sequence as the batched prefill
             crate::quant::q8::quantize_q8_into(qh, &mut qq);
-            max_score = crate::quant::q8::score_window(
+            fa_query(
                 &qq,
                 &cache.kq,
                 &cache.kqs,
+                &cache.v,
                 kv_width,
                 kh * hd,
                 hd / 32,
                 cache.len,
                 scale,
-                &mut scores,
+                &mut mixed[h * hd..(h + 1) * hd],
             );
-        } else {
+            continue;
+        }
+        {
         for t in 0..cache.len {
             let off = t * kv_width + kh * hd;
             let sc = crate::model::ops::dot(qh, &cache.k[off..off + hd]) * scale;
