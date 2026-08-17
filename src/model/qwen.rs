@@ -161,6 +161,11 @@ impl LinCache {
 pub struct FullCache {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
+    /// q8 mirror of `k` (same flat layout; per-32 scales alongside).
+    /// Maintained at every append so the quantized spine modes can score
+    /// attention with integer dots; the f32 paths never read it.
+    pub kq: Vec<i8>,
+    pub kqs: Vec<f32>,
     pub len: usize,
 }
 
@@ -170,9 +175,35 @@ impl FullCache {
         FullCache {
             k: Vec::with_capacity(width * 256),
             v: Vec::with_capacity(width * 256),
+            kq: Vec::with_capacity(width * 256),
+            kqs: Vec::with_capacity(width * 8),
             len: 0,
         }
     }
+}
+
+/// Appends the q8 mirror for freshly appended key rows (kv_width is a
+/// multiple of 32, so flat 32-blocks align with per-head slices).
+fn push_k_mirror(cache: &mut FullCache, k_new: &[f32]) {
+    if k_new.len() % 32 != 0 {
+        return; // tiny test fixtures; the q8 scoring gates on hd % 32 too
+    }
+    let xq = crate::quant::q8::quantize_q8(k_new);
+    cache.kq.extend_from_slice(&xq.q);
+    cache.kqs.extend_from_slice(&xq.scales);
+}
+
+/// One q8 attention score: integer block dots against the cache mirror,
+/// fused block-sequential scale application (the shared q8 order).
+#[inline]
+fn q8_score_row(qq: &crate::quant::q8::Q8Vec, kq: &[i8], ks: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..ks.len() {
+        let idot =
+            crate::quant::q8::block_dot_i8(&kq[g * 32..(g + 1) * 32], &qq.q[g * 32..(g + 1) * 32]);
+        acc = (idot as f32).mul_add(ks[g] * qq.scales[g], acc);
+    }
+    acc
 }
 
 #[cfg(test)]
@@ -484,6 +515,7 @@ pub fn full_attn_step(
     }
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(&v);
+    push_k_mirror(cache, &k);
     cache.len += 1;
 
     let groups = c.n_heads / c.n_kv_heads;
@@ -1925,6 +1957,8 @@ impl QwenModel {
                     let len = snap.full_lens[fi];
                     c.k.truncate(len * kv_width);
                     c.v.truncate(len * kv_width);
+                    c.kq.truncate(len * kv_width);
+                    c.kqs.truncate(len * kv_width / 32);
                     c.len = len;
                     fi += 1;
                 }
@@ -1932,6 +1966,8 @@ impl QwenModel {
         }
         self.mtp_cache.k.truncate(snap.mtp_len * kv_width);
         self.mtp_cache.v.truncate(snap.mtp_len * kv_width);
+        self.mtp_cache.kq.truncate(snap.mtp_len * kv_width);
+        self.mtp_cache.kqs.truncate(snap.mtp_len * kv_width / 32);
         self.mtp_cache.len = snap.mtp_len;
         self.pos = snap.pos;
     }
@@ -2099,6 +2135,8 @@ impl QwenModel {
         let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
         self.mtp_cache.k.truncate(len * kv_width);
         self.mtp_cache.v.truncate(len * kv_width);
+        self.mtp_cache.kq.truncate(len * kv_width);
+        self.mtp_cache.kqs.truncate(len * kv_width / 32);
         self.mtp_cache.len = len;
     }
 
@@ -2847,6 +2885,7 @@ fn full_attn_prefill(
             tensor(data, &w.k_norm),
             base_pos,
             cache,
+            q8_mats.is_some() && hd % 32 == 0,
             &mut mixed,
         );
         match q8_mats {
@@ -2944,6 +2983,7 @@ fn full_attn_prefill(
     }
     cache.k.extend_from_slice(&k_all);
     cache.v.extend_from_slice(&v_all);
+    push_k_mirror(cache, &k_all);
     cache.len += t_count;
 
     // each position attends over its causal prefix, parallel over tokens;
@@ -2970,11 +3010,15 @@ fn full_attn_prefill(
             let cache_v = &cache.v;
             let q_all = &q_all;
             let gate_all = &gate_all;
+            let q8_scores = q8_mats.is_some() && hd % 32 == 0;
+            let cache_kq = &cache.kq;
+            let cache_kqs = &cache.kqs;
             for (t0, t1) in causal_ranges(t_count, workers, base_pos) {
                 let n = t1 - t0;
                 let (mixed_c, mr) = mixed_rest.split_at_mut(n * q_width);
                 mixed_rest = mr;
                 s.spawn(move || {
+                    let mut qq = crate::quant::q8::Q8Vec::new();
                     for i in 0..n {
                         let t = t0 + i;
                         let window = base_pos + t + 1;
@@ -2984,12 +3028,29 @@ fn full_attn_prefill(
                             let kh = h / groups;
                             let qh = &q_all[t * q_width + h * hd..t * q_width + (h + 1) * hd];
                             let mut max_score = f32::NEG_INFINITY;
+                            // quantized spine: integer score dots against the
+                            // K mirror (the f32 default stays bit-exact)
+                            if q8_scores {
+                                crate::quant::q8::quantize_q8_into(qh, &mut qq);
+                                let nbh = hd / 32;
+                                for (u, sc_slot) in scores[..window].iter_mut().enumerate() {
+                                    let off = u * kv_width + kh * hd;
+                                    let sc = q8_score_row(
+                                        &qq,
+                                        &cache_kq[off..off + hd],
+                                        &cache_kqs[off / 32..off / 32 + nbh],
+                                    ) * scale;
+                                    *sc_slot = sc;
+                                    max_score = max_score.max(sc);
+                                }
+                            } else {
                             for u in 0..window {
                                 let off = u * kv_width + kh * hd;
                                 let sc =
                                     crate::model::ops::dot(qh, &cache_k[off..off + hd]) * scale;
                                 scores[u] = sc;
                                 max_score = max_score.max(sc);
+                            }
                             }
                             let mut denom = 0.0f32;
                             for sc in scores.iter_mut() {
@@ -3630,6 +3691,7 @@ impl QwenModel {
                     let q_norm = tensor(data, &w.q_norm);
                     let k_norm = tensor(data, &w.k_norm);
                     let mut mixed = vec![vec![0.0f32; q_width]; n];
+                    let lane_q8 = self.q8_spine[l].is_some() && hd % 32 == 0;
                     std::thread::scope(|scope| {
                         for (((lane, mixed_i), qg_i), (k_i, v_i)) in lanes
                             .iter_mut()
@@ -3643,7 +3705,7 @@ impl QwenModel {
                             };
                             let cfg = &c;
                             scope.spawn(move || {
-                                full_attn_tail(cfg, qg_i, k_i, v_i, q_norm, k_norm, pos, cache, mixed_i);
+                                full_attn_tail(cfg, qg_i, k_i, v_i, q_norm, k_norm, pos, cache, lane_q8, mixed_i);
                             });
                         }
                     });
@@ -3831,6 +3893,7 @@ fn lin_attn_tail(
 /// the ops of `full_attn_step` after its three matvecs, writing the gated
 /// mix (before o_proj, which runs lane-batched).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn full_attn_tail(
     c: &QwenConfig,
     qg: &[f32],
@@ -3840,6 +3903,7 @@ fn full_attn_tail(
     k_norm: &[f32],
     pos: usize,
     cache: &mut FullCache,
+    q8_scores: bool,
     mixed: &mut [f32],
 ) {
     let hd = c.head_dim;
@@ -3865,19 +3929,38 @@ fn full_attn_tail(
     }
     cache.k.extend_from_slice(&k);
     cache.v.extend_from_slice(v);
+    push_k_mirror(cache, &k);
     cache.len += 1;
     let groups = c.n_heads / c.n_kv_heads;
     let scale = 1.0f32 / (hd as f32).sqrt();
     let mut scores = vec![0.0f32; cache.len];
+    let mut qq = crate::quant::q8::Q8Vec::new();
     for h in 0..c.n_heads {
         let kh = h / groups;
         let qh = &q[h * hd..(h + 1) * hd];
         let mut max_score = f32::NEG_INFINITY;
+        // quantized spine: integer score dots against the K mirror
+        // (bit-identical to the batch path's q8 branch)
+        if q8_scores {
+            crate::quant::q8::quantize_q8_into(qh, &mut qq);
+            let nbh = hd / 32;
+            for (u, slot) in scores[..cache.len].iter_mut().enumerate() {
+                let off = u * kv_width + kh * hd;
+                let sc = q8_score_row(
+                    &qq,
+                    &cache.kq[off..off + hd],
+                    &cache.kqs[off / 32..off / 32 + nbh],
+                ) * scale;
+                *slot = sc;
+                max_score = max_score.max(sc);
+            }
+        } else {
         for t in 0..cache.len {
             let off = t * kv_width + kh * hd;
             let sc = crate::model::ops::dot(qh, &cache.k[off..off + hd]) * scale;
             scores[t] = sc;
             max_score = max_score.max(sc);
+        }
         }
         let mut denom = 0.0f32;
         for sc in scores.iter_mut() {
