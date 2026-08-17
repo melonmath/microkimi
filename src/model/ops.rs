@@ -434,7 +434,7 @@ unsafe fn multi_rows_q8_packed(
                 }
             } else {
             while l0 + 2 <= lanes.len() {
-                let width = (lanes.len() - l0).min(8);
+                let width = (lanes.len() - l0).min(16);
                 let tile = unsafe {
                     crate::quant::q8::rows4_dot_fma_x4_packed(wq, wsq, &lanes[l0..l0 + width])
                 };

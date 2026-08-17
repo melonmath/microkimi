@@ -875,12 +875,13 @@ pub unsafe fn rows4_dot_fma_x4_packed(
     wq: &[i8],
     ws: &[f32],
     xqs: &[(&[i8], &[f32])],
-) -> [[f32; 4]; 8] {
+) -> [[f32; 4]; 16] {
     use std::arch::aarch64::*;
-    debug_assert!(xqs.len() <= 8, "lane tile is at most 8 wide");
+    debug_assert!(xqs.len() <= 16, "lane tile is at most 16 wide");
     let nb = xqs[0].1.len();
     unsafe {
-        let mut acc = [vdupq_n_f32(0.0); 8];
+        // 16 accumulators: one weight-quad load per block serves 16 lanes
+        let mut acc = [vdupq_n_f32(0.0); 16];
         for g in 0..nb {
             let wp = wq.as_ptr().add(g * 128);
             let w00 = vld1q_s8(wp);
@@ -925,7 +926,7 @@ pub unsafe fn rows4_dot_fma_x4_packed(
                 acc[l] = vfmaq_f32(acc[l], sums, sv);
             }
         }
-        let mut out = [[0.0f32; 4]; 8];
+        let mut out = [[0.0f32; 4]; 16];
         for l in 0..xqs.len() {
             vst1q_f32(out[l].as_mut_ptr(), acc[l]);
         }
