@@ -1120,8 +1120,10 @@ pub fn smmla_available() -> bool {
 /// twice SDOT's throughput. Operands come PAIR-INTERLEAVED:
 ///   weights `wp`, per block: [r0[0..8] r1[0..8] r0[8..16] r1[8..16]
 ///   ... r2/r3 likewise] (128 bytes per (quad, block));
-///   activations `xp`, per lane-pair, per block: [lA[0..8] lB[0..8]
-///   lA[8..16] ...] (64 bytes per (pair, block)).
+///   activations `xp`, TILE-major: for the tile's up to 8 pairs, block g
+///   holds the pairs contiguously at ((g*8)+pair)*64, each pair
+///   [lA[0..8] lB[0..8] lA[8..16] ...] (64 bytes) - one address stream
+///   per block for the whole 16-lane tile.
 /// Scales apply per block with one fused multiply-add per accumulator
 /// element in block order - the same per-(row, lane) arithmetic as
 /// rows4_dot_fma, so results are bit-identical to the SDOT kernels.
@@ -1158,7 +1160,9 @@ pub unsafe fn rows4_x8_smmla(
             let a23_3 = vld1q_s8(wb.add(112));
             let wsv = [ws[g * 4], ws[g * 4 + 1], ws[g * 4 + 2], ws[g * 4 + 3]];
             for p in 0..pairs {
-                let xb = xp.as_ptr().add((p * nb + g) * 64);
+                // tile-major layout: the tile's pairs of one block sit
+                // contiguous (one address stream per block for 16 lanes)
+                let xb = xp.as_ptr().add((g * 8 + p) * 64);
                 let b0 = vld1q_s8(xb);
                 let b1 = vld1q_s8(xb.add(16));
                 let b2 = vld1q_s8(xb.add(32));

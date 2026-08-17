@@ -363,7 +363,8 @@ unsafe fn multi_rows_q8_packed(
             let xp_slice = if xp.is_empty() {
                 xp
             } else {
-                &xp[(l0 / 2) * nb * 64..(l1 / 2) * nb * 64]
+                // 256-lane blocks are 16 whole tiles
+                &xp[(l0 / 16) * nb * 8 * 64..((l1 + 15) / 16) * nb * 8 * 64]
             };
             // SAFETY: forwarded contract; lane blocks are disjoint.
             unsafe {
@@ -393,7 +394,10 @@ unsafe fn multi_rows_q8_packed(
                 while l0 + 2 <= lanes.len() {
                     let width = (lanes.len() - l0).min(16);
                     let pairs = width / 2;
-                    let xps = &xp[(l0 / 2) * nb * 64..(l0 / 2 + pairs) * nb * 64];
+                    // tile-major: tile index = l0/16 (l0 advances by 16 -
+                    // or the tail width - so it stays tile-aligned)
+                    let tix = l0 / 16;
+                    let xps = &xp[tix * nb * 8 * 64..(tix + 1) * nb * 8 * 64];
                     // SAFETY: i8mm checked inside smmla_available; slices
                     // hold nb blocks in the pair layout.
                     unsafe {
@@ -805,45 +809,49 @@ impl Q8Head {
             let nbx = cols / 32;
             let xp: Vec<i8> = if crate::quant::q8::smmla_available() {
                 let pairs = lanes / 2;
-                let mut xp = vec![0i8; pairs * nbx * 64];
-                // pack pairs in parallel (single-threaded this was a
-                // measurable slice of every prefill GEMM call)
+                // tile-major pack: tiles of 8 pairs (16 lanes), each tile a
+                // contiguous nbx*8*64-byte region ordered (block, pair) so
+                // the SMMLA kernel streams one address per block; the last
+                // tile may be partial (kernel reads only `pairs` of it)
+                let tiles = pairs.div_ceil(8);
+                let mut xp = vec![0i8; tiles * nbx * 8 * 64];
                 let pl = crate::model::pool::pool();
-                let workers = pl.workers.max(1).min(pairs.max(1));
-                let chunk = pairs.div_ceil(workers.max(1)).max(1);
+                let workers = pl.workers.max(1).min(tiles.max(1));
+                let chunk = tiles.div_ceil(workers.max(1)).max(1);
                 let xp_ptr = xp.as_mut_ptr() as usize;
                 let xqs_ptr = xqs.as_ptr() as usize;
                 let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
-                let mut p0 = 0usize;
-                while p0 < pairs {
-                    let p1 = (p0 + chunk).min(pairs);
+                let mut t0 = 0usize;
+                while t0 < tiles {
+                    let t1 = (t0 + chunk).min(tiles);
                     jobs.push(Box::new(move || {
-                        // SAFETY: disjoint pair ranges; the pool barrier
+                        // SAFETY: disjoint tile ranges; the pool barrier
                         // outlives the captured pointers.
                         unsafe {
                             let xqs_all = std::slice::from_raw_parts(
                                 xqs_ptr as *const crate::quant::q8::Q8Vec,
-                                p1 * 2,
+                                pairs * 2,
                             );
-                            let c = std::slice::from_raw_parts_mut(
-                                (xp_ptr as *mut i8).add(p0 * nbx * 64),
-                                (p1 - p0) * nbx * 64,
-                            );
-                            for p in p0..p1 {
+                            for tile in t0..t1 {
+                                let base = (xp_ptr as *mut i8).add(tile * nbx * 8 * 64);
+                                let np = (pairs - tile * 8).min(8);
                                 for g in 0..nbx {
-                                    for seg in 0..4 {
-                                        for l in 0..2 {
-                                            let src = &xqs_all[p * 2 + l].q
-                                                [g * 32 + seg * 8..g * 32 + seg * 8 + 8];
-                                            let d = ((p - p0) * nbx + g) * 64 + seg * 16 + l * 8;
-                                            c[d..d + 8].copy_from_slice(src);
+                                    for pin in 0..np {
+                                        let p = tile * 8 + pin;
+                                        for seg in 0..4 {
+                                            for l in 0..2 {
+                                                let src = &xqs_all[p * 2 + l].q
+                                                    [g * 32 + seg * 8..g * 32 + seg * 8 + 8];
+                                                let d = (g * 8 + pin) * 64 + seg * 16 + l * 8;
+                                                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(d), 8);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }));
-                    p0 = p1;
+                    t0 = t1;
                 }
                 pl.run(jobs);
                 xp
@@ -1670,13 +1678,13 @@ pub fn kernbench_cmd(_args: &[String]) {
                 }
             }
         }
-        let mut xp = vec![0i8; 4 * nb * 64];
+        let mut xp = vec![0i8; nb * 8 * 64];
         for p in 0..4 {
             for g in 0..nb {
                 for seg in 0..4 {
                     for l in 0..2 {
                         let src = &xqs[p * 2 + l].q[g * 32 + seg * 8..g * 32 + seg * 8 + 8];
-                        let d = (p * nb + g) * 64 + seg * 16 + l * 8;
+                        let d = (g * 8 + p) * 64 + seg * 16 + l * 8;
                         xp[d..d + 8].copy_from_slice(src);
                     }
                 }
