@@ -309,20 +309,16 @@ unsafe fn multi_rows_q8(
                 &scales[(r + 3) * nb..(r + 4) * nb],
             ];
             let mut l0 = 0usize;
-            while l0 + 4 <= lanes.len() {
-                let tile = unsafe {
-                    crate::quant::q8::rows4_dot_fma_x4(
-                        w4,
-                        s4,
-                        [lanes[l0], lanes[l0 + 1], lanes[l0 + 2], lanes[l0 + 3]],
-                    )
-                };
-                for (dl, lane_out) in tile.iter().enumerate() {
+            while l0 + 2 <= lanes.len() {
+                let width = (lanes.len() - l0).min(8);
+                let tile =
+                    unsafe { crate::quant::q8::rows4_dot_fma_x4(w4, s4, &lanes[l0..l0 + width]) };
+                for (dl, lane_out) in tile.iter().take(width).enumerate() {
                     for k in 0..4 {
                         unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
                     }
                 }
-                l0 += 4;
+                l0 += width;
             }
             for (l, lane) in lanes.iter().enumerate().skip(l0) {
                 let sums = unsafe { crate::quant::q8::rows4_dot_fma(w4, s4, lane.0, lane.1) };
@@ -565,7 +561,12 @@ impl Q8Head {
                                 // 4x4 register tile: weights load once per
                                 // block for four lanes at a time
                                 let mut l0 = 0usize;
-                                while l0 + 4 <= xqs.len() {
+                                while l0 + 2 <= xqs.len() {
+                                    let width = (xqs.len() - l0).min(8);
+                                    let lane_refs: Vec<(&[i8], &[f32])> = xqs[l0..l0 + width]
+                                        .iter()
+                                        .map(|x| (&x.q[..], &x.scales[..]))
+                                        .collect();
                                     // SAFETY: dotprod checked; slices hold nb blocks
                                     let tile = unsafe {
                                         crate::quant::q8::rows4_dot_fma_x4(
@@ -581,15 +582,10 @@ impl Q8Head {
                                                 &this.scales[(r + 2) * nb..(r + 3) * nb],
                                                 &this.scales[(r + 3) * nb..(r + 4) * nb],
                                             ],
-                                            [
-                                                (&xqs[l0].q[..], &xqs[l0].scales[..]),
-                                                (&xqs[l0 + 1].q[..], &xqs[l0 + 1].scales[..]),
-                                                (&xqs[l0 + 2].q[..], &xqs[l0 + 2].scales[..]),
-                                                (&xqs[l0 + 3].q[..], &xqs[l0 + 3].scales[..]),
-                                            ],
+                                            &lane_refs,
                                         )
                                     };
-                                    for (dl, lane_out) in tile.iter().enumerate() {
+                                    for (dl, lane_out) in tile.iter().take(width).enumerate() {
                                         for k in 0..4 {
                                             unsafe {
                                                 *(out_ptrs[l0 + dl] as *mut f32).add(r + k) =
@@ -597,7 +593,7 @@ impl Q8Head {
                                             }
                                         }
                                     }
-                                    l0 += 4;
+                                    l0 += width;
                                 }
                                 for (l, xq) in xqs.iter().enumerate().skip(l0) {
                                     // SAFETY: dotprod checked; slices hold nb blocks

@@ -64,8 +64,17 @@ pub fn delta_step(
     for x in s.iter_mut() {
         *x *= decay;
     }
-    // what the state already predicts for this key
-    let mut pred = vec![0.0f32; vd];
+    // what the state already predicts for this key - stack scratch: this
+    // runs once per (head, token) and a heap allocation here was ~10% of
+    // the whole prefill scan (heap fallback for exotic value dims)
+    let mut pred_stack = [0.0f32; 256];
+    let mut pred_heap;
+    let pred: &mut [f32] = if vd <= 256 {
+        &mut pred_stack[..vd]
+    } else {
+        pred_heap = vec![0.0f32; vd];
+        &mut pred_heap
+    };
     for i in 0..kd {
         let ki = k[i];
         if ki == 0.0 {
@@ -580,10 +589,13 @@ pub fn lin_attn_step(
     let rep = c.lin_v_heads / c.lin_k_heads.max(1);
     let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
     let mut mixed = vec![0.0f32; vt];
+    // reusable q/k scratch (two heap allocations per head added up)
+    let mut q = vec![0.0f32; kd];
+    let mut k = vec![0.0f32; kd];
     for h in 0..c.lin_v_heads {
         let kh = h / rep.max(1);
-        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
-        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        q.copy_from_slice(&conved[kh * kd..(kh + 1) * kd]);
+        k.copy_from_slice(&conved[kt + kh * kd..kt + (kh + 1) * kd]);
         let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
         l2norm(&mut q, 1e-6);
         l2norm(&mut k, 1e-6);
@@ -2315,6 +2327,54 @@ fn ranges(items: usize, workers: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Residual add plus RMS norm over all positions, parallel over token
+/// ranges above a small-batch threshold (both are element-wise or
+/// per-token, so the split is bit-identical to the serial loop).
+fn par_add_norm(
+    hidden: &mut [f32],
+    add: Option<&[f32]>,
+    w: &[f32],
+    eps: f32,
+    normed: &mut [f32],
+    t_count: usize,
+    d: usize,
+) {
+    if t_count < 64 {
+        if let Some(a) = add {
+            for i in 0..t_count * d {
+                hidden[i] += a[i];
+            }
+        }
+        for t in 0..t_count {
+            rmsnorm(&hidden[t * d..(t + 1) * d], w, eps, &mut normed[t * d..(t + 1) * d]);
+        }
+        return;
+    }
+    let workers = prefill_workers(t_count);
+    std::thread::scope(|s| {
+        let mut h_rest = &mut hidden[..t_count * d];
+        let mut n_rest = &mut normed[..t_count * d];
+        for (t0, t1) in ranges(t_count, workers) {
+            let n = t1 - t0;
+            let (h_c, hr) = h_rest.split_at_mut(n * d);
+            let (n_c, nr) = n_rest.split_at_mut(n * d);
+            h_rest = hr;
+            n_rest = nr;
+            let a_c = add.map(|a| &a[t0 * d..t1 * d]);
+            s.spawn(move || {
+                if let Some(a) = a_c {
+                    for (hv, av) in h_c.iter_mut().zip(a) {
+                        *hv += av;
+                    }
+                }
+                for t in 0..n {
+                    rmsnorm(&h_c[t * d..(t + 1) * d], w, eps, &mut n_c[t * d..(t + 1) * d]);
+                }
+            });
+        }
+    });
+}
+
 /// Splits `items` into contiguous ranges of ~equal CAUSAL cost: token t
 /// attends over base+t+1 positions, so uniform ranges make the last
 /// worker do about twice the work of the first at base=0. Cuts are placed
@@ -2416,10 +2476,9 @@ impl QwenModel {
             let data = &self.bin.data;
             {
                 let w = tensor(data, &layer.input_norm);
-                for t in 0..t_count {
-                    let (h, n) = (&hidden[t * d..(t + 1) * d], &mut normed[t * d..(t + 1) * d]);
-                    rmsnorm(h, w, c.norm_eps as f32, n);
-                }
+                // fold the previous layer's MLP residual into this norm pass
+                let add = if l > 0 { Some(&attn_out[..t_count * d]) } else { None };
+                par_add_norm(&mut hidden, add, w, c.norm_eps as f32, &mut normed, t_count, d);
             }
             let q8 = self.q8_spine[l].as_ref();
             let t_attn = std::time::Instant::now();
@@ -2436,15 +2495,17 @@ impl QwenModel {
                 }
                 _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
             }
-            for i in 0..t_count * d {
-                hidden[i] += attn_out[i];
-            }
             {
                 let w = tensor(data, &layer.post_norm);
-                for t in 0..t_count {
-                    let (h, n) = (&hidden[t * d..(t + 1) * d], &mut normed[t * d..(t + 1) * d]);
-                    rmsnorm(h, w, c.norm_eps as f32, n);
-                }
+                par_add_norm(
+                    &mut hidden,
+                    Some(&attn_out[..t_count * d]),
+                    w,
+                    c.norm_eps as f32,
+                    &mut normed,
+                    t_count,
+                    d,
+                );
             }
             let t_mlp = std::time::Instant::now();
             mlp_prefill(
@@ -2458,9 +2519,11 @@ impl QwenModel {
                 &mut attn_out,
             );
             dprof_add(2, t_mlp.elapsed());
-            for i in 0..t_count * d {
-                hidden[i] += attn_out[i];
-            }
+            // the MLP residual folds into the NEXT layer's input-norm pass;
+            // after the last layer it is applied just below
+        }
+        for i in 0..t_count * d {
+            hidden[i] += attn_out[i];
         }
         let t_head = std::time::Instant::now();
 
@@ -2706,6 +2769,10 @@ fn lin_attn_prefill(
                 state_rest = sr;
                 mixed_rest = mr;
                 s.spawn(move || {
+                    // reusable per-worker q/k scratch: a heap allocation
+                    // per (head, token) was a measurable slice of the scan
+                    let mut q = vec![0.0f32; kd];
+                    let mut k = vec![0.0f32; kd];
                     for h in h0..h1 {
                         let state_h =
                             &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
@@ -2714,8 +2781,8 @@ fn lin_attn_prefill(
                         let kh = h / rep.max(1);
                         for t in 0..t_count {
                             let row = &conved[t * conv_dim..(t + 1) * conv_dim];
-                            let mut q: Vec<f32> = row[kh * kd..(kh + 1) * kd].to_vec();
-                            let mut k: Vec<f32> = row[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+                            q.copy_from_slice(&row[kh * kd..(kh + 1) * kd]);
+                            k.copy_from_slice(&row[kt + kh * kd..kt + (kh + 1) * kd]);
                             let v = &row[2 * kt + h * vd..2 * kt + (h + 1) * vd];
                             l2norm(&mut q, 1e-6);
                             l2norm(&mut k, 1e-6);
@@ -2816,10 +2883,13 @@ fn lin_attn_recur(
     let rep = c.lin_v_heads / c.lin_k_heads.max(1);
     let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
     let _ = vt;
+    // reusable q/k scratch (two heap allocations per head added up)
+    let mut q = vec![0.0f32; kd];
+    let mut k = vec![0.0f32; kd];
     for h in 0..c.lin_v_heads {
         let kh = h / rep.max(1);
-        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
-        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        q.copy_from_slice(&conved[kh * kd..(kh + 1) * kd]);
+        k.copy_from_slice(&conved[kt + kh * kd..kt + (kh + 1) * kd]);
         let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
         l2norm(&mut q, 1e-6);
         l2norm(&mut k, 1e-6);
@@ -3867,10 +3937,13 @@ fn lin_attn_tail(
     let rep = c.lin_v_heads / c.lin_k_heads.max(1);
     let (kd, vd) = (c.lin_k_dim, c.lin_v_dim);
     let mut mixed = vec![0.0f32; vt];
+    // reusable q/k scratch (two heap allocations per head added up)
+    let mut q = vec![0.0f32; kd];
+    let mut k = vec![0.0f32; kd];
     for h in 0..c.lin_v_heads {
         let kh = h / rep.max(1);
-        let mut q: Vec<f32> = conved[kh * kd..(kh + 1) * kd].to_vec();
-        let mut k: Vec<f32> = conved[kt + kh * kd..kt + (kh + 1) * kd].to_vec();
+        q.copy_from_slice(&conved[kh * kd..(kh + 1) * kd]);
+        k.copy_from_slice(&conved[kt + kh * kd..kt + (kh + 1) * kd]);
         let v = &conved[2 * kt + h * vd..2 * kt + (h + 1) * vd];
         l2norm(&mut q, 1e-6);
         l2norm(&mut k, 1e-6);

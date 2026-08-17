@@ -784,7 +784,7 @@ unsafe fn row_dot_fp4_multi_sdot(prow: &[u8], srow: &[u8], xqs: &[&Q8Vec], out: 
     }
 }
 
-/// Four rows x four lanes, register-tiled: each block's eight weight
+/// Four rows x up to eight lanes, register-tiled: each block's eight weight
 /// vectors load ONCE and serve all four activations. Per lane the
 /// instruction sequence is rows4_dot_fma exactly (same sdot pairs, same
 /// pairwise collapse, same scale-vector FMA, block-sequential), so each
@@ -797,12 +797,13 @@ unsafe fn row_dot_fp4_multi_sdot(prow: &[u8], srow: &[u8], xqs: &[&Q8Vec], out: 
 pub unsafe fn rows4_dot_fma_x4(
     w: [&[i8]; 4],
     s: [&[f32]; 4],
-    xqs: [(&[i8], &[f32]); 4],
-) -> [[f32; 4]; 4] {
+    xqs: &[(&[i8], &[f32])],
+) -> [[f32; 4]; 8] {
     use std::arch::aarch64::*;
+    debug_assert!(xqs.len() <= 8, "lane tile is at most 8 wide");
     let nb = xqs[0].1.len();
     unsafe {
-        let mut acc = [vdupq_n_f32(0.0); 4]; // per lane, rows in vector lanes
+        let mut acc = [vdupq_n_f32(0.0); 8]; // per lane, rows in vector lanes
         for g in 0..nb {
             let w00 = vld1q_s8(w[0].as_ptr().add(g * 32));
             let w01 = vld1q_s8(w[0].as_ptr().add(g * 32 + 16));
@@ -849,8 +850,8 @@ pub unsafe fn rows4_dot_fma_x4(
                 acc[l] = vfmaq_f32(acc[l], sums, sv);
             }
         }
-        let mut out = [[0.0f32; 4]; 4];
-        for l in 0..4 {
+        let mut out = [[0.0f32; 4]; 8];
+        for l in 0..xqs.len() {
             vst1q_f32(out[l].as_mut_ptr(), acc[l]);
         }
         out
