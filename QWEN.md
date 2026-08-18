@@ -287,9 +287,11 @@ What moves and why:
   convert once, activations at the staging boundary via fcvtn/fcvtl
   inline asm); accumulation is wider. `MICROKIMI_QWEN_GPU_F32=1`
   restores f32 storage. The scan is always f32.
-- **Decode stays on CPU**: a Metal dispatch costs ~0.25 ms of sync
-  latency and a single token walks ~100 matvecs - per-op offload would
-  cost more than the whole CPU token.
+- **Whole layers**: a dense linear-attention layer encodes as one
+  command buffer (input norm, projections, causal conv + SiLU, scan
+  prep, delta scan, gated norm, out_proj, residual, post-norm, MLP) so
+  the CPU tissue between GPU ops all but disappears (`split:` line of
+  `qwengpubench`).
 
 The offload is not bit-exact against the CPU path (GPU reassociation,
 no q8 activation quantization); `qwengpubench` prints the measured
@@ -297,6 +299,47 @@ last-position logits disagreement next to the timing, plus the
 gpu-versus-cpu-tissue split. Every failure path falls back to the CPU
 kernels. Off by default; small batches and lane decode never take this
 route. Numbers in [RESULTS.md](RESULTS.md).
+
+## GPU decode (macOS)
+
+Under the same switch, every single-token step after a prefill runs
+as ONE command buffer against resident state: the token's 24 layers,
+final norm and lm_head, one CPU wait per token. A per-op offload would
+lose to the CPU (a dispatch costs ~0.25 ms of sync latency and a token
+walks ~100 matvecs); the graph pays that latency once.
+
+- **Bytes, not FLOPs**: a decode token is a weight stream. The MLP is
+  read as stored (MXFP4 nibbles + e8m0 scale bytes, `dec_matvec_fp4`,
+  exact against the CPU dequantization); the attention projections and
+  the lm_head are q8_0 rows built once at load (int8 + one f16 scale
+  per block of 32, `dec_matvec_q8`); one simdgroup streams one row.
+  `MICROKIMI_QWEN_GPU_DEC_F16=1` keeps f16 copies of everything (the
+  A/B arm: 2x the bytes, 14 ms/token instead of 8 on the M5).
+- **State**: linear conv/scan states in f32 and the KV cache in f16 live
+  on the device. The CPU caches stay authoritative for everything else:
+  a batch, a full-logits pass or a snapshot first brings the resident
+  state home (`GpuDecoder::export`) and drops the decoder, which
+  rebuilds on demand. `MICROKIMI_QWEN_GPU_NODECODE=1` pins decode to the
+  CPU while the prefill still offloads.
+- **Kernels**: `dec_matvec` (f16), `dec_matvec_fp4`, `dec_matvec_q8`,
+  `dec_attn` (lanes split the head dim, 32 positions per simdgroup
+  chunk, online softmax, log-sum-exp combine; head dims up to 256),
+  `dec_qk_prep` (q/k norm, partial RoPE, KV append), `dec_conv`,
+  `dec_add_norm`, `dec_add`, plus the shared `scan_prep_f16`,
+  `delta_scan`, `gated_rmsnorm_f16` and `silu_mul_f16`.
+- **Verifiers first**: `gpudecodebench` certifies each kernel on
+  synthetic inputs (`dec_attn check`, `dec_matvec_fp4/q8 check`) before
+  any wiring, then decodes N tokens on the GPU and the CPU from the same
+  state and prints the greedy agreement; `--trace` prints the per-layer
+  hidden-state error, `--trace --layer L` the sub-stages of one
+  full-attention layer; `--kern` streams the decode shapes and prints
+  GB/s; `MICROKIMI_GPU_DECODE_TIMING=1` splits encode wall from GPU
+  busy time.
+
+Not bit-exact against the CPU (f16 activations and KV, q8 rows): the
+per-layer hidden state stays within ~2e-2 relative and the greedy
+tokens agree over the measured runs; the numbers are in
+[RESULTS.md](RESULTS.md).
 
 The CPU prefill itself is fully parallel (SiLU merge, causal
 convolution, causally weighted token ranges), and the pooled row

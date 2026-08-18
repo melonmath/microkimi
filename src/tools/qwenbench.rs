@@ -425,6 +425,7 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             gemm_calls,
             (g - gm).max(0.0)
         );
+        crate::model::metal::layer_prof_print();
         println!("  last-position logits: max rel diff {:.2e} vs the CPU path", max_rel);
         println!(
             "  precision: {} storage in the GEMMs (MICROKIMI_QWEN_GPU_F32=1 for f32)",

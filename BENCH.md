@@ -15,8 +15,12 @@ The battery is paired and reports per-round values; quote medians.
 Arms: decode with the f32/q8/fp4 spines, SDOT A/B, all-cores A/B,
 batched vs sequential prefill, GPU prefill vs CPU prefill (in-process,
 with the logits disagreement), lane batching, and MTP when the model
-has a draft head. `microkimi qwengpubench --model q08.bin` runs the
-GPU prefill arm alone.
+has a draft head, plus the GPU decode arm on macOS. `microkimi
+qwengpubench --model q08.bin` runs the GPU prefill arm alone;
+`microkimi gpudecodebench --model q08.bin --steps 64` runs the GPU
+decode arm alone: kernel checks, then N tokens decoded on the GPU and
+the CPU from the same state, ms/token for both (first step apart) and
+the greedy agreement. Read `tg64` against its median.
 
 ## llama.cpp, same machine
 
@@ -50,7 +54,7 @@ llama.cpp CPU rows for the same reason.
 
 - microkimi's MLP is MXFP4 (4-bit) while Q8_0 is 8-bit everywhere, so
   microkimi reads less weight per token than llama.cpp at Q8_0.
-- the q8 spine and the GPU prefill are opt-in; the default engine path
+- the q8 spine and the GPU paths are opt-in; the default engine path
   is bit-exact f32. Quote the arm that matches the property you need,
   with the NLL deltas from [QWEN.md](QWEN.md) next to any speed claim.
 - absolute numbers want a plugged-in host; on battery, use the paired

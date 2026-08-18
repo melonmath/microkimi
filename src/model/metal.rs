@@ -2172,19 +2172,29 @@ const DELTA_SCAN_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// One threadgroup per head, one thread per value column. Layouts:
+// The recurrent state lives in registers. Inside a SIMD group, SCAN_L
+// consecutive lanes share a set of SCAN_C consecutive value columns and
+// split the kd state rows between them (per = kd / SCAN_L rows per lane;
+// kd a multiple of SCAN_L, per <= 16); the 32/SCAN_L lane groups of the
+// SIMD group take consecutive column sets. No private array beyond the
+// register tile, no threadgroup memory, no barrier: the per-token dot
+// products (prediction, readout) reduce over the SCAN_L lanes with
+// xor-shuffles, and k/q are read once per token per lane for SCAN_C
+// columns. Threadgroups of 128 threads carry 4 * (32/SCAN_L) * SCAN_C
+// columns; the host dispatches heads x ceil(vd / that) threadgroups.
+// Layouts:
 //   q, k    [t, heads, kd]   (kv-heads pre-expanded across their group)
 //   v       [t, heads, vd]
 //   beta    [t, heads]
 //   decay   [t, heads]       (exp(g), precomputed on the CPU)
 //   state   [heads, kd, vd]  (read-write, f32 - the recurrent object)
 //   out     [heads, t, vd]
-// Per token the group cooperatively stages k and q in threadgroup
-// memory (one device read per value instead of one per thread), then
-// each thread runs the CPU delta_step order on its private state
-// column: decay, prediction, beta-scaled delta, q readout. The host
-// dispatches EXACT threadgroups (heads x vd threads), so every thread
-// reaches every barrier.
+// Per token, in the CPU delta_step order: decay, prediction, beta-scaled
+// delta, q readout.
+constant uint SCAN_L = 16;
+constant uint SCAN_C = 4;
+constant uint SCAN_PER_MAX = 16;
+
 kernel void delta_scan(device const float* q     [[buffer(0)]],
                        device const float* k     [[buffer(1)]],
                        device const float* v     [[buffer(2)]],
@@ -2193,39 +2203,72 @@ kernel void delta_scan(device const float* q     [[buffer(0)]],
                        device float*       state [[buffer(5)]],
                        device float*       out   [[buffer(6)]],
                        constant uint4&     dims  [[buffer(7)]],
-                       uint j     [[thread_position_in_threadgroup]],
-                       uint h     [[threadgroup_position_in_grid]],
-                       uint lanes [[threads_per_threadgroup]]) {
+                       uint tg    [[threadgroup_position_in_grid]],
+                       uint lane  [[thread_position_in_threadgroup]]) {
     uint t_count = dims.x, heads = dims.y, kd = dims.z, vd = dims.w;
-    threadgroup float kq[256];
-    float s[128];
-    device float* scol = state + (size_t)h * kd * vd + j;
-    for (uint i = 0; i < kd; i++) { s[i] = scol[i * vd]; }
+    uint sg = lane / 32u, sl = lane & 31u;
+    uint grp = sl / SCAN_L, rl = sl % SCAN_L;
+    uint groups_per_sg = 32u / SCAN_L;
+    uint cols_per_tg = 4u * groups_per_sg * SCAN_C;
+    uint groups = (vd + cols_per_tg - 1u) / cols_per_tg;
+    uint h = tg / groups;
+    uint j0 = (tg % groups) * cols_per_tg + (sg * groups_per_sg + grp) * SCAN_C;
+    if (h >= heads || j0 >= vd) { return; }
+    uint per = kd / SCAN_L;
+    uint nc = min(SCAN_C, vd - j0);
+    float s[SCAN_PER_MAX][SCAN_C];
+    for (uint i = 0; i < SCAN_PER_MAX; i++) { for (uint c = 0; c < SCAN_C; c++) { s[i][c] = 0.0f; } }
+    device float* sbase = state + (size_t)h * kd * vd + j0;
+    for (uint i = 0; i < per; i++) { for (uint c = 0; c < nc; c++) { s[i][c] = sbase[(rl * per + i) * vd + c]; } }
     for (uint t = 0; t < t_count; t++) {
-        device const float* kt = k + (size_t)(t * heads + h) * kd;
-        device const float* qt = q + (size_t)(t * heads + h) * kd;
-        for (uint i = j; i < kd; i += lanes) {
-            kq[i] = kt[i];
-            kq[kd + i] = qt[i];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float* kt = k + (size_t)(t * heads + h) * kd + rl * per;
+        device const float* qt = q + (size_t)(t * heads + h) * kd + rl * per;
+        device const float* vt = v + (size_t)(t * heads + h) * vd + j0;
         float dec = decay[t * heads + h];
         float bet = beta[t * heads + h];
-        float vj = v[(size_t)(t * heads + h) * vd + j];
-        float pred = 0.0f;
-        for (uint i = 0; i < kd; i++) { s[i] *= dec; pred += kq[i] * s[i]; }
-        float delta = (vj - pred) * bet;
-        float o = 0.0f;
-        for (uint i = 0; i < kd; i++) {
-            s[i] += kq[i] * delta;
-            o += kq[kd + i] * s[i];
+        float kk[SCAN_PER_MAX], qq[SCAN_PER_MAX];
+        for (uint i = 0; i < per; i++) { kk[i] = kt[i]; qq[i] = qt[i]; }
+        float pred[SCAN_C];
+        for (uint c = 0; c < SCAN_C; c++) { pred[c] = 0.0f; }
+        for (uint i = 0; i < per; i++) {
+            for (uint c = 0; c < SCAN_C; c++) { s[i][c] *= dec; pred[c] += kk[i] * s[i][c]; }
         }
-        out[((size_t)h * t_count + t) * vd + j] = o;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float delta[SCAN_C];
+        for (uint c = 0; c < SCAN_C; c++) {
+            float p = pred[c];
+            for (uint off = SCAN_L / 2u; off > 0u; off >>= 1u) { p += simd_shuffle_xor(p, (ushort)off); }
+            delta[c] = ((c < nc) ? (vt[c] - p) : 0.0f) * bet;
+        }
+        float o[SCAN_C];
+        for (uint c = 0; c < SCAN_C; c++) { o[c] = 0.0f; }
+        for (uint i = 0; i < per; i++) {
+            for (uint c = 0; c < SCAN_C; c++) { s[i][c] += kk[i] * delta[c]; o[c] += qq[i] * s[i][c]; }
+        }
+        for (uint c = 0; c < SCAN_C; c++) {
+            float oc = o[c];
+            for (uint off = SCAN_L / 2u; off > 0u; off >>= 1u) { oc += simd_shuffle_xor(oc, (ushort)off); }
+            if (rl == 0u && c < nc) { out[((size_t)h * t_count + t) * vd + j0 + c] = oc; }
+        }
     }
-    for (uint i = 0; i < kd; i++) { scol[i * vd] = s[i]; }
+    for (uint i = 0; i < per; i++) { for (uint c = 0; c < nc; c++) { sbase[(rl * per + i) * vd + c] = s[i][c]; } }
 }
 "#;
+
+/// Lanes per column set and columns per lane group in `delta_scan`
+/// (SCAN_L / SCAN_C in the shader); kd must be a multiple of SCAN_L with
+/// kd / SCAN_L <= 16.
+const SCAN_L: usize = 16;
+const SCAN_C: usize = 4;
+
+/// Threadgroups for the delta scan grid: heads x ceil(vd / columns per threadgroup).
+fn scan_groups(heads: usize, vd: usize) -> usize {
+    heads * vd.div_ceil(4 * (32 / SCAN_L) * SCAN_C)
+}
+
+/// The scan kernel's kd budget: a multiple of SCAN_L, at most 16 rows per lane.
+fn scan_kd_ok(kd: usize) -> bool {
+    kd % SCAN_L == 0 && kd / SCAN_L <= 16
+}
 
 struct ScanCtx {
     pipeline: Id,
@@ -2314,8 +2357,8 @@ pub fn gpu_delta_scan(
     kd: usize,
     vd: usize,
 ) -> bool {
-    if kd > 128 || vd > 128 {
-        return false; // thread-private column and threadgroup staging budgets
+    if !scan_kd_ok(kd) {
+        return false; // register-tile scan: kd/SCAN_L state rows per lane, up to 16
     }
     assert_eq!(q.len(), t_count * heads * kd);
     assert_eq!(k.len(), t_count * heads * kd);
@@ -2383,8 +2426,8 @@ pub fn gpu_delta_scan(
             f(
                 encoder,
                 sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-                MTLSize { width: heads as u64, height: 1, depth: 1 },
-                MTLSize { width: vd as u64, height: 1, depth: 1 },
+                MTLSize { width: scan_groups(heads, vd) as u64, height: 1, depth: 1 },
+                MTLSize { width: 128, height: 1, depth: 1 },
             );
         }
         msg_void(encoder, sel("endEncoding"));
@@ -3452,6 +3495,39 @@ pub struct LinDims {
 /// `scan_state` are updated in place. False = the caller runs the CPU
 /// layer (nothing was mutated).
 #[allow(clippy::too_many_arguments)]
+/// Per-stage GPU micros of gpu_linear_layer under MICROKIMI_GPU_LAYER_PROF=1:
+/// 0 norm, 1 projections, 2 conv, 3 scan prep, 4 scan, 5 gated norm,
+/// 6 out_proj, 7 add+post-norm, 8 MLP.
+static LAYER_PROF: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn layer_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_GPU_LAYER_PROF").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Prints and resets the per-stage split of the linear-layer command
+/// buffer (when MICROKIMI_GPU_LAYER_PROF=1), in ms total since the last print.
+pub fn layer_prof_print() {
+    if !layer_prof_on() {
+        return;
+    }
+    let names = ["norm", "proj", "conv", "scanprep", "scan", "gnorm", "out_proj", "add+norm", "mlp"];
+    let v: Vec<u64> = LAYER_PROF.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+    let total: u64 = v.iter().sum();
+    let parts: Vec<String> = names.iter().zip(&v).map(|(n, x)| format!("{} {:.2}", n, *x as f64 / 1000.0)).collect();
+    println!("  layer stages (ms, GPU, all linear layers): {} | total {:.2}", parts.join(" | "), total as f64 / 1000.0);
+}
+
 pub fn gpu_linear_layer(
     w: &LinLayerRefs,
     gated_w: &[f32], // the DeltaNet output norm weight [vd]
@@ -3462,7 +3538,7 @@ pub fn gpu_linear_layer(
     scan_state: &mut [f32],
     attn_plus_mlp: &mut [f32],
 ) -> bool {
-    if !gemm_f16_on() || dm.kd > 128 || dm.vd > 128 || dm.conv_k > 9 {
+    if !gemm_f16_on() || dm.kd > 128 || !scan_kd_ok(dm.kd) || dm.vd > 128 || dm.conv_k > 9 {
         return false;
     }
     let (d, heads, kd, vd, inter) = (dm.d, dm.heads, dm.kd, dm.vd, dm.inter);
@@ -3599,7 +3675,23 @@ pub fn gpu_linear_layer(
             x
         };
 
-        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        let mut cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        // MICROKIMI_GPU_LAYER_PROF=1: each stage in its own command buffer,
+        // GPU time per stage accumulated (relative costs, not the fused time)
+        let prof = layer_prof_on();
+        macro_rules! stage {
+            ($i:expr) => {
+                if prof {
+                    msg_void(cmdbuf, sel("commit"));
+                    msg_void(cmdbuf, sel("waitUntilCompleted"));
+                    let getf: extern "C" fn(Id, Sel) -> f64 =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    let dt = getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime"));
+                    LAYER_PROF[$i].fetch_add((dt * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+                    cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+                }
+            };
+        }
 
         // 1. input norm: normed = rmsnorm(hidden) * (1 + norm_w)   [hidden f16 view]
         {
@@ -3616,12 +3708,14 @@ pub fn gpu_linear_layer(
             disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(0);
         // 2. projections from normed: qkv, z, b, a
         let mx = m(b_norm, 0, t, d);
         enc_gemm(k_qkv, sel_enc, cmdbuf, mx, m(b_qkv, 0, conv_dim, d), m(b_qkvo, 0, t, conv_dim));
         enc_gemm(k_z, sel_enc, cmdbuf, mx, m(b_z, 0, vt, d), m(b_zo, 0, t, vt));
         enc_gemm(k_ba, sel_enc, cmdbuf, mx, m(b_b, 0, heads, d), m(b_ba, 0, t, heads));
         enc_gemm(k_ba, sel_enc, cmdbuf, mx, m(b_a, 0, heads, d), m(b_ba, t * heads * 2, t, heads));
+        stage!(1);
         // 3. causal conv + SiLU (state carried)
         {
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
@@ -3637,6 +3731,7 @@ pub fn gpu_linear_layer(
             f(e, sel("dispatchThreads:threadsPerThreadgroup:"), MTLSize { width: conv_dim as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(2);
         // 4. scan prep -> q,k,v,beta,decay (f32, scan layouts)
         {
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
@@ -3658,6 +3753,7 @@ pub fn gpu_linear_layer(
             disp_tg(e, sel_dtg, MTLSize { width: (t * heads) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(3);
         // 5. delta scan (state in place, mixed head-major)
         {
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
@@ -3671,9 +3767,10 @@ pub fn gpu_linear_layer(
             set_buf(e, sel_sb, b_mixhm, 0, 6);
             let dims: [u32; 4] = [t as u32, heads as u32, kd as u32, vd as u32];
             set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 16, 7);
-            disp_tg(e, sel_dtg, MTLSize { width: heads as u64, height: 1, depth: 1 }, MTLSize { width: vd as u64, height: 1, depth: 1 });
+            disp_tg(e, sel_dtg, MTLSize { width: scan_groups(heads, vd) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(4);
         // 6. gated norm: reads the scan's f32 head-major mix, writes the
         //    token-major f16 GEMM input
         {
@@ -3689,8 +3786,10 @@ pub fn gpu_linear_layer(
             disp_tg(e, sel_dtg, MTLSize { width: (t * heads) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(5);
         // 7. out_proj -> attn out
         enc_gemm(k_out, sel_enc, cmdbuf, m(b_mixtm, 0, t, vt), m(b_out, 0, d, vt), m(b_attn, 0, t, d));
+        stage!(6);
         // 8. hidden2 = hidden + attn (device-side f16 sum, used ONLY as the
         //    post-norm input; the f32 residual add happens on the CPU from the
         //    returned attn+mlp), normed2 = rmsnorm(hidden2) * (1 + post_w)
@@ -3708,6 +3807,7 @@ pub fn gpu_linear_layer(
             disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
+        stage!(7);
         // 9. MLP: gate/up from normed2, SiLU*up, down -> out
         let mx2 = m(b_norm2, 0, t, d);
         enc_gemm(k_gu, sel_enc, cmdbuf, mx2, m(b_g, 0, inter, d), m(b_h, 0, t, inter));
@@ -3726,6 +3826,7 @@ pub fn gpu_linear_layer(
         }
         enc_gemm(k_dn, sel_enc, cmdbuf, m(b_h, 0, t, inter), m(b_dn, 0, d, inter), m(b_out_mlp, 0, t, d));
 
+        stage!(8);
         msg_void(cmdbuf, sel("commit"));
         msg_void(cmdbuf, sel("waitUntilCompleted"));
 
@@ -4292,6 +4393,146 @@ pub fn dec_matvec_check(rows: usize, cols: usize) -> Option<(f32, f32)> {
         let r1 = rel("dec_matvec_fp4", &out_fp4, &ref_fp4);
         let r2 = rel("dec_matvec_q8", &out_q8, &ref_q8);
         Some((r1, r2))
+    }
+}
+
+/// Certifies and times the delta scan alone: synthetic q/k/v/beta/decay
+/// for `t` tokens, `heads` heads, kd x vd state; CPU reference in the
+/// delta_step order; prints the max relative error of out and state, the
+/// GPU time per pass and the per-token-step latency.
+pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps: usize) -> Option<()> {
+    let (base, sc) = scan_ctx()?;
+    let mut seed = 0x5eed_1234u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q: Vec<f32> = (0..t * heads * kd).map(|_| rnd() * 0.3).collect();
+    let k: Vec<f32> = (0..t * heads * kd).map(|_| rnd() * 0.3).collect();
+    let v: Vec<f32> = (0..t * heads * vd).map(|_| rnd()).collect();
+    let beta: Vec<f32> = (0..t * heads).map(|_| 0.2 + 0.7 * rnd().abs()).collect();
+    let decay: Vec<f32> = (0..t * heads).map(|_| 0.9 + 0.1 * rnd().abs()).collect();
+    let state0: Vec<f32> = (0..heads * kd * vd).map(|_| rnd() * 0.1).collect();
+    // CPU reference
+    let mut st = state0.clone();
+    let mut out_ref = vec![0.0f32; heads * t * vd];
+    for h in 0..heads {
+        for tt in 0..t {
+            let dec = decay[tt * heads + h];
+            let bet = beta[tt * heads + h];
+            let kt = &k[(tt * heads + h) * kd..(tt * heads + h + 1) * kd];
+            let qt = &q[(tt * heads + h) * kd..(tt * heads + h + 1) * kd];
+            for j in 0..vd {
+                let vj = v[(tt * heads + h) * vd + j];
+                let mut pred = 0.0f32;
+                for i in 0..kd {
+                    let sv = st[(h * kd + i) * vd + j] * dec;
+                    st[(h * kd + i) * vd + j] = sv;
+                    pred += kt[i] * sv;
+                }
+                let delta = (vj - pred) * bet;
+                let mut o = 0.0f32;
+                for i in 0..kd {
+                    let sv = st[(h * kd + i) * vd + j] + kt[i] * delta;
+                    st[(h * kd + i) * vd + j] = sv;
+                    o += qt[i] * sv;
+                }
+                out_ref[(h * t + tt) * vd + j] = o;
+            }
+        }
+    }
+    // SAFETY: buffer creation, dispatches, waits, readbacks, releases.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let mk = |x: &[f32]| f(base.device, sel("newBufferWithBytes:length:options:"), x.as_ptr() as *const c_void, (x.len() * 4) as u64, 0);
+        let (bq, bk, bv, bb, bd) = (mk(&q), mk(&k), mk(&v), mk(&beta), mk(&decay));
+        let bs = mk(&state0);
+        let bo = mk(&vec![0.0f32; heads * t * vd]);
+        if [bq, bk, bv, bb, bd, bs, bo].iter().any(|b| b.is_null()) {
+            msg_void(pool, sel("drain"));
+            return None;
+        }
+        let set_pipe: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_bytes: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_tg: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let getf: extern "C" fn(Id, Sel) -> f64 =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let contents: extern "C" fn(Id, Sel) -> *mut c_void =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let encode = |cmdbuf: Id, state_buf: Id| {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel("setComputePipelineState:"), sc.pipeline);
+            let sb = sel("setBuffer:offset:atIndex:");
+            set_buf(e, sb, bq, 0, 0);
+            set_buf(e, sb, bk, 0, 1);
+            set_buf(e, sb, bv, 0, 2);
+            set_buf(e, sb, bb, 0, 3);
+            set_buf(e, sb, bd, 0, 4);
+            set_buf(e, sb, state_buf, 0, 5);
+            set_buf(e, sb, bo, 0, 6);
+            let dims: [u32; 4] = [t as u32, heads as u32, kd as u32, vd as u32];
+            set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 16, 7);
+            disp_tg(
+                e,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MTLSize { width: scan_groups(heads, vd) as u64, height: 1, depth: 1 },
+                MTLSize { width: 128, height: 1, depth: 1 },
+            );
+            msg_void(e, sel("endEncoding"));
+        };
+        // correctness pass on the real state
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        encode(cmdbuf, bs);
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+        let out_gpu = std::slice::from_raw_parts(contents(bo, sel("contents")) as *const f32, heads * t * vd).to_vec();
+        let st_gpu = std::slice::from_raw_parts(contents(bs, sel("contents")) as *const f32, heads * kd * vd).to_vec();
+        // timing passes on a scratch state (its content does not matter for time)
+        let bs2 = mk(&state0);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+            for _ in 0..reps {
+                encode(cmdbuf, bs2);
+            }
+            msg_void(cmdbuf, sel("commit"));
+            msg_void(cmdbuf, sel("waitUntilCompleted"));
+            best = best.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+        }
+        for b in [bq, bk, bv, bb, bd, bs, bo, bs2] {
+            msg_void(b, sel("release"));
+        }
+        msg_void(pool, sel("drain"));
+        let rel = |g: &[f32], c: &[f32]| -> f32 {
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            for i in 0..c.len() {
+                let e = (g[i] - c[i]).abs();
+                if e > max_abs || e.is_nan() {
+                    max_abs = e;
+                }
+                max_ref = max_ref.max(c[i].abs());
+            }
+            max_abs / max_ref.max(1e-30)
+        };
+        let (ro, rs) = (rel(&out_gpu, &out_ref), rel(&st_gpu, &st));
+        let per_pass = best / reps as f64;
+        println!(
+            "gpu: delta_scan check (t {}, heads {}, kd {}, vd {}): out rel {:.2e} state rel {:.2e} - {} | {:.2} ms/pass, {:.2} us per token step",
+            t, heads, kd, vd, ro, rs,
+            if ro < 1e-4 && rs < 1e-4 { "MATCH" } else { "MISMATCH" },
+            per_pass * 1000.0, per_pass * 1e6 / t as f64
+        );
+        Some(())
     }
 }
 
@@ -4886,6 +5127,282 @@ pub fn gpu_decode_prepare(m: &DecodeModelRefs) -> bool {
     resolve_decode_weights(base, mps, m).is_some()
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Tensor GEMM: the Metal 4 tensor ops (matmul2d) on the M5's GPU tensor units
+// ════════════════════════════════════════════════════════════════════════════
+//
+// A prompt read is FLOP-bound; MPSMatrixMultiplication runs on the plain
+// ALUs. The tensor-ops path (MetalPerformancePrimitives, M5/A19 and
+// later, macOS 26) streams f16 tiles through the GPU's neural
+// accelerators. Compiled at runtime like every other shader here; when
+// the include or the device refuse, the probe says so and MPS stays.
+
+const TGEMM_MSL: &str = r#"
+#include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+// y[t, rows] (f16) = x[t, cols] (f16) . W[rows, cols]^T (f16), f32
+// accumulation on the tensor units. One threadgroup (4 simdgroups) owns
+// a TB-token x TA-row tile; K advances by TK per matmul2d run; the f32
+// tile lands in threadgroup memory and leaves as f16.
+constant int TA = 64;
+constant int TB = 64;
+constant int TK = 32;
+
+kernel void tgemm_f16(device half* W         [[buffer(0)]], // (non-const: the tensor ops' operand types)
+                      device half* X         [[buffer(1)]],
+                      device half* Y         [[buffer(2)]],
+                      constant uint4& dims   [[buffer(3)]], // rows, cols, t, x row stride (elements)
+                      threadgroup float* tile [[threadgroup(0)]],
+                      uint2 tgid  [[threadgroup_position_in_grid]],
+                      ushort tid  [[thread_index_in_threadgroup]]) {
+    const int rows = dims.x, cols = dims.y, t = dims.z, xs = dims.w;
+    const int ra = tgid.y * TA;
+    const int rb = tgid.x * TB;
+    auto tA = tensor(W, dextents<int32_t, 2>(cols, rows), array<int, 2>({1, cols}));
+    auto tB = tensor(X, dextents<int32_t, 2>(cols, t), array<int, 2>({1, xs}));
+    matmul2d<matmul2d_descriptor(TB, TA, TK, false, true, true, matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    for (int k = 0; k < cols; k += TK) {
+        auto sB = tB.slice(k, rb);
+        auto sA = tA.slice(k, ra);
+        mm.run(sB, sA, cT);
+    }
+    auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(tile, dextents<int32_t, 2>(TA, TB));
+    cT.store(tC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = tid; i < TA * TB; i += 128) {
+        int a = i % TA, b = i / TA;
+        int r = ra + a, tt = rb + b;
+        if (r < rows && tt < t) { Y[(size_t)tt * rows + r] = half(tile[b * TA + a]); }
+    }
+}
+"#;
+
+pub(crate) struct TgemmCtx {
+    pub(crate) pipeline: Id,
+}
+unsafe impl Send for TgemmCtx {}
+unsafe impl Sync for TgemmCtx {}
+
+static TGEMM: std::sync::OnceLock<Option<TgemmCtx>> = std::sync::OnceLock::new();
+
+/// The tensor GEMM pipeline, compiled once; None (with a `gpu:` line)
+/// when the tensor ops are unavailable on this device or OS.
+pub(crate) fn tgemm_ctx() -> Option<(&'static MetalCtx, &'static TgemmCtx)> {
+    let base = ctx()?;
+    let c = TGEMM
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(TGEMM_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: tensor GEMM unavailable - MPS GEMM stays:\n{}", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let function = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library, sel("newFunctionWithName:"), ns_string("tgemm_f16"))
+                };
+                let mut perr: Id = std::ptr::null_mut();
+                let pipeline = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                };
+                if pipeline.is_null() {
+                    println!("gpu: tensor GEMM pipeline error: {} - MPS GEMM stays", err_desc(perr));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                retain(pipeline);
+                retain(function);
+                retain(library);
+                msg_void(pool, sel("drain"));
+                Some(TgemmCtx { pipeline })
+            }
+        })
+        .as_ref()?;
+    Some((base, c))
+}
+
+/// Encodes y[t, rows] = x[t, cols] . W[rows, cols]^T on the tensor GEMM
+/// (all f16, byte offsets into the buffers, `x_stride` in elements).
+/// SAFETY: `e` is a live compute encoder; buffers outlive the command.
+unsafe fn tgemm_encode(tg: &TgemmCtx, e: Id, w: Id, w_off: usize, x: Id, x_off: usize, x_stride: usize, y: Id, y_off: usize, t: usize, rows: usize, cols: usize) {
+    // SAFETY: typed objc_msgSend signatures matching the Metal selectors.
+    let (set_pipe, set_buf, set_bytes, set_tgm, disp_tg) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, Id)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, Id, u64, u64)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, *const c_void, u64, u64)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, u64, u64)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, MTLSize, MTLSize)>(objc_msgSend),
+        )
+    };
+    set_pipe(e, sel("setComputePipelineState:"), tg.pipeline);
+    set_buf(e, sel("setBuffer:offset:atIndex:"), w, w_off as u64, 0);
+    set_buf(e, sel("setBuffer:offset:atIndex:"), x, x_off as u64, 1);
+    set_buf(e, sel("setBuffer:offset:atIndex:"), y, y_off as u64, 2);
+    let dims: [u32; 4] = [rows as u32, cols as u32, t as u32, x_stride as u32];
+    set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 16, 3);
+    set_tgm(e, sel("setThreadgroupMemoryLength:atIndex:"), (64 * 64 * 4) as u64, 0);
+    disp_tg(
+        e,
+        sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+        MTLSize { width: t.div_ceil(64) as u64, height: rows.div_ceil(64) as u64, depth: 1 },
+        MTLSize { width: 128, height: 1, depth: 1 },
+    );
+}
+
+/// Certifies and times the tensor GEMM against the CPU reference and the
+/// MPS GEMM on one shape (y[t, rows] = x[t, cols] . W^T, all f16 storage):
+/// prints the max relative error of both and their TFLOP/s.
+pub fn tgemm_check_bench(t: usize, rows: usize, cols: usize, reps: usize) -> Option<()> {
+    let (base, tg) = tgemm_ctx()?;
+    let (_, mps) = mps_ctx()?;
+    let mut seed = 0x0badf00du32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let w: Vec<f32> = (0..rows * cols).map(|_| rnd() * 0.1).collect();
+    let x: Vec<f32> = (0..t * cols).map(|_| rnd()).collect();
+    let r16 = |v: &[f32]| -> (Vec<u16>, Vec<f32>) {
+        let mut h = vec![0u16; v.len()];
+        f32s_to_f16s(v, &mut h);
+        let mut back = vec![0.0f32; v.len()];
+        f16s_to_f32s(&h, &mut back);
+        (h, back)
+    };
+    let (w16, wr) = r16(&w);
+    let (x16, xr) = r16(&x);
+    // CPU reference on a sample of rows (the full product is t*rows*cols)
+    let sample: Vec<usize> = (0..t).step_by((t / 8).max(1)).collect();
+    let mut reference = vec![0.0f32; t * rows];
+    for &tt in &sample {
+        for r in 0..rows {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += xr[tt * cols + c] * wr[r * cols + c];
+            }
+            reference[tt * rows + r] = acc;
+        }
+    }
+    let Some(k_mps) = gemm_kernel(base, mps, t, rows, cols, true, 1.0) else {
+        return None;
+    };
+    // SAFETY: buffer creation, dispatches, waits, readbacks, releases.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bw = f(base.device, sel("newBufferWithBytes:length:options:"), w16.as_ptr() as *const c_void, (w16.len() * 2) as u64, 0);
+        let bx = f(base.device, sel("newBufferWithBytes:length:options:"), x16.as_ptr() as *const c_void, (x16.len() * 2) as u64, 0);
+        let y0 = vec![0u16; t * rows];
+        let by1 = f(base.device, sel("newBufferWithBytes:length:options:"), y0.as_ptr() as *const c_void, (y0.len() * 2) as u64, 0);
+        let by2 = f(base.device, sel("newBufferWithBytes:length:options:"), y0.as_ptr() as *const c_void, (y0.len() * 2) as u64, 0);
+        if [bw, bx, by1, by2].iter().any(|b| b.is_null()) {
+            msg_void(pool, sel("drain"));
+            return None;
+        }
+        let getf: extern "C" fn(Id, Sel) -> f64 =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let contents: extern "C" fn(Id, Sel) -> *mut c_void =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        // tensor GEMM: reps in one command buffer, best of 3
+        let mut best_t = f64::MAX;
+        for _ in 0..3 {
+            let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            for _ in 0..reps {
+                tgemm_encode(tg, e, bw, 0, bx, 0, cols, by1, 0, t, rows, cols);
+            }
+            msg_void(e, sel("endEncoding"));
+            msg_void(cmdbuf, sel("commit"));
+            msg_void(cmdbuf, sel("waitUntilCompleted"));
+            best_t = best_t.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+        }
+        // MPS GEMM: same
+        let desc16 = |r: usize, c: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(class("MPSMatrixDescriptor"), sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), r as u64, c as u64, (c * 2) as u64, MPS_FLOAT16)
+        };
+        let mat = |buf: Id, dsc: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:offset:descriptor:"), buf, 0, dsc)
+        };
+        let mx = mat(bx, desc16(t, cols));
+        let mw = mat(bw, desc16(rows, cols));
+        let my = mat(by2, desc16(t, rows));
+        let enc_gemm: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let mut best_m = f64::MAX;
+        for _ in 0..3 {
+            let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+            for _ in 0..reps {
+                enc_gemm(k_mps, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mw, my);
+            }
+            msg_void(cmdbuf, sel("commit"));
+            msg_void(cmdbuf, sel("waitUntilCompleted"));
+            best_m = best_m.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+        }
+        let mut out_t = vec![0.0f32; t * rows];
+        let mut out_m = vec![0.0f32; t * rows];
+        f16s_to_f32s(std::slice::from_raw_parts(contents(by1, sel("contents")) as *const u16, t * rows), &mut out_t);
+        f16s_to_f32s(std::slice::from_raw_parts(contents(by2, sel("contents")) as *const u16, t * rows), &mut out_m);
+        for b in [mx, mw, my, bw, bx, by1, by2] {
+            msg_void(b, sel("release"));
+        }
+        msg_void(pool, sel("drain"));
+        let rel = |out: &[f32]| -> (f32, usize) {
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            let mut worst = 0usize;
+            for &tt in &sample {
+                for r in 0..rows {
+                    let i = tt * rows + r;
+                    let e = (out[i] - reference[i]).abs();
+                    if e > max_abs || e.is_nan() {
+                        max_abs = e;
+                        worst = i;
+                    }
+                    max_ref = max_ref.max(reference[i].abs());
+                }
+            }
+            (max_abs / max_ref.max(1e-30), worst)
+        };
+        let (rt, wt) = rel(&out_t);
+        let (rm, _) = rel(&out_m);
+        let flops = 2.0 * t as f64 * rows as f64 * cols as f64 * reps as f64;
+        println!(
+            "gpu: tensor GEMM check [{}x{}]x[{}x{}]^T: rel {:.2e} (at [{}] gpu {:.4} cpu {:.4}) - {} | tensor {:.2} ms/pass {:.2} TFLOP/s | MPS rel {:.2e} {:.2} ms/pass {:.2} TFLOP/s",
+            t, cols, rows, cols, rt, wt, out_t[wt], reference[wt],
+            if rt < 5e-3 { "MATCH" } else { "MISMATCH" },
+            best_t * 1000.0 / reps as f64, flops / best_t / 1e12,
+            rm, best_m * 1000.0 / reps as f64, flops / best_m / 1e12
+        );
+        Some(())
+    }
+}
+
 /// Trace stop point: encoding stops after sub-stage `stage` of layer
 /// `layer` (full-attention layers: 0 qkv projections, 1 qk prep, 2
 /// attention, 3 o_proj), leaving the scratch buffers readable through
@@ -5037,7 +5554,7 @@ fn gpu_decode_step_impl(
     for l in &m.layers {
         match l {
             DecodeLayerRefs::Linear { dm, .. } => {
-                if dm.kd > 128 || dm.vd > 128 || dm.conv_k > 9 {
+                if dm.kd > 128 || !scan_kd_ok(dm.kd) || dm.vd > 128 || dm.conv_k > 9 {
                     return None;
                 }
             }
@@ -5264,7 +5781,7 @@ fn gpu_decode_step_impl(
                         set_buf(e, sel_sb, dec.mix_hm, 0, 6);
                         let dims: [u32; 4] = [1, heads as u32, dm.kd as u32, dm.vd as u32];
                         set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 16, 7);
-                        disp_tg(e, sel_dtg, MTLSize { width: heads as u64, height: 1, depth: 1 }, MTLSize { width: dm.vd as u64, height: 1, depth: 1 });
+                        disp_tg(e, sel_dtg, MTLSize { width: scan_groups(heads, dm.vd) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
                                 }
                     // gated norm: mix_hm (f32) x z (mix_tm holds z) -> tmp_a[..vt] f16
                     {
