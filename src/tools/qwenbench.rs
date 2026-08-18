@@ -349,6 +349,7 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             println!("qwengpubench: no usable Metal/MPS context - nothing to measure");
             return;
         }
+        crate::model::metal::tissue_probe();
         let mut model = crate::model::qwen::QwenModel::load(&model_path);
         let vocab = (model.cfg.vocab as u32).min(50_000);
         let prompt: Vec<u32> = (0..n_tokens as u32).map(|i| (i * 7 + 3) % vocab).collect();

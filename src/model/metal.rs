@@ -3031,3 +3031,216 @@ fn addnorm_ctx() -> Option<(&'static MetalCtx, &'static ScanCtx)> {
     Some((base, c))
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 3: per-layer command buffers - the linear layer's tissue kernels
+// (causal conv + SiLU, gated RMSNorm) so a whole layer encodes at once
+// ════════════════════════════════════════════════════════════════════════════
+
+const LAYER_TISSUE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Causal depthwise conv over t rows of conv_dim channels, taps k, then
+// SiLU. Sequential over time per channel (each thread owns a channel and
+// walks all rows: the state carries the last k-1 inputs). f16 in/out,
+// f32 math. state [conv_dim, k-1] in/out (f32).
+kernel void causal_conv_silu_f16(device const half* x   [[buffer(0)]],
+                                 device const float* w  [[buffer(1)]],
+                                 device float* state    [[buffer(2)]],
+                                 device half* y         [[buffer(3)]],
+                                 constant uint3& dims   [[buffer(4)]], // t, conv_dim, k
+                                 uint i [[thread_position_in_grid]]) {
+    uint t = dims.x, cd = dims.y, k = dims.z;
+    if (i >= cd) { return; }
+    float st[8];
+    for (uint j = 0; j + 1 < k; j++) { st[j] = state[i * (k - 1) + j]; }
+    for (uint r = 0; r < t; r++) {
+        float xv = float(x[(size_t)r * cd + i]);
+        float acc = 0.0f;
+        for (uint j = 0; j + 1 < k; j++) { acc += st[j] * w[i * k + j]; }
+        acc += xv * w[i * k + (k - 1)];
+        y[(size_t)r * cd + i] = half(acc / (1.0f + exp(-acc)));
+        for (uint j = 0; j + 2 < k; j++) { st[j] = st[j + 1]; }
+        st[k - 2] = xv;
+    }
+    for (uint j = 0; j + 1 < k; j++) { state[i * (k - 1) + j] = st[j]; }
+}
+
+// Scan prep from the conv output: per (row, value head h) with kv head
+// kh = h / rep: q = l2norm(conv[q part, kh]) / sqrt(kd), k = l2norm(conv[k
+// part, kh]), v = conv[v part, h]; beta = sigmoid(b_raw), decay =
+// exp(-exp(a_log) * softplus(a_raw + dt_bias)). Outputs in the scan's
+// layouts: q,k [t, heads, kd], v [t, heads, vd], beta/decay [t, heads].
+// One threadgroup per (row, head); lanes stride kd/vd.
+kernel void scan_prep_f16(device const half* conved  [[buffer(0)]], // [t, conv_dim]
+                          device const half* b_raw   [[buffer(1)]], // [t, heads]
+                          device const half* a_raw   [[buffer(2)]], // [t, heads]
+                          device const float* a_log  [[buffer(3)]], // [heads]
+                          device const float* dt_bias[[buffer(4)]], // [heads]
+                          device float* q            [[buffer(5)]],
+                          device float* k            [[buffer(6)]],
+                          device float* v            [[buffer(7)]],
+                          device float* beta         [[buffer(8)]],
+                          device float* decay        [[buffer(9)]],
+                          constant uint4& d0         [[buffer(10)]], // t, heads, kd, vd
+                          constant uint4& d1         [[buffer(11)]], // rep, kt, conv_dim, 0
+                          uint tg    [[threadgroup_position_in_grid]],
+                          uint lane  [[thread_position_in_threadgroup]],
+                          uint lanes [[threads_per_threadgroup]]) {
+    uint t = d0.x, heads = d0.y, kd = d0.z, vd = d0.w;
+    uint rep = d1.x, kt = d1.y, cd = d1.z;
+    uint row = tg / heads, h = tg % heads;
+    uint kh = h / max(rep, 1u);
+    device const half* rowp = conved + (size_t)row * cd;
+    threadgroup float partial[64];
+    // q norm
+    float sq = 0.0f, sk = 0.0f;
+    for (uint i = lane; i < kd; i += lanes) {
+        float a = float(rowp[kh * kd + i]);
+        float b = float(rowp[kt + kh * kd + i]);
+        sq += a * a; sk += b * b;
+    }
+    sq = simd_sum(sq); sk = simd_sum(sk);
+    if ((lane & 31u) == 0u) { partial[lane / 32u] = sq; partial[32u + lane / 32u] = sk; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) {
+        float a = (lane < nsg) ? partial[lane] : 0.0f;
+        float b = (lane < nsg) ? partial[32u + lane] : 0.0f;
+        a = simd_sum(a); b = simd_sum(b);
+        if (lane == 0u) { partial[0] = a; partial[32] = b; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float nq = sqrt(partial[0] + 1e-6f), nk = sqrt(partial[32] + 1e-6f);
+    float qs = rsqrt(float(kd));
+    size_t ob = ((size_t)row * heads + h);
+    for (uint i = lane; i < kd; i += lanes) {
+        q[ob * kd + i] = float(rowp[kh * kd + i]) / nq * qs;
+        k[ob * kd + i] = float(rowp[kt + kh * kd + i]) / nk;
+    }
+    for (uint i = lane; i < vd; i += lanes) {
+        v[ob * vd + i] = float(rowp[2u * kt + h * vd + i]);
+    }
+    if (lane == 0u) {
+        float br = float(b_raw[row * heads + h]);
+        beta[ob] = 1.0f / (1.0f + exp(-br));
+        float arg = float(a_raw[row * heads + h]) + dt_bias[h];
+        float sp = (arg > 20.0f) ? arg : log(1.0f + exp(arg));
+        decay[ob] = exp(-exp(a_log[h]) * sp);
+    }
+}
+
+// Gated RMSNorm per (row, head): y = rmsnorm(x_h) * w * silu(z_h), the
+// gated-DeltaNet output norm (direct weight, no offset). One threadgroup
+// per (row, head); vd <= 256 lanes.
+kernel void gated_rmsnorm_f16(device const half* mixed_hm [[buffer(0)]], // [heads, t, vd]
+                              device const half* z        [[buffer(1)]], // [t, heads*vd]
+                              device const float* w       [[buffer(2)]], // [vd]
+                              device half* out            [[buffer(3)]], // [t, heads*vd]
+                              constant uint3& dims        [[buffer(4)]], // t, heads, vd
+                              constant float& eps         [[buffer(5)]],
+                              uint tg    [[threadgroup_position_in_grid]],
+                              uint lane  [[thread_position_in_threadgroup]],
+                              uint lanes [[threads_per_threadgroup]]) {
+    uint t = dims.x, heads = dims.y, vd = dims.z;
+    uint row = tg / heads, h = tg % heads;
+    device const half* xin = mixed_hm + ((size_t)h * t + row) * vd;
+    device const half* zin = z + (size_t)row * heads * vd + h * vd;
+    device half* o = out + (size_t)row * heads * vd + h * vd;
+    threadgroup float partial[32];
+    float ss = 0.0f;
+    for (uint i = lane; i < vd; i += lanes) { float v = float(xin[i]); ss += v * v; }
+    ss = simd_sum(ss);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) {
+        float v = (lane < nsg) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt(partial[0] / float(vd) + eps);
+    for (uint i = lane; i < vd; i += lanes) {
+        float zv = float(zin[i]);
+        float g = zv / (1.0f + exp(-zv));
+        o[i] = half(float(xin[i]) * inv * w[i] * g);
+    }
+}
+"#;
+
+#[allow(dead_code)] // pipelines consumed by the per-layer encoder (phase 3 wiring)
+pub(crate) struct TissueCtx {
+    pub(crate) conv: Id,
+    pub(crate) gnorm: Id,
+    pub(crate) scanprep: Id,
+}
+unsafe impl Send for TissueCtx {}
+unsafe impl Sync for TissueCtx {}
+
+static TISSUE: std::sync::OnceLock<Option<TissueCtx>> = std::sync::OnceLock::new();
+
+/// Compiles the phase-3 tissue kernels and reports; called by the GPU
+/// bench so the next bare-metal run validates the MSL before the layer
+/// encoder that uses them is wired.
+pub fn tissue_probe() {
+    match tissue_ctx() {
+        Some(_) => println!("gpu: layer-tissue kernels ready (conv+silu, gated norm, scan prep)"),
+        None => println!("gpu: layer-tissue kernels unavailable"),
+    }
+}
+
+pub(crate) fn tissue_ctx() -> Option<(&'static MetalCtx, &'static TissueCtx)> {
+    let base = ctx()?;
+    let c = TISSUE
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(LAYER_TISSUE_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: layer-tissue shader error: {} - per-layer graph off", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let mk = |name: &str| -> Id {
+                    let function = {
+                        let f: extern "C" fn(Id, Sel, Id) -> Id =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(library, sel("newFunctionWithName:"), ns_string(name))
+                    };
+                    let mut perr: Id = std::ptr::null_mut();
+                    let p = {
+                        let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                    };
+                    if p.is_null() {
+                        println!("gpu: {} pipeline error: {} - per-layer graph off", name, err_desc(perr));
+                    } else {
+                        retain(p);
+                        retain(function);
+                    }
+                    p
+                };
+                let conv = mk("causal_conv_silu_f16");
+                let gnorm = mk("gated_rmsnorm_f16");
+                let scanprep = mk("scan_prep_f16");
+                retain(library);
+                msg_void(pool, sel("drain"));
+                if conv.is_null() || gnorm.is_null() || scanprep.is_null() {
+                    return None;
+                }
+                Some(TissueCtx { conv, gnorm, scanprep })
+            }
+        })
+        .as_ref()?;
+    Some((base, c))
+}
