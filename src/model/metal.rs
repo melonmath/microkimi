@@ -3694,6 +3694,36 @@ kernel void dec_add_norm(device float* hidden      [[buffer(0)]],
     }
 }
 
+// Decode matvec: y[r] = W[r,:] . x, W f16 row-major, x f16, y f16 (f32
+// accumulate). One SIMD group (32 lanes) per row, lanes stride the
+// columns in 8-wide half loads, simd_sum reduces; 4 rows per threadgroup
+// (128 threads). Weight rows stream once from device memory - the
+// bandwidth-bound shape a decode wants; MPS GEMM at t=1 is not it.
+kernel void dec_matvec(device const half* W   [[buffer(0)]],
+                       device const half* x   [[buffer(1)]],
+                       device half* y         [[buffer(2)]],
+                       constant uint2& dims   [[buffer(3)]], // rows, cols
+                       uint tid   [[thread_position_in_grid]],
+                       uint lane  [[thread_index_in_simdgroup]]) {
+    uint rows = dims.x, cols = dims.y;
+    uint row = tid / 32u;
+    if (row >= rows) { return; }
+    device const half* w = W + (size_t)row * cols;
+    float acc = 0.0f;
+    uint c8 = cols / 8u;
+    for (uint i = lane; i < c8; i += 32u) {
+        half4 w0 = *(device const half4*)(w + i * 8u);
+        half4 w1 = *(device const half4*)(w + i * 8u + 4u);
+        half4 x0 = *(device const half4*)(x + i * 8u);
+        half4 x1 = *(device const half4*)(x + i * 8u + 4u);
+        float4 p = float4(w0) * float4(x0) + float4(w1) * float4(x1);
+        acc += p.x + p.y + p.z + p.w;
+    }
+    for (uint c = c8 * 8u + lane; c < cols; c += 32u) { acc += float(w[c]) * float(x[c]); }
+    acc = simd_sum(acc);
+    if (lane == 0u) { y[row] = half(acc); }
+}
+
 // hidden += add (f16 GEMM output), f32 accumulate - the plain residual
 kernel void dec_add(device float* hidden [[buffer(0)]], device const half* add [[buffer(1)]],
                     constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
@@ -3731,39 +3761,73 @@ kernel void dec_attn(device const half* q      [[buffer(0)]], // [n_heads*hd]
                      uint h     [[threadgroup_position_in_grid]],
                      uint lane  [[thread_position_in_threadgroup]],
                      uint lanes [[threads_per_threadgroup]]) {
+    // Online softmax over KV tiles of 256 positions: scores for the tile
+    // (lanes stride positions), running max/denominator, then the mix
+    // accumulates per lane over its OWN positions into a private hd-vector
+    // partial (hd <= 128) and reduces across lanes at the end - no O(len)
+    // serial loop per lane, 1 KB of threadgroup memory per tile.
     uint len = dims.x, hd = dims.y, kvw = dims.z, groups = dims.w;
     uint kh = h / groups;
-    threadgroup float sc[4096];
+    threadgroup float sc[256];
     threadgroup float red[32];
-    float m = -INFINITY;
-    for (uint u = lane; u < len; u += lanes) {
-        float s = 0.0f;
-        for (uint j = 0; j < hd; j++) { s += float(q[h * hd + j]) * float(kc[(size_t)u * kvw + kh * hd + j]); }
-        s *= scale;
-        sc[u] = s;
-        m = max(m, s);
-    }
-    m = simd_max(m);
-    if ((lane & 31u) == 0u) red[lane / 32u] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float redv[128 * 4]; // 4 simdgroups x hd partials
+    float qreg[128];
+    for (uint j = 0; j < hd; j++) { qreg[j] = float(q[h * hd + j]); }
+    float acc[128];
+    for (uint j = 0; j < hd; j++) { acc[j] = 0.0f; }
+    float m_run = -INFINITY, d_run = 0.0f;
     uint nsg = (lanes + 31u) / 32u;
-    if (lane < 32u) { float v = (lane < nsg) ? red[lane] : -INFINITY; v = simd_max(v); if (lane == 0u) red[0] = v; }
+    for (uint u0 = 0; u0 < len; u0 += 256u) {
+        uint n = min(256u, len - u0);
+        // tile scores
+        float m_loc = -INFINITY;
+        for (uint i = lane; i < n; i += lanes) {
+            device const half* kr = kc + (size_t)(u0 + i) * kvw + kh * hd;
+            float s = 0.0f;
+            for (uint j = 0; j < hd; j++) { s += qreg[j] * float(kr[j]); }
+            s *= scale;
+            sc[i] = s;
+            m_loc = max(m_loc, s);
+        }
+        m_loc = simd_max(m_loc);
+        if ((lane & 31u) == 0u) red[lane / 32u] = m_loc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 32u) { float v = (lane < nsg) ? red[lane] : -INFINITY; v = simd_max(v); if (lane == 0u) red[0] = v; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m_new = max(m_run, red[0]);
+        float r = exp(m_run - m_new);
+        d_run *= r;
+        for (uint j = 0; j < hd; j++) { acc[j] *= r; }
+        // exp and mix over this lane's positions
+        float d_loc = 0.0f;
+        for (uint i = lane; i < n; i += lanes) {
+            float e = exp(sc[i] - m_new);
+            d_loc += e;
+            device const half* vr = vc + (size_t)(u0 + i) * kvw + kh * hd;
+            for (uint j = 0; j < hd; j++) { acc[j] += e * float(vr[j]); }
+        }
+        d_loc = simd_sum(d_loc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((lane & 31u) == 0u) red[lane / 32u] = d_loc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 32u) { float v = (lane < nsg) ? red[lane] : 0.0f; v = simd_sum(v); if (lane == 0u) red[0] = v; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        d_run += red[0];
+        m_run = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // reduce acc across lanes: simd_sum per dim, then across simdgroups
+    for (uint j = 0; j < hd; j++) {
+        float v = simd_sum(acc[j]);
+        if ((lane & 31u) == 0u) redv[(lane / 32u) * hd + j] = v;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    m = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float den = 0.0f;
-    for (uint u = lane; u < len; u += lanes) { float e = exp(sc[u] - m); sc[u] = e; den += e; }
-    den = simd_sum(den);
-    if ((lane & 31u) == 0u) red[lane / 32u] = den;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane < 32u) { float v = (lane < nsg) ? red[lane] : 0.0f; v = simd_sum(v); if (lane == 0u) red[0] = v; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = 1.0f / red[0];
+    float inv = 1.0f / d_run;
     for (uint j = lane; j < hd; j += lanes) {
-        float acc = 0.0f;
-        for (uint u = 0; u < len; u++) { acc += sc[u] * float(vc[(size_t)u * kvw + kh * hd + j]); }
-        float g = float(gate[h * hd + j]);
-        out[h * hd + j] = half(acc * inv * (g / (1.0f + exp(-g))));
+        float v = 0.0f;
+        for (uint g = 0; g < nsg; g++) { v += redv[g * hd + j]; }
+        float gt = float(gate[h * hd + j]);
+        out[h * hd + j] = half(v * inv * (gt / (1.0f + exp(-gt))));
     }
 }
 
@@ -3835,6 +3899,7 @@ pub(crate) struct DecodeCtx {
     pub(crate) conv: Id,
     pub(crate) attn: Id,
     pub(crate) qk_prep: Id,
+    pub(crate) matvec: Id,
 }
 unsafe impl Send for DecodeCtx {}
 unsafe impl Sync for DecodeCtx {}
@@ -3885,12 +3950,13 @@ pub(crate) fn decode_ctx() -> Option<(&'static MetalCtx, &'static DecodeCtx)> {
                 let conv = mk("dec_conv");
                 let attn = mk("dec_attn");
                 let qk_prep = mk("dec_qk_prep");
+                let matvec = mk("dec_matvec");
                 retain(library);
                 msg_void(pool, sel("drain"));
-                if [add_norm, add, conv, attn, qk_prep].iter().any(|p| p.is_null()) {
+                if [add_norm, add, conv, attn, qk_prep, matvec].iter().any(|p| p.is_null()) {
                     return None;
                 }
-                Some(DecodeCtx { add_norm, add, conv, attn, qk_prep })
+                Some(DecodeCtx { add_norm, add, conv, attn, qk_prep, matvec })
             }
         })
         .as_ref()?;
@@ -3900,7 +3966,7 @@ pub(crate) fn decode_ctx() -> Option<(&'static MetalCtx, &'static DecodeCtx)> {
 /// Compiles the decode kernels and reports (bench probe).
 pub fn decode_probe() {
     match decode_ctx() {
-        Some(_) => println!("gpu: decode kernels ready (add_norm, add, conv, attn, qk_prep)"),
+        Some(_) => println!("gpu: decode kernels ready (add_norm, add, conv, attn, qk_prep, matvec)"),
         None => println!("gpu: decode kernels unavailable"),
     }
 }
@@ -4165,11 +4231,9 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
     // state mutation on refusal)
     struct LinW {
         qkv: Id, z: Id, b: Id, a: Id, out: Id, g: Id, u: Id, dn: Id,
-        k_qkv: Id, k_z: Id, k_ba: Id, k_out: Id, k_gu: Id, k_dn: Id,
     }
     struct FullW {
         q: Id, k: Id, v: Id, o: Id, g: Id, u: Id, dn: Id,
-        k_q: Id, k_kv: Id, k_o: Id, k_gu: Id, k_dn: Id,
     }
     enum LW { L(LinW), F(FullW) }
     let mut lw: Vec<LW> = Vec::with_capacity(m.layers.len());
@@ -4188,12 +4252,6 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     g: dequant_buffer(base, mps, w.gate.0, w.gate.1, dm.inter, d)?,
                     u: dequant_buffer(base, mps, w.up.0, w.up.1, dm.inter, d)?,
                     dn: dequant_buffer(base, mps, w.down.0, w.down.1, d, dm.inter)?,
-                    k_qkv: gemm_kernel(base, mps, 1, cd, d, true, 1.0)?,
-                    k_z: gemm_kernel(base, mps, 1, vt, d, true, 1.0)?,
-                    k_ba: gemm_kernel(base, mps, 1, dm.heads, d, true, 1.0)?,
-                    k_out: gemm_kernel(base, mps, 1, d, vt, true, 1.0)?,
-                    k_gu: gemm_kernel(base, mps, 1, dm.inter, d, true, 1.0)?,
-                    k_dn: gemm_kernel(base, mps, 1, d, dm.inter, true, 1.0)?,
                 }));
             }
             DecodeLayerRefs::Full { q_proj, k_proj, v_proj, o_proj, gate, up, down, n_heads, n_kv, hd, inter, .. } => {
@@ -4207,17 +4265,11 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     g: dequant_buffer(base, mps, gate.0, gate.1, *inter, d)?,
                     u: dequant_buffer(base, mps, up.0, up.1, *inter, d)?,
                     dn: dequant_buffer(base, mps, down.0, down.1, d, *inter)?,
-                    k_q: gemm_kernel(base, mps, 1, qw * 2, d, true, 1.0)?,
-                    k_kv: gemm_kernel(base, mps, 1, kvw, d, true, 1.0)?,
-                    k_o: gemm_kernel(base, mps, 1, d, qw, true, 1.0)?,
-                    k_gu: gemm_kernel(base, mps, 1, *inter, d, true, 1.0)?,
-                    k_dn: gemm_kernel(base, mps, 1, d, *inter, true, 1.0)?,
                 }));
             }
         }
     }
     let head_buf = weight_buffer_f16(base, mps, m.lm_head, vocab, d)?;
-    let k_head = gemm_kernel(base, mps, 1, vocab, d, true, 1.0)?;
     let final_norm = m.norm_f;
 
     // SAFETY: all objects come from the live context; the decoder's buffers
@@ -4244,21 +4296,6 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             return None;
         }
 
-        let desc16 = |r: usize, c: usize| -> Id {
-            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
-                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
-            f(class("MPSMatrixDescriptor"), sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), r as u64, c as u64, (c * 2) as u64, MPS_FLOAT16)
-        };
-        let mats: std::cell::RefCell<Vec<Id>> = std::cell::RefCell::new(Vec::new());
-        let mat = |buf: Id, off: usize, r: usize, c: usize| -> Id {
-            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
-                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
-            let x = f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:offset:descriptor:"), buf, off as u64, desc16(r, c));
-            mats.borrow_mut().push(x);
-            x
-        };
-        let enc_gemm: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
-            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let set_pipe: extern "C" fn(Id, Sel, Id) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
@@ -4269,7 +4306,6 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let disp_th: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
-        let sel_enc = sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:");
         let sel_pipe = sel("setComputePipelineState:");
         let sel_sb = sel("setBuffer:offset:atIndex:");
         let sel_by = sel("setBytes:length:atIndex:");
@@ -4305,11 +4341,23 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             disp_th(e, sel_dth, MTLSize { width: d as u64, height: 1, depth: 1 }, tg256);
             msg_void(e, sel_end);
         };
+        // helper: f16 matvec y[rows] = W[rows, cols] . x through dec_matvec
+        // (one simdgroup per row; replaces MPS GEMM at t=1 for bandwidth)
+        let mv_enc = |w: Id, rows: usize, cols: usize, x: Id, x_off: usize, y: Id, y_off: usize| {
+            let e = msg_id(cmdbuf, sel_ce);
+            set_pipe(e, sel_pipe, dc.matvec);
+            set_buf(e, sel_sb, w, 0, 0);
+            set_buf(e, sel_sb, x, x_off as u64, 1);
+            set_buf(e, sel_sb, y, y_off as u64, 2);
+            let dims: [u32; 2] = [rows as u32, cols as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 3);
+            disp_th(e, sel_dth, MTLSize { width: (rows * 32) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        };
         // helper: MLP from `normed` -> tmp_a[..d] (f16): gate|up in tmp_a, silu, down into tmp_b[..d]
-        let mlp_enc = |g: Id, u: Id, dn: Id, k_gu: Id, k_dn: Id, inter: usize| -> Id {
-            let mx = mat(dec.normed, 0, 1, d);
-            enc_gemm(k_gu, sel_enc, cmdbuf, mx, mat(g, 0, inter, d), mat(dec.tmp_a, 0, 1, inter));
-            enc_gemm(k_gu, sel_enc, cmdbuf, mx, mat(u, 0, inter, d), mat(dec.tmp_a, inter * 2, 1, inter));
+        let mlp_enc = |g: Id, u: Id, dn: Id, inter: usize| -> Id {
+            mv_enc(g, inter, d, dec.normed, 0, dec.tmp_a, 0);
+            mv_enc(u, inter, d, dec.normed, 0, dec.tmp_a, inter * 2);
             let e = msg_id(cmdbuf, sel_ce);
             set_pipe(e, sel_pipe, sm.pipeline);
             set_buf(e, sel_sb, dec.tmp_a, 0, 0);
@@ -4318,7 +4366,7 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             set_bytes(e, sel_by, (&n) as *const u32 as *const c_void, 4, 2);
             disp_th(e, sel_dth, MTLSize { width: inter as u64, height: 1, depth: 1 }, tg256);
             msg_void(e, sel_end);
-            enc_gemm(k_dn, sel_enc, cmdbuf, mat(dec.tmp_a, 0, 1, inter), mat(dn, 0, d, inter), mat(dec.tmp_b, 0, 1, d));
+            mv_enc(dn, d, inter, dec.tmp_a, 0, dec.tmp_b, 0);
             dec.tmp_b
         };
 
@@ -4334,11 +4382,10 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     // input norm (folds the previous MLP output)
                     norm_enc(prev_add, o[0]);
                     // projections: qkv -> tmp_a[..cd], z -> mix_tm (as z buffer), b|a -> ba
-                    let mx = mat(dec.normed, 0, 1, d);
-                    enc_gemm(w.k_qkv, sel_enc, cmdbuf, mx, mat(w.qkv, 0, cd, d), mat(dec.tmp_a, 0, 1, cd));
-                    enc_gemm(w.k_z, sel_enc, cmdbuf, mx, mat(w.z, 0, vt, d), mat(dec.mix_tm, 0, 1, vt));
-                    enc_gemm(w.k_ba, sel_enc, cmdbuf, mx, mat(w.b, 0, heads, d), mat(dec.ba, 0, 1, heads));
-                    enc_gemm(w.k_ba, sel_enc, cmdbuf, mx, mat(w.a, 0, heads, d), mat(dec.ba, heads * 2, 1, heads));
+                    mv_enc(w.qkv, cd, d, dec.normed, 0, dec.tmp_a, 0);
+                    mv_enc(w.z, vt, d, dec.normed, 0, dec.mix_tm, 0);
+                    mv_enc(w.b, heads, d, dec.normed, 0, dec.ba, 0);
+                    mv_enc(w.a, heads, d, dec.normed, 0, dec.ba, heads * 2);
                     // conv + silu: tmp_a[..cd] -> tmp_b[..cd]
                     {
                         let e = msg_id(cmdbuf, sel_ce);
@@ -4409,9 +4456,9 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                         msg_void(e, sel_end);
                     }
                     // out_proj: tmp_a[..vt] -> tmp_b[..d]; residual add; post-norm; MLP
-                    enc_gemm(w.k_out, sel_enc, cmdbuf, mat(dec.tmp_a, 0, 1, vt), mat(w.out, 0, d, vt), mat(dec.tmp_b, 0, 1, d));
+                    mv_enc(w.out, d, vt, dec.tmp_a, 0, dec.tmp_b, 0);
                     norm_enc(Some(dec.tmp_b), o[1]);
-                    prev_add = Some(mlp_enc(w.g, w.u, w.dn, w.k_gu, w.k_dn, dm.inter));
+                    prev_add = Some(mlp_enc(w.g, w.u, w.dn, dm.inter));
                 }
                 (DecodeLayerRefs::Full { n_heads, n_kv, hd, rope_dim, theta, inter, .. }, LW::F(w), GpuLayerState::Full { kc, vc, cap }) => {
                     if pos >= *cap {
@@ -4421,11 +4468,10 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     let qw = n_heads * hd;
                     let kvw = n_kv * hd;
                     norm_enc(prev_add, o[0]);
-                    let mx = mat(dec.normed, 0, 1, d);
                     // qg -> tmp_a[..2qw], k -> tmp_b[..kvw], v -> tmp_b[kvw..2kvw]
-                    enc_gemm(w.k_q, sel_enc, cmdbuf, mx, mat(w.q, 0, qw * 2, d), mat(dec.tmp_a, 0, 1, qw * 2));
-                    enc_gemm(w.k_kv, sel_enc, cmdbuf, mx, mat(w.k, 0, kvw, d), mat(dec.tmp_b, 0, 1, kvw));
-                    enc_gemm(w.k_kv, sel_enc, cmdbuf, mx, mat(w.v, 0, kvw, d), mat(dec.tmp_b, kvw * 2, 1, kvw));
+                    mv_enc(w.q, qw * 2, d, dec.normed, 0, dec.tmp_a, 0);
+                    mv_enc(w.k, kvw, d, dec.normed, 0, dec.tmp_b, 0);
+                    mv_enc(w.v, kvw, d, dec.normed, 0, dec.tmp_b, kvw * 2);
                     // qk prep + rope + cache append (row `pos`): q -> mix_tm[..qw], gate -> mix_tm[qw..2qw]
                     {
                         let e = msg_id(cmdbuf, sel_ce);
@@ -4465,9 +4511,9 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                         msg_void(e, sel_end);
                     }
                     // o_proj -> tmp_b[..d]; residual; post-norm; MLP
-                    enc_gemm(w.k_o, sel_enc, cmdbuf, mat(dec.tmp_a, 0, 1, qw), mat(w.o, 0, d, qw), mat(dec.tmp_b, 0, 1, d));
+                    mv_enc(w.o, d, qw, dec.tmp_a, 0, dec.tmp_b, 0);
                     norm_enc(Some(dec.tmp_b), o[1]);
-                    prev_add = Some(mlp_enc(w.g, w.u, w.dn, w.k_gu, w.k_dn, *inter));
+                    prev_add = Some(mlp_enc(w.g, w.u, w.dn, *inter));
                 }
                 _ => {
                     msg_void(pool, sel("drain"));
@@ -4492,13 +4538,10 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             disp_tg(e, sel_dtg, one, tg256);
             msg_void(e, sel_end);
         }
-        enc_gemm(k_head, sel_enc, cmdbuf, mat(dec.normed, 0, 1, d), mat(head_buf, 0, vocab, d), mat(dec.logits, 0, 1, vocab));
+        mv_enc(head_buf, vocab, d, dec.normed, 0, dec.logits, 0);
         msg_void(cmdbuf, sel("commit"));
         msg_void(cmdbuf, sel("waitUntilCompleted"));
         f16s_to_f32s(std::slice::from_raw_parts(contents(dec.logits) as *const u16, vocab), &mut logits_out[..vocab]);
-        for x in mats.borrow().iter() {
-            msg_void(*x, sel("release"));
-        }
         msg_void(fnw, sel("release"));
         msg_void(pool, sel("drain"));
     }
