@@ -4221,6 +4221,22 @@ pub fn gpu_decoder_new(
 /// states have then diverged from the caller's; the caller must treat a
 /// None as "GPU decode is off for this session").
 pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, logits_out: &mut [f32]) -> Option<()> {
+    // kernel budgets: private q/acc arrays and threadgroup rows are sized
+    // for head dims up to 128; refuse cleanly beyond
+    for l in &m.layers {
+        match l {
+            DecodeLayerRefs::Linear { dm, .. } => {
+                if dm.kd > 128 || dm.vd > 128 || dm.conv_k > 9 {
+                    return None;
+                }
+            }
+            DecodeLayerRefs::Full { hd, .. } => {
+                if *hd > 128 {
+                    return None;
+                }
+            }
+        }
+    }
     let (base, dc) = decode_ctx()?;
     let (_, mps) = mps_ctx()?;
     let (_, sc) = scan_ctx()?;
