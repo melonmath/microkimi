@@ -471,6 +471,15 @@ mod q8_tests {
                     if vnni512_available() {
                         let v = unsafe { row_dot_fp4_vnni(&prow, &srow, &xq) };
                         assert_eq!(v.to_bits(), want.to_bits(), "vnni nb={nb}");
+                        // four-row form: row 0 is this row, rows 1..3 shifted copies
+                        let p1: Vec<u8> = prow.iter().rev().cloned().collect();
+                        let s1: Vec<u8> = srow.iter().rev().cloned().collect();
+                        let t = unsafe { rows4_dot_fp4_vnni([&prow, &p1, &prow, &p1], [&srow, &s1, &srow, &s1], &xq) };
+                        let want1 = unsafe { row_dot_fp4_generic(&p1, &s1, &xq) };
+                        assert_eq!(t[0].to_bits(), want.to_bits(), "vnni4 r0 nb={nb}");
+                        assert_eq!(t[1].to_bits(), want1.to_bits(), "vnni4 r1 nb={nb}");
+                        assert_eq!(t[2].to_bits(), want.to_bits(), "vnni4 r2 nb={nb}");
+                        assert_eq!(t[3].to_bits(), want1.to_bits(), "vnni4 r3 nb={nb}");
                     }
                 }
             }
@@ -1398,5 +1407,77 @@ unsafe fn row_dot_fp4_vnni(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
             g += 1;
         }
         total
+    }
+}
+
+/// Four MXFP4 rows against one q8 activation with AVX-512 VNNI: the
+/// activation permutations, the LUT and the block scales of x are
+/// shared by the four rows; per row the same exact block dots and the
+/// same fused four-lane order as row_dot_fp4_vnni, so each output equals
+/// row_dot_fp4 on that row bit for bit.
+///
+/// SAFETY: caller guarantees avx512f/bw/vnni; every prow has 16*nb
+/// bytes, every srow nb bytes, xq nb blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,fma")]
+pub unsafe fn rows4_dot_fp4_vnni(prows: [&[u8]; 4], srows: [&[u8]; 4], xq: &Q8Vec) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let nb = srows[0].len();
+    unsafe {
+        let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(E2M1_X2.as_ptr() as *const __m128i));
+        let msk = _mm512_set1_epi8(0x0F);
+        let c128 = _mm512_set1_epi8(-128);
+        let idx = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 8, 4, 0);
+        let pa = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let pb = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let mut acc = [_mm_setzero_ps(); 4];
+        let mut g = 0usize;
+        while g + 4 <= nb {
+            let x0 = _mm512_loadu_si512(xq.q.as_ptr().add(g * 32) as *const _);
+            let x1 = _mm512_loadu_si512(xq.q.as_ptr().add(g * 32 + 64) as *const _);
+            let uxa = _mm512_xor_si512(_mm512_permutex2var_epi64(x0, pa, x1), c128);
+            let uxb = _mm512_xor_si512(_mm512_permutex2var_epi64(x0, pb, x1), c128);
+            let xs = _mm_loadu_ps(xq.scales.as_ptr().add(g));
+            for r in 0..4 {
+                let bytes = _mm512_loadu_si512(prows[r].as_ptr().add(g * 16) as *const _);
+                let lo = _mm512_shuffle_epi8(lut, _mm512_and_si512(bytes, msk));
+                let hi = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(bytes, 4), msk));
+                let ilo = _mm512_unpacklo_epi8(lo, hi);
+                let ihi = _mm512_unpackhi_epi8(lo, hi);
+                let d = _mm512_add_epi32(
+                    _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), uxa, ilo), _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, ilo)),
+                    _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), uxb, ihi), _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, ihi)),
+                );
+                let d2 = _mm512_add_epi32(d, _mm512_shuffle_epi32(d, _MM_PERM_BADC));
+                let d1 = _mm512_add_epi32(d2, _mm512_shuffle_epi32(d2, _MM_PERM_CDAB));
+                let idots = _mm512_castsi512_si128(_mm512_permutexvar_epi32(idx, d1));
+                let s = srows[r];
+                let sc = _mm_mul_ps(
+                    _mm_set_ps(
+                        crate::quant::mxfp4::exp2_i(s[g + 3] as i32 - 128),
+                        crate::quant::mxfp4::exp2_i(s[g + 2] as i32 - 128),
+                        crate::quant::mxfp4::exp2_i(s[g + 1] as i32 - 128),
+                        crate::quant::mxfp4::exp2_i(s[g] as i32 - 128),
+                    ),
+                    xs,
+                );
+                acc[r] = _mm_fmadd_ps(_mm_cvtepi32_ps(idots), sc, acc[r]);
+            }
+            g += 4;
+        }
+        let mut out = [0.0f32; 4];
+        for r in 0..4 {
+            let mut lanes = [0.0f32; 4];
+            _mm_storeu_ps(lanes.as_mut_ptr(), acc[r]);
+            let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            let mut gg = g;
+            while gg < nb {
+                let idot = block_dot(&prows[r][gg * 16..(gg + 1) * 16], &xq.q[gg * 32..(gg + 1) * 32]);
+                total += idot as f32 * (crate::quant::mxfp4::exp2_i(srows[r][gg] as i32 - 128) * xq.scales[gg]);
+                gg += 1;
+            }
+            out[r] = total;
+        }
+        out
     }
 }

@@ -423,6 +423,35 @@ thread_local! {
 /// out_block = 2^(sb-128) * dx_g * <LUT2 block, q8 block>, the inner dot in
 /// exact int32. NOT bit-identical to the f32 path (that is the deal;
 /// MICROKIMI_NO_Q8=1 disables it). Same row splitting as the f32 path.
+/// Rows [r0, r1) of a packed matrix against one q8 activation, written
+/// to out[r]. Four rows per step on AVX-512 VNNI hosts (shared
+/// activation work), the shared row kernel otherwise; identical bits.
+/// SAFETY: out points at `rows` f32; every row in range is written once.
+#[inline]
+unsafe fn rows_range(packed: &[u8], scales: &[u8], cols: usize, xq: &crate::quant::q8::Q8Vec, r0: usize, r1: usize, out: *mut f32) {
+    let pr = cols / 2;
+    let sr = cols / 32;
+    let mut r = r0;
+    #[cfg(target_arch = "x86_64")]
+    if crate::quant::q8::vnni512_available() {
+        while r + 4 <= r1 {
+            let p4 = [&packed[r * pr..(r + 1) * pr], &packed[(r + 1) * pr..(r + 2) * pr], &packed[(r + 2) * pr..(r + 3) * pr], &packed[(r + 3) * pr..(r + 4) * pr]];
+            let s4 = [&scales[r * sr..(r + 1) * sr], &scales[(r + 1) * sr..(r + 2) * sr], &scales[(r + 2) * sr..(r + 3) * sr], &scales[(r + 3) * sr..(r + 4) * sr]];
+            // SAFETY: vnni checked; slices hold nb blocks each.
+            let t = unsafe { crate::quant::q8::rows4_dot_fp4_vnni(p4, s4, xq) };
+            for k in 0..4 {
+                unsafe { *out.add(r + k) = t[k] };
+            }
+            r += 4;
+        }
+    }
+    while r < r1 {
+        let v = crate::quant::q8::row_dot_fp4(&packed[r * pr..(r + 1) * pr], &scales[r * sr..(r + 1) * sr], xq);
+        unsafe { *out.add(r) = v };
+        r += 1;
+    }
+}
+
 pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, xq: &crate::quant::q8::Q8Vec, out: &mut [f32], n_threads: usize) {
     assert_eq!(xq.q.len(), cols);
     assert_eq!(xq.scales.len(), cols / 32);
@@ -471,14 +500,8 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
                             if r0 >= rows {
                                 break;
                             }
-                            for r in r0..(r0 + step).min(rows) {
-                                *op.0.add(r) = row(
-                                    &packed[r * cols / 2..(r + 1) * cols / 2],
-                                    &scales[r * cols / 32..(r + 1) * cols / 32],
-                                    cols,
-                                    xq,
-                                );
-                            }
+                            let r1 = (r0 + step).min(rows);
+                            rows_range(packed, scales, cols, xq, r0, r1, op.0);
                         }
                     }
                 }));
