@@ -1414,13 +1414,20 @@ fn packed_moe(
 /// Single-token dense MLP through the unpacked-i8 copies when the q8
 /// spine carries them (and no block budget is active); the packed path
 /// otherwise. Same math, pure-SDOT kernels.
-/// Single-token dense MLP source: the packed fp4 rows (half the bytes of
-/// the unpacked i8 copy) when MICROKIMI_DECODE_MLP_FP4=1. Decode of a
-/// large dense model is DRAM-bound, so bytes per token is the whole
-/// story there; the i8 copy is the prefill's kernel (compute-bound).
+/// Single-token dense MLP source. Decode of a large dense model is
+/// DRAM-bound, so bytes per token is the whole story there: the packed
+/// fp4 rows are half the unpacked i8 copy. Default on where the packed
+/// matvec has a four-row tile that streams at the DRAM ceiling (x86
+/// AVX-512 VNNI: 80 GB/s against 98 for q8 on a Cascade Lake, 27B decode
+/// 374 -> 321 ms/token); the i8 copy elsewhere (it is the prefill's
+/// kernel, compute-bound). MICROKIMI_DECODE_MLP_FP4=1|0 forces either.
 fn decode_mlp_fp4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MICROKIMI_DECODE_MLP_FP4").map(|v| v == "1").unwrap_or(false))
+    *ON.get_or_init(|| match std::env::var("MICROKIMI_DECODE_MLP_FP4").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => crate::quant::q8::vnni512_available(),
+    })
 }
 
 fn packed_dense_mlp_q8(

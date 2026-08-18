@@ -21,6 +21,7 @@
 /// e2m1's negative zero, mapped to 0.
 pub const E2M1_X2: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 /// E2M1_X2 + 12: the same values as unsigned bytes 0..24 (dpbusd's u8 operand).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub const E2M1_X2_P12: [u8; 16] = [12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0];
 
 /// One q8_0-quantized activation vector: int8 values + one f32 scale per
