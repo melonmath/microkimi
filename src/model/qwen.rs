@@ -2686,6 +2686,69 @@ impl QwenModel {
             }
             let q8 = self.q8_spine[l].as_ref();
             let t_attn = std::time::Instant::now();
+            // GPU phase 3: a dense linear layer as ONE command buffer
+            // (input norm, projections, conv, scan, gated norm, out_proj,
+            // post-norm, MLP); the returned attn+mlp joins the f32 residual
+            // here. The MLP residual of the previous layer was already
+            // folded by par_add_norm above, so `hidden` is current.
+            #[cfg(target_os = "macos")]
+            if crate::model::metal::qwen_gpu_on()
+                && t_count >= crate::model::metal::GEMM_MIN_T
+                && !crate::model::accel::accel_on()
+                && self.skip_bounds[l].is_none()
+            {
+                if let (QwenAttnW::Linear(w), QwenCache::Linear(cache), QwenMlpW::Dense { gate, up, down }) =
+                    (&layer.attn, &mut self.caches[l], &layer.mlp)
+                {
+                    let refs = crate::model::metal::LinLayerRefs {
+                        in_qkv: tensor(data, &w.in_qkv),
+                        in_z: tensor(data, &w.in_z),
+                        in_b: tensor(data, &w.in_b),
+                        in_a: tensor(data, &w.in_a),
+                        conv_w: tensor(data, &w.conv),
+                        a_log: tensor(data, &w.a_log),
+                        dt_bias: tensor(data, &w.dt_bias),
+                        norm_w: tensor(data, &w.norm),
+                        out_proj: tensor(data, &w.out_proj),
+                        post_norm_w: tensor(data, &layer.post_norm),
+                        gate: packed_parts(data, gate),
+                        up: packed_parts(data, up),
+                        down: packed_parts(data, down),
+                    };
+                    let dm = crate::model::metal::LinDims {
+                        d,
+                        heads: c.lin_v_heads,
+                        kv_heads: c.lin_k_heads,
+                        kd: c.lin_k_dim,
+                        vd: c.lin_v_dim,
+                        conv_k: c.conv_kernel,
+                        inter: c.dense_inter,
+                        eps: c.norm_eps as f32,
+                    };
+                    // the input norm is on the GPU too: pass hidden, and the
+                    // layer's input_norm weight rides in norm_w? No - the
+                    // gated norm uses w.norm; the INPUT norm weight is
+                    // layer.input_norm. LinLayerRefs.norm_w must be the
+                    // input norm; the gated norm weight goes separately.
+                    let mut delta = vec![0.0f32; t_count * d];
+                    let mut refs = refs;
+                    refs.norm_w = tensor(data, &layer.input_norm);
+                    let gated_w = tensor(data, &w.norm);
+                    if crate::model::metal::gpu_linear_layer(
+                        &refs, gated_w, dm, &hidden[..t_count * d], t_count,
+                        &mut cache.conv, &mut cache.state, &mut delta,
+                    ) {
+                        for i in 0..t_count * d {
+                            hidden[i] += delta[i];
+                        }
+                        dprof_add(0, t_attn.elapsed());
+                        // the MLP residual is already inside `delta`; make the
+                        // next layer's par_add_norm add nothing extra
+                        attn_out[..t_count * d].fill(0.0);
+                        continue;
+                    }
+                }
+            }
             match (&layer.attn, &mut self.caches[l]) {
                 (QwenAttnW::Linear(w), QwenCache::Linear(cache)) => {
                     lin_attn_prefill(data, w, q8, &c, &normed, t_count, cache, &mut attn_out);

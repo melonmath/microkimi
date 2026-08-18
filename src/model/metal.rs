@@ -2757,6 +2757,7 @@ pub fn gpu_mlp_fused(
             f2(encoder, sel("setBuffer:offset:atIndex:"), buf_st, 0, 1);
             f2(encoder, sel("setBuffer:offset:atIndex:"), buf_st, (t * d * 2) as u64, 2);
             f2(encoder, sel("setBuffer:offset:atIndex:"), buf_x, 0, 3);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_x, 0, 6);
             let dims: [u32; 2] = [d as u32, 0];
             let f3: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
@@ -2951,18 +2952,21 @@ kernel void add_rmsnorm_f16(device const half* hidden [[buffer(0)]],
                             device const half* add    [[buffer(1)]],
                             device const float* w     [[buffer(2)]],
                             device half* normed       [[buffer(3)]],
-                            constant uint2& dims      [[buffer(4)]], // d, unused
+                            constant uint2& dims      [[buffer(4)]], // d, has_add
                             constant float& eps       [[buffer(5)]],
+                            device half* sum_out      [[buffer(6)]], // hidden+add when has_add
                             uint row   [[threadgroup_position_in_grid]],
                             uint lane  [[thread_position_in_threadgroup]],
                             uint lanes [[threads_per_threadgroup]]) {
     uint d = dims.x;
     device const half* h = hidden + (size_t)row * d;
-    (void)add;
+    device const half* a = add + (size_t)row * d;
+    device half* so = sum_out + (size_t)row * d;
     threadgroup float partial[32];
     float ss = 0.0f;
     for (uint i = lane; i < d; i += lanes) {
         float v = float(h[i]);
+        if (dims.y != 0u) { v += float(a[i]); so[i] = half(v); }
         ss += v * v;
     }
     ss = simd_sum(ss);
@@ -2978,7 +2982,8 @@ kernel void add_rmsnorm_f16(device const half* hidden [[buffer(0)]],
     float inv = rsqrt(partial[0] / float(d) + eps);
     device half* n = normed + (size_t)row * d;
     for (uint i = lane; i < d; i += lanes) {
-        n[i] = half(float(h[i]) * inv * (1.0f + w[i]));
+        float v = (dims.y != 0u) ? float(so[i]) : float(h[i]);
+        n[i] = half(v * inv * (1.0f + w[i]));
     }
 }
 "#;
@@ -3134,7 +3139,7 @@ kernel void scan_prep_f16(device const half* conved  [[buffer(0)]], // [t, conv_
 // Gated RMSNorm per (row, head): y = rmsnorm(x_h) * w * silu(z_h), the
 // gated-DeltaNet output norm (direct weight, no offset). One threadgroup
 // per (row, head); vd <= 256 lanes.
-kernel void gated_rmsnorm_f16(device const half* mixed_hm [[buffer(0)]], // [heads, t, vd]
+kernel void gated_rmsnorm_f16(device const float* mixed_hm [[buffer(0)]], // [heads, t, vd] (f32: the scan's output)
                               device const half* z        [[buffer(1)]], // [t, heads*vd]
                               device const float* w       [[buffer(2)]], // [vd]
                               device half* out            [[buffer(3)]], // [t, heads*vd]
@@ -3145,12 +3150,12 @@ kernel void gated_rmsnorm_f16(device const half* mixed_hm [[buffer(0)]], // [hea
                               uint lanes [[threads_per_threadgroup]]) {
     uint t = dims.x, heads = dims.y, vd = dims.z;
     uint row = tg / heads, h = tg % heads;
-    device const half* xin = mixed_hm + ((size_t)h * t + row) * vd;
+    device const float* xin = mixed_hm + ((size_t)h * t + row) * vd;
     device const half* zin = z + (size_t)row * heads * vd + h * vd;
     device half* o = out + (size_t)row * heads * vd + h * vd;
     threadgroup float partial[32];
     float ss = 0.0f;
-    for (uint i = lane; i < vd; i += lanes) { float v = float(xin[i]); ss += v * v; }
+    for (uint i = lane; i < vd; i += lanes) { float v = xin[i]; ss += v * v; }
     ss = simd_sum(ss);
     if ((lane & 31u) == 0u) partial[lane / 32u] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3165,7 +3170,7 @@ kernel void gated_rmsnorm_f16(device const half* mixed_hm [[buffer(0)]], // [hea
     for (uint i = lane; i < vd; i += lanes) {
         float zv = float(zin[i]);
         float g = zv / (1.0f + exp(-zv));
-        o[i] = half(float(xin[i]) * inv * w[i] * g);
+        o[i] = half(xin[i] * inv * w[i] * g);
     }
 }
 "#;
@@ -3243,4 +3248,395 @@ pub(crate) fn tissue_ctx() -> Option<(&'static MetalCtx, &'static TissueCtx)> {
         })
         .as_ref()?;
     Some((base, c))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 3: one command buffer per linear layer
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The whole GatedDeltaNet layer - in_qkv/in_z GEMMs, in_b/in_a GEMMs,
+// causal conv + SiLU, scan prep, delta scan, gated norm, out_proj GEMM,
+// residual add, post-norm, gate/up GEMMs, SiLU*up, down GEMM - encodes
+// into ONE command buffer with every intermediate resident on the GPU.
+// The CPU sees the layer as: upload hidden (f16 view) once, one wait,
+// read back the new hidden delta and the updated conv/scan states. The
+// f32 residual stream stays on the CPU (added in f32 there), so precision
+// across the 24 layers is unchanged from the CPU path.
+
+/// Device buffers a linear layer's chain needs, grown on demand.
+struct LayerArena {
+    bufs: Vec<(Id, usize)>,
+}
+
+// SAFETY: device buffers are owned by the Metal runtime; the arena only
+// hands out pointers under its own lock.
+unsafe impl Send for LayerArena {}
+
+static ARENA: std::sync::Mutex<Option<LayerArena>> = std::sync::Mutex::new(None);
+
+/// Slot indices in the arena.
+const A_HID: usize = 0; // hidden f16 [t, d]
+const A_NORM: usize = 1; // normed f16 [t, d]
+const A_QKV: usize = 2; // qkv f16 [t, conv_dim]
+const A_Z: usize = 3; // z f16 [t, vt]
+const A_BA: usize = 4; // b_raw|a_raw f16 [t, heads]x2
+const A_CONV: usize = 5; // conved f16 [t, conv_dim]
+const A_SCANIN: usize = 6; // q|k|v|beta|decay f32 (scan layouts)
+const A_MIXHM: usize = 7; // mixed head-major f32 [heads, t, vd]
+const A_MIXTM: usize = 8; // mixed token-major f16 [t, vt]
+const A_ATTN: usize = 9; // attention out f16 [t, d]
+const A_HID2: usize = 10; // hidden + attn f16 [t, d] (post-norm input)
+const A_NORM2: usize = 11; // post-normed f16 [t, d]
+const A_H: usize = 12; // gate|up f16 [t, inter]x2
+const A_OUT: usize = 13; // mlp out f16 [t, d]
+const A_STATE: usize = 14; // scan state f32 [heads, kd, vd]
+const A_CONVST: usize = 15; // conv state f32 [conv_dim, k-1]
+const A_SMALL: usize = 16; // small f32 params: norm weights, a_log, dt_bias, conv w
+const A_N: usize = 17;
+
+/// Ensures arena slot `i` holds at least `bytes`; returns (contents, buffer).
+/// SAFETY: caller holds the ARENA lock for the whole layer encode.
+unsafe fn arena_buf(base: &MetalCtx, arena: &mut LayerArena, i: usize, bytes: usize) -> (*mut c_void, Id) {
+    while arena.bufs.len() < A_N {
+        arena.bufs.push((std::ptr::null_mut(), 0));
+    }
+    unsafe { ensure_buf(base, &mut arena.bufs[i], bytes) }
+}
+
+/// Everything a linear layer needs, by reference (weights as slices of the
+/// mapping or the q8/dequant caches).
+#[allow(clippy::too_many_arguments)]
+pub struct LinLayerRefs<'a> {
+    pub in_qkv: &'a [f32],
+    pub in_z: &'a [f32],
+    pub in_b: &'a [f32],
+    pub in_a: &'a [f32],
+    pub conv_w: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm_w: &'a [f32],
+    pub out_proj: &'a [f32],
+    pub post_norm_w: &'a [f32],
+    pub gate: (&'a [u8], &'a [u8]),
+    pub up: (&'a [u8], &'a [u8]),
+    pub down: (&'a [u8], &'a [u8]),
+}
+
+/// Dimensions of a linear layer.
+#[derive(Clone, Copy)]
+pub struct LinDims {
+    pub d: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub kd: usize,
+    pub vd: usize,
+    pub conv_k: usize,
+    pub inter: usize,
+    pub eps: f32,
+}
+
+/// One whole linear layer on the GPU. `hidden` [t, d] f32 in; on return
+/// `attn_plus_mlp` [t, d] holds (attention output + MLP output) so the
+/// caller adds it into its f32 residual stream; `conv_state` and
+/// `scan_state` are updated in place. False = the caller runs the CPU
+/// layer (nothing was mutated).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_linear_layer(
+    w: &LinLayerRefs,
+    gated_w: &[f32], // the DeltaNet output norm weight [vd]
+    dm: LinDims,
+    hidden: &[f32],
+    t: usize,
+    conv_state: &mut [f32],
+    scan_state: &mut [f32],
+    attn_plus_mlp: &mut [f32],
+) -> bool {
+    if !gemm_f16_on() || dm.kd > 128 || dm.vd > 128 || dm.conv_k > 9 {
+        return false;
+    }
+    let (d, heads, kd, vd, inter) = (dm.d, dm.heads, dm.kd, dm.vd, dm.inter);
+    let kt = dm.kv_heads * kd;
+    let vt = heads * vd;
+    let conv_dim = 2 * kt + vt;
+    let rep = heads / dm.kv_heads.max(1);
+    let Some((base, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some((_, tis)) = tissue_ctx() else {
+        return false;
+    };
+    let Some((_, an)) = addnorm_ctx() else {
+        return false;
+    };
+    let Some((_, sm)) = silu_ctx() else {
+        return false;
+    };
+    let Some((_, sc)) = scan_ctx() else {
+        return false;
+    };
+    // weights on device
+    let Some(b_qkv) = weight_buffer_f16(base, mps, w.in_qkv, conv_dim, d) else { return false };
+    let Some(b_z) = weight_buffer_f16(base, mps, w.in_z, vt, d) else { return false };
+    let Some(b_b) = weight_buffer_f16(base, mps, w.in_b, heads, d) else { return false };
+    let Some(b_a) = weight_buffer_f16(base, mps, w.in_a, heads, d) else { return false };
+    let Some(b_out) = weight_buffer_f16(base, mps, w.out_proj, d, vt) else { return false };
+    let Some(b_g) = dequant_buffer(base, mps, w.gate.0, w.gate.1, inter, d) else { return false };
+    let Some(b_u) = dequant_buffer(base, mps, w.up.0, w.up.1, inter, d) else { return false };
+    let Some(b_dn) = dequant_buffer(base, mps, w.down.0, w.down.1, d, inter) else { return false };
+    // kernels
+    let Some(k_qkv) = gemm_kernel(base, mps, t, conv_dim, d, true, 1.0) else { return false };
+    let Some(k_z) = gemm_kernel(base, mps, t, vt, d, true, 1.0) else { return false };
+    let Some(k_ba) = gemm_kernel(base, mps, t, heads, d, true, 1.0) else { return false };
+    let Some(k_out) = gemm_kernel(base, mps, t, d, vt, true, 1.0) else { return false };
+    let Some(k_gu) = gemm_kernel(base, mps, t, inter, d, true, 1.0) else { return false };
+    let Some(k_dn) = gemm_kernel(base, mps, t, d, inter, true, 1.0) else { return false };
+    let t_start = std::time::Instant::now();
+
+    let mut arena_guard = ARENA.lock().unwrap();
+    let arena = arena_guard.get_or_insert_with(|| LayerArena { bufs: Vec::new() });
+    // SAFETY: the ARENA lock serializes layer encodes; every buffer below is
+    // sized before use; waitUntilCompleted precedes the readbacks; the io
+    // mutex is NOT taken (the arena is separate), so no deadlock with the
+    // per-op paths.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        macro_rules! slot {
+            ($i:expr, $bytes:expr) => {{
+                let (p, b) = arena_buf(base, arena, $i, $bytes);
+                if p.is_null() || b.is_null() {
+                    msg_void(pool, sel("drain"));
+                    return false;
+                }
+                (p, b)
+            }};
+        }
+        let (p_hid, b_hid) = slot!(A_HID, t * d * 2);
+        let (_, b_norm) = slot!(A_NORM, t * d * 2);
+        let (_, b_qkvo) = slot!(A_QKV, t * conv_dim * 2);
+        let (_, b_zo) = slot!(A_Z, t * vt * 2);
+        let (_, b_ba) = slot!(A_BA, t * heads * 2 * 2);
+        let (_, b_conv) = slot!(A_CONV, t * conv_dim * 2);
+        let scan_q = 0usize;
+        let scan_k = t * heads * kd;
+        let scan_v = 2 * t * heads * kd;
+        let scan_beta = scan_v + t * heads * vd;
+        let scan_decay = scan_beta + t * heads;
+        let scan_total = scan_decay + t * heads;
+        let (_, b_scanin) = slot!(A_SCANIN, scan_total * 4);
+        let (_, b_mixhm) = slot!(A_MIXHM, heads * t * vd * 4);
+        let (_, b_mixtm) = slot!(A_MIXTM, t * vt * 2);
+        let (p_attn, b_attn) = slot!(A_ATTN, t * d * 2);
+        let (_, b_hid2) = slot!(A_HID2, t * d * 2);
+        let (_, b_norm2) = slot!(A_NORM2, t * d * 2);
+        let (_, b_h) = slot!(A_H, t * inter * 2 * 2);
+        let (p_out, b_out_mlp) = slot!(A_OUT, t * d * 2);
+        let (p_state, b_state) = slot!(A_STATE, scan_state.len() * 4);
+        let (p_convst, b_convst) = slot!(A_CONVST, conv_state.len() * 4);
+        // small params packed: [norm_w d | post_norm_w d | a_log heads | dt_bias heads | conv_w conv_dim*k]
+        let off_norm = 0usize;
+        let off_post = d;
+        let off_alog = 2 * d;
+        let off_dtb = 2 * d + heads;
+        let off_convw = 2 * d + 2 * heads;
+        let off_gated = off_convw + conv_dim * dm.conv_k;
+        let small_total = off_gated + vd;
+        let (p_small, b_small) = slot!(A_SMALL, small_total * 4);
+
+        // uploads
+        f32s_to_f16s(hidden, std::slice::from_raw_parts_mut(p_hid as *mut u16, t * d));
+        std::ptr::copy_nonoverlapping(scan_state.as_ptr(), p_state as *mut f32, scan_state.len());
+        std::ptr::copy_nonoverlapping(conv_state.as_ptr(), p_convst as *mut f32, conv_state.len());
+        let sm_ptr = p_small as *mut f32;
+        std::ptr::copy_nonoverlapping(w.norm_w.as_ptr(), sm_ptr.add(off_norm), d.min(w.norm_w.len()));
+        std::ptr::copy_nonoverlapping(w.post_norm_w.as_ptr(), sm_ptr.add(off_post), d);
+        std::ptr::copy_nonoverlapping(w.a_log.as_ptr(), sm_ptr.add(off_alog), heads);
+        std::ptr::copy_nonoverlapping(w.dt_bias.as_ptr(), sm_ptr.add(off_dtb), heads);
+        std::ptr::copy_nonoverlapping(w.conv_w.as_ptr(), sm_ptr.add(off_convw), conv_dim * dm.conv_k);
+        std::ptr::copy_nonoverlapping(gated_w.as_ptr(), sm_ptr.add(off_gated), vd.min(gated_w.len()));
+
+        // helpers
+        let desc16 = |r: usize, c: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(class("MPSMatrixDescriptor"), sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), r as u64, c as u64, (c * 2) as u64, MPS_FLOAT16)
+        };
+        let mat = |buf: Id, off: usize, dsc: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:offset:descriptor:"), buf, off as u64, dsc)
+        };
+        let enc_gemm: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_pipe: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_bytes: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_tg: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let sel_enc = sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:");
+        let sel_pipe = sel("setComputePipelineState:");
+        let sel_sb = sel("setBuffer:offset:atIndex:");
+        let sel_by = sel("setBytes:length:atIndex:");
+        let sel_dtg = sel("dispatchThreadgroups:threadsPerThreadgroup:");
+        let sel_end = sel("endEncoding");
+        let mut mats: Vec<Id> = Vec::new();
+        let mut m = |buf: Id, off: usize, r: usize, c: usize| -> Id {
+            let x = mat(buf, off, desc16(r, c));
+            mats.push(x);
+            x
+        };
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+
+        // 1. input norm: normed = rmsnorm(hidden) * (1 + norm_w)   [hidden f16 view]
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, an.pipeline);
+            set_buf(e, sel_sb, b_hid, 0, 0);
+            set_buf(e, sel_sb, b_hid, 0, 1);
+            set_buf(e, sel_sb, b_small, (off_norm * 4) as u64, 2);
+            set_buf(e, sel_sb, b_norm, 0, 3);
+            set_buf(e, sel_sb, b_norm, 0, 6);
+            let dims: [u32; 2] = [d as u32, 0];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 4);
+            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
+            disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 2. projections from normed: qkv, z, b, a
+        let mx = m(b_norm, 0, t, d);
+        enc_gemm(k_qkv, sel_enc, cmdbuf, mx, m(b_qkv, 0, conv_dim, d), m(b_qkvo, 0, t, conv_dim));
+        enc_gemm(k_z, sel_enc, cmdbuf, mx, m(b_z, 0, vt, d), m(b_zo, 0, t, vt));
+        enc_gemm(k_ba, sel_enc, cmdbuf, mx, m(b_b, 0, heads, d), m(b_ba, 0, t, heads));
+        enc_gemm(k_ba, sel_enc, cmdbuf, mx, m(b_a, 0, heads, d), m(b_ba, t * heads * 2, t, heads));
+        // 3. causal conv + SiLU (state carried)
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, tis.conv);
+            set_buf(e, sel_sb, b_qkvo, 0, 0);
+            set_buf(e, sel_sb, b_small, (off_convw * 4) as u64, 1);
+            set_buf(e, sel_sb, b_convst, 0, 2);
+            set_buf(e, sel_sb, b_conv, 0, 3);
+            let dims: [u32; 3] = [t as u32, conv_dim as u32, dm.conv_k as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 4);
+            let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(e, sel("dispatchThreads:threadsPerThreadgroup:"), MTLSize { width: conv_dim as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 4. scan prep -> q,k,v,beta,decay (f32, scan layouts)
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, tis.scanprep);
+            set_buf(e, sel_sb, b_conv, 0, 0);
+            set_buf(e, sel_sb, b_ba, 0, 1);
+            set_buf(e, sel_sb, b_ba, (t * heads * 2) as u64, 2);
+            set_buf(e, sel_sb, b_small, (off_alog * 4) as u64, 3);
+            set_buf(e, sel_sb, b_small, (off_dtb * 4) as u64, 4);
+            set_buf(e, sel_sb, b_scanin, (scan_q * 4) as u64, 5);
+            set_buf(e, sel_sb, b_scanin, (scan_k * 4) as u64, 6);
+            set_buf(e, sel_sb, b_scanin, (scan_v * 4) as u64, 7);
+            set_buf(e, sel_sb, b_scanin, (scan_beta * 4) as u64, 8);
+            set_buf(e, sel_sb, b_scanin, (scan_decay * 4) as u64, 9);
+            let d0: [u32; 4] = [t as u32, heads as u32, kd as u32, vd as u32];
+            let d1: [u32; 4] = [rep as u32, kt as u32, conv_dim as u32, 0];
+            set_bytes(e, sel_by, d0.as_ptr() as *const c_void, 16, 10);
+            set_bytes(e, sel_by, d1.as_ptr() as *const c_void, 16, 11);
+            disp_tg(e, sel_dtg, MTLSize { width: (t * heads) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 5. delta scan (state in place, mixed head-major)
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, sc.pipeline);
+            set_buf(e, sel_sb, b_scanin, (scan_q * 4) as u64, 0);
+            set_buf(e, sel_sb, b_scanin, (scan_k * 4) as u64, 1);
+            set_buf(e, sel_sb, b_scanin, (scan_v * 4) as u64, 2);
+            set_buf(e, sel_sb, b_scanin, (scan_beta * 4) as u64, 3);
+            set_buf(e, sel_sb, b_scanin, (scan_decay * 4) as u64, 4);
+            set_buf(e, sel_sb, b_state, 0, 5);
+            set_buf(e, sel_sb, b_mixhm, 0, 6);
+            let dims: [u32; 4] = [t as u32, heads as u32, kd as u32, vd as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 16, 7);
+            disp_tg(e, sel_dtg, MTLSize { width: heads as u64, height: 1, depth: 1 }, MTLSize { width: vd as u64, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 6. gated norm: reads the scan's f32 head-major mix, writes the
+        //    token-major f16 GEMM input
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, tis.gnorm);
+            set_buf(e, sel_sb, b_mixhm, 0, 0);
+            set_buf(e, sel_sb, b_zo, 0, 1);
+            set_buf(e, sel_sb, b_small, (off_gated * 4) as u64, 2);
+            set_buf(e, sel_sb, b_mixtm, 0, 3);
+            let dims: [u32; 3] = [t as u32, heads as u32, vd as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 4);
+            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
+            disp_tg(e, sel_dtg, MTLSize { width: (t * heads) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 7. out_proj -> attn out
+        enc_gemm(k_out, sel_enc, cmdbuf, m(b_mixtm, 0, t, vt), m(b_out, 0, d, vt), m(b_attn, 0, t, d));
+        // 8. hidden2 = hidden + attn (device-side f16 sum, used ONLY as the
+        //    post-norm input; the f32 residual add happens on the CPU from the
+        //    returned attn+mlp), normed2 = rmsnorm(hidden2) * (1 + post_w)
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, an.pipeline);
+            set_buf(e, sel_sb, b_hid, 0, 0);
+            set_buf(e, sel_sb, b_attn, 0, 1);
+            set_buf(e, sel_sb, b_small, (off_post * 4) as u64, 2);
+            set_buf(e, sel_sb, b_norm2, 0, 3);
+            set_buf(e, sel_sb, b_hid2, 0, 6);
+            let dims: [u32; 2] = [d as u32, 1];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 4);
+            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
+            disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        // 9. MLP: gate/up from normed2, SiLU*up, down -> out
+        let mx2 = m(b_norm2, 0, t, d);
+        enc_gemm(k_gu, sel_enc, cmdbuf, mx2, m(b_g, 0, inter, d), m(b_h, 0, t, inter));
+        enc_gemm(k_gu, sel_enc, cmdbuf, mx2, m(b_u, 0, inter, d), m(b_h, t * inter * 2, t, inter));
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, sm.pipeline);
+            set_buf(e, sel_sb, b_h, 0, 0);
+            set_buf(e, sel_sb, b_h, (t * inter * 2) as u64, 1);
+            let n = (t * inter) as u32;
+            set_bytes(e, sel_by, (&n) as *const u32 as *const c_void, 4, 2);
+            let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(e, sel("dispatchThreads:threadsPerThreadgroup:"), MTLSize { width: (t * inter) as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        enc_gemm(k_dn, sel_enc, cmdbuf, m(b_h, 0, t, inter), m(b_dn, 0, d, inter), m(b_out_mlp, 0, t, d));
+
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        // readback: attn + mlp (both f16) summed into the caller's f32 buffer,
+        // and the two states
+        {
+            let a16 = std::slice::from_raw_parts(p_attn as *const u16, t * d);
+            let o16 = std::slice::from_raw_parts(p_out as *const u16, t * d);
+            let mut tmp = vec![0.0f32; t * d];
+            f16s_to_f32s(a16, attn_plus_mlp);
+            f16s_to_f32s(o16, &mut tmp);
+            for (x, y) in attn_plus_mlp.iter_mut().zip(&tmp) {
+                *x += y;
+            }
+        }
+        scan_state.copy_from_slice(std::slice::from_raw_parts(p_state as *const f32, scan_state.len()));
+        conv_state.copy_from_slice(std::slice::from_raw_parts(p_convst as *const f32, conv_state.len()));
+        for x in &mats {
+            msg_void(*x, sel("release"));
+        }
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
 }
