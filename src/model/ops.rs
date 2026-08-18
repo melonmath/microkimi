@@ -653,6 +653,28 @@ pub(super) fn q8_rows_dot(
             r += 4;
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::quant::q8::x86_tiles_available() {
+        while r + 4 <= n {
+            let base = r0 + r;
+            let w4 = [
+                &q[base * cols..(base + 1) * cols],
+                &q[(base + 1) * cols..(base + 2) * cols],
+                &q[(base + 2) * cols..(base + 3) * cols],
+                &q[(base + 3) * cols..(base + 4) * cols],
+            ];
+            let s4 = [
+                &scales[base * nb..(base + 1) * nb],
+                &scales[(base + 1) * nb..(base + 2) * nb],
+                &scales[(base + 2) * nb..(base + 3) * nb],
+                &scales[(base + 3) * nb..(base + 4) * nb],
+            ];
+            // SAFETY: avx2/fma checked; slices hold nb blocks each.
+            let tile = unsafe { x86_rows4_tile(w4, s4, &[(xq_q, xq_scales)]) };
+            out[r..r + 4].copy_from_slice(&tile[0]);
+            r += 4;
+        }
+    }
     while r < n {
         let row = r0 + r;
         let mut sum = 0f32;
