@@ -100,6 +100,16 @@ pub fn n_threads() -> usize {
         // decode: 10 threads 11 ms/token vs 4 threads 13; prefill jobs
         // are long enough that six extra cores are pure compute).
         // MICROKIMI_THREADS=4 restores the P-core arm.
+        // With SMT (Linux, two hardware threads per core) the default is
+        // one thread per PHYSICAL core, each pinned to its own core by the
+        // pool: the int8 tiles saturate a core's vector units, so a
+        // sibling adds nothing and the scheduler's placement of two
+        // threads on one core made a 27B prefill 20% slower.
+        if let Some(cores) = pool::physical_cpus() {
+            if cores.len() >= 2 {
+                return cores.len();
+            }
+        }
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     })
 }

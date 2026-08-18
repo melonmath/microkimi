@@ -90,8 +90,126 @@ pub fn pool() -> &'static Pool {
     POOL.get_or_init(|| Pool::new(crate::model::n_threads()))
 }
 
+/// One logical CPU per physical core, in core order, restricted to the
+/// CPUs this process may run on. Some(list) only on Linux hosts where
+/// SMT is present (some core lists two hardware threads); None
+/// elsewhere, so callers keep their previous behavior. Read from sysfs
+/// (`thread_siblings_list`) and sched_getaffinity - no dependencies.
+pub fn physical_cpus() -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        static CORES: std::sync::OnceLock<Option<Vec<usize>>> = std::sync::OnceLock::new();
+        return CORES
+            .get_or_init(|| {
+                let allowed = affinity::current_set()?;
+                let mut seen = std::collections::HashSet::new();
+                let mut cores = Vec::new();
+                let mut smt = false;
+                for &cpu in &allowed {
+                    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+                    let list = std::fs::read_to_string(&path).ok()?;
+                    let sibs: Vec<usize> = list
+                        .trim()
+                        .split(',')
+                        .flat_map(|part| match part.split_once('-') {
+                            Some((a, b)) => {
+                                let (a, b) = (a.parse::<usize>().ok(), b.parse::<usize>().ok());
+                                match (a, b) {
+                                    (Some(a), Some(b)) => (a..=b).collect::<Vec<_>>(),
+                                    _ => Vec::new(),
+                                }
+                            }
+                            None => part.parse::<usize>().ok().into_iter().collect(),
+                        })
+                        .collect();
+                    if sibs.len() > 1 {
+                        smt = true;
+                    }
+                    let key = *sibs.iter().min()?;
+                    if seen.insert(key) {
+                        cores.push(cpu);
+                    }
+                }
+                if smt && !cores.is_empty() {
+                    Some(cores)
+                } else {
+                    None
+                }
+            })
+            .clone();
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Linux CPU affinity through raw libc calls (sched_getaffinity /
+/// sched_setaffinity on a cpu_set_t of 1024 bits, the glibc default).
+#[cfg(target_os = "linux")]
+mod affinity {
+    const SET_WORDS: usize = 1024 / 64;
+    unsafe extern "C" {
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+    }
+    /// CPUs the calling thread may run on.
+    pub fn current_set() -> Option<Vec<usize>> {
+        let mut mask = [0u64; SET_WORDS];
+        // SAFETY: mask is SET_WORDS * 8 bytes, as declared.
+        let rc = unsafe { sched_getaffinity(0, SET_WORDS * 8, mask.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let mut cpus = Vec::new();
+        for (w, word) in mask.iter().enumerate() {
+            for b in 0..64 {
+                if word & (1u64 << b) != 0 {
+                    cpus.push(w * 64 + b);
+                }
+            }
+        }
+        Some(cpus)
+    }
+    /// Pins the calling thread to one CPU (best effort).
+    pub fn pin_current(cpu: usize) {
+        if cpu >= 1024 {
+            return;
+        }
+        let mut mask = [0u64; SET_WORDS];
+        mask[cpu / 64] |= 1u64 << (cpu % 64);
+        // SAFETY: mask is SET_WORDS * 8 bytes, as declared.
+        unsafe {
+            sched_setaffinity(0, SET_WORDS * 8, mask.as_ptr());
+        }
+    }
+}
+
+/// The pinning plan for `n` participants (the calling thread runs jobs
+/// too): with SMT and n <= physical cores, the caller sits on core 0
+/// and worker i on core i + 1 - every participant its own core, no
+/// sibling sharing; otherwise no pinning. MICROKIMI_NO_PIN=1 disables it.
+fn pin_plan(n: usize) -> Option<Vec<usize>> {
+    if std::env::var("MICROKIMI_NO_PIN").map(|v| v == "1").unwrap_or(false) {
+        return None;
+    }
+    let cores = physical_cpus()?;
+    if n <= cores.len() {
+        Some(cores)
+    } else {
+        None
+    }
+}
+
 impl Pool {
     fn new(n: usize) -> Pool {
+        let plan = pin_plan(n);
+        // pinned: the caller is one of the n participants, so n - 1
+        // workers; unpinned: n workers as before (the caller's share of
+        // the tickets is whatever it claims)
+        let spawn = if plan.is_some() { n.saturating_sub(1) } else { n };
+        #[cfg(target_os = "linux")]
+        if let Some(cores) = &plan {
+            affinity::pin_current(cores[0]);
+        }
         let board = Arc::new(Board {
             word: Padded(AtomicU64::new(0)),
             pending: Padded(AtomicUsize::new(0)),
@@ -100,10 +218,17 @@ impl Pool {
             handles: Mutex::new(Vec::new()),
             runner: Mutex::new(()),
         });
-        for _ in 0..n {
+        for i in 0..spawn {
             let b = board.clone();
+            let pin = plan.as_ref().map(|cores| cores[(i + 1) % cores.len()]);
             let h = std::thread::spawn(move || {
                 IN_POOL.with(|c| c.set(true));
+                #[cfg(target_os = "linux")]
+                if let Some(cpu) = pin {
+                    affinity::pin_current(cpu);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = pin;
                 let mut seen: u64 = 0; // tag of the last batch we worked or skipped
                 let mut idle: u32 = 0;
                 loop {
