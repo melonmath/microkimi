@@ -1352,21 +1352,28 @@ impl Q8Head {
                                 }
                                 l0 += 4;
                             }
+                            // lane tail (< 4): one lane per tile call, still
+                            // inside the pool (a serial row_dot tail on 17408
+                            // rows cost the 27B prefill 20 ms per GEMM)
+                            while l0 < lanes {
+                                let xu1: [&[u8]; 1] = [&xu_all[l0 * cols..(l0 + 1) * cols]];
+                                let xs1: [&[f32]; 1] = [std::slice::from_raw_parts(xs_ptrs[l0] as *const f32, nb)];
+                                // SAFETY: as above.
+                                let tile = crate::quant::q8::tile16_vnni::<1>(pack, t, xu1, xs1);
+                                let o = out_ptrs[l0] as *mut f32;
+                                for r in 0..16 {
+                                    *o.add(t * 16 + r) = tile[0][r];
+                                }
+                                l0 += 1;
+                            }
                         }
                     }
                 }
             }));
         }
         p.run(jobs);
-        // leftover lanes (< 4) over the tiled rows, and leftover rows (< 16)
-        // over every lane: the row-major kernels
-        let full_lanes = lanes / 4 * 4;
+        // leftover rows (< 16) over every lane: the row-major kernel
         let tiled_rows = tiles * 16;
-        for l in full_lanes..lanes {
-            for r in 0..tiled_rows {
-                outs[l][r] = self.row_dot(r, &xqs[l]);
-            }
-        }
         for l in 0..lanes {
             for r in tiled_rows..rows {
                 outs[l][r] = self.row_dot(r, &xqs[l]);
