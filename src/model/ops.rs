@@ -1785,7 +1785,9 @@ pub fn kernbench_cmd(args: &[String]) {
     if args.iter().any(|a| a == "--dram") {
         return kernbench_dram();
     }
-    let (rows, cols, lanes_n) = (3072usize, 1024usize, 256usize);
+    let lanes_n: usize = crate::value_flag(args, "--lanes").and_then(|v| v.parse().ok()).unwrap_or(256);
+    let rows: usize = crate::value_flag(args, "--rows").and_then(|v| v.parse().ok()).unwrap_or(3072);
+    let cols: usize = crate::value_flag(args, "--cols").and_then(|v| v.parse().ok()).unwrap_or(1024);
     let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7 + 3) % 23) as f32 * 0.01 - 0.1).collect();
     let head = Q8Head::from_f32(&w, rows, cols);
     let xs_data: Vec<Vec<f32>> = (0..lanes_n)
