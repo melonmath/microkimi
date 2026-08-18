@@ -2699,12 +2699,26 @@ impl QwenModel {
                 }
                 _ => unreachable!("Qwen attention/cache kind mismatch at layer {}", l),
             }
-            {
-                let w = tensor(data, &layer.post_norm);
+            // GPU: residual add on the CPU (f32 stream), the post-norm
+            // fused into the MLP command buffer - normed is not needed
+            #[cfg(target_os = "macos")]
+            let gpu_norm_ok = crate::model::metal::qwen_gpu_on()
+                && t_count >= crate::model::metal::GEMM_MIN_T
+                && !crate::model::accel::accel_on()
+                && matches!(layer.mlp, QwenMlpW::Dense { .. })
+                && self.skip_bounds[l].is_none();
+            #[cfg(not(target_os = "macos"))]
+            let gpu_norm_ok = false;
+            let post_w = tensor(data, &layer.post_norm);
+            if gpu_norm_ok {
+                for i in 0..t_count * d {
+                    hidden[i] += attn_out[i];
+                }
+            } else {
                 par_add_norm(
                     &mut hidden,
                     Some(&attn_out[..t_count * d]),
-                    w,
+                    post_w,
                     c.norm_eps as f32,
                     &mut normed,
                     t_count,
@@ -2712,12 +2726,13 @@ impl QwenModel {
                 );
             }
             let t_mlp = std::time::Instant::now();
-            mlp_prefill(
+            mlp_prefill_ext(
                 data,
                 &layer.mlp,
                 self.mlp_q8[l].as_ref(),
                 &c,
                 &normed,
+                if gpu_norm_ok { Some((&hidden[..t_count * d], post_w, c.norm_eps as f32)) } else { None },
                 t_count,
                 self.skip_bounds[l].as_ref(),
                 &mut attn_out,
@@ -3750,13 +3765,18 @@ fn gather_gate(
 /// Prefill MLP dispatch: every token is independent, so tokens fan out over
 /// worker ranges and each token runs the exact single-token math (routed
 /// experts sequentially inside its worker for the MoE variant).
+/// Prefill MLP with an optional GPU-fused post-norm: when `gpu_norm` is
+/// Some((hidden_rows, w, eps)) and the fused MLP path is taken, the norm
+/// runs on the device from `hidden_rows` and `normed` is ignored there
+/// (the CPU paths keep using `normed`).
 #[allow(clippy::too_many_arguments)]
-fn mlp_prefill(
+fn mlp_prefill_ext(
     data: &[u8],
     mlp: &QwenMlpW,
     q8m: Option<&MlpQ8>,
     c: &QwenConfig,
     normed: &[f32],
+    gpu_norm: Option<(&[f32], &[f32], f32)>,
     t_count: usize,
     bounds: Option<&SkipBounds>,
     out: &mut [f32],
@@ -3785,18 +3805,27 @@ fn mlp_prefill(
                 && !crate::model::accel::accel_on()
             {
                 let mut outs: Vec<&mut [f32]> = out[..t_count * d].chunks_mut(d).collect();
+                // with a fused norm the GEMM input is the HIDDEN rows and
+                // the norm runs on device; otherwise the CPU-normed rows
+                let (xin, nrm): (Vec<&[f32]>, Option<(&[f32], f32)>) = match gpu_norm {
+                    Some((hid, w, eps)) => (hid.chunks(d).take(t_count).collect(), Some((w, eps))),
+                    None => (xs.clone(), None),
+                };
                 if crate::model::metal::gpu_mlp_fused(
                     packed_parts(data, gate),
                     packed_parts(data, up),
                     packed_parts(data, down),
                     inter,
                     d,
-                    &xs,
+                    &xin,
+                    nrm,
                     &mut outs,
                 ) {
                     return;
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = gpu_norm;
             let mut h_gate = vec![0.0f32; t_count * inter];
             let mut h_up = vec![0.0f32; t_count * inter];
             let t_gemm = std::time::Instant::now();

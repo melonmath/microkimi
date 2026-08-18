@@ -2638,6 +2638,7 @@ pub fn gpu_mlp_fused(
     inter: usize,
     d: usize,
     xs: &[&[f32]],
+    norm: Option<(&[f32], f32)>, // (post-norm weight, eps): xs are hidden rows, norm on GPU
     outs: &mut [&mut [f32]],
 ) -> bool {
     if !gemm_f16_on() {
@@ -2650,6 +2651,10 @@ pub fn gpu_mlp_fused(
     let Some((base, sm)) = silu_ctx() else {
         return false;
     };
+    let norm_ctx = if norm.is_some() { addnorm_ctx() } else { None };
+    if norm.is_some() && norm_ctx.is_none() {
+        return false;
+    }
     let Some((_, mps)) = mps_ctx() else {
         return false;
     };
@@ -2677,14 +2682,31 @@ pub fn gpu_mlp_fused(
         // [gate | up] halves in one staging buffer, output in y
         let (h_ptr, buf_h) = ensure_buf(base, &mut io.z, t * inter * 2 * 2);
         let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * d * 2);
-        if buf_x.is_null() || buf_h.is_null() || buf_y.is_null() || x_ptr.is_null() || h_ptr.is_null() || y_ptr.is_null() {
+        // st: [hidden f16 (t*d) | norm weight f32 (d)] when the norm is fused
+        let (st_ptr, buf_st) = if norm.is_some() {
+            ensure_buf(base, &mut io.st, t * d * 2 + d * 4)
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if buf_x.is_null() || buf_h.is_null() || buf_y.is_null() || x_ptr.is_null() || h_ptr.is_null() || y_ptr.is_null()
+            || (norm.is_some() && (buf_st.is_null() || st_ptr.is_null()))
+        {
             drop(io);
             msg_void(pool, sel("drain"));
             return false;
         }
-        for (l, x) in xs.iter().enumerate() {
-            let dst = std::slice::from_raw_parts_mut((x_ptr as *mut u16).add(l * d), d);
-            f32s_to_f16s(x, dst);
+        if let Some((nw, _)) = norm {
+            // hidden rows staged f16; the norm kernel produces X on device
+            for (l, x) in xs.iter().enumerate() {
+                let dst = std::slice::from_raw_parts_mut((st_ptr as *mut u16).add(l * d), d);
+                f32s_to_f16s(x, dst);
+            }
+            std::ptr::copy_nonoverlapping(nw.as_ptr(), (st_ptr as *mut u8).add(t * d * 2) as *mut f32, d);
+        } else {
+            for (l, x) in xs.iter().enumerate() {
+                let dst = std::slice::from_raw_parts_mut((x_ptr as *mut u16).add(l * d), d);
+                f32s_to_f16s(x, dst);
+            }
         }
         let desc = |r: usize, c: usize| -> Id {
             let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
@@ -2723,6 +2745,33 @@ pub fn gpu_mlp_fused(
         }
 
         let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        if let (Some((_, eps)), Some((_, an))) = (norm, norm_ctx) {
+            // fused post-norm: X = rmsnorm(hidden) * (1 + w), on device
+            let encoder = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            let f1: extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f1(encoder, sel("setComputePipelineState:"), an.pipeline);
+            let f2: extern "C" fn(Id, Sel, Id, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_st, 0, 0);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_st, 0, 1);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_st, (t * d * 2) as u64, 2);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_x, 0, 3);
+            let dims: [u32; 2] = [d as u32, 0];
+            let f3: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f3(encoder, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 8, 4);
+            f3(encoder, sel("setBytes:length:atIndex:"), (&eps) as *const f32 as *const c_void, 4, 5);
+            let f4: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f4(
+                encoder,
+                sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+                MTLSize { width: t as u64, height: 1, depth: 1 },
+                MTLSize { width: 256, height: 1, depth: 1 },
+            );
+            msg_void(encoder, sel("endEncoding"));
+        }
         let enc: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         enc(k_up, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mwg, mg);
@@ -2885,3 +2934,100 @@ pub fn gpu_gemm_multi_w(
     gemm_account(t_start.elapsed().as_micros() as u64);
     true
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 2: residual + RMSNorm on the GPU (f16 activations, f32 math)
+// ════════════════════════════════════════════════════════════════════════════
+
+const ADD_NORM_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// normed[t] = rmsnorm(hidden[t]) * (1 + w) (Qwen's offset-from-one norm
+// weights). hidden arrives as f16 for the norm only - the f32 residual
+// stream itself stays on the CPU, so precision accumulates in f32 across
+// the layers. One threadgroup per row, simd reductions.
+kernel void add_rmsnorm_f16(device const half* hidden [[buffer(0)]],
+                            device const half* add    [[buffer(1)]],
+                            device const float* w     [[buffer(2)]],
+                            device half* normed       [[buffer(3)]],
+                            constant uint2& dims      [[buffer(4)]], // d, unused
+                            constant float& eps       [[buffer(5)]],
+                            uint row   [[threadgroup_position_in_grid]],
+                            uint lane  [[thread_position_in_threadgroup]],
+                            uint lanes [[threads_per_threadgroup]]) {
+    uint d = dims.x;
+    device const half* h = hidden + (size_t)row * d;
+    (void)add;
+    threadgroup float partial[32];
+    float ss = 0.0f;
+    for (uint i = lane; i < d; i += lanes) {
+        float v = float(h[i]);
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) {
+        float v = (lane < nsg) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt(partial[0] / float(d) + eps);
+    device half* n = normed + (size_t)row * d;
+    for (uint i = lane; i < d; i += lanes) {
+        n[i] = half(float(h[i]) * inv * (1.0f + w[i]));
+    }
+}
+"#;
+
+static ADDNORM: std::sync::OnceLock<Option<ScanCtx>> = std::sync::OnceLock::new();
+
+fn addnorm_ctx() -> Option<(&'static MetalCtx, &'static ScanCtx)> {
+    let base = ctx()?;
+    let c = ADDNORM
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(ADD_NORM_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: add_rmsnorm shader error: {} - norms stay on CPU", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let function = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library, sel("newFunctionWithName:"), ns_string("add_rmsnorm_f16"))
+                };
+                let mut perr: Id = std::ptr::null_mut();
+                let pipeline = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                };
+                if pipeline.is_null() {
+                    println!("gpu: add_rmsnorm pipeline error: {} - norms stay on CPU", err_desc(perr));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                retain(pipeline);
+                retain(function);
+                retain(library);
+                msg_void(pool, sel("drain"));
+                Some(ScanCtx { pipeline })
+            }
+        })
+        .as_ref()?;
+    Some((base, c))
+}
+
