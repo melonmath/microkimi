@@ -1965,6 +1965,32 @@ pub fn kernbench_cmd(args: &[String]) {
         println!("smmla: i8mm not exposed on this host");
     }
 
+    // x86: the VNNI GEMM tile alone, single thread (kernel ceiling per core)
+    #[cfg(target_arch = "x86_64")]
+    if crate::quant::q8::vnni512_available() {
+        let pack = crate::quant::q8::build_vnni_pack(&head.q, &head.scales, rows, cols);
+        let xqs: Vec<crate::quant::q8::Q8Vec> = xs_data[..8].iter().map(|x| crate::quant::q8::quantize_q8(x)).collect();
+        let xu: Vec<Vec<u8>> = xqs.iter().map(|x| x.q.iter().map(|&v| (v as u8) ^ 0x80).collect()).collect();
+        let xu8: [&[u8]; 8] = std::array::from_fn(|i| xu[i].as_slice());
+        let xs8: [&[f32]; 8] = std::array::from_fn(|i| xqs[i].scales.as_slice());
+        let mut sink = 0.0f32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            for t in 0..pack.tiles {
+                // SAFETY: vnni checked above.
+                let tile = unsafe { crate::quant::q8::tile16_vnni::<8>(&pack, t, xu8, xs8) };
+                sink += tile[0][0];
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "vnni tile16x8 (single thread): {:>7.1} GMAC/s  ({:.1} ms, sink {:.3})",
+            (pack.tiles * 16 * cols * 8 * 4) as f64 / dt / 1e9,
+            dt * 1000.0,
+            sink
+        );
+    }
+
     // single-lane pooled matvec (the decode shape)
     let mut out1 = vec![0.0f32; rows];
     let t0 = std::time::Instant::now();
