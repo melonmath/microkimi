@@ -277,6 +277,24 @@ pub fn run(args: &[String]) {
         }
     }
 
+    // ── GPU decode (macOS, phase 4): the whole token in one command buffer ──
+    #[cfg(target_os = "macos")]
+    {
+        let out = run_self(&["gpudecodebench", "--model", &model, "--steps", "32"], &[]);
+        println!("decode gpu (one command buffer per token):");
+        let mut shown = false;
+        for line in out.lines() {
+            let t = line.trim_start();
+            if t.starts_with("gpudecodebench:") || t.starts_with("gpu:") {
+                println!("  {}", t);
+                shown = true;
+            }
+        }
+        if !shown {
+            println!("  unavailable ({})", out.lines().last().unwrap_or("no output").trim());
+        }
+    }
+
     // ── lanes A/B (q8 spine) ──
     println!("lane-batched aggregate (q8 spine, in-process A/B):");
     for lanes in [4usize, 8] {

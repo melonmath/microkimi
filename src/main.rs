@@ -59,6 +59,7 @@ fn main() {
         "qwenbench" => tools::qwenbench::run(&args),
         "qwengpubench" => tools::qwenbench::gpu_prefill_cmd(&args),
         "prefillbench" => tools::qwenbench::prefill_bench_cmd(&args),
+        "gpudecodebench" => model::qwen::gpu_decode_bench_cmd(&args),
         "kernbench" => model::kernbench_cmd(&args),
         "scanbench" => model::scanbench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),

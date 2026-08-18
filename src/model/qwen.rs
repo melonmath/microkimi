@@ -5720,3 +5720,162 @@ pub(crate) fn chunked_scan_head_strided(
         c0 = c1;
     }
 }
+
+/// GPU decode (phase 4): builds the resident decoder from this model's
+/// current caches and returns it. macOS only; None when unavailable.
+#[cfg(target_os = "macos")]
+impl QwenModel {
+    pub(crate) fn gpu_decoder(&self, kv_cap: usize) -> Option<crate::model::metal::GpuDecoder> {
+        let refs = self.decode_refs();
+        let mut lin_states: Vec<(&[f32], &[f32])> = Vec::new();
+        let mut full_kv: Vec<(&[f32], &[f32], usize)> = Vec::new();
+        for cache in &self.caches {
+            match cache {
+                QwenCache::Linear(c) => lin_states.push((&c.conv, &c.state)),
+                QwenCache::Full(c) => full_kv.push((&c.k, &c.v, c.len)),
+            }
+        }
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        crate::model::metal::gpu_decoder_new(&refs, &lin_states, &full_kv, kv_width, kv_cap, self.pos)
+    }
+
+    /// The by-reference view of the model the GPU decoder consumes.
+    pub(crate) fn decode_refs(&self) -> crate::model::metal::DecodeModelRefs<'_> {
+        let c = &self.cfg;
+        let data = &self.bin.data;
+        let d = c.d;
+        let mut layers = Vec::with_capacity(c.n_layers);
+        for layer in &self.layers {
+            let (gate, up, down) = match &layer.mlp {
+                QwenMlpW::Dense { gate, up, down } => (gate, up, down),
+                QwenMlpW::Moe { .. } => panic!("GPU decode: dense MLP only"),
+            };
+            match &layer.attn {
+                QwenAttnW::Linear(w) => layers.push(crate::model::metal::DecodeLayerRefs::Linear {
+                    in_norm: tensor(data, &layer.input_norm),
+                    post_norm: tensor(data, &layer.post_norm),
+                    w: crate::model::metal::LinLayerRefs {
+                        in_qkv: tensor(data, &w.in_qkv),
+                        in_z: tensor(data, &w.in_z),
+                        in_b: tensor(data, &w.in_b),
+                        in_a: tensor(data, &w.in_a),
+                        conv_w: tensor(data, &w.conv),
+                        a_log: tensor(data, &w.a_log),
+                        dt_bias: tensor(data, &w.dt_bias),
+                        norm_w: tensor(data, &layer.input_norm),
+                        out_proj: tensor(data, &w.out_proj),
+                        post_norm_w: tensor(data, &layer.post_norm),
+                        gate: packed_parts(data, gate),
+                        up: packed_parts(data, up),
+                        down: packed_parts(data, down),
+                    },
+                    gated_w: tensor(data, &w.norm),
+                    dm: crate::model::metal::LinDims {
+                        d,
+                        heads: c.lin_v_heads,
+                        kv_heads: c.lin_k_heads,
+                        kd: c.lin_k_dim,
+                        vd: c.lin_v_dim,
+                        conv_k: c.conv_kernel,
+                        inter: c.dense_inter,
+                        eps: c.norm_eps as f32,
+                    },
+                }),
+                QwenAttnW::Full(w) => layers.push(crate::model::metal::DecodeLayerRefs::Full {
+                    in_norm: tensor(data, &layer.input_norm),
+                    post_norm: tensor(data, &layer.post_norm),
+                    q_proj: tensor(data, &w.q_proj),
+                    k_proj: tensor(data, &w.k_proj),
+                    v_proj: tensor(data, &w.v_proj),
+                    o_proj: tensor(data, &w.o_proj),
+                    q_norm: tensor(data, &w.q_norm),
+                    k_norm: tensor(data, &w.k_norm),
+                    gate: packed_parts(data, gate),
+                    up: packed_parts(data, up),
+                    down: packed_parts(data, down),
+                    n_heads: c.n_heads,
+                    n_kv: c.n_kv_heads,
+                    hd: c.head_dim,
+                    rope_dim: c.rope_dim(),
+                    theta: c.rope_theta as f32,
+                    inter: c.dense_inter,
+                }),
+            }
+        }
+        crate::model::metal::DecodeModelRefs {
+            layers,
+            embed: tensor(data, &self.embed),
+            norm_f: tensor(data, &self.norm_f),
+            lm_head: tensor(data, &self.lm_head),
+            d,
+            vocab: c.vocab,
+            eps: c.norm_eps as f32,
+        }
+    }
+}
+
+/// `microkimi gpudecodebench --model X.bin [--steps N]`: prefill a short
+/// prompt on the CPU, then decode N tokens on the GPU (phase 4) and the
+/// same N on the CPU from the same state, reporting ms/token for both and
+/// the greedy-token agreement between them.
+pub fn gpu_decode_bench_cmd(args: &[String]) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        println!("gpudecodebench: macOS only");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let model_path = crate::value_flag(args, "--model").expect("gpudecodebench requires --model");
+        let steps: usize = crate::value_flag(args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(32);
+        crate::model::metal::set_qwen_gpu(true);
+        crate::model::metal::decode_probe();
+        let mut model = QwenModel::load(&model_path);
+        let vocab = (model.cfg.vocab as u32).min(50_000);
+        let prompt: Vec<u32> = (0..16u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let out = model.prefill_collect(&prompt, false);
+        let mut logits = out.logits.last().cloned().unwrap();
+        let snap = model.snapshot();
+        let saved_pos = model.pos;
+        let first = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+        // GPU decode from the post-prefill state (refs scoped so the model
+        // is free again for the CPU arm)
+        let (gpu_tokens, gpu_ms) = {
+            let refs = model.decode_refs();
+            let Some(mut dec) = model.gpu_decoder(prompt.len() + steps + 8) else {
+                println!("gpudecodebench: GPU decoder unavailable");
+                return;
+            };
+            let mut gpu_tokens = Vec::new();
+            let mut gl = vec![0.0f32; model.cfg.vocab];
+            let mut tok = first;
+            let t0 = std::time::Instant::now();
+            for _ in 0..steps {
+                if crate::model::metal::gpu_decode_step(&mut dec, &refs, tok, &mut gl).is_none() {
+                    println!("gpudecodebench: GPU step refused");
+                    return;
+                }
+                tok = crate::model::top_k_probs(&gl, 5)[0].0 as u32;
+                gpu_tokens.push(tok);
+            }
+            (gpu_tokens, t0.elapsed().as_secs_f64() * 1000.0 / steps as f64)
+        };
+        // CPU decode from the same state
+        model.restore(&snap);
+        model.pos = saved_pos;
+        let mut cpu_tokens = Vec::new();
+        let mut tok = first;
+        let t1 = std::time::Instant::now();
+        for _ in 0..steps {
+            logits = model.forward(tok);
+            tok = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+            cpu_tokens.push(tok);
+        }
+        let cpu_ms = t1.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        let agree = gpu_tokens.iter().zip(&cpu_tokens).take_while(|(a, b)| a == b).count();
+        println!(
+            "gpudecodebench: {} steps | gpu {:.2} ms/token ({:.1} tok/s) | cpu {:.2} ms/token ({:.1} tok/s) | greedy agreement {}/{} tokens",
+            steps, gpu_ms, 1000.0 / gpu_ms, cpu_ms, 1000.0 / cpu_ms, agree, steps
+        );
+    }
+}
