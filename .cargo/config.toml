@@ -1,0 +1,7 @@
+# x86_64 Linux builds target the host CPU (AVX2/AVX-512 for the generic
+# loops - the same choice llama.cpp makes with GGML_NATIVE); the explicit
+# kernels detect features at run time regardless. Override with
+# RUSTFLAGS or `--config` for a portable binary. Apple silicon and
+# aarch64 Linux keep the default target (NEON is baseline there).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
