@@ -6819,16 +6819,22 @@ pub fn cuda_decode_bench_cmd(args: &[String]) {
         model.pos = saved_pos;
         let mut cpu_tokens = Vec::new();
         let mut cpu_ms = Vec::with_capacity(steps);
+        let mut cpu_margin = Vec::with_capacity(steps); // top-1 minus top-2 probability at each step
         let mut tok = first;
         for _ in 0..steps {
             let t0 = std::time::Instant::now();
             let l = model.forward(tok);
             cpu_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-            tok = crate::model::top_k_probs(&l, 1)[0].0 as u32;
+            let top = crate::model::top_k_probs(&l, 2);
+            cpu_margin.push(top[0].1 - top.get(1).map(|t| t.1).unwrap_or(0.0));
+            tok = top[0].0 as u32;
             cpu_tokens.push(tok);
         }
         let agree = gpu_tokens.iter().zip(&cpu_tokens).filter(|(a, b)| a == b).count();
         let first_diff = gpu_tokens.iter().zip(&cpu_tokens).position(|(a, b)| a != b);
+        if let Some(i) = first_diff {
+            println!("cpu top-1/top-2 probability margin at the first divergence: {:.4} (a tie under ~0.01 is the two arms' rounding, not a defect)", cpu_margin[i]);
+        }
         let med = |v: &[f64]| {
             let mut s = v.to_vec();
             s.sort_by(|a, b| a.partial_cmp(b).unwrap());

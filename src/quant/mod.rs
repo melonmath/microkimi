@@ -7,6 +7,7 @@
 pub mod dequant;
 pub mod imatrix;
 pub mod lut_gemv;
+pub mod f16;
 pub mod mxfp4;
 pub mod q8;
 pub mod quant;

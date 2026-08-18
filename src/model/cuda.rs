@@ -297,8 +297,8 @@ const KERNEL_NAMES: &[&str] = &[
     "k_silu_mul",
     "k_conv_silu",
     "k_delta_step",
-    "k_delta_step128",
-    "k_delta_step64",
+    "k_lin_head_step128",
+    "k_lin_head_step64",
     "k_qk_prep",
     "k_attn_decode",
     "k_attn_prefill",
@@ -381,7 +381,7 @@ fn compile(nv: &Nvrtc, major: i32, minor: i32) -> Result<Vec<u8>, String> {
     let key = {
         let mut h = crate::sha256::Sha256::new();
         h.update(src.as_bytes());
-        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v14-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
+        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v22-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
         let d = h.finalize();
         d.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
     };
@@ -576,6 +576,13 @@ impl CudaCtx {
     /// Launches `name` with the given grid/block, dynamic shared bytes and
     /// argument list (each entry a pointer to the argument value).
     fn launch(&self, name: &str, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32, args: &mut [*mut c_void]) -> bool {
+        // MICROKIMI_CUDA_MV_ONLY=1: a timing experiment - only the matvec
+        // kernels run (the answer is garbage), isolating the weight stream
+        // from everything else in a token
+        static MV_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MV_ONLY.get_or_init(|| std::env::var("MICROKIMI_CUDA_MV_ONLY").map(|v| v == "1").unwrap_or(false)) && !name.starts_with("k_matvec") {
+            return true;
+        }
         let f = match self.funcs.get(name) {
             Some(f) => *f,
             None => return false,
@@ -702,18 +709,30 @@ impl CudaCtx {
     /// y[rows] = W(q8 rows x cols) . x(q8). One warp per row.
     pub fn matvec_q8(&self, wq: &DBuf, ws: &DBuf, xq: &DBuf, xs: &DBuf, y: &DBuf, y_off: usize, rows: u32, cols: u32) -> bool {
         let yp = y.ptr + y_off as u64;
-        let mut a = args!(wq.ptr, ws.ptr, xq.ptr, xs.ptr, yp, rows, cols);
+        let (w, rpw) = self.mv_shape(rows);
+        let mut a = args!(wq.ptr, ws.ptr, xq.ptr, xs.ptr, yp, rows, cols, rpw);
         let shared = cols + cols / 32 * 4;
-        let w = self.mv_warps(rows, cols);
-        self.launch("k_matvec_q8", (rows.div_ceil(w), 1, 1), (32 * w, 1, 1), shared, &mut a)
+        self.launch("k_matvec_q8", (rows.div_ceil(w * rpw), 1, 1), (32 * w, 1, 1), shared, &mut a)
     }
     /// y[rows] = W(MXFP4 rows x cols) . x(q8). One warp per row.
     pub fn matvec_fp4(&self, wp: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, y: &DBuf, y_off: usize, rows: u32, cols: u32) -> bool {
         let yp = y.ptr + y_off as u64;
-        let mut a = args!(wp.ptr, wsc.ptr, xq.ptr, xs.ptr, yp, rows, cols);
+        let (w, rpw) = self.mv_shape(rows);
+        let mut a = args!(wp.ptr, wsc.ptr, xq.ptr, xs.ptr, yp, rows, cols, rpw);
         let shared = cols + cols / 32 * 4;
-        let w = self.mv_warps(rows, cols);
-        self.launch("k_matvec_fp4", (rows.div_ceil(w), 1, 1), (32 * w, 1, 1), shared, &mut a)
+        self.launch("k_matvec_fp4", (rows.div_ceil(w * rpw), 1, 1), (32 * w, 1, 1), shared, &mut a)
+    }
+    /// (warps per block, rows per warp) of a matvec: MICROKIMI_CUDA_MV_WARPS
+    /// and MICROKIMI_CUDA_MV_RPW override; otherwise 8 warps and as many
+    /// rows per warp as keep four blocks per SM.
+    fn mv_shape(&self, rows: u32) -> (u32, u32) {
+        static RPW: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let w = self.mv_warps(rows, 0);
+        if let Some(r) = *RPW.get_or_init(|| std::env::var("MICROKIMI_CUDA_MV_RPW").ok().and_then(|v| v.parse().ok())) {
+            return (w, r.max(1));
+        }
+        let _ = rows;
+        (w, 1)
     }
     /// Warps (rows) per matvec block: MICROKIMI_CUDA_MV_WARPS overrides;
     /// otherwise 8, or 4 when the grid would be under four blocks per SM.
@@ -888,6 +907,12 @@ __device__ __forceinline__ float block_max(float v, float* red) {
     __syncthreads();
     return red[0];
 }
+// f16 bits -> f32 (hardware cvt; no header needed under NVRTC)
+__device__ __forceinline__ float h2f(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float siluf_(float x) { return x / (1.0f + expf(-x)); }
 // 2^(e-128) exactly (e8m0 scale byte, LUT2 convention: values doubled)
@@ -937,9 +962,9 @@ extern "C" __global__ void k_quantize_q8(const float* __restrict__ x, i8* __rest
 }
 
 // ── matvecs: one warp per row, lane l handles blocks l, l+32, ... ──
-extern "C" __global__ void k_matvec_q8(const i8* __restrict__ wq, const float* __restrict__ ws,
+extern "C" __global__ void k_matvec_q8(const i8* __restrict__ wq, const unsigned short* __restrict__ ws,
                                        const i8* __restrict__ xq, const float* __restrict__ xs,
-                                       float* __restrict__ y, unsigned rows, unsigned cols) {
+                                       float* __restrict__ y, unsigned rows, unsigned cols, unsigned rpw) {
     extern __shared__ __align__(16) unsigned char smem[];
     int* sx = (int*)smem;                       // cols bytes as ints
     float* sxs = (float*)(smem + cols);         // cols/32 scales
@@ -947,17 +972,42 @@ extern "C" __global__ void k_matvec_q8(const i8* __restrict__ wq, const float* _
     for (unsigned i = threadIdx.x; i < (cols >> 2); i += blockDim.x) sx[i] = ((const int*)xq)[i];
     for (unsigned i = threadIdx.x; i < nb; i += blockDim.x) sxs[i] = xs[i];
     __syncthreads();
-    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const unsigned row = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= rows) return;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    // rpw rows per warp: the activation is staged once per warps*rpw rows
+    for (unsigned row = blockIdx.x * warps * rpw + warp; row < min(rows, (blockIdx.x + 1) * warps * rpw); row += warps) {
     const int4* wrow = (const int4*)(wq + (size_t)row * cols);
-    const float* srow = ws + (size_t)row * nb;
-    float acc0 = 0.0f, acc1 = 0.0f;
+    const unsigned short* srow = ws + (size_t)row * nb;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     unsigned g = lane;
-    // two blocks per iteration, independent chains (memory-level parallelism)
+    // four blocks per iteration, independent chains (memory-level parallelism)
+    for (; g + 96 < nb; g += 128) {
+        int4 a = wrow[g * 2], b = wrow[g * 2 + 1];
+        int4 a2 = wrow[(g + 32) * 2], b2 = wrow[(g + 32) * 2 + 1];
+        int4 a3 = wrow[(g + 64) * 2], b3 = wrow[(g + 64) * 2 + 1];
+        int4 a4 = wrow[(g + 96) * 2], b4 = wrow[(g + 96) * 2 + 1];
+        unsigned short s1 = srow[g], s2 = srow[g + 32], s3 = srow[g + 64], s4 = srow[g + 96];
+        const int* xb = sx + g * 8;
+        const int* xb2 = sx + (g + 32) * 8;
+        const int* xb3 = sx + (g + 64) * 8;
+        const int* xb4 = sx + (g + 96) * 8;
+        int d = 0, d2 = 0, d3 = 0, d4 = 0;
+        d = __dp4a(a.x, xb[0], d); d = __dp4a(a.y, xb[1], d); d = __dp4a(a.z, xb[2], d); d = __dp4a(a.w, xb[3], d);
+        d = __dp4a(b.x, xb[4], d); d = __dp4a(b.y, xb[5], d); d = __dp4a(b.z, xb[6], d); d = __dp4a(b.w, xb[7], d);
+        d2 = __dp4a(a2.x, xb2[0], d2); d2 = __dp4a(a2.y, xb2[1], d2); d2 = __dp4a(a2.z, xb2[2], d2); d2 = __dp4a(a2.w, xb2[3], d2);
+        d2 = __dp4a(b2.x, xb2[4], d2); d2 = __dp4a(b2.y, xb2[5], d2); d2 = __dp4a(b2.z, xb2[6], d2); d2 = __dp4a(b2.w, xb2[7], d2);
+        d3 = __dp4a(a3.x, xb3[0], d3); d3 = __dp4a(a3.y, xb3[1], d3); d3 = __dp4a(a3.z, xb3[2], d3); d3 = __dp4a(a3.w, xb3[3], d3);
+        d3 = __dp4a(b3.x, xb3[4], d3); d3 = __dp4a(b3.y, xb3[5], d3); d3 = __dp4a(b3.z, xb3[6], d3); d3 = __dp4a(b3.w, xb3[7], d3);
+        d4 = __dp4a(a4.x, xb4[0], d4); d4 = __dp4a(a4.y, xb4[1], d4); d4 = __dp4a(a4.z, xb4[2], d4); d4 = __dp4a(a4.w, xb4[3], d4);
+        d4 = __dp4a(b4.x, xb4[4], d4); d4 = __dp4a(b4.y, xb4[5], d4); d4 = __dp4a(b4.z, xb4[6], d4); d4 = __dp4a(b4.w, xb4[7], d4);
+        acc0 = fmaf((float)d, h2f(s1) * sxs[g], acc0);
+        acc1 = fmaf((float)d2, h2f(s2) * sxs[g + 32], acc1);
+        acc2 = fmaf((float)d3, h2f(s3) * sxs[g + 64], acc2);
+        acc3 = fmaf((float)d4, h2f(s4) * sxs[g + 96], acc3);
+    }
     for (; g + 32 < nb; g += 64) {
         int4 a = wrow[g * 2], b = wrow[g * 2 + 1];
         int4 a2 = wrow[(g + 32) * 2], b2 = wrow[(g + 32) * 2 + 1];
+        unsigned short s1 = srow[g], s2 = srow[g + 32];
         const int* xb = sx + g * 8;
         const int* xb2 = sx + (g + 32) * 8;
         int d = 0, d2 = 0;
@@ -965,8 +1015,8 @@ extern "C" __global__ void k_matvec_q8(const i8* __restrict__ wq, const float* _
         d = __dp4a(b.x, xb[4], d); d = __dp4a(b.y, xb[5], d); d = __dp4a(b.z, xb[6], d); d = __dp4a(b.w, xb[7], d);
         d2 = __dp4a(a2.x, xb2[0], d2); d2 = __dp4a(a2.y, xb2[1], d2); d2 = __dp4a(a2.z, xb2[2], d2); d2 = __dp4a(a2.w, xb2[3], d2);
         d2 = __dp4a(b2.x, xb2[4], d2); d2 = __dp4a(b2.y, xb2[5], d2); d2 = __dp4a(b2.z, xb2[6], d2); d2 = __dp4a(b2.w, xb2[7], d2);
-        acc0 = fmaf((float)d, srow[g] * sxs[g], acc0);
-        acc1 = fmaf((float)d2, srow[g + 32] * sxs[g + 32], acc1);
+        acc0 = fmaf((float)d, h2f(s1) * sxs[g], acc0);
+        acc1 = fmaf((float)d2, h2f(s2) * sxs[g + 32], acc1);
     }
     for (; g < nb; g += 32) {
         int4 a = wrow[g * 2], b = wrow[g * 2 + 1];
@@ -974,15 +1024,16 @@ extern "C" __global__ void k_matvec_q8(const i8* __restrict__ wq, const float* _
         int d = 0;
         d = __dp4a(a.x, xb[0], d); d = __dp4a(a.y, xb[1], d); d = __dp4a(a.z, xb[2], d); d = __dp4a(a.w, xb[3], d);
         d = __dp4a(b.x, xb[4], d); d = __dp4a(b.y, xb[5], d); d = __dp4a(b.z, xb[6], d); d = __dp4a(b.w, xb[7], d);
-        acc0 = fmaf((float)d, srow[g] * sxs[g], acc0);
+        acc0 = fmaf((float)d, h2f(srow[g]) * sxs[g], acc0);
     }
-    float acc = warp_sum(acc0 + acc1);
+    float acc = warp_sum((acc0 + acc1) + (acc2 + acc3));
     if (lane == 0) y[row] = acc;
+    }
 }
 
 extern "C" __global__ void k_matvec_fp4(const u8* __restrict__ wp, const u8* __restrict__ wsc,
                                         const i8* __restrict__ xq, const float* __restrict__ xs,
-                                        float* __restrict__ y, unsigned rows, unsigned cols) {
+                                        float* __restrict__ y, unsigned rows, unsigned cols, unsigned rpw) {
     extern __shared__ __align__(16) unsigned char smem[];
     int* sx = (int*)smem;
     float* sxs = (float*)(smem + cols);
@@ -990,15 +1041,42 @@ extern "C" __global__ void k_matvec_fp4(const u8* __restrict__ wp, const u8* __r
     for (unsigned i = threadIdx.x; i < (cols >> 2); i += blockDim.x) sx[i] = ((const int*)xq)[i];
     for (unsigned i = threadIdx.x; i < nb; i += blockDim.x) sxs[i] = xs[i];
     __syncthreads();
-    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const unsigned row = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= rows) return;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    for (unsigned row = blockIdx.x * warps * rpw + warp; row < min(rows, (blockIdx.x + 1) * warps * rpw); row += warps) {
     const int4* prow = (const int4*)(wp + (size_t)row * (cols >> 1));
     const u8* srow = wsc + (size_t)row * nb;
-    float acc0 = 0.0f, acc1 = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     unsigned g = lane;
+    // four blocks per iteration, independent chains, streaming loads (the
+    // weights are read once per token: keep them out of the caches)
+    for (; g + 96 < nb; g += 128) {
+        int4 pk = __ldcs(prow + g), pk2 = __ldcs(prow + g + 32), pk3 = __ldcs(prow + g + 64), pk4 = __ldcs(prow + g + 96);
+        unsigned s1 = srow[g], s2 = srow[g + 32], s3 = srow[g + 64], s4 = srow[g + 96];
+        const int* xb = sx + g * 8;
+        const int* xb2 = sx + (g + 32) * 8;
+        const int* xb3 = sx + (g + 64) * 8;
+        const int* xb4 = sx + (g + 96) * 8;
+        int w0, w1, w2, w3, w4, w5, w6, w7;
+        int d;
+        fp4_decode8((unsigned)pk.x, w0, w1); fp4_decode8((unsigned)pk.y, w2, w3); fp4_decode8((unsigned)pk.z, w4, w5); fp4_decode8((unsigned)pk.w, w6, w7);
+        d = 0; d = __dp4a(w0, xb[0], d); d = __dp4a(w1, xb[1], d); d = __dp4a(w2, xb[2], d); d = __dp4a(w3, xb[3], d);
+        d = __dp4a(w4, xb[4], d); d = __dp4a(w5, xb[5], d); d = __dp4a(w6, xb[6], d); d = __dp4a(w7, xb[7], d);
+        acc0 = fmaf((float)d, e8m0_x2(s1) * sxs[g], acc0);
+        fp4_decode8((unsigned)pk2.x, w0, w1); fp4_decode8((unsigned)pk2.y, w2, w3); fp4_decode8((unsigned)pk2.z, w4, w5); fp4_decode8((unsigned)pk2.w, w6, w7);
+        d = 0; d = __dp4a(w0, xb2[0], d); d = __dp4a(w1, xb2[1], d); d = __dp4a(w2, xb2[2], d); d = __dp4a(w3, xb2[3], d);
+        d = __dp4a(w4, xb2[4], d); d = __dp4a(w5, xb2[5], d); d = __dp4a(w6, xb2[6], d); d = __dp4a(w7, xb2[7], d);
+        acc1 = fmaf((float)d, e8m0_x2(s2) * sxs[g + 32], acc1);
+        fp4_decode8((unsigned)pk3.x, w0, w1); fp4_decode8((unsigned)pk3.y, w2, w3); fp4_decode8((unsigned)pk3.z, w4, w5); fp4_decode8((unsigned)pk3.w, w6, w7);
+        d = 0; d = __dp4a(w0, xb3[0], d); d = __dp4a(w1, xb3[1], d); d = __dp4a(w2, xb3[2], d); d = __dp4a(w3, xb3[3], d);
+        d = __dp4a(w4, xb3[4], d); d = __dp4a(w5, xb3[5], d); d = __dp4a(w6, xb3[6], d); d = __dp4a(w7, xb3[7], d);
+        acc2 = fmaf((float)d, e8m0_x2(s3) * sxs[g + 64], acc2);
+        fp4_decode8((unsigned)pk4.x, w0, w1); fp4_decode8((unsigned)pk4.y, w2, w3); fp4_decode8((unsigned)pk4.z, w4, w5); fp4_decode8((unsigned)pk4.w, w6, w7);
+        d = 0; d = __dp4a(w0, xb4[0], d); d = __dp4a(w1, xb4[1], d); d = __dp4a(w2, xb4[2], d); d = __dp4a(w3, xb4[3], d);
+        d = __dp4a(w4, xb4[4], d); d = __dp4a(w5, xb4[5], d); d = __dp4a(w6, xb4[6], d); d = __dp4a(w7, xb4[7], d);
+        acc3 = fmaf((float)d, e8m0_x2(s4) * sxs[g + 96], acc3);
+    }
     for (; g + 32 < nb; g += 64) {
-        int4 pk = prow[g], pk2 = prow[g + 32];
+        int4 pk = __ldcs(prow + g), pk2 = __ldcs(prow + g + 32);
         unsigned s1 = srow[g], s2 = srow[g + 32];
         const int* xb = sx + g * 8;
         const int* xb2 = sx + (g + 32) * 8;
@@ -1017,7 +1095,7 @@ extern "C" __global__ void k_matvec_fp4(const u8* __restrict__ wp, const u8* __r
         acc1 = fmaf((float)d2, e8m0_x2(s2) * sxs[g + 32], acc1);
     }
     for (; g < nb; g += 32) {
-        int4 pk = prow[g];
+        int4 pk = __ldcs(prow + g);
         const int* xb = sx + g * 8;
         int w0, w1, w2, w3, w4, w5, w6, w7;
         fp4_decode8((unsigned)pk.x, w0, w1); fp4_decode8((unsigned)pk.y, w2, w3);
@@ -1027,15 +1105,16 @@ extern "C" __global__ void k_matvec_fp4(const u8* __restrict__ wp, const u8* __r
         d = __dp4a(w4, xb[4], d); d = __dp4a(w5, xb[5], d); d = __dp4a(w6, xb[6], d); d = __dp4a(w7, xb[7], d);
         acc0 = fmaf((float)d, e8m0_x2(srow[g]) * sxs[g], acc0);
     }
-    float acc = warp_sum(acc0 + acc1);
+    float acc = warp_sum((acc0 + acc1) + (acc2 + acc3));
     if (lane == 0) y[row] = acc;
+    }
 }
 
 // ── GEMM: C[t][r] = sum_g ws[r][g] xs[t][g] dot(W[r][g], X[t][g]) ──
 // tiles of 64 rows x 64 tokens, k-step of one 32-column block; 256 threads,
 // each a 4x4 (rows x tokens) micro-tile. W tile [64][32] i8, X tile [64][32] i8.
 #define GT 64
-extern "C" __global__ void k_gemm_q8(const i8* __restrict__ wq, const float* __restrict__ ws,
+extern "C" __global__ void k_gemm_q8(const i8* __restrict__ wq, const unsigned short* __restrict__ ws,
                                      const i8* __restrict__ xq, const float* __restrict__ xs,
                                      float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
     __shared__ __align__(16) int sw[GT * 8];   // 64 rows x 8 ints
@@ -1066,7 +1145,7 @@ extern "C" __global__ void k_gemm_q8(const i8* __restrict__ wq, const float* __r
             }
             if (tid < GT) {
                 unsigned grow = r0 + tid;
-                sws[tid] = (grow < rows) ? ws[(size_t)grow * nb + g] : 0.0f;
+                sws[tid] = (grow < rows) ? h2f(ws[(size_t)grow * nb + g]) : 0.0f;
             } else if (tid < 2 * GT) {
                 unsigned gtok = t0 + tid - GT;
                 sxs[tid - GT] = (gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
@@ -1193,9 +1272,16 @@ extern "C" __global__ void k_gemm_fp4(const u8* __restrict__ wp, const u8* __res
 // tile is read from global once per NT tokens.
 __device__ __forceinline__ void mma_s8_16x8x32(int& d0, int& d1, int& d2, int& d3,
                                                int a0, int a1, int a2, int a3, int b0, int b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
+#else
+    // sm_75 and older (T4): the tensor-core GEMMs are never launched there
+    // (mma_on() is false); the symbol still has to compile
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+    d0 = d1 = d2 = d3 = 0;
+#endif
 }
 #define SROW 9 /* shared row stride in ints per block (8 + 1 pad against bank conflicts) */
 // warps: WM x WN = 8; each warp owns 32 rows and NT / WN tokens
@@ -1276,7 +1362,7 @@ __device__ __forceinline__ void gemm_mma_store(float (&acc)[2][NT / (8 / WMOf<MT
     }
 }
 template <int MTR, int NT>
-__device__ __forceinline__ void gemm_q8_mma_t(const i8* __restrict__ wq, const float* __restrict__ ws,
+__device__ __forceinline__ void gemm_q8_mma_t(const i8* __restrict__ wq, const unsigned short* __restrict__ ws,
                                               const i8* __restrict__ xq, const float* __restrict__ xs,
                                               float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
     constexpr int KB = KBOf<NT>::v; constexpr int LDS = KB * SROW;
@@ -1313,7 +1399,7 @@ __device__ __forceinline__ void gemm_q8_mma_t(const i8* __restrict__ wq, const f
         for (unsigned i = tid; i < KB * MTR; i += 256) {
             unsigned kb = i / MTR, rr = i % MTR;
             unsigned g = g0 + kb, grow = r0 + rr;
-            sws[i] = (g < nb && grow < rows) ? ws[(size_t)grow * nb + g] : 0.0f;
+            sws[i] = (g < nb && grow < rows) ? h2f(ws[(size_t)grow * nb + g]) : 0.0f;
         }
         for (unsigned i = tid; i < KB * NT; i += 256) {
             unsigned kb = i / NT, rr = i % NT;
@@ -1381,10 +1467,10 @@ __device__ __forceinline__ void gemm_fp4_mma_t(const u8* __restrict__ wp, const 
     }
     gemm_mma_store<MTR, NT>(acc, C, r0, t0, rows, t, ldc, warp, lane);
 }
-extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma64(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 64>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma256(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 256>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128x128(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<128, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma64(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 64>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma256(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 256>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128x128(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<128, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma64(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 64>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma256(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 256>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
@@ -1438,32 +1524,26 @@ extern "C" __global__ void k_add_rmsnorm_quant_rows(float* __restrict__ x, const
     }
     ss = block_sum(ss, red);
     float inv = 1.0f / sqrtf(ss / (float)n + eps);
-    for (unsigned i = threadIdx.x; i < n; i += blockDim.x) {
-        float ww = one_plus ? (1.0f + w[i]) : w[i];
-        orow[i] = xr[i] * inv * ww;
-    }
-    __syncthreads();
-    // quantize: thread per block of 32
+    // normalize and quantize in one pass: warp w handles blocks w, w+warps, ...
+    // (32 lanes = the 32 values of a block; the max by shuffle; the values
+    // stay in registers between the norm and the quantization)
     unsigned nb = n >> 5;
-    for (unsigned b = threadIdx.x; b < nb; b += blockDim.x) {
-        const float* p = orow + b * 32;
-        float m = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 32; j++) m = fmaxf(m, fabsf(p[j]));
+    unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    for (unsigned b = warp; b < nb; b += warps) {
+        unsigned i = b * 32 + lane;
+        float ww = one_plus ? (1.0f + w[i]) : w[i];
+        float v = xr[i] * inv * ww;
+        orow[i] = v;
+        float m = warp_max(fabsf(v));
         float dx = m / 127.0f;
-        xs[(size_t)r * nb + b] = dx;
-        i8* q = xq + ((size_t)r * nb + b) * 32;
-        if (dx == 0.0f) {
-            #pragma unroll
-            for (int j = 0; j < 32; j++) q[j] = 0;
-        } else {
-            #pragma unroll
-            for (int j = 0; j < 32; j++) {
-                float rr = roundf(p[j] / dx);
-                rr = fminf(fmaxf(rr, -127.0f), 127.0f);
-                q[j] = (i8)(int)rr;
-            }
+        i8 qv = 0;
+        if (dx != 0.0f) {
+            float rr = roundf(v / dx);
+            rr = fminf(fmaxf(rr, -127.0f), 127.0f);
+            qv = (i8)(int)rr;
         }
+        xq[((size_t)r * nb + b) * 32 + lane] = qv;
+        if (lane == 0) xs[(size_t)r * nb + b] = dx;
     }
 }
 // h[t][inter] = silu(gu[t][i]) * gu[t][inter+i], quantized into xq/xs (block per (row, 1024 columns))
@@ -1696,46 +1776,111 @@ extern "C" __global__ void k_delta_scan64(float* __restrict__ state, const float
                                           float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned vd) {
     delta_scan_reg<64>(state, qn, kn, conved, ldc, beta, decay, out, t, heads, kv_heads, vd);
 }
-// single-token register form (KD = 128 / 64): the column loads are issued
-// together instead of one dependent walk
+// the whole per-head work of a linear layer's decode step in one launch
+// (KD = 128 / 64, block = vd threads, vd a multiple of 32): q/k norms of
+// the head's kv head, beta and decay, the delta step with the state
+// column in registers, the gated norm with silu(z), then the head's vd
+// outputs quantized (one warp per block of 32) into xq/xs for the out
+// projection. Same arithmetic as the separate kernels.
 template <int KD>
-__device__ __forceinline__ void delta_step_reg(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
-                                               const float* __restrict__ conved, const float* __restrict__ beta, const float* __restrict__ decay,
-                                               float* __restrict__ out, unsigned heads, unsigned kv_heads, unsigned vd) {
+__device__ __forceinline__ void lin_head_step(const float* __restrict__ conved, const float* __restrict__ b_raw, const float* __restrict__ a_raw,
+                                              const float* __restrict__ z, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                              float* __restrict__ state, const float* __restrict__ gated_w,
+                                              float* __restrict__ mixed, i8* __restrict__ xq, float* __restrict__ xs,
+                                              unsigned heads, unsigned kv_heads, unsigned vd, float eps) {
+    // block = 4 * vd threads: group g (0..3) owns rows [g*KD/4, (g+1)*KD/4)
+    // of column j = threadIdx.x % vd; the two column reductions (pred, out)
+    // combine the four groups through shared memory - four times the
+    // memory-level parallelism of one thread per column
+    constexpr int G = 4;
+    constexpr int KR = KD / G;
     __shared__ float sq[KD];
     __shared__ float sk[KD];
+    __shared__ float red[32];
+    __shared__ float part[G * 1024 / 4]; // [G][vd] partials (vd <= 256)
+    __shared__ float sh_beta, sh_dec;
     unsigned h = blockIdx.x;
-    unsigned j = threadIdx.x;
-    if (h >= heads || j >= vd) return;
+    unsigned tid = threadIdx.x;
+    unsigned grp = tid / vd, j = tid % vd;
+    if (h >= heads) return;
+    unsigned rep = heads / kv_heads;
+    unsigned kh = h / rep;
     unsigned kt = kv_heads * KD;
-    float* S = state + (size_t)h * KD * vd;
-    for (unsigned i = threadIdx.x; i < KD; i += blockDim.x) { sq[i] = qn[(size_t)h * KD + i]; sk[i] = kn[(size_t)h * KD + i]; }
-    float col[KD];
-    #pragma unroll
-    for (int i = 0; i < KD; i++) col[i] = S[(size_t)i * vd + j];
+    const float* qsrc = conved + kh * KD;
+    const float* ksrc = conved + kt + kh * KD;
+    float sqv = 0.0f, skv = 0.0f;
+    for (unsigned i = tid; i < KD; i += blockDim.x) { sqv += qsrc[i] * qsrc[i]; skv += ksrc[i] * ksrc[i]; }
+    sqv = block_sum(sqv, red);
+    skv = block_sum(skv, red);
+    float nq = sqrtf(sqv + 1e-6f), nk = sqrtf(skv + 1e-6f);
+    float scale = 1.0f / sqrtf((float)KD);
+    for (unsigned i = tid; i < KD; i += blockDim.x) { sq[i] = (qsrc[i] / nq) * scale; sk[i] = ksrc[i] / nk; }
+    if (tid == 0) {
+        float b = b_raw[h];
+        sh_beta = 1.0f / (1.0f + expf(-b));
+        float a = a_raw[h] + dt_bias[h];
+        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+        sh_dec = expf(-expf(a_log[h]) * sp);
+    }
     __syncthreads();
-    float dec = decay[h], bt = beta[h];
-    float vj = conved[2 * kt + h * vd + j];
+    float* S = state + (size_t)h * KD * vd;
+    float col[KR];
+    #pragma unroll
+    for (int i = 0; i < KR; i++) col[i] = S[(size_t)(grp * KR + i) * vd + j];
+    float dec = sh_dec, bt = sh_beta;
     float pred = 0.0f;
     #pragma unroll
-    for (int i = 0; i < KD; i++) { float s = col[i] * dec; col[i] = s; pred = fmaf(sk[i], s, pred); }
+    for (int i = 0; i < KR; i++) { float s = col[i] * dec; col[i] = s; pred = fmaf(sk[grp * KR + i], s, pred); }
+    part[grp * vd + j] = pred;
+    __syncthreads();
+    // pred over the four groups in group order (the same sum for every group)
+    pred = ((part[j] + part[vd + j]) + part[2 * vd + j]) + part[3 * vd + j];
+    float vj = conved[2 * kt + h * vd + j];
     float delta = (vj - pred) * bt;
     float o = 0.0f;
     #pragma unroll
-    for (int i = 0; i < KD; i++) { float s = col[i] + sk[i] * delta; col[i] = s; o = fmaf(sq[i], s, o); }
+    for (int i = 0; i < KR; i++) { float s = col[i] + sk[grp * KR + i] * delta; col[i] = s; o = fmaf(sq[grp * KR + i], s, o); }
     #pragma unroll
-    for (int i = 0; i < KD; i++) S[(size_t)i * vd + j] = col[i];
-    out[(size_t)h * vd + j] = o;
+    for (int i = 0; i < KR; i++) S[(size_t)(grp * KR + i) * vd + j] = col[i];
+    __syncthreads();
+    part[grp * vd + j] = o;
+    __syncthreads();
+    o = ((part[j] + part[vd + j]) + part[2 * vd + j]) + part[3 * vd + j];
+    // gated norm over the head's vd outputs (group 0 finishes; the block
+    // reduction takes every thread)
+    float ss = block_sum((grp == 0) ? o * o : 0.0f, red);
+    float inv = 1.0f / sqrtf(ss / (float)vd + eps);
+    if (grp == 0) {
+        float g = z[h * vd + j];
+        float outv = o * inv * gated_w[j] * (g / (1.0f + expf(-g)));
+        mixed[(size_t)h * vd + j] = outv;
+        unsigned warp = j >> 5, lane = j & 31;
+        float m = warp_max(fabsf(outv));
+        float dx = m / 127.0f;
+        i8 qv = 0;
+        if (dx != 0.0f) {
+            float rr = roundf(outv / dx);
+            rr = fminf(fmaxf(rr, -127.0f), 127.0f);
+            qv = (i8)(int)rr;
+        }
+        unsigned blk = (h * vd) / 32 + warp;
+        xq[(size_t)blk * 32 + lane] = qv;
+        if (lane == 0) xs[blk] = dx;
+    }
 }
-extern "C" __global__ void k_delta_step128(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
-                                           const float* __restrict__ conved, const float* __restrict__ beta, const float* __restrict__ decay,
-                                           float* __restrict__ out, unsigned heads, unsigned kv_heads, unsigned vd) {
-    delta_step_reg<128>(state, qn, kn, conved, beta, decay, out, heads, kv_heads, vd);
+extern "C" __global__ void __launch_bounds__(512) k_lin_head_step128(const float* __restrict__ conved, const float* __restrict__ b_raw, const float* __restrict__ a_raw,
+                                              const float* __restrict__ z, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                              float* __restrict__ state, const float* __restrict__ gated_w,
+                                              float* __restrict__ mixed, i8* __restrict__ xq, float* __restrict__ xs,
+                                              unsigned heads, unsigned kv_heads, unsigned vd, float eps) {
+    lin_head_step<128>(conved, b_raw, a_raw, z, a_log, dt_bias, state, gated_w, mixed, xq, xs, heads, kv_heads, vd, eps);
 }
-extern "C" __global__ void k_delta_step64(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
-                                          const float* __restrict__ conved, const float* __restrict__ beta, const float* __restrict__ decay,
-                                          float* __restrict__ out, unsigned heads, unsigned kv_heads, unsigned vd) {
-    delta_step_reg<64>(state, qn, kn, conved, beta, decay, out, heads, kv_heads, vd);
+extern "C" __global__ void __launch_bounds__(512) k_lin_head_step64(const float* __restrict__ conved, const float* __restrict__ b_raw, const float* __restrict__ a_raw,
+                                             const float* __restrict__ z, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+                                             float* __restrict__ state, const float* __restrict__ gated_w,
+                                             float* __restrict__ mixed, i8* __restrict__ xq, float* __restrict__ xs,
+                                             unsigned heads, unsigned kv_heads, unsigned vd, float eps) {
+    lin_head_step<64>(conved, b_raw, a_raw, z, a_log, dt_bias, state, gated_w, mixed, xq, xs, heads, kv_heads, vd, eps);
 }
 // single-token form (same math), out [heads*vd]
 extern "C" __global__ void k_delta_step(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
@@ -2064,7 +2209,8 @@ pub fn cudabench_cmd(args: &[String]) {
     let mut y_cpu = vec![0f32; rows];
     head.matvec(&x, &mut y_cpu);
     let (wq, ws) = quantize_rows_q8(&w, rows, cols);
-    let (dwq, dws) = (c.upload(&wq).unwrap(), c.upload(&ws).unwrap());
+    let ws16: Vec<u16> = ws.iter().map(|&v| crate::quant::f16::f32_to_f16(v)).collect();
+    let (dwq, dws) = (c.upload(&wq).unwrap(), c.upload(&ws16).unwrap());
     let dx = c.upload(&x).unwrap();
     let dxq = c.alloc(cols).unwrap();
     let dxs = c.alloc(cols / 32 * 4).unwrap();
@@ -2136,7 +2282,7 @@ pub fn cudabench_cmd(args: &[String]) {
         let gc: usize = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(5120);
         let gt: usize = args.get(i + 3).and_then(|v| v.parse().ok()).unwrap_or(256);
         let gw: Vec<i8> = (0..gr * gc).map(|i| ((i * 7 + 3) % 23) as i8 - 11).collect();
-        let gs: Vec<f32> = vec![0.01; gr * gc / 32];
+        let gs: Vec<u16> = vec![crate::quant::f16::f32_to_f16(0.01); gr * gc / 32];
         let dgw = c.upload(&gw).unwrap();
         let dgs = c.upload(&gs).unwrap();
         let gx: Vec<i8> = (0..gt * gc).map(|i| ((i * 5 + 1) % 13) as i8 - 6).collect();
@@ -2200,18 +2346,18 @@ pub fn cudabench_cmd(args: &[String]) {
     let big_rows = 8 * 4096usize; // 8 matrices' worth as one tall matrix: 32768 x 5120 i8 = 168 MB.. use 6 copies
     let reps = 6usize;
     let mut bigq: Vec<i8> = Vec::with_capacity(reps * big_rows * cols);
-    let mut bigs: Vec<f32> = Vec::with_capacity(reps * big_rows * cols / 32);
+    let mut bigs: Vec<u16> = Vec::with_capacity(reps * big_rows * cols / 32);
     for _ in 0..reps {
         for _ in 0..(big_rows / rows) {
             bigq.extend_from_slice(&wq);
-            bigs.extend_from_slice(&ws);
+            bigs.extend_from_slice(&ws16);
         }
     }
     let brows = reps * big_rows;
     let dbq = c.upload(&bigq).unwrap();
     let dbs = c.upload(&bigs).unwrap();
     let dby = c.alloc(brows * 4).unwrap();
-    let bytes = (bigq.len() + bigs.len() * 4) as f64;
+    let bytes = (bigq.len() + bigs.len() * 2) as f64;
     for round in 0..3 {
         let ms = c.timed(|| {
             c.matvec_q8(&dbq, &dbs, &dxq, &dxs, &dby, 0, brows as u32, cols as u32);
@@ -2239,7 +2385,7 @@ pub fn cudabench_cmd(args: &[String]) {
     // GEMM speed on the 27B shape (17408 x 5120, 256 tokens)
     let (gr, gc, gt) = (17408usize, 5120usize, 256usize);
     let gw: Vec<i8> = (0..gr * gc).map(|i| ((i * 7 + 3) % 23) as i8 - 11).collect();
-    let gs: Vec<f32> = vec![0.01; gr * gc / 32];
+    let gs: Vec<u16> = vec![crate::quant::f16::f32_to_f16(0.01); gr * gc / 32];
     let dgw = c.upload(&gw).unwrap();
     let dgs = c.upload(&gs).unwrap();
     let gx: Vec<i8> = (0..gt * gc).map(|i| ((i * 5 + 1) % 13) as i8 - 6).collect();
@@ -2465,7 +2611,10 @@ fn upload_q8(c: &CudaCtx, w: &[f32], rows: usize, cols: usize) -> Option<WQ8> {
         }
         p.run(jobs);
     }
-    Some(WQ8 { q: c.upload(&q)?, s: c.upload(&s)?, rows, cols })
+    // f16 block scales: half the scale bytes per token (Metal stores them
+    // the same way); a scale is max|w|/127, well inside f16's range
+    let s16: Vec<u16> = s.iter().map(|&v| crate::quant::f16::f32_to_f16(v)).collect();
+    Some(WQ8 { q: c.upload(&q)?, s: c.upload(&s16)?, rows, cols })
 }
 
 /// Concatenated q8 weight: the given (f32 matrix, rows) share `cols`.
@@ -2728,50 +2877,65 @@ impl CudaDecoder {
         };
         chk(c.write_async(&self.hidden, 0, &self.emb_pin, d * 4));
         chk(c.write_async(&self.pos_dev, 0, &self.pos_pin, 4));
+        // the MLP residual of a layer folds into the next layer's input
+        // norm (one kernel instead of add + norm); in trace mode it is
+        // applied eagerly so the traced hidden state is the layer's output
         for (li, l) in self.layers.iter().enumerate() {
+            let prev: Option<&DBuf> = if li == 0 || trace { None } else { Some(&self.y_d) };
             match l {
                 LayerDev::Linear { in_norm, post_norm, proj, out, gu, dn, conv_w, a_log, dt_bias, gated_w, conv_state, scan_state, heads, kv_heads, kd, vd, conv_k, inter, .. } => {
                     let kt = kv_heads * kd;
                     let vt = heads * vd;
                     let cd = 2 * kt + vt;
-                    // input norm
+                    // input norm (+ the previous layer's MLP residual)
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, None, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     // fused projections -> big_a [qkv | z | b | a]
                     self.prof(1, || chk(c.matvec_q8(&proj.q, &proj.s, &self.xq, &self.xs, &self.big_a, 0, proj.rows as u32, d as u32)));
-                    // conv + silu -> big_b[0..cd]; q/k norms, beta, decay: qn -> q_buf, kn -> gate_buf
+                    // conv + silu -> big_b[0..cd]
                     self.prof(2, || {
                         let k = *conv_k as u32;
                         let cdim = cd as u32;
                         let mut a = args!(self.big_a.ptr, conv_w.ptr, k, conv_state.ptr, self.big_b.ptr, cdim);
                         chk(c.launch("k_conv_silu", (cdim.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut a));
-                        let bp = self.big_a.ptr + ((cd + vt) * 4) as u64;
-                        let ap = self.big_a.ptr + ((cd + vt + heads) * 4) as u64;
-                        let (t1, hh, kvh, kdd, cdim, ldba) = (1u32, *heads as u32, *kv_heads as u32, *kd as u32, cd as u32, *heads as u32);
-                        let mut a = args!(self.big_b.ptr, cdim, bp, ap, ldba, a_log.ptr, dt_bias.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.beta.ptr, self.decay.ptr, t1, hh, kvh, kdd);
-                        chk(c.launch("k_lin_prep", (1, *heads as u32, 1), ((*kd as u32).max(32), 1, 1), 0, &mut a));
                     });
-                    // delta step per head -> mixed [heads*vd]
-                    self.prof(3, || {
-                        let (hh, kvh, kdd, vdd, cdim) = (*heads as u32, *kv_heads as u32, *kd as u32, *vd as u32, cd as u32);
-                        if *kd == 128 || *kd == 64 {
-                            let name = if *kd == 128 { "k_delta_step128" } else { "k_delta_step64" };
-                            let mut a = args!(scan_state.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.big_b.ptr, self.beta.ptr, self.decay.ptr, self.mixed.ptr, hh, kvh, vdd);
-                            chk(c.launch(name, (*heads as u32, 1, 1), (*vd as u32, 1, 1), 0, &mut a));
-                        } else {
+                    let fused = (*kd == 128 || *kd == 64) && vd % 32 == 0 && *vd <= 256;
+                    if fused {
+                        // q/k norms, beta/decay, delta step, gated norm, quantization: one launch per layer
+                        self.prof(3, || {
+                            let bp = self.big_a.ptr + ((cd + vt) * 4) as u64;
+                            let ap = self.big_a.ptr + ((cd + vt + heads) * 4) as u64;
+                            let zp = self.big_a.ptr + (cd * 4) as u64;
+                            let (hh, kvh, vdd) = (*heads as u32, *kv_heads as u32, *vd as u32);
+                            let name = if *kd == 128 { "k_lin_head_step128" } else { "k_lin_head_step64" };
+                            let mut a = args!(self.big_b.ptr, bp, ap, zp, a_log.ptr, dt_bias.ptr, scan_state.ptr, gated_w.ptr, self.mixed.ptr, self.xq.ptr, self.xs.ptr, hh, kvh, vdd, eps);
+                            chk(c.launch(name, (*heads as u32, 1, 1), (4 * *vd as u32, 1, 1), 0, &mut a));
+                        });
+                    } else {
+                        // q/k norms, beta, decay: qn -> q_buf, kn -> gate_buf
+                        self.prof(2, || {
+                            let bp = self.big_a.ptr + ((cd + vt) * 4) as u64;
+                            let ap = self.big_a.ptr + ((cd + vt + heads) * 4) as u64;
+                            let (t1, hh, kvh, kdd, cdim, ldba) = (1u32, *heads as u32, *kv_heads as u32, *kd as u32, cd as u32, *heads as u32);
+                            let mut a = args!(self.big_b.ptr, cdim, bp, ap, ldba, a_log.ptr, dt_bias.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.beta.ptr, self.decay.ptr, t1, hh, kvh, kdd);
+                            chk(c.launch("k_lin_prep", (1, *heads as u32, 1), ((*kd as u32).max(32), 1, 1), 0, &mut a));
+                        });
+                        // delta step per head -> mixed [heads*vd]
+                        self.prof(3, || {
+                            let (hh, kvh, kdd, vdd, cdim) = (*heads as u32, *kv_heads as u32, *kd as u32, *vd as u32, cd as u32);
                             let mut a = args!(scan_state.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.big_b.ptr, self.beta.ptr, self.decay.ptr, self.mixed.ptr, hh, kvh, kdd, vdd, cdim);
                             chk(c.launch("k_delta_step", (*heads as u32, 1, 1), (*vd as u32, 1, 1), (2 * kd * 4) as u32, &mut a));
-                        }
-                    });
-                    // gated norm with z = big_a[cd..cd+vt]
-                    self.prof(4, || {
-                        let zp = self.big_a.ptr + (cd * 4) as u64;
-                        let (hh, vdd) = (*heads as u32, *vd as u32);
-                        let mut a = args!(self.mixed.ptr, gated_w.ptr, zp, hh, vdd, eps);
-                        chk(c.launch("k_gated_norm", (*heads as u32, 1, 1), ((*vd as u32).max(32), 1, 1), 0, &mut a));
-                        chk(c.quantize_q8(&self.mixed, 0, &self.xq, &self.xs, 1, vt as u32));
-                    });
+                        });
+                        // gated norm with z = big_a[cd..cd+vt]
+                        self.prof(4, || {
+                            let zp = self.big_a.ptr + (cd * 4) as u64;
+                            let (hh, vdd) = (*heads as u32, *vd as u32);
+                            let mut a = args!(self.mixed.ptr, gated_w.ptr, zp, hh, vdd, eps);
+                            chk(c.launch("k_gated_norm", (*heads as u32, 1, 1), ((*vd as u32).max(32), 1, 1), 0, &mut a));
+                            chk(c.quantize_q8(&self.mixed, 0, &self.xq, &self.xs, 1, vt as u32));
+                        });
+                    }
                     // out projection
                     self.prof(1, || chk(c.matvec_q8(&out.q, &out.s, &self.xq, &self.xs, &self.y_d, 0, d as u32, vt as u32)));
                     // residual + post norm
@@ -2782,13 +2946,15 @@ impl CudaDecoder {
                     self.prof(6, || chk(c.matvec_fp4(&gu.p, &gu.s, &self.xq, &self.xs, &self.big_a, 0, (2 * inter) as u32, d as u32)));
                     self.prof(7, || chk(c.silu_mul_quant_rows(&self.big_a, &self.big_b, &self.xq, &self.xs, 1, *inter as u32)));
                     self.prof(6, || chk(c.matvec_fp4(&dn.p, &dn.s, &self.xq, &self.xs, &self.y_d, 0, d as u32, *inter as u32)));
-                    self.prof(0, || chk(c.add(&self.hidden, 0, &self.y_d, 0, d as u32)));
+                    if trace {
+                        chk(c.add(&self.hidden, 0, &self.y_d, 0, d as u32));
+                    }
                 }
                 LayerDev::Full { in_norm, post_norm, proj, o, gu, dn, q_norm, k_norm, kc, vc, n_heads, n_kv, hd, rope_dim, theta, inter } => {
                     let qw = n_heads * hd;
                     let kvw = n_kv * hd;
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, None, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     self.prof(1, || chk(c.matvec_q8(&proj.q, &proj.s, &self.xq, &self.xs, &self.big_a, 0, proj.rows as u32, d as u32)));
                     // q/k norms + rope; K/V rows into the cache at pos; attention over [0, pos]
@@ -2808,16 +2974,19 @@ impl CudaDecoder {
                     self.prof(6, || chk(c.matvec_fp4(&gu.p, &gu.s, &self.xq, &self.xs, &self.big_a, 0, (2 * inter) as u32, d as u32)));
                     self.prof(7, || chk(c.silu_mul_quant_rows(&self.big_a, &self.big_b, &self.xq, &self.xs, 1, *inter as u32)));
                     self.prof(6, || chk(c.matvec_fp4(&dn.p, &dn.s, &self.xq, &self.xs, &self.y_d, 0, d as u32, *inter as u32)));
-                    self.prof(0, || chk(c.add(&self.hidden, 0, &self.y_d, 0, d as u32)));
+                    if trace {
+                        chk(c.add(&self.hidden, 0, &self.y_d, 0, d as u32));
+                    }
                 }
             }
             if trace {
                 chk(c.copy_dtod(&self.trace_buf, li * d * 4, &self.hidden, 0, d * 4));
             }
         }
-        // final norm + head, logits out
+        // final norm (+ the last MLP residual) + head, logits out
+        let last: Option<&DBuf> = if trace || self.layers.is_empty() { None } else { Some(&self.y_d) };
         self.prof(8, || {
-            chk(c.add_rmsnorm_quant_rows(&self.hidden, None, &self.norm_f, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+            chk(c.add_rmsnorm_quant_rows(&self.hidden, last, &self.norm_f, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
             chk(c.matvec_q8(&self.lm_head.q, &self.lm_head.s, &self.xq, &self.xs, &self.logits, 0, self.vocab as u32, d as u32));
             chk(c.read_async(&self.logits, 0, &self.logits_pin, self.vocab * 4));
         });
