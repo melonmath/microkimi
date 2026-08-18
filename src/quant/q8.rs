@@ -1185,3 +1185,105 @@ unsafe fn row_dot_fp4_x86(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
         total
     }
 }
+
+/// True with AVX-512 VNNI (Cascade Lake and later): vpdpbusd on 512-bit
+/// vectors, 64 int8 MACs per instruction.
+pub fn vnni512_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ON.get_or_init(|| {
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni")
+                && std::env::var("MICROKIMI_NO_VNNI").map(|v| v != "1").unwrap_or(true)
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// Four rows x N lanes with AVX-512 VNNI: two 32-column blocks per
+/// 512-bit vector, one vpdpbusd per (row, lane, 64 columns). VNNI is
+/// unsigned x signed, so the row (weights) provides the signed operand
+/// and |x| the unsigned one, with sign(x) folded into w as the AVX2 path
+/// does (sign_epi8): exact integer sums, identical to every other q8
+/// kernel. Block sums are extracted per 32-column half so the per-block
+/// scale FMA keeps the shared block-sequential order - bit-identical.
+///
+/// SAFETY: caller guarantees avx512f/bw/vnni; slices hold nb blocks,
+/// nb even (caller routes odd tails to the AVX2 tile).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,fma")]
+pub unsafe fn rows4_dot_fma_vnni(
+    w: [&[i8]; 4],
+    s: [&[f32]; 4],
+    xqs: &[(&[i8], &[f32])],
+) -> [[f32; 4]; 16] {
+    use std::arch::x86_64::*;
+    let nb = xqs[0].1.len();
+    let mut out = [[0.0f32; 4]; 16];
+    unsafe {
+        let mut acc = [_mm_setzero_ps(); 16];
+        let mut g = 0usize;
+        while g + 2 <= nb {
+            // 64 columns = blocks g, g+1
+            let w0 = _mm512_loadu_si512(w[0].as_ptr().add(g * 32) as *const _);
+            let w1 = _mm512_loadu_si512(w[1].as_ptr().add(g * 32) as *const _);
+            let w2 = _mm512_loadu_si512(w[2].as_ptr().add(g * 32) as *const _);
+            let w3 = _mm512_loadu_si512(w[3].as_ptr().add(g * 32) as *const _);
+            let ws_a = _mm_set_ps(s[3][g], s[2][g], s[1][g], s[0][g]);
+            let ws_b = _mm_set_ps(s[3][g + 1], s[2][g + 1], s[1][g + 1], s[0][g + 1]);
+            for (l, xq) in xqs.iter().enumerate() {
+                let x = _mm512_loadu_si512(xq.0.as_ptr().add(g * 32) as *const _);
+                // |x| unsigned, sign folded into each row: w' = w * sign(x)
+                let ax = _mm512_abs_epi8(x);
+                let neg = _mm512_movepi8_mask(x); // lanes where x < 0
+                let sx = |wv: __m512i| _mm512_mask_sub_epi8(wv, neg, _mm512_setzero_si512(), wv);
+                let d0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w0));
+                let d1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w1));
+                let d2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w2));
+                let d3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w3));
+                // per-row: sum of low 8 i32 lanes = block g, high 8 = block g+1
+                let half = |v: __m512i| -> (i32, i32) {
+                    let lo = _mm512_castsi512_si256(v);
+                    let hi = _mm512_extracti64x4_epi64(v, 1);
+                    (hsum_i32(lo), hsum_i32(hi))
+                };
+                let (a0, b0) = half(d0);
+                let (a1, b1) = half(d1);
+                let (a2, b2) = half(d2);
+                let (a3, b3) = half(d3);
+                let sums_a = _mm_cvtepi32_ps(_mm_set_epi32(a3, a2, a1, a0));
+                let sums_b = _mm_cvtepi32_ps(_mm_set_epi32(b3, b2, b1, b0));
+                let sv_a = _mm_mul_ps(ws_a, _mm_set1_ps(xq.1[g]));
+                let sv_b = _mm_mul_ps(ws_b, _mm_set1_ps(xq.1[g + 1]));
+                acc[l] = _mm_fmadd_ps(sums_a, sv_a, acc[l]);
+                acc[l] = _mm_fmadd_ps(sums_b, sv_b, acc[l]);
+            }
+            g += 2;
+        }
+        // odd tail block through the AVX2 pair
+        if g < nb {
+            let w0 = _mm256_loadu_si256(w[0].as_ptr().add(g * 32) as *const __m256i);
+            let w1 = _mm256_loadu_si256(w[1].as_ptr().add(g * 32) as *const __m256i);
+            let w2 = _mm256_loadu_si256(w[2].as_ptr().add(g * 32) as *const __m256i);
+            let w3 = _mm256_loadu_si256(w[3].as_ptr().add(g * 32) as *const __m256i);
+            let ws = _mm_set_ps(s[3][g], s[2][g], s[1][g], s[0][g]);
+            for (l, xq) in xqs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.0.as_ptr().add(g * 32) as *const __m256i);
+                let d0 = hsum_i32(i8_block_dot_vec(w0, x));
+                let d1 = hsum_i32(i8_block_dot_vec(w1, x));
+                let d2 = hsum_i32(i8_block_dot_vec(w2, x));
+                let d3 = hsum_i32(i8_block_dot_vec(w3, x));
+                let sums = _mm_cvtepi32_ps(_mm_set_epi32(d3, d2, d1, d0));
+                let sv = _mm_mul_ps(ws, _mm_set1_ps(xq.1[g]));
+                acc[l] = _mm_fmadd_ps(sums, sv, acc[l]);
+            }
+        }
+        for l in 0..xqs.len() {
+            _mm_storeu_ps(out[l].as_mut_ptr(), acc[l]);
+        }
+    }
+    out
+}

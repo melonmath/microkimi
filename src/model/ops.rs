@@ -111,6 +111,21 @@ pub(crate) fn lane_block() -> usize {
     })
 }
 
+/// x86 four-row tile dispatch: AVX-512 VNNI when the CPU has it, the
+/// AVX2/FMA tile otherwise. Both produce the same bits.
+/// SAFETY: caller guarantees avx2/fma; slices hold nb blocks each.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn x86_rows4_tile(w: [&[i8]; 4], s: [&[f32]; 4], xqs: &[(&[i8], &[f32])]) -> [[f32; 4]; 16] {
+    unsafe {
+        if crate::quant::q8::vnni512_available() {
+            crate::quant::q8::rows4_dot_fma_vnni(w, s, xqs)
+        } else {
+            crate::quant::q8::rows4_dot_fma_x86(w, s, xqs)
+        }
+    }
+}
+
 /// Chunk size for dynamically scheduled row loops: ~8 pulls per worker
 /// bound the straggler tail, a 16-row floor keeps the atomic traffic
 /// negligible, and the multiple-of-4 rounding feeds the quad-row kernels.
@@ -530,7 +545,7 @@ unsafe fn multi_rows_q8(
             while l0 < lanes.len() {
                 let width = (lanes.len() - l0).min(16);
                 // SAFETY: avx2/fma checked; slices hold nb blocks each.
-                let tile = unsafe { crate::quant::q8::rows4_dot_fma_x86(w4, s4, &lanes[l0..l0 + width]) };
+                let tile = unsafe { x86_rows4_tile(w4, s4, &lanes[l0..l0 + width]) };
                 for (dl, lane_out) in tile.iter().take(width).enumerate() {
                     for k in 0..4 {
                         unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
