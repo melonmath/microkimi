@@ -287,15 +287,21 @@ What moves and why:
   convert once, activations at the staging boundary via fcvtn/fcvtl
   inline asm); accumulation is wider. `MICROKIMI_QWEN_GPU_F32=1`
   restores f32 storage. The scan is always f32.
-- **Whole layers, chained**: the run of consecutive dense
-  linear-attention layers between two full-attention layers encodes as
-  ONE command buffer (per layer: input norm, projections, causal conv +
-  SiLU, scan prep, delta scan, gated norm, out_proj, residual,
-  post-norm, MLP), the f32 residual stream resident on the device for
-  the run, so the CPU tissue between GPU ops all but disappears
-  (`split:` and `by op:` lines of `qwengpubench`). The delta scan keeps
-  its recurrent state in registers (lanes split the state rows of a few
-  columns; shuffle reductions; no barrier).
+- **The whole prompt as one command buffer**: every dense layer encodes
+  in sequence into one command buffer with the f32 residual stream
+  resident on the device - a linear layer as input norm, projections,
+  causal conv + SiLU, scan prep, delta scan, gated norm, out_proj,
+  residual, post-norm, MLP; a full-attention layer as input norm, the
+  q|gate|k|v projection, q/k norm + RoPE with the k/v rows appended to
+  the layer's resident cache, scores and mix as one GEMM per kv group
+  over the cache rows with the causal softmax kernel between them, the
+  gate, o_proj, residual, post-norm, MLP. The new key/value rows come
+  back to the CPU caches after the prompt (`split: ... inside 1 gpu
+  ops`, `by op:` of `qwengpubench`). The delta scan keeps its recurrent
+  state in registers (lanes split the state rows of a few columns;
+  shuffle reductions; no barrier). `MICROKIMI_QWEN_GPU_NOATTN=1` keeps
+  the full-attention layers on the CPU path (the linear runs still
+  chain).
 - **Command buffers and memory**: what a prompt touches once (the f16
   weight copies) can be paged out between prompts on a host short of
   memory, and the driver pages it back inside the next submission;

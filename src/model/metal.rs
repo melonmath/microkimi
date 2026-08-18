@@ -1467,6 +1467,8 @@ struct MpsCtx {
     // (nibbles, scale bytes, tag)
     wq8cat: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, u32)>>,
     fp4cat: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, [u8; 16])>>,
+    // (first part ptr, total rows, cols) → (retained f16 rows of the parts concatenated, tag)
+    w16cat: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, u32)>>,
 }
 
 // SAFETY: same argument as MetalCtx - kernel objects and buffers are
@@ -1499,6 +1501,7 @@ fn mps_ctx() -> Option<(&'static MetalCtx, &'static MpsCtx)> {
                 fp4raw: std::sync::Mutex::new(std::collections::HashMap::new()),
                 wq8cat: std::sync::Mutex::new(std::collections::HashMap::new()),
                 fp4cat: std::sync::Mutex::new(std::collections::HashMap::new()),
+                w16cat: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         })
         .as_ref()?;
@@ -2210,6 +2213,54 @@ fn upload_q8(base: &MetalCtx, q: &[i8], sc: &[u16]) -> Option<(Id, Id)> {
         residency_add(base, bs);
         Some((bq, bs))
     }
+}
+
+/// The f16 rows of several f32 matrices with the same `cols`, concatenated
+/// (one GEMM over the stacked rows). Keyed by the first part's pointer,
+/// the total rows and cols.
+fn weight_buffer_f16_cat(base: &MetalCtx, mps: &MpsCtx, parts: &[(&[f32], usize)], cols: usize) -> Option<Id> {
+    if parts.is_empty() {
+        return None;
+    }
+    let rows: usize = parts.iter().map(|p| p.1).sum();
+    for (w, r) in parts {
+        if w.len() < r * cols {
+            return None;
+        }
+    }
+    let key = (parts[0].0.as_ptr() as usize, rows, cols);
+    let tag = parts[0].0.first().map(|v| v.to_bits()).unwrap_or(0);
+    let mut cache = mps.w16cat.lock().unwrap();
+    if let Some(&(buf, seen)) = cache.get(&key) {
+        if seen == tag {
+            return Some(buf);
+        }
+        cache.remove(&key);
+        // SAFETY: the stale buffer is owned by this cache (retained at insert).
+        unsafe { msg_void(buf, sel("release")) };
+    }
+    let mut h = vec![0u16; rows * cols];
+    let mut at = 0usize;
+    for (w, r) in parts {
+        f32s_to_f16s(&w[..r * cols], &mut h[at..at + r * cols]);
+        at += r * cols;
+    }
+    // SAFETY: `h` is alive for the whole call; the buffer copies its bytes.
+    let buf = unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let b = f(base.device, sel("newBufferWithBytes:length:options:"), h.as_ptr() as *const c_void, (h.len() * 2) as u64, 0);
+        if !b.is_null() {
+            retain(b);
+        }
+        b
+    };
+    if buf.is_null() {
+        return None;
+    }
+    residency_add(base, buf);
+    cache.insert(key, (buf, tag));
+    Some(buf)
 }
 
 /// The q8_0 rows of several f32 matrices with the same `cols`,
@@ -3978,6 +4029,94 @@ kernel void chain_add_norm(device float* hidden      [[buffer(0)]], // [t, d] f3
         n[i] = half(v * inv * (1.0f + w[i]));
     }
 }
+
+// Prefill q/k prep of a full-attention layer for every (token, head):
+// the q|gate|k|v projection row (f16, token-major [t, 2qw + 2kvw]) ->
+// per-head RMSNorm (offset weights) + partial RoPE at base+t on q and k,
+// q head-major [heads, t, hd] (the block GEMM per kv group), gate
+// token-major [t, qw], k and v rows appended to the resident caches
+// (token-major [cap, kvw], row base+t). Threadgroups: heads + n_kv per
+// token (q heads first).
+kernel void pf_qk_prep(device const half* proj    [[buffer(0)]],  // [t, 2qw + 2kvw]
+                       device const float* qn     [[buffer(1)]],  // [hd]
+                       device const float* kn     [[buffer(2)]],  // [hd]
+                       device half* qout          [[buffer(3)]],  // [heads, t, hd]
+                       device half* gout          [[buffer(4)]],  // [t, qw]
+                       device half* kc            [[buffer(5)]],  // [cap, kvw]
+                       device half* vc            [[buffer(6)]],
+                       constant uint4& dims       [[buffer(7)]],  // t, heads, n_kv, hd
+                       constant uint4& dims2      [[buffer(8)]],  // rope_dim, base_pos, 0, 0
+                       constant float& theta      [[buffer(9)]],
+                       constant float& eps        [[buffer(10)]],
+                       uint tg    [[threadgroup_position_in_grid]],
+                       uint lane  [[thread_position_in_threadgroup]],
+                       uint lanes [[threads_per_threadgroup]]) {
+    uint t_count = dims.x, nh = dims.y, nkv = dims.z, hd = dims.w;
+    uint rd = dims2.x, base = dims2.y;
+    uint per_tok = nh + nkv;
+    uint tok = tg / per_tok, hh = tg % per_tok;
+    if (tok >= t_count) { return; }
+    uint qw = nh * hd, kvw = nkv * hd;
+    uint rowlen = 2u * qw + 2u * kvw;
+    device const half* prow = proj + (size_t)tok * rowlen;
+    threadgroup float row[256];
+    threadgroup float red[32];
+    bool is_q = hh < nh;
+    uint h = is_q ? hh : hh - nh;
+    for (uint j = lane; j < hd; j += lanes) {
+        row[j] = is_q ? float(prow[h * 2u * hd + j]) : float(prow[2u * qw + h * hd + j]);
+    }
+    if (is_q) { for (uint j = lane; j < hd; j += lanes) { gout[(size_t)tok * qw + h * hd + j] = prow[h * 2u * hd + hd + j]; } }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ss = 0.0f;
+    for (uint j = lane; j < hd; j += lanes) { ss += row[j] * row[j]; }
+    ss = simd_sum(ss);
+    if ((lane & 31u) == 0u) red[lane / 32u] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) { float v = (lane < nsg) ? red[lane] : 0.0f; v = simd_sum(v); if (lane == 0u) red[0] = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt(red[0] / float(hd) + eps);
+    device const float* wn = is_q ? qn : kn;
+    for (uint j = lane; j < hd; j += lanes) { row[j] = row[j] * inv * (1.0f + wn[j]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint half_rd = rd / 2;
+    uint pos = base + tok;
+    for (uint i = lane; i < half_rd; i += lanes) {
+        float freq = pow(theta, -float(2u * i) / float(rd));
+        float ang = float(pos) * freq;
+        float c = cos(ang), s = sin(ang);
+        float a = row[i], b = row[i + half_rd];
+        row[i] = a * c - b * s;
+        row[i + half_rd] = a * s + b * c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (is_q) {
+        for (uint j = lane; j < hd; j += lanes) { qout[((size_t)h * t_count + tok) * hd + j] = half(row[j]); }
+    } else {
+        for (uint j = lane; j < hd; j += lanes) {
+            kc[(size_t)pos * kvw + h * hd + j] = half(row[j]);
+            vc[(size_t)pos * kvw + h * hd + j] = prow[2u * qw + kvw + h * hd + j];
+        }
+    }
+}
+
+// The attention mix back to token-major with the sigmoid gate:
+// mixed [heads, t, hd] -> out [t, heads*hd] * sigmoid(gate[t, heads*hd]).
+kernel void pf_gate_repack(device const half* mixed [[buffer(0)]],
+                           device const half* gate  [[buffer(1)]],
+                           device half* out         [[buffer(2)]],
+                           constant uint3& dims     [[buffer(3)]], // t, heads, hd
+                           uint i [[thread_position_in_grid]]) {
+    uint t_count = dims.x, heads = dims.y, hd = dims.z;
+    uint qw = heads * hd;
+    if (i >= t_count * qw) { return; }
+    uint tok = i / qw, r = i % qw;
+    uint h = r / hd, j = r % hd;
+    float m = float(mixed[((size_t)h * t_count + tok) * hd + j]);
+    float g = float(gate[i]);
+    out[i] = half(m / (1.0f + exp(-g)));
+}
 "#;
 
 #[allow(dead_code)] // pipelines consumed by the per-layer encoder (phase 3 wiring)
@@ -3986,6 +4125,8 @@ pub(crate) struct TissueCtx {
     pub(crate) gnorm: Id,
     pub(crate) scanprep: Id,
     pub(crate) chainnorm: Id,
+    pub(crate) qkprep: Id,
+    pub(crate) gaterepack: Id,
 }
 unsafe impl Send for TissueCtx {}
 unsafe impl Sync for TissueCtx {}
@@ -4045,12 +4186,14 @@ pub(crate) fn tissue_ctx() -> Option<(&'static MetalCtx, &'static TissueCtx)> {
                 let gnorm = mk("gated_rmsnorm_f16");
                 let scanprep = mk("scan_prep_f16");
                 let chainnorm = mk("chain_add_norm");
+                let qkprep = mk("pf_qk_prep");
+                let gaterepack = mk("pf_gate_repack");
                 retain(library);
                 msg_void(pool, sel("drain"));
-                if conv.is_null() || gnorm.is_null() || scanprep.is_null() || chainnorm.is_null() {
+                if conv.is_null() || gnorm.is_null() || scanprep.is_null() || chainnorm.is_null() || qkprep.is_null() || gaterepack.is_null() {
                     return None;
                 }
-                Some(TissueCtx { conv, gnorm, scanprep, chainnorm })
+                Some(TissueCtx { conv, gnorm, scanprep, chainnorm, qkprep, gaterepack })
             }
         })
         .as_ref()?;
@@ -4097,7 +4240,13 @@ const A_NORM2: usize = 11; // post-normed f16 [t, d]
 const A_H: usize = 12; // gate|up f16 [t, inter]x2
 const A_OUT: usize = 13; // mlp out f16 [t, d]
 const A_HID32: usize = 14; // resident hidden f32 [t, d] (the chain's residual stream)
-const A_N: usize = 15; // per-layer slots of a chain follow: A_N + 3*i + {0 scan state, 1 conv state, 2 small params}
+const A_PQKV: usize = 15; // full layer: q|gate|k|v projection f16 [t, 2qw + 2kvw]
+const A_QHM: usize = 16; // full layer: q head-major f16 [heads, t, hd]
+const A_GATE: usize = 17; // full layer: gate f16 [t, qw]
+const A_SCORES: usize = 18; // full layer: scores f16 [heads*t, l]
+const A_MIXHMF: usize = 19; // full layer: mixed head-major f16 [heads, t, hd]
+const A_MIXTMF: usize = 20; // full layer: mixed token-major f16 [t, qw]
+const A_N: usize = 21; // per-layer slots of a chain follow: A_N + 3*i + {0 scan state | kc, 1 conv state | vc, 2 small params}
 
 /// Ensures arena slot `i` holds at least `bytes`; returns (contents, buffer).
 /// SAFETY: caller holds the ARENA lock for the whole layer encode.
@@ -4248,33 +4397,111 @@ pub struct ChainLayer<'a> {
     pub dm: LinDims,
 }
 
-/// A run of consecutive dense linear-attention layers as ONE command
-/// buffer: the f32 residual stream lives on the device for the whole
-/// chain (uploaded once, read back once), each layer's input norm,
-/// projections, conv, scan, gated norm, out_proj, residual, post-norm
-/// and MLP encode in sequence, and the per-layer states ride in their
-/// own buffers. `hidden` [t, d] is updated in place; `states` holds
-/// each layer's (conv_state, scan_state), updated in place. False (with
-/// nothing mutated) when any piece is unavailable.
-pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, states: &mut [(&mut [f32], &mut [f32])]) -> bool {
-    if layers.is_empty() || states.len() != layers.len() {
+/// One full-attention layer of a chain, by reference.
+pub struct ChainFull<'a> {
+    pub in_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub q_proj: &'a [f32], // [2*heads*hd, d] (query | gate per head)
+    pub k_proj: &'a [f32], // [n_kv*hd, d]
+    pub v_proj: &'a [f32],
+    pub o_proj: &'a [f32], // [d, heads*hd]
+    pub q_norm: &'a [f32], // [hd]
+    pub k_norm: &'a [f32],
+    pub gate: (&'a [u8], &'a [u8]),
+    pub up: (&'a [u8], &'a [u8]),
+    pub down: (&'a [u8], &'a [u8]),
+    pub d: usize,
+    pub n_heads: usize,
+    pub n_kv: usize,
+    pub hd: usize,
+    pub rope_dim: usize,
+    pub theta: f32,
+    pub inter: usize,
+    pub eps: f32,
+}
+
+pub enum ChainLayerRef<'a> {
+    Linear(ChainLayer<'a>),
+    Full(ChainFull<'a>),
+}
+
+/// The CPU key/value cache rows of a full-attention layer entering the
+/// chain (token-major [len, kv_width] f32).
+pub struct ChainKv<'a> {
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub len: usize,
+}
+
+/// A run of consecutive dense layers (linear attention or full attention)
+/// as ONE command buffer: the f32 residual stream lives on the device
+/// for the whole run (uploaded once, read back once); per layer, the
+/// input norm, projections, attention (conv + scan + gated norm, or q/k
+/// prep + causal softmax attention over the resident key/value rows),
+/// out projection, residual, post-norm and MLP encode in sequence; the
+/// per-layer states ride in their own buffers. `hidden` [t, d] is updated
+/// in place; `lin_states` holds each linear layer's (conv_state,
+/// scan_state) in order, updated in place; `kv` holds each full layer's
+/// cache rows in order (all at `base_pos` rows) and `kv_out` receives
+/// the t new (k, v) rows per full layer, token-major f32, in order.
+/// False (with nothing mutated) when any piece is unavailable.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_layer_chain(
+    layers: &[ChainLayerRef],
+    hidden: &mut [f32],
+    t: usize,
+    lin_states: &mut [(&mut [f32], &mut [f32])],
+    kv: &[ChainKv],
+    kv_width: usize,
+    base_pos: usize,
+    kv_out: &mut Vec<(Vec<f32>, Vec<f32>)>,
+) -> bool {
+    if layers.is_empty() || !gemm_f16_on() {
         return false;
     }
-    let dm = layers[0].dm;
-    if !gemm_f16_on() || dm.kd > 128 || !scan_kd_ok(dm.kd) || dm.vd > 128 || dm.conv_k > 9 {
+    let n_lin = layers.iter().filter(|l| matches!(l, ChainLayerRef::Linear(_))).count();
+    let n_full = layers.len() - n_lin;
+    if lin_states.len() != n_lin || kv.len() != n_full {
         return false;
     }
+    // shared dims: d and inter from the first layer; the linear dims from
+    // the first linear layer (all linear layers must agree), the full
+    // dims from the first full layer (likewise)
+    let (d, inter, eps) = match &layers[0] {
+        ChainLayerRef::Linear(l) => (l.dm.d, l.dm.inter, l.dm.eps),
+        ChainLayerRef::Full(f) => (f.d, f.inter, f.eps),
+    };
+    let dm = layers.iter().find_map(|l| if let ChainLayerRef::Linear(l) = l { Some(l.dm) } else { None });
+    let fdm = layers.iter().find_map(|l| if let ChainLayerRef::Full(f) = l { Some((f.n_heads, f.n_kv, f.hd, f.rope_dim, f.theta)) } else { None });
     for l in layers {
-        let o = l.dm;
-        if o.d != dm.d || o.heads != dm.heads || o.kv_heads != dm.kv_heads || o.kd != dm.kd || o.vd != dm.vd || o.conv_k != dm.conv_k || o.inter != dm.inter {
+        match l {
+            ChainLayerRef::Linear(l) => {
+                let o = l.dm;
+                let r = dm.unwrap();
+                if o.d != d || o.inter != inter || o.heads != r.heads || o.kv_heads != r.kv_heads || o.kd != r.kd || o.vd != r.vd || o.conv_k != r.conv_k {
+                    return false;
+                }
+                if o.kd > 128 || !scan_kd_ok(o.kd) || o.vd > 128 || o.conv_k > 9 {
+                    return false;
+                }
+            }
+            ChainLayerRef::Full(f) => {
+                let r = fdm.unwrap();
+                if f.d != d || f.inter != inter || (f.n_heads, f.n_kv, f.hd, f.rope_dim) != (r.0, r.1, r.2, r.3) || f.hd > 256 || f.n_kv * f.hd != kv_width {
+                    return false;
+                }
+                if f.n_heads % f.n_kv.max(1) != 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    let l_total = base_pos + t;
+    for c in kv {
+        if c.len != base_pos || c.k.len() < base_pos * kv_width || c.v.len() < base_pos * kv_width {
             return false;
         }
     }
-    let (d, heads, kd, vd, inter) = (dm.d, dm.heads, dm.kd, dm.vd, dm.inter);
-    let kt = dm.kv_heads * kd;
-    let vt = heads * vd;
-    let conv_dim = 2 * kt + vt;
-    let rep = heads / dm.kv_heads.max(1);
     let Some((base, mps)) = mps_ctx() else {
         return false;
     };
@@ -4290,28 +4517,85 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
     let Some((_, sc)) = scan_ctx() else {
         return false;
     };
+    let Some((_, smx)) = softmax_ctx() else {
+        return false;
+    };
+    // linear dims (zeros when the chain has no linear layer)
+    let (heads, kd, vd, conv_k) = dm.map(|r| (r.heads, r.kd, r.vd, r.conv_k)).unwrap_or((0, 0, 0, 0));
+    let kv_heads = dm.map(|r| r.kv_heads).unwrap_or(1);
+    let kt = kv_heads * kd;
+    let vt = heads * vd;
+    let conv_dim = 2 * kt + vt;
+    let rep = heads / kv_heads.max(1);
+    // full dims
+    let (fh, fkv, fhd, frd, ftheta) = fdm.unwrap_or((0, 1, 0, 0, 0.0));
+    let qw = fh * fhd;
+    let fkvw = fkv * fhd;
+    let groups = fh / fkv.max(1);
+    let scores_len = fh * t * l_total; // f16 halves
+    if n_full > 0 && scores_len * 2 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
     // weights on device, every layer of the chain before any encode
-    struct LayerBufs {
-        qkv: Id, z: Id, b: Id, a: Id, out: Id, g: Id, u: Id, dn: Id,
+    enum LayerBufs {
+        Lin { qkv: Id, z: Id, b: Id, a: Id, out: Id, g: Id, u: Id, dn: Id },
+        Full { qkv: Id, o: Id, g: Id, u: Id, dn: Id },
     }
     let mut wbufs: Vec<LayerBufs> = Vec::with_capacity(layers.len());
     for l in layers {
-        let w = &l.w;
-        let Some(qkv) = weight_buffer_f16(base, mps, w.in_qkv, conv_dim, d) else { return false };
-        let Some(z) = weight_buffer_f16(base, mps, w.in_z, vt, d) else { return false };
-        let Some(b) = weight_buffer_f16(base, mps, w.in_b, heads, d) else { return false };
-        let Some(a) = weight_buffer_f16(base, mps, w.in_a, heads, d) else { return false };
-        let Some(out) = weight_buffer_f16(base, mps, w.out_proj, d, vt) else { return false };
-        let Some(g) = dequant_buffer(base, mps, w.gate.0, w.gate.1, inter, d) else { return false };
-        let Some(u) = dequant_buffer(base, mps, w.up.0, w.up.1, inter, d) else { return false };
-        let Some(dn) = dequant_buffer(base, mps, w.down.0, w.down.1, d, inter) else { return false };
-        wbufs.push(LayerBufs { qkv, z, b, a, out, g, u, dn });
+        match l {
+            ChainLayerRef::Linear(l) => {
+                let w = &l.w;
+                let Some(qkv) = weight_buffer_f16(base, mps, w.in_qkv, conv_dim, d) else { return false };
+                let Some(z) = weight_buffer_f16(base, mps, w.in_z, vt, d) else { return false };
+                let Some(b) = weight_buffer_f16(base, mps, w.in_b, heads, d) else { return false };
+                let Some(a) = weight_buffer_f16(base, mps, w.in_a, heads, d) else { return false };
+                let Some(out) = weight_buffer_f16(base, mps, w.out_proj, d, vt) else { return false };
+                let Some(g) = dequant_buffer(base, mps, w.gate.0, w.gate.1, inter, d) else { return false };
+                let Some(u) = dequant_buffer(base, mps, w.up.0, w.up.1, inter, d) else { return false };
+                let Some(dn) = dequant_buffer(base, mps, w.down.0, w.down.1, d, inter) else { return false };
+                wbufs.push(LayerBufs::Lin { qkv, z, b, a, out, g, u, dn });
+            }
+            ChainLayerRef::Full(f) => {
+                let Some(qkv) = weight_buffer_f16_cat(base, mps, &[(f.q_proj, 2 * qw), (f.k_proj, fkvw), (f.v_proj, fkvw)], d) else { return false };
+                let Some(o) = weight_buffer_f16(base, mps, f.o_proj, d, qw) else { return false };
+                let Some(g) = dequant_buffer(base, mps, f.gate.0, f.gate.1, inter, d) else { return false };
+                let Some(u) = dequant_buffer(base, mps, f.up.0, f.up.1, inter, d) else { return false };
+                let Some(dn) = dequant_buffer(base, mps, f.down.0, f.down.1, d, inter) else { return false };
+                wbufs.push(LayerBufs::Full { qkv, o, g, u, dn });
+            }
+        }
     }
     // kernels
-    let Some(k_qkv) = gemm_kernel(base, mps, t, conv_dim, d, true, 1.0) else { return false };
-    let Some(k_z) = gemm_kernel(base, mps, t, vt, d, true, 1.0) else { return false };
-    let Some(k_ba) = gemm_kernel(base, mps, t, heads, d, true, 1.0) else { return false };
-    let Some(k_out) = gemm_kernel(base, mps, t, d, vt, true, 1.0) else { return false };
+    let mut k_qkv = std::ptr::null_mut();
+    let mut k_z = std::ptr::null_mut();
+    let mut k_ba = std::ptr::null_mut();
+    let mut k_out = std::ptr::null_mut();
+    if n_lin > 0 {
+        let Some(k1) = gemm_kernel(base, mps, t, conv_dim, d, true, 1.0) else { return false };
+        let Some(k2) = gemm_kernel(base, mps, t, vt, d, true, 1.0) else { return false };
+        let Some(k3) = gemm_kernel(base, mps, t, heads, d, true, 1.0) else { return false };
+        let Some(k4) = gemm_kernel(base, mps, t, d, vt, true, 1.0) else { return false };
+        k_qkv = k1;
+        k_z = k2;
+        k_ba = k3;
+        k_out = k4;
+    }
+    let mut k_qkvf = std::ptr::null_mut();
+    let mut k_scores = std::ptr::null_mut();
+    let mut k_mix = std::ptr::null_mut();
+    let mut k_o = std::ptr::null_mut();
+    if n_full > 0 {
+        let scale = 1.0f32 / (fhd as f32).sqrt();
+        let Some(k1) = gemm_kernel(base, mps, t, 2 * qw + 2 * fkvw, d, true, 1.0) else { return false };
+        let Some(k2) = gemm_kernel(base, mps, groups * t, l_total, fhd, true, scale) else { return false };
+        let Some(k3) = gemm_kernel(base, mps, groups * t, fhd, l_total, false, 1.0) else { return false };
+        let Some(k4) = gemm_kernel(base, mps, t, d, qw, true, 1.0) else { return false };
+        k_qkvf = k1;
+        k_scores = k2;
+        k_mix = k3;
+        k_o = k4;
+    }
     let Some(k_gu) = gemm_kernel(base, mps, t, inter, d, true, 1.0) else { return false };
     let Some(k_dn) = gemm_kernel(base, mps, t, d, inter, true, 1.0) else { return false };
     let t_start = std::time::Instant::now();
@@ -4334,56 +4618,105 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
                 (p, b)
             }};
         }
+        // a slot only when the chain uses it (a zero-byte request is refused)
+        macro_rules! slot_if {
+            ($cond:expr, $i:expr, $bytes:expr) => {{
+                if $cond {
+                    slot!($i, $bytes)
+                } else {
+                    (std::ptr::null_mut::<c_void>(), std::ptr::null_mut::<std::ffi::c_void>() as Id)
+                }
+            }};
+        }
         let (_, b_hid) = slot!(A_HID, t * d * 2);
         let (p_hid32, b_hid32) = slot!(A_HID32, t * d * 4);
         let (_, b_norm) = slot!(A_NORM, t * d * 2);
-        let (_, b_qkvo) = slot!(A_QKV, t * conv_dim * 2);
-        let (_, b_zo) = slot!(A_Z, t * vt * 2);
-        let (_, b_ba) = slot!(A_BA, t * heads * 2 * 2);
-        let (_, b_conv) = slot!(A_CONV, t * conv_dim * 2);
+        let has_lin = n_lin > 0;
+        let has_full = n_full > 0;
+        let (_, b_qkvo) = slot_if!(has_lin, A_QKV, t * conv_dim * 2);
+        let (_, b_zo) = slot_if!(has_lin, A_Z, t * vt * 2);
+        let (_, b_ba) = slot_if!(has_lin, A_BA, t * heads * 2 * 2);
+        let (_, b_conv) = slot_if!(has_lin, A_CONV, t * conv_dim * 2);
         let scan_q = 0usize;
         let scan_k = t * heads * kd;
         let scan_v = 2 * t * heads * kd;
         let scan_beta = scan_v + t * heads * vd;
         let scan_decay = scan_beta + t * heads;
         let scan_total = scan_decay + t * heads;
-        let (_, b_scanin) = slot!(A_SCANIN, scan_total * 4);
-        let (_, b_mixhm) = slot!(A_MIXHM, heads * t * vd * 4);
-        let (_, b_mixtm) = slot!(A_MIXTM, t * vt * 2);
+        let (_, b_scanin) = slot_if!(has_lin, A_SCANIN, scan_total * 4);
+        let (_, b_mixhm) = slot_if!(has_lin, A_MIXHM, heads * t * vd * 4);
+        let (_, b_mixtm) = slot_if!(has_lin, A_MIXTM, t * vt * 2);
         let (_, b_attn) = slot!(A_ATTN, t * d * 2);
         let (_, b_hid2) = slot!(A_HID2, t * d * 2);
         let (_, b_norm2) = slot!(A_NORM2, t * d * 2);
         let (_, b_h) = slot!(A_H, t * inter * 2 * 2);
         let (_, b_out_mlp) = slot!(A_OUT, t * d * 2);
-        // small params packed per layer: [norm_w d | post_norm_w d | a_log heads | dt_bias heads | conv_w conv_dim*k | gated vd]
+        // full-attention scratch
+        let (_, b_pqkv) = slot_if!(has_full, A_PQKV, t * (2 * qw + 2 * fkvw) * 2);
+        let (_, b_qhm) = slot_if!(has_full, A_QHM, fh * t * fhd * 2);
+        let (_, b_gate) = slot_if!(has_full, A_GATE, t * qw * 2);
+        let (_, b_scores) = slot_if!(has_full, A_SCORES, scores_len * 2);
+        let (_, b_mixhmf) = slot_if!(has_full, A_MIXHMF, fh * t * fhd * 2);
+        let (_, b_mixtmf) = slot_if!(has_full, A_MIXTMF, t * qw * 2);
+        // small params packed per layer:
+        //   linear: [norm_w d | post_norm_w d | a_log heads | dt_bias heads | conv_w conv_dim*k | gated vd]
+        //   full:   [in_norm d | post_norm d | q_norm hd | k_norm hd]
         let off_norm = 0usize;
         let off_post = d;
         let off_alog = 2 * d;
         let off_dtb = 2 * d + heads;
         let off_convw = 2 * d + 2 * heads;
-        let off_gated = off_convw + conv_dim * dm.conv_k;
-        let small_total = off_gated + vd;
-        // per-layer buffers: state, conv state, small params
-        struct LayerSlots {
-            p_state: *mut c_void, b_state: Id, p_convst: *mut c_void, b_convst: Id, b_small: Id,
+        let off_gated = off_convw + conv_dim * conv_k;
+        let small_lin = off_gated + vd;
+        let off_qn = 2 * d;
+        let off_kn = 2 * d + fhd;
+        let small_full = 2 * d + 2 * fhd;
+        // per-layer buffers: (scan state, conv state, small) or (kc, vc, small)
+        enum LayerSlots {
+            Lin { p_state: *mut c_void, b_state: Id, p_convst: *mut c_void, b_convst: Id, b_small: Id },
+            Full { p_kc: *mut c_void, b_kc: Id, p_vc: *mut c_void, b_vc: Id, b_small: Id },
         }
         let mut lslots: Vec<LayerSlots> = Vec::with_capacity(layers.len());
+        let (mut li_lin, mut li_full) = (0usize, 0usize);
         for (i, l) in layers.iter().enumerate() {
-            let (conv_state, scan_state) = &states[i];
-            let (p_state, b_state) = slot!(A_N + 3 * i, scan_state.len() * 4);
-            let (p_convst, b_convst) = slot!(A_N + 3 * i + 1, conv_state.len() * 4);
-            let (p_small, b_small) = slot!(A_N + 3 * i + 2, small_total * 4);
-            std::ptr::copy_nonoverlapping(scan_state.as_ptr(), p_state as *mut f32, scan_state.len());
-            std::ptr::copy_nonoverlapping(conv_state.as_ptr(), p_convst as *mut f32, conv_state.len());
-            let w = &l.w;
-            let sm_ptr = p_small as *mut f32;
-            std::ptr::copy_nonoverlapping(w.norm_w.as_ptr(), sm_ptr.add(off_norm), d.min(w.norm_w.len()));
-            std::ptr::copy_nonoverlapping(w.post_norm_w.as_ptr(), sm_ptr.add(off_post), d);
-            std::ptr::copy_nonoverlapping(w.a_log.as_ptr(), sm_ptr.add(off_alog), heads);
-            std::ptr::copy_nonoverlapping(w.dt_bias.as_ptr(), sm_ptr.add(off_dtb), heads);
-            std::ptr::copy_nonoverlapping(w.conv_w.as_ptr(), sm_ptr.add(off_convw), conv_dim * dm.conv_k);
-            std::ptr::copy_nonoverlapping(l.gated_w.as_ptr(), sm_ptr.add(off_gated), vd.min(l.gated_w.len()));
-            lslots.push(LayerSlots { p_state, b_state, p_convst, b_convst, b_small });
+            match l {
+                ChainLayerRef::Linear(l) => {
+                    let (conv_state, scan_state) = &lin_states[li_lin];
+                    li_lin += 1;
+                    let (p_state, b_state) = slot!(A_N + 3 * i, scan_state.len() * 4);
+                    let (p_convst, b_convst) = slot!(A_N + 3 * i + 1, conv_state.len() * 4);
+                    let (p_small, b_small) = slot!(A_N + 3 * i + 2, small_lin * 4);
+                    std::ptr::copy_nonoverlapping(scan_state.as_ptr(), p_state as *mut f32, scan_state.len());
+                    std::ptr::copy_nonoverlapping(conv_state.as_ptr(), p_convst as *mut f32, conv_state.len());
+                    let w = &l.w;
+                    let sm_ptr = p_small as *mut f32;
+                    std::ptr::copy_nonoverlapping(w.norm_w.as_ptr(), sm_ptr.add(off_norm), d.min(w.norm_w.len()));
+                    std::ptr::copy_nonoverlapping(w.post_norm_w.as_ptr(), sm_ptr.add(off_post), d);
+                    std::ptr::copy_nonoverlapping(w.a_log.as_ptr(), sm_ptr.add(off_alog), heads);
+                    std::ptr::copy_nonoverlapping(w.dt_bias.as_ptr(), sm_ptr.add(off_dtb), heads);
+                    std::ptr::copy_nonoverlapping(w.conv_w.as_ptr(), sm_ptr.add(off_convw), conv_dim * conv_k);
+                    std::ptr::copy_nonoverlapping(l.gated_w.as_ptr(), sm_ptr.add(off_gated), vd.min(l.gated_w.len()));
+                    lslots.push(LayerSlots::Lin { p_state, b_state, p_convst, b_convst, b_small });
+                }
+                ChainLayerRef::Full(f) => {
+                    let c = &kv[li_full];
+                    li_full += 1;
+                    let (p_kc, b_kc) = slot!(A_N + 3 * i, l_total * kv_width * 2);
+                    let (p_vc, b_vc) = slot!(A_N + 3 * i + 1, l_total * kv_width * 2);
+                    let (p_small, b_small) = slot!(A_N + 3 * i + 2, small_full * 4);
+                    // the cache rows already there, f16 token-major
+                    if base_pos > 0 {
+                        f32s_to_f16s(&c.k[..base_pos * kv_width], std::slice::from_raw_parts_mut(p_kc as *mut u16, base_pos * kv_width));
+                        f32s_to_f16s(&c.v[..base_pos * kv_width], std::slice::from_raw_parts_mut(p_vc as *mut u16, base_pos * kv_width));
+                    }
+                    let sm_ptr = p_small as *mut f32;
+                    std::ptr::copy_nonoverlapping(f.in_norm.as_ptr(), sm_ptr.add(off_norm), d);
+                    std::ptr::copy_nonoverlapping(f.post_norm.as_ptr(), sm_ptr.add(off_post), d);
+                    std::ptr::copy_nonoverlapping(f.q_norm.as_ptr(), sm_ptr.add(off_qn), fhd);
+                    std::ptr::copy_nonoverlapping(f.k_norm.as_ptr(), sm_ptr.add(off_kn), fhd);
+                    lslots.push(LayerSlots::Full { p_kc, b_kc, p_vc, b_vc, b_small });
+                }
+            }
         }
         // the residual stream, once
         std::ptr::copy_nonoverlapping(hidden.as_ptr(), p_hid32 as *mut f32, t * d);
@@ -4393,6 +4726,12 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
             f(class("MPSMatrixDescriptor"), sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), r as u64, c as u64, (c * 2) as u64, MPS_FLOAT16)
+        };
+        // a strided view: `c` columns of a wider row of `stride` elements
+        let desc16s = |r: usize, c: usize, stride: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(class("MPSMatrixDescriptor"), sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"), r as u64, c as u64, (stride * 2) as u64, MPS_FLOAT16)
         };
         let mat = |buf: Id, off: usize, dsc: Id| -> Id {
             let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
@@ -4409,16 +4748,24 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let disp_tg: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_th: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let sel_enc = sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:");
         let sel_pipe = sel("setComputePipelineState:");
         let sel_sb = sel("setBuffer:offset:atIndex:");
         let sel_by = sel("setBytes:length:atIndex:");
         let sel_dtg = sel("dispatchThreadgroups:threadsPerThreadgroup:");
+        let sel_dth = sel("dispatchThreads:threadsPerThreadgroup:");
         let sel_end = sel("endEncoding");
-        let mut mats: Vec<Id> = Vec::new();
-        let mut m = |buf: Id, off: usize, r: usize, c: usize| -> Id {
+        let mats: std::cell::RefCell<Vec<Id>> = std::cell::RefCell::new(Vec::new());
+        let m = |buf: Id, off: usize, r: usize, c: usize| -> Id {
             let x = mat(buf, off, desc16(r, c));
-            mats.push(x);
+            mats.borrow_mut().push(x);
+            x
+        };
+        let ms = |buf: Id, off: usize, r: usize, c: usize, stride: usize| -> Id {
+            let x = mat(buf, off, desc16s(r, c, stride));
+            mats.borrow_mut().push(x);
             x
         };
 
@@ -4454,14 +4801,53 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             set_buf(e, sel_sb, b_hid, 0, 5);
             let dims: [u32; 3] = [d as u32, n_adds, do_norm];
             set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 6);
-            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 7);
+            set_bytes(e, sel_by, (&eps) as *const f32 as *const c_void, 4, 7);
             disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             msg_void(e, sel_end);
         };
+        // post-norm + MLP shared by both layer kinds: hidden2 = hidden16 + attn
+        // (f16, the post-norm's input only), normed2, gate/up, SiLU*up, down -> b_out_mlp
+        let post_mlp = |cmdbuf: Id, b_small: Id, b_g: Id, b_u: Id, b_dn: Id, mats: &mut Vec<Id>| {
+            {
+                let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+                set_pipe(e, sel_pipe, an.pipeline);
+                set_buf(e, sel_sb, b_hid, 0, 0);
+                set_buf(e, sel_sb, b_attn, 0, 1);
+                set_buf(e, sel_sb, b_small, (off_post * 4) as u64, 2);
+                set_buf(e, sel_sb, b_norm2, 0, 3);
+                set_buf(e, sel_sb, b_hid2, 0, 6);
+                let dims: [u32; 2] = [d as u32, 1];
+                set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 4);
+                set_bytes(e, sel_by, (&eps) as *const f32 as *const c_void, 4, 5);
+                disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+                msg_void(e, sel_end);
+            }
+            let mm = |buf: Id, off: usize, r: usize, c: usize, mats: &mut Vec<Id>| -> Id {
+                let x = mat(buf, off, desc16(r, c));
+                mats.push(x);
+                x
+            };
+            let mx2 = mm(b_norm2, 0, t, d, mats);
+            enc_gemm(k_gu, sel_enc, cmdbuf, mx2, mm(b_g, 0, inter, d, mats), mm(b_h, 0, t, inter, mats));
+            enc_gemm(k_gu, sel_enc, cmdbuf, mx2, mm(b_u, 0, inter, d, mats), mm(b_h, t * inter * 2, t, inter, mats));
+            {
+                let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+                set_pipe(e, sel_pipe, sm.pipeline);
+                set_buf(e, sel_sb, b_h, 0, 0);
+                set_buf(e, sel_sb, b_h, (t * inter * 2) as u64, 1);
+                let n = (t * inter) as u32;
+                set_bytes(e, sel_by, (&n) as *const u32 as *const c_void, 4, 2);
+                disp_th(e, sel_dth, MTLSize { width: (t * inter) as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+                msg_void(e, sel_end);
+            }
+            enc_gemm(k_dn, sel_enc, cmdbuf, mm(b_h, 0, t, inter, mats), mm(b_dn, 0, d, inter, mats), mm(b_out_mlp, 0, t, d, mats));
+        };
+        let mut post_mats: Vec<Id> = Vec::new();
         for li in 0..layers.len() {
-        let wb = &wbufs[li];
-        let (b_qkv, b_z, b_b, b_a, b_out, b_g, b_u, b_dn) = (wb.qkv, wb.z, wb.b, wb.a, wb.out, wb.g, wb.u, wb.dn);
-        let (b_state, b_convst, b_small) = (lslots[li].b_state, lslots[li].b_convst, lslots[li].b_small);
+        match (&wbufs[li], &lslots[li]) {
+        (LayerBufs::Lin { qkv: b_qkv, z: b_z, b: b_b, a: b_a, out: b_out, g: b_g, u: b_u, dn: b_dn }, LayerSlots::Lin { b_state, b_convst, b_small, .. }) => {
+        let (b_qkv, b_z, b_b, b_a, b_out, b_g, b_u, b_dn) = (*b_qkv, *b_z, *b_b, *b_a, *b_out, *b_g, *b_u, *b_dn);
+        let (b_state, b_convst, b_small) = (*b_state, *b_convst, *b_small);
         // 1. residual fold (layers after the first) + input norm
         chain_norm(cmdbuf, if li == 0 { 0 } else { 2 }, 1, b_small);
         stage!(0);
@@ -4480,7 +4866,7 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             set_buf(e, sel_sb, b_small, (off_convw * 4) as u64, 1);
             set_buf(e, sel_sb, b_convst, 0, 2);
             set_buf(e, sel_sb, b_conv, 0, 3);
-            let dims: [u32; 3] = [t as u32, conv_dim as u32, dm.conv_k as u32];
+            let dims: [u32; 3] = [t as u32, conv_dim as u32, conv_k as u32];
             set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 4);
             let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
@@ -4538,7 +4924,7 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             set_buf(e, sel_sb, b_mixtm, 0, 3);
             let dims: [u32; 3] = [t as u32, heads as u32, vd as u32];
             set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 4);
-            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
+            set_bytes(e, sel_by, (&eps) as *const f32 as *const c_void, 4, 5);
             disp_tg(e, sel_dtg, MTLSize { width: (t * heads) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
             msg_void(e, sel_end);
         }
@@ -4546,45 +4932,97 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
         // 7. out_proj -> attn out
         enc_gemm(k_out, sel_enc, cmdbuf, m(b_mixtm, 0, t, vt), m(b_out, 0, d, vt), m(b_attn, 0, t, d));
         stage!(6);
-        // 8. hidden2 = hidden + attn (device-side f16 sum, used ONLY as the
-        //    post-norm input; the f32 residual add happens on the CPU from the
-        //    returned attn+mlp), normed2 = rmsnorm(hidden2) * (1 + post_w)
-        {
-            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
-            set_pipe(e, sel_pipe, an.pipeline);
-            set_buf(e, sel_sb, b_hid, 0, 0);
-            set_buf(e, sel_sb, b_attn, 0, 1);
-            set_buf(e, sel_sb, b_small, (off_post * 4) as u64, 2);
-            set_buf(e, sel_sb, b_norm2, 0, 3);
-            set_buf(e, sel_sb, b_hid2, 0, 6);
-            let dims: [u32; 2] = [d as u32, 1];
-            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 4);
-            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
-            disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
-            msg_void(e, sel_end);
-        }
+        // 8-9. post-norm and MLP (shared with the full layer)
         stage!(7);
-        // 9. MLP: gate/up from normed2, SiLU*up, down -> out
-        let mx2 = m(b_norm2, 0, t, d);
-        enc_gemm(k_gu, sel_enc, cmdbuf, mx2, m(b_g, 0, inter, d), m(b_h, 0, t, inter));
-        enc_gemm(k_gu, sel_enc, cmdbuf, mx2, m(b_u, 0, inter, d), m(b_h, t * inter * 2, t, inter));
-        {
-            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
-            set_pipe(e, sel_pipe, sm.pipeline);
-            set_buf(e, sel_sb, b_h, 0, 0);
-            set_buf(e, sel_sb, b_h, (t * inter * 2) as u64, 1);
-            let n = (t * inter) as u32;
-            set_bytes(e, sel_by, (&n) as *const u32 as *const c_void, 4, 2);
-            let f: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
-                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
-            f(e, sel("dispatchThreads:threadsPerThreadgroup:"), MTLSize { width: (t * inter) as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
-            msg_void(e, sel_end);
-        }
-        enc_gemm(k_dn, sel_enc, cmdbuf, m(b_h, 0, t, inter), m(b_dn, 0, d, inter), m(b_out_mlp, 0, t, d));
+        post_mlp(cmdbuf, b_small, b_g, b_u, b_dn, &mut post_mats);
         stage!(8);
         }
+        (LayerBufs::Full { qkv: b_wqkv, o: b_o, g: b_g, u: b_u, dn: b_dn }, LayerSlots::Full { b_kc, b_vc, b_small, .. }) => {
+        let (b_wqkv, b_o, b_g, b_u, b_dn) = (*b_wqkv, *b_o, *b_g, *b_u, *b_dn);
+        let (b_kc, b_vc, b_small) = (*b_kc, *b_vc, *b_small);
+        // 1. residual fold + input norm
+        chain_norm(cmdbuf, if li == 0 { 0 } else { 2 }, 1, b_small);
+        stage!(0);
+        // 2. q|gate|k|v projection from normed: [t, 2qw + 2kvw]
+        let rowlen = 2 * qw + 2 * fkvw;
+        enc_gemm(k_qkvf, sel_enc, cmdbuf, m(b_norm, 0, t, d), m(b_wqkv, 0, rowlen, d), m(b_pqkv, 0, t, rowlen));
+        stage!(1);
+        // 3. q/k norm + RoPE, gate split, k/v rows into the resident caches
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, tis.qkprep);
+            set_buf(e, sel_sb, b_pqkv, 0, 0);
+            set_buf(e, sel_sb, b_small, (off_qn * 4) as u64, 1);
+            set_buf(e, sel_sb, b_small, (off_kn * 4) as u64, 2);
+            set_buf(e, sel_sb, b_qhm, 0, 3);
+            set_buf(e, sel_sb, b_gate, 0, 4);
+            set_buf(e, sel_sb, b_kc, 0, 5);
+            set_buf(e, sel_sb, b_vc, 0, 6);
+            let d0: [u32; 4] = [t as u32, fh as u32, fkv as u32, fhd as u32];
+            let d1: [u32; 4] = [frd as u32, base_pos as u32, 0, 0];
+            set_bytes(e, sel_by, d0.as_ptr() as *const c_void, 16, 7);
+            set_bytes(e, sel_by, d1.as_ptr() as *const c_void, 16, 8);
+            set_bytes(e, sel_by, (&ftheta) as *const f32 as *const c_void, 4, 9);
+            set_bytes(e, sel_by, (&eps) as *const f32 as *const c_void, 4, 10);
+            disp_tg(e, sel_dtg, MTLSize { width: (t * (fh + fkv)) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        stage!(2);
+        // 4. scores per kv group: Q block [groups*t, hd] . K[kh]^T over l rows
+        for kh in 0..fkv {
+            let q_off = kh * groups * t * fhd * 2;
+            let s_off = kh * groups * t * l_total * 2;
+            enc_gemm(k_scores, sel_enc, cmdbuf, m(b_qhm, q_off, groups * t, fhd), ms(b_kc, kh * fhd * 2, l_total, fhd, kv_width), m(b_scores, s_off, groups * t, l_total));
+        }
+        stage!(3);
+        // 5. causal softmax over [heads*t, l]
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, smx.pipeline);
+            set_buf(e, sel_sb, b_scores, 0, 0);
+            let dims: [u32; 4] = [t as u32, l_total as u32, base_pos as u32, fh as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 16, 1);
+            disp_tg(e, sel_dtg, MTLSize { width: (fh * t) as u64, height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        stage!(4);
+        // 6. mix per kv group: P block [groups*t, l] . V[kh] [l, hd] -> mixed head-major
+        for kh in 0..fkv {
+            let s_off = kh * groups * t * l_total * 2;
+            let o_off = kh * groups * t * fhd * 2;
+            enc_gemm(k_mix, sel_enc, cmdbuf, m(b_scores, s_off, groups * t, l_total), ms(b_vc, kh * fhd * 2, l_total, fhd, kv_width), m(b_mixhmf, o_off, groups * t, fhd));
+        }
+        stage!(5);
+        // 7. gate + token-major, o_proj -> attn out
+        {
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel_pipe, tis.gaterepack);
+            set_buf(e, sel_sb, b_mixhmf, 0, 0);
+            set_buf(e, sel_sb, b_gate, 0, 1);
+            set_buf(e, sel_sb, b_mixtmf, 0, 2);
+            let dims: [u32; 3] = [t as u32, fh as u32, fhd as u32];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 3);
+            disp_th(e, sel_dth, MTLSize { width: (t * qw) as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            msg_void(e, sel_end);
+        }
+        enc_gemm(k_o, sel_enc, cmdbuf, m(b_mixtmf, 0, t, qw), m(b_o, 0, d, qw), m(b_attn, 0, t, d));
+        stage!(6);
+        // 8-9. post-norm and MLP
+        stage!(7);
+        post_mlp(cmdbuf, b_small, b_g, b_u, b_dn, &mut post_mats);
+        stage!(8);
+        }
+        _ => {
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        }
+        }
         // the last layer's attn + mlp join the resident stream
-        chain_norm(cmdbuf, 2, 0, lslots[0].b_small);
+        let last_small = match &lslots[layers.len() - 1] {
+            LayerSlots::Lin { b_small, .. } | LayerSlots::Full { b_small, .. } => *b_small,
+        };
+        chain_norm(cmdbuf, 2, 0, last_small);
         let t_commit = std::time::Instant::now();
         let mt_commit = media_time_now();
         msg_void(cmdbuf, sel("commit"));
@@ -4607,13 +5045,32 @@ pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, sta
             LAYER_WALL[7].fetch_add(((k0 - mt_commit).max(0.0) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // readback: the residual stream and every layer's states
+        // readback: the residual stream, every linear layer's states, every
+        // full layer's new key/value rows
         hidden[..t * d].copy_from_slice(std::slice::from_raw_parts(p_hid32 as *const f32, t * d));
-        for (i, (conv_state, scan_state)) in states.iter_mut().enumerate() {
-            scan_state.copy_from_slice(std::slice::from_raw_parts(lslots[i].p_state as *const f32, scan_state.len()));
-            conv_state.copy_from_slice(std::slice::from_raw_parts(lslots[i].p_convst as *const f32, conv_state.len()));
+        let (mut li_lin, mut li_full) = (0usize, 0usize);
+        kv_out.clear();
+        for sl in &lslots {
+            match sl {
+                LayerSlots::Lin { p_state, p_convst, .. } => {
+                    let (conv_state, scan_state) = &mut lin_states[li_lin];
+                    li_lin += 1;
+                    scan_state.copy_from_slice(std::slice::from_raw_parts(*p_state as *const f32, scan_state.len()));
+                    conv_state.copy_from_slice(std::slice::from_raw_parts(*p_convst as *const f32, conv_state.len()));
+                }
+                LayerSlots::Full { p_kc, p_vc, .. } => {
+                    li_full += 1;
+                    let n = t * kv_width;
+                    let mut kn = vec![0.0f32; n];
+                    let mut vn = vec![0.0f32; n];
+                    f16s_to_f32s(std::slice::from_raw_parts((*p_kc as *const u16).add(base_pos * kv_width), n), &mut kn);
+                    f16s_to_f32s(std::slice::from_raw_parts((*p_vc as *const u16).add(base_pos * kv_width), n), &mut vn);
+                    kv_out.push((kn, vn));
+                }
+            }
         }
-        for x in &mats {
+        let _ = li_full;
+        for x in mats.borrow().iter().chain(&post_mats) {
             msg_void(*x, sel("release"));
         }
         msg_void(pool, sel("drain"));

@@ -2769,12 +2769,19 @@ impl QwenModel {
                 && t_count >= crate::model::metal::GEMM_MIN_T
                 && !crate::model::accel::accel_on()
             {
+                // full-attention layers join the chain when their attention
+                // offload is on (MICROKIMI_QWEN_GPU_NOATTN=1 keeps them on the
+                // CPU path) and the caches sit at self.pos
+                let full_ok = crate::model::metal::qwen_gpu_attn_on();
                 let eligible = |i: usize| -> bool {
                     i < c.n_layers
                         && self.skip_bounds[i].is_none()
-                        && matches!(self.layers[i].attn, QwenAttnW::Linear(_))
                         && matches!(self.layers[i].mlp, QwenMlpW::Dense { .. })
-                        && matches!(self.caches[i], QwenCache::Linear(_))
+                        && match (&self.layers[i].attn, &self.caches[i]) {
+                            (QwenAttnW::Linear(_), QwenCache::Linear(_)) => true,
+                            (QwenAttnW::Full(_), QwenCache::Full(cache)) => full_ok && cache.len == self.pos,
+                            _ => false,
+                        }
                 };
                 let mut n = 0usize;
                 while eligible(l + n) {
@@ -2791,13 +2798,36 @@ impl QwenModel {
                         inter: c.dense_inter,
                         eps: c.norm_eps as f32,
                     };
-                    let mut chain: Vec<crate::model::metal::ChainLayer> = Vec::with_capacity(n);
+                    let mut chain: Vec<crate::model::metal::ChainLayerRef> = Vec::with_capacity(n);
                     for i in l..l + n {
                         let li = &self.layers[i];
-                        let (QwenAttnW::Linear(w), QwenMlpW::Dense { gate, up, down }) = (&li.attn, &li.mlp) else {
-                            unreachable!()
-                        };
-                        chain.push(crate::model::metal::ChainLayer {
+                        let QwenMlpW::Dense { gate, up, down } = &li.mlp else { unreachable!() };
+                        if let QwenAttnW::Full(w) = &li.attn {
+                            chain.push(crate::model::metal::ChainLayerRef::Full(crate::model::metal::ChainFull {
+                                in_norm: tensor(data, &li.input_norm),
+                                post_norm: tensor(data, &li.post_norm),
+                                q_proj: tensor(data, &w.q_proj),
+                                k_proj: tensor(data, &w.k_proj),
+                                v_proj: tensor(data, &w.v_proj),
+                                o_proj: tensor(data, &w.o_proj),
+                                q_norm: tensor(data, &w.q_norm),
+                                k_norm: tensor(data, &w.k_norm),
+                                gate: packed_parts(data, gate),
+                                up: packed_parts(data, up),
+                                down: packed_parts(data, down),
+                                d,
+                                n_heads: c.n_heads,
+                                n_kv: c.n_kv_heads,
+                                hd: c.head_dim,
+                                rope_dim: c.rope_dim(),
+                                theta: c.rope_theta as f32,
+                                inter: c.dense_inter,
+                                eps: c.norm_eps as f32,
+                            }));
+                            continue;
+                        }
+                        let QwenAttnW::Linear(w) = &li.attn else { unreachable!() };
+                        chain.push(crate::model::metal::ChainLayerRef::Linear(crate::model::metal::ChainLayer {
                             w: crate::model::metal::LinLayerRefs {
                                 in_qkv: tensor(data, &w.in_qkv),
                                 in_z: tensor(data, &w.in_z),
@@ -2817,15 +2847,40 @@ impl QwenModel {
                             },
                             gated_w: tensor(data, &w.norm),
                             dm,
-                        });
+                        }));
                     }
-                    let mut states: Vec<(&mut [f32], &mut [f32])> = Vec::with_capacity(n);
-                    for cache in self.caches[l..l + n].iter_mut() {
-                        if let QwenCache::Linear(cc) = cache {
-                            states.push((&mut cc.conv, &mut cc.state));
+                    let kv_width = c.n_kv_heads * c.head_dim;
+                    let base_pos = self.pos;
+                    let ok = {
+                        let mut states: Vec<(&mut [f32], &mut [f32])> = Vec::with_capacity(n);
+                        let mut kvs: Vec<crate::model::metal::ChainKv> = Vec::new();
+                        for cache in self.caches[l..l + n].iter_mut() {
+                            match cache {
+                                QwenCache::Linear(cc) => states.push((&mut cc.conv, &mut cc.state)),
+                                QwenCache::Full(cc) => kvs.push(crate::model::metal::ChainKv { k: &cc.k, v: &cc.v, len: cc.len }),
+                            }
                         }
-                    }
-                    if crate::model::metal::gpu_linear_chain(&chain, &mut hidden[..t_count * d], t_count, &mut states) {
+                        let mut kv_out: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+                        let ok = crate::model::metal::gpu_layer_chain(&chain, &mut hidden[..t_count * d], t_count, &mut states, &kvs, kv_width, base_pos, &mut kv_out);
+                        drop(states);
+                        drop(kvs);
+                        if ok {
+                            // the new key/value rows join the CPU caches (and the q8 K mirror)
+                            let mut fi = 0usize;
+                            for cache in self.caches[l..l + n].iter_mut() {
+                                if let QwenCache::Full(cc) = cache {
+                                    let (kn, vn) = &kv_out[fi];
+                                    fi += 1;
+                                    cc.k.extend_from_slice(kn);
+                                    cc.v.extend_from_slice(vn);
+                                    push_k_mirror(cc, kn);
+                                    cc.len += t_count;
+                                }
+                            }
+                        }
+                        ok
+                    };
+                    if ok {
                         dprof_add(0, t_attn.elapsed());
                         // the residuals are already inside `hidden`; make the
                         // next layer's par_add_norm add nothing extra
