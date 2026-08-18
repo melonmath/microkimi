@@ -1497,3 +1497,96 @@ pub unsafe fn rows4_dot_fp4_vnni(prows: [&[u8]; 4], srows: [&[u8]; 4], xq: &Q8Ve
 pub fn xsum12(xq: &Q8Vec) -> Vec<i32> {
     xq.q.chunks_exact(32).map(|b| 12 * b.iter().map(|&v| v as i32).sum::<i32>()).collect()
 }
+
+/// The x86 VNNI GEMM layout of a q8 matrix: sixteen-row tiles, per
+/// 32-column block eight groups of four columns, each group the sixteen
+/// rows' four bytes in a row - one 64-byte vector per dpbusd, the
+/// activation broadcast as one 32-bit group. Alongside: per (tile,
+/// block) the sixteen rows' scales, and 128 x their block sums (the
+/// exact u8 x s8 correction). Rows past the last full tile keep the
+/// row-major path.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub struct VnniPack {
+    pub w: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub rowsum128: Vec<i32>,
+    pub tiles: usize,
+    pub nb: usize,
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn build_vnni_pack(q: &[i8], scales: &[f32], rows: usize, cols: usize) -> VnniPack {
+    let nb = cols / 32;
+    let tiles = rows / 16;
+    let mut w = vec![0i8; tiles * nb * 8 * 64];
+    let mut sc = vec![0f32; tiles * nb * 16];
+    let mut rs = vec![0i32; tiles * nb * 16];
+    for t in 0..tiles {
+        for g in 0..nb {
+            for r in 0..16 {
+                let row = t * 16 + r;
+                let src = &q[row * cols + g * 32..row * cols + (g + 1) * 32];
+                let mut sum = 0i32;
+                for k in 0..8 {
+                    let d = ((t * nb + g) * 8 + k) * 64 + r * 4;
+                    w[d..d + 4].copy_from_slice(&src[k * 4..k * 4 + 4]);
+                }
+                for &v in src {
+                    sum += v as i32;
+                }
+                sc[(t * nb + g) * 16 + r] = scales[row * nb + g];
+                rs[(t * nb + g) * 16 + r] = 128 * sum;
+            }
+        }
+    }
+    VnniPack { w, scales: sc, rowsum128: rs, tiles, nb }
+}
+
+/// Sixteen rows x four lanes with AVX-512 VNNI on the VnniPack layout.
+/// xu are the four lanes' activations as u8 (x + 128), each nb*32 bytes;
+/// xs their block scales. out[l][r] for the tile's sixteen rows. Same
+/// exact integer block dots and the same per-row fused block-sequential
+/// order as every other q8 kernel: bit-identical.
+///
+/// SAFETY: caller guarantees avx512f/bw/vnni; pack slices belong to
+/// tile `t` of a VnniPack with `nb` blocks; xu/xs hold nb blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,fma")]
+pub unsafe fn tile16x4_vnni(
+    pack: &VnniPack,
+    t: usize,
+    xu: [&[u8]; 4],
+    xs: [&[f32]; 4],
+) -> [[f32; 16]; 4] {
+    use std::arch::x86_64::*;
+    let nb = pack.nb;
+    let mut out = [[0.0f32; 16]; 4];
+    unsafe {
+        let mut accf = [_mm512_setzero_ps(); 4];
+        let wbase = pack.w.as_ptr().add(t * nb * 8 * 64);
+        let sbase = pack.scales.as_ptr().add(t * nb * 16);
+        let rbase = pack.rowsum128.as_ptr().add(t * nb * 16);
+        for g in 0..nb {
+            let mut acc = [_mm512_setzero_si512(); 4];
+            let wg = wbase.add(g * 8 * 64);
+            for k in 0..8 {
+                let wv = _mm512_loadu_si512(wg.add(k * 64) as *const _);
+                for l in 0..4 {
+                    let xb = _mm512_set1_epi32((xu[l].as_ptr().add(g * 32 + k * 4) as *const i32).read_unaligned());
+                    acc[l] = _mm512_dpbusd_epi32(acc[l], xb, wv);
+                }
+            }
+            let corr = _mm512_loadu_si512(rbase.add(g * 16) as *const _);
+            let ws = _mm512_loadu_ps(sbase.add(g * 16));
+            for l in 0..4 {
+                let sums = _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[l], corr));
+                let sv = _mm512_mul_ps(ws, _mm512_set1_ps(*xs[l].get_unchecked(g)));
+                accf[l] = _mm512_fmadd_ps(sums, sv, accf[l]);
+            }
+        }
+        for l in 0..4 {
+            _mm512_storeu_ps(out[l].as_mut_ptr(), accf[l]);
+        }
+    }
+    out
+}

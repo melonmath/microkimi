@@ -716,6 +716,8 @@ pub struct Q8Head {
     /// consecutively and their four scales together - one address stream
     /// for the tile kernel instead of four plus a scalar scale gather.
     gemm_pack: std::sync::OnceLock<(Vec<i8>, Vec<f32>)>,
+    /// x86 VNNI GEMM layout (sixteen-row tiles), built lazily like gemm_pack.
+    vnni_pack: std::sync::OnceLock<crate::quant::q8::VnniPack>,
 }
 
 /// Builds the quad-interleaved copy (rows past the last full quad stay
@@ -793,7 +795,7 @@ impl Q8Head {
             q[r * cols..(r + 1) * cols].copy_from_slice(&scratch.q);
             scales[r * nb..(r + 1) * nb].copy_from_slice(&scratch.scales);
         }
-        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new() }
+        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new(), vnni_pack: std::sync::OnceLock::new() }
     }
 
     /// Single-threaded q8 matvec for callers that already own a worker
@@ -878,6 +880,11 @@ impl Q8Head {
                     outs[l][r] = self.row_dot(r, &xqs[l]);
                 }
             }
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !crate::model::pool::in_pool_worker() && crate::quant::q8::vnni512_available() && lanes >= 4 && rows >= 16 {
+            self.matvec_multi_vnni(&xqs, outs, njobs);
             return;
         }
         // main thread: run on the PERSISTENT pool (the scoped path below
@@ -1191,7 +1198,7 @@ impl Q8Head {
                 r0 = r1;
             }
         });
-        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new() }
+        Q8Head { q, scales, rows, cols, gemm_pack: std::sync::OnceLock::new(), vnni_pack: std::sync::OnceLock::new() }
     }
 
     /// Two heads, one input: the activation is quantized ONCE and both
@@ -1269,7 +1276,109 @@ impl Q8Head {
     /// Builds the GEMM pack eagerly (load time): the lazy build was
     /// measured inside the first prefill - up to a second of interleaving
     /// billed to prompt reading.
+    /// x86 AVX-512 VNNI GEMM: sixteen-row tiles x four-lane groups on the
+    /// VnniPack layout, dynamic tile scheduling on the pool; leftover
+    /// rows (< 16) and lanes (< 4) go through the row-major kernels.
+    /// Bit-identical to the other pooled paths.
+    #[cfg(target_arch = "x86_64")]
+    fn matvec_multi_vnni(&self, xqs: &[crate::quant::q8::Q8Vec], outs: &mut [&mut [f32]], njobs: usize) {
+        let (rows, cols) = (self.rows, self.cols);
+        let lanes = xqs.len();
+        let nb = cols / 32;
+        let t_pack = std::time::Instant::now();
+        let pack = self
+            .vnni_pack
+            .get_or_init(|| crate::quant::q8::build_vnni_pack(&self.q, &self.scales, rows, cols));
+        // activations as u8 (x + 128), one contiguous cols-byte row per lane
+        let mut xu = vec![0u8; lanes * cols];
+        for (l, x) in xqs.iter().enumerate() {
+            for (d, &v) in xu[l * cols..(l + 1) * cols].iter_mut().zip(x.q.iter()) {
+                *d = (v as u8) ^ 0x80;
+            }
+        }
+        crate::model::qwen::dprof_add(6, t_pack.elapsed());
+        let t_pool = std::time::Instant::now();
+        let tiles = pack.tiles;
+        let p = crate::model::pool::pool();
+        let ctr = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let step = dyn_step(tiles.max(1), njobs);
+        let pack_ptr = pack as *const crate::quant::q8::VnniPack as usize;
+        let xu_ptr = crate::model::pool::SPtrU8(xu.as_ptr());
+        let xs_ptrs: Vec<usize> = xqs.iter().map(|x| x.scales.as_ptr() as usize).collect();
+        let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for _ in 0..njobs {
+            let ctr = ctr.clone();
+            let xs_ptrs = xs_ptrs.clone();
+            let out_ptrs = out_ptrs.clone();
+            jobs.push(Box::new(move || {
+                let xu_ptr = xu_ptr;
+                // SAFETY: the pool barrier outlives every borrow; each
+                // (row, lane) cell is written exactly once.
+                unsafe {
+                    let pack = &*(pack_ptr as *const crate::quant::q8::VnniPack);
+                    let xu_all = std::slice::from_raw_parts(xu_ptr.0, lanes * cols);
+                    loop {
+                        let t0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
+                        if t0 >= tiles {
+                            break;
+                        }
+                        let t1 = (t0 + step).min(tiles);
+                        for t in t0..t1 {
+                            let mut l0 = 0usize;
+                            while l0 + 4 <= lanes {
+                                let xu4 = [
+                                    &xu_all[l0 * cols..(l0 + 1) * cols],
+                                    &xu_all[(l0 + 1) * cols..(l0 + 2) * cols],
+                                    &xu_all[(l0 + 2) * cols..(l0 + 3) * cols],
+                                    &xu_all[(l0 + 3) * cols..(l0 + 4) * cols],
+                                ];
+                                let xs4 = [
+                                    std::slice::from_raw_parts(xs_ptrs[l0] as *const f32, nb),
+                                    std::slice::from_raw_parts(xs_ptrs[l0 + 1] as *const f32, nb),
+                                    std::slice::from_raw_parts(xs_ptrs[l0 + 2] as *const f32, nb),
+                                    std::slice::from_raw_parts(xs_ptrs[l0 + 3] as *const f32, nb),
+                                ];
+                                // SAFETY: vnni checked by the caller; tile t of this pack.
+                                let tile = crate::quant::q8::tile16x4_vnni(pack, t, xu4, xs4);
+                                for l in 0..4 {
+                                    let o = out_ptrs[l0 + l] as *mut f32;
+                                    for r in 0..16 {
+                                        *o.add(t * 16 + r) = tile[l][r];
+                                    }
+                                }
+                                l0 += 4;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        p.run(jobs);
+        // leftover lanes (< 4) over the tiled rows, and leftover rows (< 16)
+        // over every lane: the row-major kernels
+        let full_lanes = lanes / 4 * 4;
+        let tiled_rows = tiles * 16;
+        for l in full_lanes..lanes {
+            for r in 0..tiled_rows {
+                outs[l][r] = self.row_dot(r, &xqs[l]);
+            }
+        }
+        for l in 0..lanes {
+            for r in tiled_rows..rows {
+                outs[l][r] = self.row_dot(r, &xqs[l]);
+            }
+        }
+        crate::model::qwen::dprof_add(7, t_pool.elapsed());
+    }
+
     pub(crate) fn prebuild_gemm(&self) {
+        if crate::quant::q8::vnni512_available() {
+            let _ = self
+                .vnni_pack
+                .get_or_init(|| crate::quant::q8::build_vnni_pack(&self.q, &self.scales, self.rows, self.cols));
+            return;
+        }
         let _ = self
             .gemm_pack
             .get_or_init(|| build_gemm_pack(&self.q, &self.scales, self.rows, self.cols));
@@ -1973,4 +2082,52 @@ pub fn scanbench_cmd(_args: &[String]) {
         best_chk,
         best_seq / best_chk
     );
+}
+
+#[cfg(test)]
+mod q8head_tests {
+    use super::Q8Head;
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            ((self.0 >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// The pooled multi-lane GEMM (every architecture's tiles: SMMLA,
+    /// SDOT, AVX2, AVX-512 VNNI) must equal the single-lane matvec on
+    /// each lane bit for bit - including the row and lane tails the
+    /// tiles leave to the row-major kernels.
+    #[test]
+    fn matvec_multi_matches_matvec_bitwise() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for &(rows, cols, lanes) in &[(37usize, 96usize, 7usize), (64, 128, 4), (48, 64, 70), (16, 32, 5)] {
+            let w: Vec<f32> = (0..rows * cols).map(|_| rng.f()).collect();
+            let head = Q8Head::from_f32(&w, rows, cols);
+            let xs: Vec<Vec<f32>> = (0..lanes).map(|_| (0..cols).map(|_| rng.f() * 3.0).collect()).collect();
+            let xr: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+            let mut outs: Vec<Vec<f32>> = vec![vec![0.0; rows]; lanes];
+            {
+                let mut om: Vec<&mut [f32]> = outs.iter_mut().map(|o| o.as_mut_slice()).collect();
+                head.matvec_multi(&xr, &mut om);
+            }
+            for l in 0..lanes {
+                let mut single = vec![0.0f32; rows];
+                head.matvec(&xs[l], &mut single);
+                for r in 0..rows {
+                    assert_eq!(
+                        outs[l][r].to_bits(),
+                        single[r].to_bits(),
+                        "rows={rows} cols={cols} lanes={lanes} lane {l} row {r}: {} vs {}",
+                        outs[l][r],
+                        single[r]
+                    );
+                }
+            }
+        }
+    }
 }
