@@ -291,6 +291,8 @@ const KERNEL_NAMES: &[&str] = &[
     "k_gemm_fp4_mma128",
     "k_gemm_fp4_mma256",
     "k_gemm_fp4_mma128x128",
+    "k_gemm_q8_pipe",
+    "k_gemm_fp4_pipe",
     "k_add",
     "k_rmsnorm",
     "k_rmsnorm_rows",
@@ -381,7 +383,7 @@ fn compile(nv: &Nvrtc, major: i32, minor: i32) -> Result<Vec<u8>, String> {
     let key = {
         let mut h = crate::sha256::Sha256::new();
         h.update(src.as_bytes());
-        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v22-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
+        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v30-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
         let d = h.finalize();
         d.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
     };
@@ -771,6 +773,16 @@ impl CudaCtx {
     /// 256-token tile: the weight tile is re-read per token tile).
     fn gemm_mma_split(&self, q8: bool, w: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, c_off: usize, rows: u32, cols: u32, t: u32, ldc: u32) -> bool {
         let nb = cols / 32;
+        static PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pipe = *PIPE.get_or_init(|| !std::env::var("MICROKIMI_CUDA_NO_PIPE").map(|v| v == "1").unwrap_or(false));
+        if pipe && t >= 64 {
+            let cp = c.ptr + c_off as u64;
+            let mut a = args!(w.ptr, wsc.ptr, xq.ptr, xs.ptr, cp, rows, cols, t, ldc);
+            let name = if q8 { "k_gemm_q8_pipe" } else { "k_gemm_fp4_pipe" };
+            let stage = if q8 { 128 * 64 + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4 } else { 128 * 32 + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4 };
+            let shared = (3 * stage) as u32;
+            return self.launch(name, (rows.div_ceil(128), t.div_ceil(128), 1), (256, 1, 1), shared, &mut a);
+        }
         let one = |t0: u32, tt: u32, mt: u32, nt: u32| -> bool {
             let name = match (q8, mt, nt) {
                 (true, 128, _) => "k_gemm_q8_mma128x128",
@@ -915,9 +927,24 @@ __device__ __forceinline__ float h2f(unsigned short h) {
 }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float siluf_(float x) { return x / (1.0f + expf(-x)); }
-// 2^(e-128) exactly (e8m0 scale byte, LUT2 convention: values doubled)
-__device__ __forceinline__ float e8m0_x2(int e) { return ldexpf(1.0f, e - 128); }
+// 2^(e-128) exactly (e8m0 scale byte, LUT2 convention: values doubled):
+// the f32 bit pattern directly - biased exponent e - 1 for e >= 1, the
+// one subnormal 2^-128 for e = 0; no ldexpf (a slow path with branches)
+__device__ __forceinline__ float e8m0_x2(int e) {
+    return __int_as_float(e >= 1 ? (e - 1) << 23 : 0x00400000);
+}
 
+// four MXFP4 nibbles (a 16-bit half-word: bytes b0 b1, low nibble first)
+// -> one int of four i8 (E2M1 x 2 values), two byte permutes: the
+// magnitude table 0,1,2,3,4,6,8,12 indexed by the low three bits of each
+// nibble, the sign bits selecting 0xFF masks, then a bytewise negate
+__device__ __forceinline__ int fp4_decode4(unsigned h) {
+    unsigned sel = h & 0x7777u;                       // magnitude indices as permute selectors
+    unsigned mag = __byte_perm(0x03020100u, 0x0C080604u, sel);
+    unsigned ssel = (h >> 1) & 0x4444u;               // sign bit -> selector 4 (byte 0 of the second word)
+    unsigned m = __byte_perm(0x00000000u, 0x000000FFu, ssel);
+    return (int)__vsub4(mag ^ m, m);                  // (x ^ 0xFF) - 0xFF == -x per signed byte
+}
 // MXFP4 nibble decode: 8 nibbles (a 32-bit word of packed bytes, low nibble
 // = even column) -> two ints of four i8 (E2M1 x 2 values), columns 0..3 and 4..7
 __device__ __forceinline__ void fp4_decode8(unsigned w, int& lo4, int& hi4) {
@@ -1283,6 +1310,20 @@ __device__ __forceinline__ void mma_s8_16x8x32(int& d0, int& d1, int& d2, int& d
     d0 = d1 = d2 = d3 = 0;
 #endif
 }
+// the same with one zero register passed in for the accumulator inputs
+// (declared once by the caller; the literal form re-materializes four
+// zero registers per mma)
+__device__ __forceinline__ void mma_s8_16x8x32_z(int& d0, int& d1, int& d2, int& d3,
+                                                 int a0, int a1, int a2, int a3, int b0, int b1, int z) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z));
+#else
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1; (void)z;
+    d0 = d1 = d2 = d3 = 0;
+#endif
+}
 #define SROW 9 /* shared row stride in ints per block (8 + 1 pad against bank conflicts) */
 // warps: WM x WN = 8; each warp owns 32 rows and NT / WN tokens
 template <int MTR> struct WMOf { static constexpr int v = MTR / 32; };
@@ -1475,6 +1516,295 @@ extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma64(const u8* 
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma256(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 256>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128x128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<128, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
+
+
+// ── pipelined tensor-core GEMM (sm_80+): cp.async three-stage staging ──
+// Tile 128 rows x 128 tokens, 8 warps as 4 x 2 (32 rows x 64 tokens
+// each), 64 columns (two blocks) per stage, three stages in flight: the
+// loads of step s+2 are in the air while step s computes, so the DRAM
+// latency of a weight tile is hidden instead of paid at every step (the
+// synchronous kernels above are latency-bound in their staging). Rows
+// are stored as 16-byte chunks XOR-swizzled by the row for the fragment
+// loads; the fp4 weights stay packed in shared memory and decode at
+// fragment load. Same exact block dots, same scale application.
+#define PM 128
+#define PN 128
+#define PKB 2       /* blocks per stage */
+#define PSTAGES 3
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gsrc, bool valid) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    int n = valid ? 16 : 0;
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gsrc), "r"(n));
+#else
+    (void)s; (void)gsrc; (void)n;
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+// shared layout of one stage (bytes): W tile [PM][WROW] | X tile [PN][64] | ws [PKB*PM] u16 | xs [PKB*PN] f32
+// q8: WROW = 64 (two 32-byte blocks); fp4: WROW = 32 (two 16-byte packed blocks)
+template <bool Q8>
+struct PipeLayout {
+    static constexpr int WROW = Q8 ? 64 : 32;
+    static constexpr int W_BYTES = PM * WROW;
+    static constexpr int X_BYTES = PN * 64;
+    static constexpr int WS_BYTES = PKB * PM * 2;
+    static constexpr int XS_BYTES = PKB * PN * 4;
+    static constexpr int STAGE = W_BYTES + X_BYTES + WS_BYTES + XS_BYTES;
+};
+// swizzled int index of (row, 16-byte chunk c, int within chunk) for a row of `chunks` chunks
+// (bank-conflict-free for the fragment loads: eight consecutive rows read
+// eight distinct bank groups when the chunk is XORed with (row >> 1) & 3
+// for four-chunk rows and (row >> 2) & 1 for two-chunk rows)
+__device__ __forceinline__ unsigned swz(unsigned row, unsigned c, unsigned chunks_log2) {
+    unsigned mask = (1u << chunks_log2) - 1u;
+    return (row << chunks_log2) + ((c ^ ((row >> (3 - chunks_log2)) & mask)) & mask);
+}
+
+template <bool Q8, bool FULL>
+__device__ __forceinline__ void pipe_step(const unsigned char* base, unsigned wr0, unsigned wt0, unsigned gid, unsigned tig, unsigned nw,
+                                          float (&acc)[2][8][4], int zero) {
+    typedef PipeLayout<Q8> L;
+    const int* sw = (const int*)base;
+    const int* sx = (const int*)(base + L::W_BYTES);
+    const unsigned short* sw16 = (const unsigned short*)base;
+    const unsigned short* sws = (const unsigned short*)(base + L::W_BYTES + L::X_BYTES);
+    const float* sxs = (const float*)(base + L::W_BYTES + L::X_BYTES + L::WS_BYTES);
+    #pragma unroll
+    for (int kb = 0; kb < PKB; kb++) {
+        int a[2][4], b[8][2];
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++) {
+            unsigned r = wr0 + mi * 16 + gid;
+            if (Q8) {
+                unsigned s4 = (r >> 1) & 3, s4b = ((r + 8) >> 1) & 3;
+                a[mi][0] = sw[(r << 2) * 4 + (((kb * 2) ^ s4) & 3) * 4 + tig];
+                a[mi][1] = sw[((r + 8) << 2) * 4 + (((kb * 2) ^ s4b) & 3) * 4 + tig];
+                a[mi][2] = sw[(r << 2) * 4 + (((kb * 2 + 1) ^ s4) & 3) * 4 + tig];
+                a[mi][3] = sw[((r + 8) << 2) * 4 + (((kb * 2 + 1) ^ s4b) & 3) * 4 + tig];
+            } else {
+                unsigned s2 = (r >> 2) & 1, s2b = ((r + 8) >> 2) & 1;
+                const unsigned short* p0 = sw16 + ((r << 1) + ((kb ^ s2) & 1)) * 8;
+                const unsigned short* p1 = sw16 + (((r + 8) << 1) + ((kb ^ s2b) & 1)) * 8;
+                a[mi][0] = fp4_decode4(p0[tig]);
+                a[mi][1] = fp4_decode4(p1[tig]);
+                a[mi][2] = fp4_decode4(p0[4 + tig]);
+                a[mi][3] = fp4_decode4(p1[4 + tig]);
+            }
+        }
+        #pragma unroll
+        for (int ni = 0; ni < 8; ni++) {
+            unsigned tt = wt0 + ni * 8 + gid;
+            unsigned s4 = (tt >> 1) & 3;
+            b[ni][0] = sx[(tt << 2) * 4 + (((kb * 2) ^ s4) & 3) * 4 + tig];
+            b[ni][1] = sx[(tt << 2) * 4 + (((kb * 2 + 1) ^ s4) & 3) * 4 + tig];
+        }
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++) {
+            unsigned rr0 = wr0 + mi * 16 + gid;
+            float ws0, ws1;
+            if (Q8) { ws0 = h2f(sws[kb * PM + rr0]); ws1 = h2f(sws[kb * PM + rr0 + 8]); }
+            else { ws0 = e8m0_x2(sws[kb * PM + rr0]); ws1 = e8m0_x2(sws[kb * PM + rr0 + 8]); }
+            #pragma unroll
+            for (int ni = 0; ni < 8; ni++) {
+                if (FULL || (unsigned)ni < nw) {
+                    int d0, d1, d2, d3;
+                    mma_s8_16x8x32_z(d0, d1, d2, d3, a[mi][0], a[mi][1], a[mi][2], a[mi][3], b[ni][0], b[ni][1], zero);
+                    float xs0 = sxs[kb * PN + wt0 + ni * 8 + tig * 2];
+                    float xs1 = sxs[kb * PN + wt0 + ni * 8 + tig * 2 + 1];
+                    acc[mi][ni][0] = fmaf((float)d0, ws0 * xs0, acc[mi][ni][0]);
+                    acc[mi][ni][1] = fmaf((float)d1, ws0 * xs1, acc[mi][ni][1]);
+                    acc[mi][ni][2] = fmaf((float)d2, ws1 * xs0, acc[mi][ni][2]);
+                    acc[mi][ni][3] = fmaf((float)d3, ws1 * xs1, acc[mi][ni][3]);
+                }
+            }
+        }
+    }
+}
+template <bool Q8>
+__device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const void* __restrict__ wsc,
+                                            const i8* __restrict__ xq, const float* __restrict__ xs,
+                                            float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
+    typedef PipeLayout<Q8> L;
+    extern __shared__ __align__(16) unsigned char pipe_smem[];
+    const unsigned nb = cols >> 5;
+    const unsigned nsteps = (nb + PKB - 1) / PKB;
+    const unsigned r0 = blockIdx.x * PM, t0 = blockIdx.y * PN;
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const unsigned wr0 = (warp & 3) * 32, wt0 = (warp >> 2) * 64;   // 4 x 2 warps
+    const unsigned gid = lane >> 2, tig = lane & 3;
+    const unsigned n_valid = t - t0;
+    const unsigned wrow_bytes = Q8 ? cols : (cols >> 1);           // global row stride
+    const unsigned wblk_bytes = Q8 ? 32 : 16;                        // bytes per 32-column block
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            #pragma unroll
+            for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
+    // one stage's asynchronous part: W chunks and X chunks (16-byte
+    // cp.async). Every thread owns fixed chunks whose global sources only
+    // advance by one stage's columns per step and whose shared
+    // destinations are fixed per stage: addresses are computed once
+    constexpr int WCH = L::WROW / 16;             // chunks per row (4 q8, 2 fp4)
+    constexpr int WCH_LOG2 = Q8 ? 2 : 1;
+    constexpr int WREPS = (PM * WCH) / 256;       // W chunks per thread per stage (2 q8, 1 fp4)
+    constexpr int XREPS = (PN * 4) / 256;         // X chunks per thread per stage (2)
+    const u8* wsrc[WREPS];
+    unsigned wdst[WREPS];
+    unsigned wblk[WREPS];       // block offset of the chunk within a stage (0..PKB-1)
+    bool wok[WREPS];
+    #pragma unroll
+    for (int rep = 0; rep < WREPS; rep++) {
+        unsigned i = tid + rep * 256;
+        unsigned rr = i / WCH, cc = i % WCH;
+        unsigned grow = r0 + rr;
+        wblk[rep] = cc * 16 / wblk_bytes;
+        unsigned off = (cc * 16) % wblk_bytes;
+        wok[rep] = grow < rows;
+        wsrc[rep] = wbytes + (size_t)(wok[rep] ? grow : 0) * wrow_bytes + off;
+        wdst[rep] = swz(rr, cc, WCH_LOG2) * 16;
+    }
+    const i8* xsrc[XREPS];
+    unsigned xdst[XREPS];
+    unsigned xblk[XREPS];
+    bool xok[XREPS];
+    #pragma unroll
+    for (int rep = 0; rep < XREPS; rep++) {
+        unsigned i = tid + rep * 256;
+        unsigned tt = i >> 2, cc = i & 3;
+        unsigned gtok = t0 + tt;
+        xblk[rep] = cc >> 1;
+        xok[rep] = gtok < t;
+        xsrc[rep] = xq + (size_t)(xok[rep] ? gtok : 0) * cols + (cc & 1) * 16;
+        xdst[rep] = swz(tt, cc, 2) * 16;
+    }
+    auto issue = [&](unsigned step, unsigned stage) {
+        unsigned char* base = pipe_smem + stage * L::STAGE;
+        unsigned g0 = step * PKB;
+        #pragma unroll
+        for (int rep = 0; rep < WREPS; rep++) {
+            unsigned g = g0 + wblk[rep];
+            bool valid = wok[rep] && g < nb;
+            cp_async16(base + wdst[rep], wsrc[rep] + (size_t)g * wblk_bytes, valid);
+        }
+        #pragma unroll
+        for (int rep = 0; rep < XREPS; rep++) {
+            unsigned g = g0 + xblk[rep];
+            bool valid = xok[rep] && g < nb;
+            cp_async16(base + L::W_BYTES + xdst[rep], xsrc[rep] + (size_t)g * 32, valid);
+        }
+        cp_async_commit();
+    };
+    // the scales are gathered per (block, row) - not contiguous in global
+    // memory - so they travel through registers one step ahead: loaded
+    // during a step's compute, stored into the stage before its sync
+    constexpr int WSR = (PKB * PM + 255) / 256;   // W scales per thread per stage
+    constexpr int XSR = (PKB * PN + 255) / 256;   // X scales per thread per stage
+    unsigned short wsreg[WSR];
+    float xsreg[XSR];
+    auto load_scales = [&](unsigned step) {
+        unsigned g0 = step * PKB;
+        #pragma unroll
+        for (int rep = 0; rep < WSR; rep++) {
+            unsigned i = tid + rep * 256;
+            unsigned kb = i / PM, rr = i % PM;
+            unsigned g = g0 + kb, grow = r0 + rr;
+            unsigned short v = 0;
+            if (i < PKB * PM && g < nb && grow < rows) {
+                if (Q8) v = ((const unsigned short*)wsc)[(size_t)grow * nb + g];
+                else v = (unsigned short)((const u8*)wsc)[(size_t)grow * nb + g];
+            }
+            wsreg[rep] = v;
+        }
+        #pragma unroll
+        for (int rep = 0; rep < XSR; rep++) {
+            unsigned i = tid + rep * 256;
+            unsigned kb = i / PN, tt = i % PN;
+            unsigned g = g0 + kb, gtok = t0 + tt;
+            xsreg[rep] = (i < PKB * PN && g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
+        }
+    };
+    auto store_scales = [&](unsigned stage) {
+        unsigned char* base = pipe_smem + stage * L::STAGE;
+        unsigned short* sws = (unsigned short*)(base + L::W_BYTES + L::X_BYTES);
+        float* sxs = (float*)(base + L::W_BYTES + L::X_BYTES + L::WS_BYTES);
+        #pragma unroll
+        for (int rep = 0; rep < WSR; rep++) {
+            unsigned i = tid + rep * 256;
+            if (i < PKB * PM) sws[i] = wsreg[rep];
+        }
+        #pragma unroll
+        for (int rep = 0; rep < XSR; rep++) {
+            unsigned i = tid + rep * 256;
+            if (i < PKB * PN) sxs[i] = xsreg[rep];
+        }
+    };
+    const int zero = 0;
+    // prologue: stages 0 .. PSTAGES-2 in flight, the scales of step 0 in registers
+    #pragma unroll
+    for (int s = 0; s < PSTAGES - 1; s++) {
+        if ((unsigned)s < nsteps) issue(s, s);
+        else cp_async_commit();
+    }
+    load_scales(0);
+    for (unsigned step = 0; step < nsteps; step++) {
+        cp_async_wait<PSTAGES - 2>();
+        store_scales(step % PSTAGES);
+        __syncthreads();
+        {
+            unsigned nxt = step + PSTAGES - 1;
+            if (nxt < nsteps) issue(nxt, nxt % PSTAGES);
+            else cp_async_commit();
+        }
+        if (step + 1 < nsteps) load_scales(step + 1);
+        // a warp whose 64 tokens are all valid runs the unrolled tile; a
+        // warp on the prompt's tail runs only its valid n8 tiles (uniform
+        // per warp and step: no divergence inside the mma loop); X rows past
+        // the prompt are zero-filled by the staging and never stored
+        const unsigned nw = (wt0 >= n_valid) ? 0u : min(8u, (n_valid - wt0 + 7) / 8);
+        if (nw > 0) {
+            const unsigned char* base = pipe_smem + (step % PSTAGES) * L::STAGE;
+            if (nw == 8) pipe_step<Q8, true>(base, wr0, wt0, gid, tig, 8u, acc, zero);
+            else pipe_step<Q8, false>(base, wr0, wt0, gid, tig, nw, acc, zero);
+        }
+    }
+    cp_async_wait<0>();
+    // store
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+        #pragma unroll
+        for (int ni = 0; ni < 8; ni++) {
+            unsigned r = r0 + wr0 + mi * 16 + gid;
+            unsigned tt = t0 + wt0 + ni * 8 + tig * 2;
+            if (tt < t) {
+                if (r < rows) C[(size_t)tt * ldc + r] = acc[mi][ni][0];
+                if (r + 8 < rows) C[(size_t)tt * ldc + r + 8] = acc[mi][ni][2];
+            }
+            if (tt + 1 < t) {
+                if (r < rows) C[(size_t)(tt + 1) * ldc + r] = acc[mi][ni][1];
+                if (r + 8 < rows) C[(size_t)(tt + 1) * ldc + r + 8] = acc[mi][ni][3];
+            }
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256, 1) k_gemm_q8_pipe(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
+    gemm_pipe_t<true>((const u8*)wq, (const void*)ws, xq, xs, C, rows, cols, t, ldc);
+}
+extern "C" __global__ void __launch_bounds__(256, 1) k_gemm_fp4_pipe(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
+    gemm_pipe_t<false>(wp, (const void*)wsc, xq, xs, C, rows, cols, t, ldc);
+}
 
 // ── elementwise ──
 extern "C" __global__ void k_add(float* __restrict__ x, const float* __restrict__ y, unsigned n) {
