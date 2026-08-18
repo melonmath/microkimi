@@ -1326,21 +1326,24 @@ impl Q8Head {
                         let t1 = (t0 + step).min(tiles);
                         for t in t0..t1 {
                             let mut l0 = 0usize;
-                            while l0 + 4 <= lanes {
-                                let xu4 = [
-                                    &xu_all[l0 * cols..(l0 + 1) * cols],
-                                    &xu_all[(l0 + 1) * cols..(l0 + 2) * cols],
-                                    &xu_all[(l0 + 2) * cols..(l0 + 3) * cols],
-                                    &xu_all[(l0 + 3) * cols..(l0 + 4) * cols],
-                                ];
-                                let xs4 = [
-                                    std::slice::from_raw_parts(xs_ptrs[l0] as *const f32, nb),
-                                    std::slice::from_raw_parts(xs_ptrs[l0 + 1] as *const f32, nb),
-                                    std::slice::from_raw_parts(xs_ptrs[l0 + 2] as *const f32, nb),
-                                    std::slice::from_raw_parts(xs_ptrs[l0 + 3] as *const f32, nb),
-                                ];
+                            while l0 + 8 <= lanes {
+                                let xu8: [&[u8]; 8] = std::array::from_fn(|i| &xu_all[(l0 + i) * cols..(l0 + i + 1) * cols]);
+                                let xs8: [&[f32]; 8] = std::array::from_fn(|i| std::slice::from_raw_parts(xs_ptrs[l0 + i] as *const f32, nb));
                                 // SAFETY: vnni checked by the caller; tile t of this pack.
-                                let tile = crate::quant::q8::tile16x4_vnni(pack, t, xu4, xs4);
+                                let tile = crate::quant::q8::tile16_vnni::<8>(pack, t, xu8, xs8);
+                                for l in 0..8 {
+                                    let o = out_ptrs[l0 + l] as *mut f32;
+                                    for r in 0..16 {
+                                        *o.add(t * 16 + r) = tile[l][r];
+                                    }
+                                }
+                                l0 += 8;
+                            }
+                            while l0 + 4 <= lanes {
+                                let xu4: [&[u8]; 4] = std::array::from_fn(|i| &xu_all[(l0 + i) * cols..(l0 + i + 1) * cols]);
+                                let xs4: [&[f32]; 4] = std::array::from_fn(|i| std::slice::from_raw_parts(xs_ptrs[l0 + i] as *const f32, nb));
+                                // SAFETY: as above.
+                                let tile = crate::quant::q8::tile16_vnni::<4>(pack, t, xu4, xs4);
                                 for l in 0..4 {
                                     let o = out_ptrs[l0 + l] as *mut f32;
                                     for r in 0..16 {

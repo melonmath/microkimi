@@ -1542,49 +1542,51 @@ pub fn build_vnni_pack(q: &[i8], scales: &[f32], rows: usize, cols: usize) -> Vn
     VnniPack { w, scales: sc, rowsum128: rs, tiles, nb }
 }
 
-/// Sixteen rows x four lanes with AVX-512 VNNI on the VnniPack layout.
-/// xu are the four lanes' activations as u8 (x + 128), each nb*32 bytes;
-/// xs their block scales. out[l][r] for the tile's sixteen rows. Same
-/// exact integer block dots and the same per-row fused block-sequential
-/// order as every other q8 kernel: bit-identical.
+/// Sixteen rows x L lanes (L = 4 or 8) with AVX-512 VNNI on the VnniPack
+/// layout. xu are the lanes' activations as u8 (x + 128), each nb*32
+/// bytes; xs their block scales. out[l][r] for the tile's sixteen rows.
+/// Eight lanes give eight independent dpbusd chains per weight vector
+/// (latency hidden, half the weight re-reads of four). Same exact
+/// integer block dots and the same per-row fused block-sequential order
+/// as every other q8 kernel: bit-identical.
 ///
-/// SAFETY: caller guarantees avx512f/bw/vnni; pack slices belong to
-/// tile `t` of a VnniPack with `nb` blocks; xu/xs hold nb blocks.
+/// SAFETY: caller guarantees avx512f/bw/vnni; the pack has `nb` blocks
+/// and tile `t`; xu/xs hold nb blocks each.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni,fma")]
-pub unsafe fn tile16x4_vnni(
+pub unsafe fn tile16_vnni<const L: usize>(
     pack: &VnniPack,
     t: usize,
-    xu: [&[u8]; 4],
-    xs: [&[f32]; 4],
-) -> [[f32; 16]; 4] {
+    xu: [&[u8]; L],
+    xs: [&[f32]; L],
+) -> [[f32; 16]; L] {
     use std::arch::x86_64::*;
     let nb = pack.nb;
-    let mut out = [[0.0f32; 16]; 4];
+    let mut out = [[0.0f32; 16]; L];
     unsafe {
-        let mut accf = [_mm512_setzero_ps(); 4];
+        let mut accf = [_mm512_setzero_ps(); L];
         let wbase = pack.w.as_ptr().add(t * nb * 8 * 64);
         let sbase = pack.scales.as_ptr().add(t * nb * 16);
         let rbase = pack.rowsum128.as_ptr().add(t * nb * 16);
         for g in 0..nb {
-            let mut acc = [_mm512_setzero_si512(); 4];
+            let mut acc = [_mm512_setzero_si512(); L];
             let wg = wbase.add(g * 8 * 64);
             for k in 0..8 {
                 let wv = _mm512_loadu_si512(wg.add(k * 64) as *const _);
-                for l in 0..4 {
+                for l in 0..L {
                     let xb = _mm512_set1_epi32((xu[l].as_ptr().add(g * 32 + k * 4) as *const i32).read_unaligned());
                     acc[l] = _mm512_dpbusd_epi32(acc[l], xb, wv);
                 }
             }
             let corr = _mm512_loadu_si512(rbase.add(g * 16) as *const _);
             let ws = _mm512_loadu_ps(sbase.add(g * 16));
-            for l in 0..4 {
+            for l in 0..L {
                 let sums = _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[l], corr));
                 let sv = _mm512_mul_ps(ws, _mm512_set1_ps(*xs[l].get_unchecked(g)));
                 accf[l] = _mm512_fmadd_ps(sums, sv, accf[l]);
             }
         }
-        for l in 0..4 {
+        for l in 0..L {
             _mm512_storeu_ps(out[l].as_mut_ptr(), accf[l]);
         }
     }
