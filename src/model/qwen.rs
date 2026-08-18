@@ -1414,6 +1414,15 @@ fn packed_moe(
 /// Single-token dense MLP through the unpacked-i8 copies when the q8
 /// spine carries them (and no block budget is active); the packed path
 /// otherwise. Same math, pure-SDOT kernels.
+/// Single-token dense MLP source: the packed fp4 rows (half the bytes of
+/// the unpacked i8 copy) when MICROKIMI_DECODE_MLP_FP4=1. Decode of a
+/// large dense model is DRAM-bound, so bytes per token is the whole
+/// story there; the i8 copy is the prefill's kernel (compute-bound).
+fn decode_mlp_fp4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_DECODE_MLP_FP4").map(|v| v == "1").unwrap_or(false))
+}
+
 fn packed_dense_mlp_q8(
     data: &[u8],
     gate: &PackedT,
@@ -1425,7 +1434,7 @@ fn packed_dense_mlp_q8(
     bounds: Option<&SkipBounds>,
 ) -> Vec<f32> {
     if let Some(mq) = q8m {
-        if bounds.is_none() || mlp_budget() == 0.0 {
+        if (bounds.is_none() || mlp_budget() == 0.0) && !decode_mlp_fp4() {
             let inter = c.dense_inter;
             let mut h_gate = vec![0.0f32; inter];
             let mut h_up = vec![0.0f32; inter];
