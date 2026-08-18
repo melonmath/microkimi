@@ -2262,6 +2262,15 @@ impl QwenModel {
         if self.q8_spine.iter().any(|x| x.is_some()) {
             return self.prefill(&[token]);
         }
+        self.forward_traced(token, None)
+    }
+
+    /// `forward` (f32 path) that also records the hidden state after every
+    /// layer into `trace` when given (layer-by-layer comparison tool).
+    pub(crate) fn forward_traced(&mut self, token: u32, mut trace: Option<&mut Vec<Vec<f32>>>) -> Vec<f32> {
+        if let Some(t) = trace.as_deref_mut() {
+            t.clear();
+        }
         assert!(
             (token as usize) < self.cfg.vocab,
             "token {} is outside the Qwen vocabulary",
@@ -2333,6 +2342,9 @@ impl QwenModel {
             };
             for i in 0..d {
                 hidden[i] += mlp[i];
+            }
+            if let Some(t) = trace.as_deref_mut() {
+                t.push(hidden.clone());
             }
         }
 
@@ -5828,8 +5840,14 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
     {
         let model_path = crate::value_flag(args, "--model").expect("gpudecodebench requires --model");
         let steps: usize = crate::value_flag(args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(32);
+        let trace = args.iter().any(|a| a == "--trace");
         crate::model::metal::set_qwen_gpu(true);
         crate::model::metal::decode_probe();
+        // kernel certification before any wiring: the attention kernel on
+        // synthetic inputs (one chunk, several chunks across simdgroups)
+        for (nh, nkv, hd, len) in [(2usize, 1usize, 256usize, 1usize), (2, 1, 256, 17), (8, 2, 256, 300), (4, 1, 128, 1000)] {
+            crate::model::metal::dec_attn_check(nh, nkv, hd, len);
+        }
         let mut model = QwenModel::load(&model_path);
         let vocab = (model.cfg.vocab as u32).min(50_000);
         let prompt: Vec<u32> = (0..16u32).map(|i| (i * 7 + 3) % vocab).collect();
@@ -5838,6 +5856,234 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
         let snap = model.snapshot();
         let saved_pos = model.pos;
         let first = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+        if trace {
+            // one token, layer by layer: max |gpu - cpu| / max |cpu| per layer
+            let mut gpu_tr: Vec<Vec<f32>> = Vec::new();
+            let mut gl = vec![0.0f32; model.cfg.vocab];
+            {
+                let refs = model.decode_refs();
+                let Some(mut dec) = model.gpu_decoder(prompt.len() + steps + 8) else {
+                    println!("gpudecodebench: GPU decoder unavailable");
+                    return;
+                };
+                if crate::model::metal::gpu_decode_step_trace(&mut dec, &refs, first, &mut gl, &mut gpu_tr).is_none() {
+                    println!("gpudecodebench: GPU step refused");
+                    return;
+                }
+            }
+            model.restore(&snap);
+            model.pos = saved_pos;
+            let mut cpu_tr: Vec<Vec<f32>> = Vec::new();
+            let cl = model.forward_traced(first, Some(&mut cpu_tr));
+            for (li, (g, c)) in gpu_tr.iter().zip(&cpu_tr).enumerate() {
+                let mut max_abs = 0.0f32;
+                let mut max_ref = 0.0f32;
+                let mut nan = 0usize;
+                let mut worst = 0usize;
+                for i in 0..c.len() {
+                    if !g[i].is_finite() {
+                        nan += 1;
+                    }
+                    let e = (g[i] - c[i]).abs();
+                    if e > max_abs || e.is_nan() {
+                        max_abs = e;
+                        worst = i;
+                    }
+                    max_ref = max_ref.max(c[i].abs());
+                }
+                println!(
+                    "  layer {:2}: max abs {:.3e} (rel {:.2e}) at [{}] gpu {:.5} cpu {:.5} | non-finite {}",
+                    li, max_abs, max_abs / max_ref.max(1e-30), worst, g[worst], c[worst], nan
+                );
+            }
+            if gl.iter().all(|v| v.is_finite()) {
+                println!("  logits top-5 gpu {:?}", crate::model::top_k_probs(&gl, 5));
+            } else {
+                println!("  logits gpu: {} non-finite", gl.iter().filter(|v| !v.is_finite()).count());
+            }
+            println!("  logits top-5 cpu {:?}", crate::model::top_k_probs(&cl, 5));
+            // sub-stage verifier for one full-attention layer (--layer L):
+            // the GPU stops after each stage, the scratch buffers are read
+            // back and compared with the CPU pieces recomputed here
+            let Some(li) = crate::value_flag(args, "--layer").and_then(|v| v.parse::<usize>().ok()) else {
+                return;
+            };
+            // the CPU cache after forward_traced (rows 0..=pos), copied out
+            // before the model is restored to the pre-step state
+            let (ck, cv, clen) = match &model.caches[li] {
+                QwenCache::Full(cache) => (cache.k.clone(), cache.v.clone(), cache.len),
+                QwenCache::Linear(_) => {
+                    println!("  layer {} is not a full-attention layer", li);
+                    return;
+                }
+            };
+            model.restore(&snap);
+            model.pos = saved_pos;
+            let refs = model.decode_refs();
+            let crate::model::metal::DecodeLayerRefs::Full {
+                in_norm, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, n_heads, n_kv, hd, rope_dim, theta, ..
+            } = &refs.layers[li]
+            else {
+                println!("  layer {} is not a full-attention layer", li);
+                return;
+            };
+            let (n_heads, n_kv, hd, rope_dim, theta) = (*n_heads, *n_kv, *hd, *rope_dim, *theta as f64);
+            let d = model.cfg.d;
+            let qw = n_heads * hd;
+            let kvw = n_kv * hd;
+            let eps = model.cfg.norm_eps as f32;
+            let pos = saved_pos;
+            let h_in: Vec<f32> = if li == 0 {
+                tensor(&model.bin.data, &model.embed)[first as usize * d..(first as usize + 1) * d].to_vec()
+            } else {
+                cpu_tr[li - 1].clone()
+            };
+            let mut x = vec![0.0f32; d];
+            rmsnorm(&h_in, in_norm, eps, &mut x);
+            let mut qg = vec![0.0f32; qw * 2];
+            let mut k = vec![0.0f32; kvw];
+            let mut v = vec![0.0f32; kvw];
+            crate::model::ops::matvec(q_proj, qw * 2, d, &x, &mut qg);
+            crate::model::ops::matvec(k_proj, kvw, d, &x, &mut k);
+            crate::model::ops::matvec(v_proj, kvw, d, &x, &mut v);
+            let mut q = vec![0.0f32; qw];
+            let mut gate = vec![0.0f32; qw];
+            for h in 0..n_heads {
+                let src = h * hd * 2;
+                gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
+                rmsnorm(&qg[src..src + hd], q_norm, eps, &mut q[h * hd..(h + 1) * hd]);
+                rope_partial(&mut q[h * hd..(h + 1) * hd], pos, rope_dim, theta);
+            }
+            let mut kr = vec![0.0f32; kvw];
+            for h in 0..n_kv {
+                rmsnorm(&k[h * hd..(h + 1) * hd], k_norm, eps, &mut kr[h * hd..(h + 1) * hd]);
+                rope_partial(&mut kr[h * hd..(h + 1) * hd], pos, rope_dim, theta);
+            }
+            // attention against the CPU cache (rows 0..=pos after forward_traced)
+            let groups = n_heads / n_kv;
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            let mut mixed = vec![0.0f32; qw];
+            let mut scores = vec![0.0f32; clen];
+            for h in 0..n_heads {
+                let kh = h / groups;
+                let qh = &q[h * hd..(h + 1) * hd];
+                let mut mx = f32::NEG_INFINITY;
+                for t in 0..clen {
+                    let off = t * kvw + kh * hd;
+                    let sc = crate::model::ops::dot(qh, &ck[off..off + hd]) * scale;
+                    scores[t] = sc;
+                    mx = mx.max(sc);
+                }
+                let mut den = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - mx).exp();
+                    den += *sc;
+                }
+                for t in 0..clen {
+                    let off = t * kvw + kh * hd;
+                    let a = scores[t] / den;
+                    for i in 0..hd {
+                        mixed[h * hd + i] += a * cv[off + i];
+                    }
+                }
+            }
+            for i in 0..qw {
+                mixed[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+            }
+            let mut o = vec![0.0f32; d];
+            crate::model::ops::matvec(o_proj, d, qw, &mixed, &mut o);
+            let cmp = |name: &str, g: &[f32], c: &[f32]| {
+                let n = g.len().min(c.len());
+                let mut max_abs = 0.0f32;
+                let mut max_ref = 0.0f32;
+                let mut worst = 0usize;
+                for i in 0..n {
+                    let e = (g[i] - c[i]).abs();
+                    if e > max_abs || e.is_nan() {
+                        max_abs = e;
+                        worst = i;
+                    }
+                    max_ref = max_ref.max(c[i].abs());
+                }
+                println!(
+                    "  layer {} {:<10} n {:5}: max abs {:.3e} (rel {:.2e}) at [{}] gpu {:.5} cpu {:.5}",
+                    li, name, n, max_abs, max_abs / max_ref.max(1e-30), worst, g[worst], c[worst]
+                );
+            };
+            for stage in 0..4u8 {
+                let Some(mut dec) = model.gpu_decoder(prompt.len() + steps + 8) else { return };
+                let stop = crate::model::metal::TraceStop { layer: li, stage };
+                if crate::model::metal::gpu_decode_step_stop(&mut dec, &refs, first, stop).is_none() {
+                    println!("  stage {}: GPU step refused", stage);
+                    return;
+                }
+                let sc = dec.scratch();
+                match stage {
+                    0 => {
+                        cmp("normed", &sc.normed, &x);
+                        cmp("qg", &sc.tmp_a[..qw * 2], &qg);
+                        cmp("k", &sc.tmp_b[..kvw], &k);
+                        cmp("v", &sc.tmp_b[kvw..2 * kvw], &v);
+                    }
+                    1 => {
+                        cmp("q", &sc.mix_tm[..qw], &q);
+                        cmp("gate", &sc.mix_tm[qw..2 * qw], &gate);
+                        if let Some((gk, gv)) = dec.kv_row(li, pos, kvw) {
+                            cmp("k row", &gk, &kr);
+                            cmp("v row", &gv, &v);
+                        }
+                        let mut gk_all = Vec::with_capacity(clen * kvw);
+                        let mut gv_all = Vec::with_capacity(clen * kvw);
+                        for t in 0..clen {
+                            let (gk, gv) = dec.kv_row(li, t, kvw).unwrap();
+                            gk_all.extend_from_slice(&gk);
+                            gv_all.extend_from_slice(&gv);
+                        }
+                        cmp("k rows", &gk_all, &ck[..clen * kvw]);
+                        cmp("v rows", &gv_all, &cv[..clen * kvw]);
+                        // CPU attention on the GPU's own inputs (q, gate, rows)
+                        let gq = &sc.mix_tm[..qw];
+                        let gg = &sc.mix_tm[qw..2 * qw];
+                        let mut ref2 = vec![0.0f32; qw];
+                        let mut scores = vec![0.0f32; clen];
+                        for h in 0..n_heads {
+                            let kh = h / groups;
+                            let mut mx = f32::NEG_INFINITY;
+                            for t in 0..clen {
+                                let off = t * kvw + kh * hd;
+                                let s = crate::model::ops::dot(&gq[h * hd..(h + 1) * hd], &gk_all[off..off + hd]) * scale;
+                                scores[t] = s;
+                                mx = mx.max(s);
+                            }
+                            let mut den = 0.0f32;
+                            for s in scores.iter_mut() {
+                                *s = (*s - mx).exp();
+                                den += *s;
+                            }
+                            for t in 0..clen {
+                                let off = t * kvw + kh * hd;
+                                for i in 0..hd {
+                                    ref2[h * hd + i] += scores[t] / den * gv_all[off + i];
+                                }
+                            }
+                            for i in 0..hd {
+                                let g = gg[h * hd + i];
+                                ref2[h * hd + i] *= 1.0 / (1.0 + (-g).exp());
+                            }
+                        }
+                        cmp("attn(ref2 vs cpu)", &ref2, &mixed);
+                    }
+                    2 => {
+                        cmp("attn", &sc.tmp_a[..qw], &mixed);
+                        for h in 0..n_heads {
+                            cmp(&format!("attn h{}", h), &sc.tmp_a[h * hd..(h + 1) * hd], &mixed[h * hd..(h + 1) * hd]);
+                        }
+                    }
+                    _ => cmp("o_proj", &sc.tmp_b[..d], &o),
+                }
+            }
+            return;
+        }
         // GPU decode from the post-prefill state (refs scoped so the model
         // is free again for the CPU arm)
         let (gpu_tokens, gpu_ms) = {
@@ -5849,18 +6095,33 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
             let mut gpu_tokens = Vec::new();
             let mut gl = vec![0.0f32; model.cfg.vocab];
             let mut tok = first;
-            let t0 = std::time::Instant::now();
+            let mut per_step = Vec::with_capacity(steps);
             for _ in 0..steps {
+                let t0 = std::time::Instant::now();
                 if crate::model::metal::gpu_decode_step(&mut dec, &refs, tok, &mut gl).is_none() {
                     println!("gpudecodebench: GPU step refused");
                     return;
                 }
+                per_step.push(t0.elapsed().as_secs_f64() * 1000.0);
                 tok = crate::model::top_k_probs(&gl, 5)[0].0 as u32;
                 gpu_tokens.push(tok);
             }
-            (gpu_tokens, t0.elapsed().as_secs_f64() * 1000.0 / steps as f64)
+            // the first step uploads the f16 weights (one-time); the
+            // steady state is the median of the rest
+            let mut rest: Vec<f64> = per_step[1.min(per_step.len() - 1)..].to_vec();
+            rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = rest[rest.len() / 2];
+            println!(
+                "gpudecodebench: gpu first step {:.1} ms (weight upload), then median {:.2} ms/token (min {:.2}, max {:.2})",
+                per_step[0],
+                median,
+                rest[0],
+                rest[rest.len() - 1]
+            );
+            (gpu_tokens, median)
         };
-        // CPU decode from the same state
+        // CPU decode from the same state (offload switch off: a pure CPU arm)
+        crate::model::metal::set_qwen_gpu(false);
         model.restore(&snap);
         model.pos = saved_pos;
         let mut cpu_tokens = Vec::new();

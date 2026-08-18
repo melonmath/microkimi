@@ -3753,7 +3753,14 @@ kernel void dec_conv(device const half* x     [[buffer(0)]], // [cd]
 
 // One-token full attention for one head over the resident KV cache
 // (f16 rows [pos, kv_width]); softmax; mix; sigmoid gate. One
-// threadgroup per head; len <= 4096.
+// threadgroup (4 simdgroups) per head. Lanes split the head dim: lane
+// l owns dims [l*per, (l+1)*per) with per = hd/32 (<= 8, hd <= 256);
+// a simdgroup takes 32 positions per chunk (chunks interleaved across
+// simdgroups), the score of position p is a simd_sum across the 32
+// lanes, the chunk's online-softmax rescale happens once, and each
+// lane accumulates its own dims over the chunk. The four simdgroups'
+// (max, denominator, partial mix) combine through threadgroup memory
+// at the end. Private state per lane: per q values + per accumulators.
 kernel void dec_attn(device const half* q      [[buffer(0)]], // [n_heads*hd]
                      device const half* kc     [[buffer(1)]], // [len, kvw]
                      device const half* vc     [[buffer(2)]], // [len, kvw]
@@ -3764,73 +3771,54 @@ kernel void dec_attn(device const half* q      [[buffer(0)]], // [n_heads*hd]
                      uint h     [[threadgroup_position_in_grid]],
                      uint lane  [[thread_position_in_threadgroup]],
                      uint lanes [[threads_per_threadgroup]]) {
-    // Online softmax over KV tiles of 256 positions: scores for the tile
-    // (lanes stride positions), running max/denominator, then the mix
-    // accumulates per lane over its OWN positions into a private hd-vector
-    // partial (hd <= 128) and reduces across lanes at the end - no O(len)
-    // serial loop per lane, 1 KB of threadgroup memory per tile.
     uint len = dims.x, hd = dims.y, kvw = dims.z, groups = dims.w;
     uint kh = h / groups;
-    threadgroup float sc[256];
-    threadgroup float red[32];
-    threadgroup float redv[128 * 4]; // 4 simdgroups x hd partials
-    float qreg[128];
-    for (uint j = 0; j < hd; j++) { qreg[j] = float(q[h * hd + j]); }
-    float acc[128];
-    for (uint j = 0; j < hd; j++) { acc[j] = 0.0f; }
+    uint sg = lane / 32u, sl = lane & 31u;
+    uint nsg = lanes / 32u;
+    uint per = hd / 32u;
+    threadgroup float tm[4];
+    threadgroup float td[4];
+    threadgroup float tacc[4 * 256];
+    float qreg[8];
+    float acc[8];
+    for (uint j = 0; j < 8u; j++) { qreg[j] = 0.0f; acc[j] = 0.0f; }
+    for (uint j = 0; j < per; j++) { qreg[j] = float(q[h * hd + sl * per + j]); }
     float m_run = -INFINITY, d_run = 0.0f;
-    uint nsg = (lanes + 31u) / 32u;
-    for (uint u0 = 0; u0 < len; u0 += 256u) {
-        uint n = min(256u, len - u0);
-        // tile scores
-        float m_loc = -INFINITY;
-        for (uint i = lane; i < n; i += lanes) {
-            device const half* kr = kc + (size_t)(u0 + i) * kvw + kh * hd;
+    for (uint c0 = sg * 32u; c0 < len; c0 += nsg * 32u) {
+        uint n = min(32u, len - c0);
+        float s_mine = -INFINITY;
+        for (uint p = 0; p < n; p++) {
+            device const half* kr = kc + (size_t)(c0 + p) * kvw + kh * hd + sl * per;
             float s = 0.0f;
-            for (uint j = 0; j < hd; j++) { s += qreg[j] * float(kr[j]); }
-            s *= scale;
-            sc[i] = s;
-            m_loc = max(m_loc, s);
+            for (uint j = 0; j < per; j++) { s += qreg[j] * float(kr[j]); }
+            s = simd_sum(s) * scale;
+            if (sl == p) { s_mine = s; }
         }
-        m_loc = simd_max(m_loc);
-        if ((lane & 31u) == 0u) red[lane / 32u] = m_loc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < 32u) { float v = (lane < nsg) ? red[lane] : -INFINITY; v = simd_max(v); if (lane == 0u) red[0] = v; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float m_new = max(m_run, red[0]);
+        float m_new = max(m_run, simd_max(s_mine));
         float r = exp(m_run - m_new);
-        d_run *= r;
-        for (uint j = 0; j < hd; j++) { acc[j] *= r; }
-        // exp and mix over this lane's positions
-        float d_loc = 0.0f;
-        for (uint i = lane; i < n; i += lanes) {
-            float e = exp(sc[i] - m_new);
-            d_loc += e;
-            device const half* vr = vc + (size_t)(u0 + i) * kvw + kh * hd;
-            for (uint j = 0; j < hd; j++) { acc[j] += e * float(vr[j]); }
+        float e_mine = (sl < n) ? exp(s_mine - m_new) : 0.0f;
+        d_run = d_run * r + simd_sum(e_mine);
+        for (uint j = 0; j < per; j++) { acc[j] *= r; }
+        for (uint p = 0; p < n; p++) {
+            float e = simd_shuffle(e_mine, (ushort)p);
+            device const half* vr = vc + (size_t)(c0 + p) * kvw + kh * hd + sl * per;
+            for (uint j = 0; j < per; j++) { acc[j] += e * float(vr[j]); }
         }
-        d_loc = simd_sum(d_loc);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((lane & 31u) == 0u) red[lane / 32u] = d_loc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane < 32u) { float v = (lane < nsg) ? red[lane] : 0.0f; v = simd_sum(v); if (lane == 0u) red[0] = v; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        d_run += red[0];
         m_run = m_new;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // reduce acc across lanes: simd_sum per dim, then across simdgroups
-    for (uint j = 0; j < hd; j++) {
-        float v = simd_sum(acc[j]);
-        if ((lane & 31u) == 0u) redv[(lane / 32u) * hd + j] = v;
-    }
+    if (sl == 0u) { tm[sg] = m_run; td[sg] = d_run; }
+    for (uint j = 0; j < per; j++) { tacc[sg * hd + sl * per + j] = acc[j]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = 1.0f / d_run;
+    float m_all = -INFINITY;
+    for (uint g = 0; g < nsg; g++) { m_all = max(m_all, tm[g]); }
+    float d_all = 0.0f;
+    for (uint g = 0; g < nsg; g++) { d_all += (tm[g] == -INFINITY) ? 0.0f : td[g] * exp(tm[g] - m_all); }
+    float inv = 1.0f / d_all;
     for (uint j = lane; j < hd; j += lanes) {
         float v = 0.0f;
-        for (uint g = 0; g < nsg; g++) { v += redv[g * hd + j]; }
+        for (uint g = 0; g < nsg; g++) { v += (tm[g] == -INFINITY) ? 0.0f : tacc[g * hd + j] * exp(tm[g] - m_all); }
         float gt = float(gate[h * hd + j]);
-        out[h * hd + j] = half(v * inv * (gt / (1.0f + exp(-gt))));
+        out[h * hd + j] = half(v * inv / (1.0f + exp(-gt)));
     }
 }
 
@@ -3974,6 +3962,144 @@ pub fn decode_probe() {
     }
 }
 
+/// Certifies `dec_attn` on synthetic inputs against a CPU reference:
+/// n_heads x n_kv heads, head dim `hd`, `len` cached positions (spans
+/// several 32-position chunks and every simdgroup). Prints one line and
+/// returns the max relative error (f16 inputs and output; ~1e-2 passes).
+pub fn dec_attn_check(n_heads: usize, n_kv: usize, hd: usize, len: usize) -> Option<f32> {
+    let (base, dc) = decode_ctx()?;
+    let qw = n_heads * hd;
+    let kvw = n_kv * hd;
+    // deterministic pseudo-random inputs
+    let mut seed = 0x9E37_79B9u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    let q: Vec<f32> = (0..qw).map(|_| rnd()).collect();
+    let gate: Vec<f32> = (0..qw).map(|_| rnd() * 3.0).collect();
+    let k: Vec<f32> = (0..len * kvw).map(|_| rnd()).collect();
+    let v: Vec<f32> = (0..len * kvw).map(|_| rnd()).collect();
+    // f16-rounded copies (what the GPU sees)
+    let r16 = |x: &[f32]| -> Vec<f32> {
+        let mut h = vec![0u16; x.len()];
+        f32s_to_f16s(x, &mut h);
+        let mut back = vec![0.0f32; x.len()];
+        f16s_to_f32s(&h, &mut back);
+        back
+    };
+    let (q16, g16, k16, v16) = (r16(&q), r16(&gate), r16(&k), r16(&v));
+    let groups = n_heads / n_kv;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let mut reference = vec![0.0f32; qw];
+    let mut scores = vec![0.0f32; len];
+    for h in 0..n_heads {
+        let kh = h / groups;
+        let mut mx = f32::NEG_INFINITY;
+        for t in 0..len {
+            let mut sc = 0.0f32;
+            for j in 0..hd {
+                sc += q16[h * hd + j] * k16[t * kvw + kh * hd + j];
+            }
+            sc *= scale;
+            scores[t] = sc;
+            mx = mx.max(sc);
+        }
+        let mut den = 0.0f32;
+        for sc in scores.iter_mut() {
+            *sc = (*sc - mx).exp();
+            den += *sc;
+        }
+        for t in 0..len {
+            let a = scores[t] / den;
+            for j in 0..hd {
+                reference[h * hd + j] += a * v16[t * kvw + kh * hd + j];
+            }
+        }
+        for j in 0..hd {
+            let g = g16[h * hd + j];
+            reference[h * hd + j] *= 1.0 / (1.0 + (-g).exp());
+        }
+    }
+    let mut out = vec![0.0f32; qw];
+    // SAFETY: plain buffer creation, one dispatch, wait, readback, release.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mkbuf = |x: &[f32]| -> Id {
+            let mut h = vec![0u16; x.len()];
+            f32s_to_f16s(x, &mut h);
+            let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(base.device, sel("newBufferWithBytes:length:options:"), h.as_ptr() as *const c_void, (h.len() * 2) as u64, 0)
+        };
+        let bq = mkbuf(&q);
+        let bg = mkbuf(&gate);
+        let bk = mkbuf(&k);
+        let bv = mkbuf(&v);
+        let bo = mkbuf(&out);
+        if [bq, bg, bk, bv, bo].iter().any(|b| b.is_null()) {
+            msg_void(pool, sel("drain"));
+            return None;
+        }
+        let set_pipe: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_bytes: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_tg: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+        set_pipe(e, sel("setComputePipelineState:"), dc.attn);
+        let sb = sel("setBuffer:offset:atIndex:");
+        set_buf(e, sb, bq, 0, 0);
+        set_buf(e, sb, bk, 0, 1);
+        set_buf(e, sb, bv, 0, 2);
+        set_buf(e, sb, bg, 0, 3);
+        set_buf(e, sb, bo, 0, 4);
+        let dims: [u32; 4] = [len as u32, hd as u32, kvw as u32, groups as u32];
+        set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 16, 5);
+        set_bytes(e, sel("setBytes:length:atIndex:"), (&scale) as *const f32 as *const c_void, 4, 6);
+        disp_tg(
+            e,
+            sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+            MTLSize { width: n_heads as u64, height: 1, depth: 1 },
+            MTLSize { width: 128, height: 1, depth: 1 },
+        );
+        msg_void(e, sel("endEncoding"));
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+        let contents: extern "C" fn(Id, Sel) -> *mut c_void =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        f16s_to_f32s(std::slice::from_raw_parts(contents(bo, sel("contents")) as *const u16, qw), &mut out);
+        for b in [bq, bg, bk, bv, bo] {
+            msg_void(b, sel("release"));
+        }
+        msg_void(pool, sel("drain"));
+    }
+    let mut max_abs = 0.0f32;
+    let mut max_ref = 0.0f32;
+    let mut worst = 0usize;
+    for i in 0..qw {
+        let e = (out[i] - reference[i]).abs();
+        if e > max_abs || e.is_nan() {
+            max_abs = e;
+            worst = i;
+        }
+        max_ref = max_ref.max(reference[i].abs());
+    }
+    let rel = max_abs / max_ref.max(1e-30);
+    println!(
+        "gpu: dec_attn check (heads {}x{}, hd {}, len {}): max abs {:.3e} rel {:.2e} at [{}] gpu {:.5} cpu {:.5} - {}",
+        n_heads, n_kv, hd, len, max_abs, rel, worst, out[worst], reference[worst],
+        if rel < 2e-2 { "MATCH" } else { "MISMATCH" }
+    );
+    Some(rel)
+}
+
 /// Per-layer resident state for the GPU decoder.
 enum GpuLayerState {
     Linear { conv_state: Id, scan_state: Id },
@@ -3996,6 +4122,7 @@ pub struct GpuDecoder {
     small: Id,    // f32 packed per-layer small params (see offsets)
     small_off: Vec<[usize; 6]>, // per layer: [in_norm, post_norm, a_log, dt_bias, conv_w, gated_w] (norm layers: [in_norm, post_norm, q_norm, k_norm, 0, 0])
     logits: Id,   // f16 [vocab]
+    sizes: [usize; 3], // element counts of tmp_a, tmp_b, mix_tm (trace readback)
     d: usize,
     vocab: usize,
     pos: usize,
@@ -4101,10 +4228,12 @@ pub fn gpu_decoder_new(
                 small_total = offs[5] + dm.vd;
                 small_off.push(offs);
             }
-            DecodeLayerRefs::Full { n_heads, hd, inter, .. } => {
+            DecodeLayerRefs::Full { n_heads, n_kv, hd, inter, .. } => {
                 let qw = n_heads * hd;
                 max_a = max_a.max(qw * 2).max(2 * inter);
-                max_b = max_b.max(qw).max(*inter);
+                max_b = max_b.max(qw).max(2 * n_kv * hd).max(*inter);
+                // q | gate ride in mix_tm during attention
+                vt_max = vt_max.max(2 * qw);
                 let offs = [small_total, small_total + d, small_total + 2 * d, small_total + 2 * d + hd, 0, 0];
                 small_total = offs[3] + hd;
                 small_off.push(offs);
@@ -4207,6 +4336,7 @@ pub fn gpu_decoder_new(
             small,
             small_off,
             logits,
+            sizes: [max_a, max_b, vt_max],
             d,
             vocab,
             pos,
@@ -4221,8 +4351,122 @@ pub fn gpu_decoder_new(
 /// states have then diverged from the caller's; the caller must treat a
 /// None as "GPU decode is off for this session").
 pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, logits_out: &mut [f32]) -> Option<()> {
-    // kernel budgets: private q/acc arrays and threadgroup rows are sized
-    // for head dims up to 128; refuse cleanly beyond
+    gpu_decode_step_inner(dec, m, token, logits_out, None)
+}
+
+/// `gpu_decode_step` that also returns the f32 hidden state after every
+/// layer (residual folded), for layer-by-layer comparison against the
+/// CPU forward. The residual is folded eagerly per layer here (same
+/// arithmetic as the fused fold, one extra encode per layer).
+pub fn gpu_decode_step_trace(
+    dec: &mut GpuDecoder,
+    m: &DecodeModelRefs,
+    token: u32,
+    logits_out: &mut [f32],
+    trace: &mut Vec<Vec<f32>>,
+) -> Option<()> {
+    gpu_decode_step_inner(dec, m, token, logits_out, Some(trace))
+}
+
+/// Trace stop point: encoding stops after sub-stage `stage` of layer
+/// `layer` (full-attention layers: 0 qkv projections, 1 qk prep, 2
+/// attention, 3 o_proj), leaving the scratch buffers readable through
+/// `GpuDecoder::scratch` (a verifier for the layer's pieces).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TraceStop {
+    pub layer: usize,
+    pub stage: u8,
+}
+
+/// `gpu_decode_step_trace` that stops encoding at `stop` (see TraceStop);
+/// the logits are not computed, `dec.pos` does not advance.
+pub fn gpu_decode_step_stop(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, stop: TraceStop) -> Option<()> {
+    let mut sink = vec![0.0f32; m.vocab];
+    let mut tr = Vec::new();
+    gpu_decode_step_impl(dec, m, token, &mut sink, Some(&mut tr), Some(stop))
+}
+
+fn gpu_decode_step_inner(
+    dec: &mut GpuDecoder,
+    m: &DecodeModelRefs,
+    token: u32,
+    logits_out: &mut [f32],
+    trace: Option<&mut Vec<Vec<f32>>>,
+) -> Option<()> {
+    gpu_decode_step_impl(dec, m, token, logits_out, trace, None)
+}
+
+/// f32 copies of the decoder's scratch buffers (trace verifier).
+pub struct DecodeScratch {
+    pub normed: Vec<f32>,
+    pub tmp_a: Vec<f32>,
+    pub tmp_b: Vec<f32>,
+    pub mix_tm: Vec<f32>,
+}
+
+impl GpuDecoder {
+    /// Reads the f16 scratch buffers back as f32.
+    pub fn scratch(&self) -> DecodeScratch {
+        // SAFETY: buffers are retained for the decoder's life; sizes are
+        // the allocation sizes recorded at construction.
+        unsafe {
+            let contents = |b: Id| -> *mut c_void {
+                let f: extern "C" fn(Id, Sel) -> *mut c_void =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(b, sel("contents"))
+            };
+            let rd = |b: Id, n: usize| -> Vec<f32> {
+                let mut out = vec![0.0f32; n];
+                f16s_to_f32s(std::slice::from_raw_parts(contents(b) as *const u16, n), &mut out);
+                out
+            };
+            DecodeScratch {
+                normed: rd(self.normed, self.d),
+                tmp_a: rd(self.tmp_a, self.sizes[0]),
+                tmp_b: rd(self.tmp_b, self.sizes[1]),
+                mix_tm: rd(self.mix_tm, self.sizes[2]),
+            }
+        }
+    }
+
+    /// The resident KV cache row `row` of full-attention layer `layer`
+    /// (k, v) as f32, or None for a linear layer / out-of-range row.
+    pub fn kv_row(&self, layer: usize, row: usize, kv_width: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        match self.layers.get(layer)? {
+            GpuLayerState::Full { kc, vc, cap } => {
+                if row >= *cap {
+                    return None;
+                }
+                // SAFETY: as above.
+                unsafe {
+                    let contents = |b: Id| -> *mut c_void {
+                        let f: extern "C" fn(Id, Sel) -> *mut c_void =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(b, sel("contents"))
+                    };
+                    let mut k = vec![0.0f32; kv_width];
+                    let mut v = vec![0.0f32; kv_width];
+                    f16s_to_f32s(std::slice::from_raw_parts((contents(*kc) as *const u16).add(row * kv_width), kv_width), &mut k);
+                    f16s_to_f32s(std::slice::from_raw_parts((contents(*vc) as *const u16).add(row * kv_width), kv_width), &mut v);
+                    Some((k, v))
+                }
+            }
+            GpuLayerState::Linear { .. } => None,
+        }
+    }
+}
+
+fn gpu_decode_step_impl(
+    dec: &mut GpuDecoder,
+    m: &DecodeModelRefs,
+    token: u32,
+    logits_out: &mut [f32],
+    mut trace: Option<&mut Vec<Vec<f32>>>,
+    stop: Option<TraceStop>,
+) -> Option<()> {
+    // kernel budgets: the linear layer's private arrays take head dims up
+    // to 128; dec_attn/dec_qk_prep take hd up to 256 (a multiple of 32);
+    // refuse cleanly beyond
     for l in &m.layers {
         match l {
             DecodeLayerRefs::Linear { dm, .. } => {
@@ -4231,7 +4475,7 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                 }
             }
             DecodeLayerRefs::Full { hd, .. } => {
-                if *hd > 128 {
+                if *hd > 256 || *hd % 32 != 0 {
                     return None;
                 }
             }
@@ -4291,6 +4535,7 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
     let head_buf = weight_buffer_f16(base, mps, m.lm_head, vocab, d)?;
     let final_norm = m.norm_f;
 
+    let mut stopped = false;
     // SAFETY: all objects come from the live context; the decoder's buffers
     // are retained for its lifetime; waitUntilCompleted precedes readback.
     unsafe {
@@ -4314,6 +4559,20 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             msg_void(pool, sel("drain"));
             return None;
         }
+        let n_layers = m.layers.len();
+        let trace_buf = if trace.is_some() {
+            let f: extern "C" fn(Id, Sel, u64, u64) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            let b = f(base.device, sel("newBufferWithLength:options:"), (n_layers * d * 4).max(16) as u64, 0);
+            if b.is_null() {
+                msg_void(fnw, sel("release"));
+                msg_void(pool, sel("drain"));
+                return None;
+            }
+            b
+        } else {
+            std::ptr::null_mut()
+        };
 
         let set_pipe: extern "C" fn(Id, Sel, Id) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
@@ -4390,7 +4649,8 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
         };
 
         let mut prev_add: Option<Id> = None; // f16 output of the previous layer's MLP, folded by the next norm
-        for (li, l) in m.layers.iter().enumerate() {
+        let stop_at = |li: usize, stage: u8| stop == Some(TraceStop { layer: li, stage });
+        'layers: for (li, l) in m.layers.iter().enumerate() {
             let o = dec.small_off[li];
             match (l, &lw[li], &dec.layers[li]) {
                 (DecodeLayerRefs::Linear { dm, .. }, LW::L(w), GpuLayerState::Linear { conv_state, scan_state }) => {
@@ -4491,6 +4751,10 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     mv_enc(w.q, qw * 2, d, dec.normed, 0, dec.tmp_a, 0);
                     mv_enc(w.k, kvw, d, dec.normed, 0, dec.tmp_b, 0);
                     mv_enc(w.v, kvw, d, dec.normed, 0, dec.tmp_b, kvw * 2);
+                    if stop_at(li, 0) {
+                        stopped = true;
+                        break 'layers;
+                    }
                     // qk prep + rope + cache append (row `pos`): q -> mix_tm[..qw], gate -> mix_tm[qw..2qw]
                     {
                         let e = msg_id(cmdbuf, sel_ce);
@@ -4513,6 +4777,10 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                         disp_tg(e, sel_dtg, MTLSize { width: (n_heads + n_kv) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
                         msg_void(e, sel_end);
                     }
+                    if stop_at(li, 1) {
+                        stopped = true;
+                        break 'layers;
+                    }
                     // attention over len = pos+1 -> tmp_a[..qw]
                     {
                         let e = msg_id(cmdbuf, sel_ce);
@@ -4529,8 +4797,16 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                         disp_tg(e, sel_dtg, MTLSize { width: *n_heads as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
                         msg_void(e, sel_end);
                     }
+                    if stop_at(li, 2) {
+                        stopped = true;
+                        break 'layers;
+                    }
                     // o_proj -> tmp_b[..d]; residual; post-norm; MLP
                     mv_enc(w.o, d, qw, dec.tmp_a, 0, dec.tmp_b, 0);
+                    if stop_at(li, 3) {
+                        stopped = true;
+                        break 'layers;
+                    }
                     norm_enc(Some(dec.tmp_b), o[1]);
                     prev_add = Some(mlp_enc(w.g, w.u, w.dn, *inter));
                 }
@@ -4539,12 +4815,32 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
                     return None;
                 }
             }
+            if !trace_buf.is_null() {
+                if let Some(a) = prev_add.take() {
+                    add_enc(a);
+                }
+                let blit = msg_id(cmdbuf, sel("blitCommandEncoder"));
+                let f: extern "C" fn(Id, Sel, Id, u64, Id, u64, u64) =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(
+                    blit,
+                    sel("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+                    dec.hidden,
+                    0,
+                    trace_buf,
+                    (li * d * 4) as u64,
+                    (d * 4) as u64,
+                );
+                msg_void(blit, sel_end);
+            }
         }
         // final: fold the last MLP, final norm, lm_head
         if let Some(a) = prev_add {
-            add_enc(a);
+            if !stopped {
+                add_enc(a);
+            }
         }
-        {
+        if !stopped {
             let e = msg_id(cmdbuf, sel_ce);
             set_pipe(e, sel_pipe, dc.add_norm);
             set_buf(e, sel_sb, dec.hidden, 0, 0);
@@ -4556,13 +4852,24 @@ pub fn gpu_decode_step(dec: &mut GpuDecoder, m: &DecodeModelRefs, token: u32, lo
             set_bytes(e, sel_by, (&m.eps) as *const f32 as *const c_void, 4, 5);
             disp_tg(e, sel_dtg, one, tg256);
             msg_void(e, sel_end);
+            mv_enc(head_buf, vocab, d, dec.normed, 0, dec.logits, 0);
         }
-        mv_enc(head_buf, vocab, d, dec.normed, 0, dec.logits, 0);
         msg_void(cmdbuf, sel("commit"));
         msg_void(cmdbuf, sel("waitUntilCompleted"));
         f16s_to_f32s(std::slice::from_raw_parts(contents(dec.logits) as *const u16, vocab), &mut logits_out[..vocab]);
+        if let Some(tr) = trace.as_deref_mut() {
+            let tp = contents(trace_buf) as *const f32;
+            tr.clear();
+            for li in 0..n_layers {
+                tr.push(std::slice::from_raw_parts(tp.add(li * d), d).to_vec());
+            }
+            msg_void(trace_buf, sel("release"));
+        }
         msg_void(fnw, sel("release"));
         msg_void(pool, sel("drain"));
+    }
+    if stopped {
+        return Some(());
     }
     dec.pos += 1;
     gemm_account(t_start.elapsed().as_micros() as u64);
