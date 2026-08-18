@@ -87,19 +87,26 @@ pub(super) fn dump_hidden_print(per_layer: &[(usize, &'static str, f64)], residu
 // captured hiddens are clones, the forward math is untouched (bit-exact).
 pub static LOGIT_LENS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LOGIT_LENS_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static LOGIT_LENS_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// The "done" latch and the pending rows are per thread: a forward computes
+// the rows and the generation loop on the same thread prints them, so a
+// concurrent forward on another thread (the test suite) neither latches
+// this thread's lens nor overwrites its rows.
+thread_local! {
+    static LOGIT_LENS_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LENS_PENDING: std::cell::RefCell<Option<LensRows>> = const { std::cell::RefCell::new(None) };
+}
 
 /// on: lens active at the last prefill position. all: also on every
 /// generated token (--logit-lens-all).
 pub fn set_logit_lens(on: bool, all: bool) {
     LOGIT_LENS.store(on, std::sync::atomic::Ordering::Relaxed);
     LOGIT_LENS_ALL.store(all, std::sync::atomic::Ordering::Relaxed);
-    LOGIT_LENS_DONE.store(false, std::sync::atomic::Ordering::Relaxed);
+    LOGIT_LENS_DONE.with(|d| d.set(false));
 }
 
 pub(super) fn logit_lens_on() -> bool {
     use std::sync::atomic::Ordering;
-    LOGIT_LENS.load(Ordering::Relaxed) && (LOGIT_LENS_ALL.load(Ordering::Relaxed) || !LOGIT_LENS_DONE.load(Ordering::Relaxed))
+    LOGIT_LENS.load(Ordering::Relaxed) && (LOGIT_LENS_ALL.load(Ordering::Relaxed) || !LOGIT_LENS_DONE.with(|d| d.get()))
 }
 
 /// One probe measurement on a lens row: (token id, 1-based rank by logit,
@@ -109,7 +116,6 @@ type ProbeStat = (u32, usize, f32);
 /// One lens row: (layer index, attention kind, top-5 (token id, softmax
 /// prob), per-probe stats).
 type LensRows = Vec<(usize, &'static str, Vec<(usize, f32)>, Vec<ProbeStat>)>;
-static LENS_PENDING: std::sync::Mutex<Option<LensRows>> = std::sync::Mutex::new(None);
 
 /// --lens-probe token ids (main resolves the strings against the vocab at
 /// startup, resolve_lens_probe). Empty = the historical top-5-only report.
@@ -160,14 +166,14 @@ pub(super) fn logit_lens_compute(cfg: &Config, lm_head: &[f32], norm_f: &[f32], 
         let stats = probes.iter().map(|&p| probe_rank_prob(row_logits, p)).collect();
         rows.push((*l, kind, top_k_probs(row_logits, 5), stats));
     }
-    LOGIT_LENS_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-    *LENS_PENDING.lock().unwrap() = Some(rows);
+    LOGIT_LENS_DONE.with(|d| d.set(true));
+    LENS_PENDING.with(|p| *p.borrow_mut() = Some(rows));
 }
 
 /// Prints the pending lens table (called by the generation loop, which owns
 /// the tokenizer, right after each forward/prefill). No-op without a dump.
 pub fn logit_lens_print_maybe(tok: &AnyTokenizer, label: &str) {
-    let rows = LENS_PENDING.lock().unwrap().take();
+    let rows = LENS_PENDING.with(|p| p.borrow_mut().take());
     let Some(rows) = rows else { return };
     println!("── logit lens ({}): top-5 of each layer through final norm + lm_head ──", label);
     for (l, kind, top, probes) in rows {
@@ -183,7 +189,7 @@ pub fn logit_lens_print_maybe(tok: &AnyTokenizer, label: &str) {
 /// would print).
 #[cfg(test)]
 pub(crate) fn lens_rows_take() -> Option<LensRows> {
-    LENS_PENDING.lock().unwrap().take()
+    LENS_PENDING.with(|p| p.borrow_mut().take())
 }
 
 /// Resolves one --lens-probe string to a token id: the string must be exactly
