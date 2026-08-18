@@ -428,17 +428,19 @@ thread_local! {
 /// activation work), the shared row kernel otherwise; identical bits.
 /// SAFETY: out points at `rows` f32; every row in range is written once.
 #[inline]
-unsafe fn rows_range(packed: &[u8], scales: &[u8], cols: usize, xq: &crate::quant::q8::Q8Vec, r0: usize, r1: usize, out: *mut f32) {
+unsafe fn rows_range(packed: &[u8], scales: &[u8], cols: usize, xq: &crate::quant::q8::Q8Vec, xsum12: &[i32], r0: usize, r1: usize, out: *mut f32) {
     let pr = cols / 2;
     let sr = cols / 32;
     let mut r = r0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = xsum12;
     #[cfg(target_arch = "x86_64")]
     if crate::quant::q8::vnni512_available() {
         while r + 4 <= r1 {
             let p4 = [&packed[r * pr..(r + 1) * pr], &packed[(r + 1) * pr..(r + 2) * pr], &packed[(r + 2) * pr..(r + 3) * pr], &packed[(r + 3) * pr..(r + 4) * pr]];
             let s4 = [&scales[r * sr..(r + 1) * sr], &scales[(r + 1) * sr..(r + 2) * sr], &scales[(r + 2) * sr..(r + 3) * sr], &scales[(r + 3) * sr..(r + 4) * sr]];
             // SAFETY: vnni checked; slices hold nb blocks each.
-            let t = unsafe { crate::quant::q8::rows4_dot_fp4_vnni(p4, s4, xq) };
+            let t = unsafe { crate::quant::q8::rows4_dot_fp4_vnni(p4, s4, xq, xsum12) };
             for k in 0..4 {
                 unsafe { *out.add(r + k) = t[k] };
             }
@@ -483,25 +485,29 @@ pub fn matvec_packed_q8(packed: &[u8], scales: &[u8], rows: usize, cols: usize, 
             let pp = crate::model::pool::SPtrU8(packed.as_ptr());
             let sp = crate::model::pool::SPtrU8(scales.as_ptr());
             let xqp = xq as *const crate::quant::q8::Q8Vec as usize;
+            let xs12 = if crate::quant::q8::vnni512_available() { crate::quant::q8::xsum12(xq) } else { Vec::new() };
+            let xs12p = crate::model::pool::SPtrU8(xs12.as_ptr() as *const u8);
+            let xs12n = xs12.len();
             let op = crate::model::pool::MPtr(out.as_mut_ptr());
             let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
             for _ in 0..njobs {
                 let ctr = ctr.clone();
                 jobs.push(Box::new(move || {
-                    let (pp, sp, op) = (pp, sp, op);
+                    let (pp, sp, op, xs12p) = (pp, sp, op, xs12p);
                     // SAFETY: the pool barrier in run() outlives every
                     // borrow captured here; each row is written once.
                     unsafe {
                         let packed = std::slice::from_raw_parts(pp.0, rows * cols / 2);
                         let scales = std::slice::from_raw_parts(sp.0, rows * cols / 32);
                         let xq = &*(xqp as *const crate::quant::q8::Q8Vec);
+                        let xs12 = std::slice::from_raw_parts(xs12p.0 as *const i32, xs12n);
                         loop {
                             let r0 = ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * step;
                             if r0 >= rows {
                                 break;
                             }
                             let r1 = (r0 + step).min(rows);
-                            rows_range(packed, scales, cols, xq, r0, r1, op.0);
+                            rows_range(packed, scales, cols, xq, xs12, r0, r1, op.0);
                         }
                     }
                 }));
