@@ -1406,6 +1406,15 @@ pub fn set_qwen_gpu(on: bool) {
     qwen_gpu_flag().store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// True when single-token decode runs on the GPU: the offload switch is
+/// on and MICROKIMI_QWEN_GPU_NODECODE=1 is not set (the A/B arm that keeps
+/// decode on the CPU while the prefill offloads).
+pub fn qwen_gpu_decode_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    qwen_gpu_on()
+        && *ON.get_or_init(|| std::env::var("MICROKIMI_QWEN_GPU_NODECODE").map(|v| v != "1").unwrap_or(true))
+}
+
 struct MpsCtx {
     // (m, n, k, transpose_b, alpha bits) → retained MPSMatrixMultiplication
     // kernel (the batch count lives in the matrix descriptors, not here)
@@ -4538,7 +4547,6 @@ unsafe impl Send for GpuDecoder {}
 
 impl GpuDecoder {
     /// Current position (next token index) of the resident state.
-    #[allow(dead_code)]
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -4790,6 +4798,94 @@ fn decode_f16_arm() -> bool {
     *ON.get_or_init(|| std::env::var("MICROKIMI_QWEN_GPU_DEC_F16").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Per-layer device weights of the decode graph.
+struct LinW {
+    qkv: W, z: W, b: W, a: W, out: W, g: W, u: W, dn: W,
+}
+struct FullW {
+    q: W, k: W, v: W, o: W, g: W, u: W, dn: W,
+}
+enum LW { L(LinW), F(FullW) }
+
+/// Resolves (builds on first use, then finds in the caches) every device
+/// weight buffer of the decode graph. Storage per matrix: f16 copies
+/// under MICROKIMI_QWEN_GPU_DEC_F16=1 (the A/B arm), else q8_0 rows for
+/// the f32 tensors and the MXFP4 blobs as stored for the MLP. None when
+/// any allocation fails.
+fn resolve_decode_weights(base: &MetalCtx, mps: &MpsCtx, m: &DecodeModelRefs) -> Option<(Vec<LW>, W)> {
+    let d = m.d;
+    let vocab = m.vocab;
+    let f16_arm = decode_f16_arm();
+    let wf = |w: &[f32], rows: usize, cols: usize| -> Option<W> {
+        if f16_arm {
+            Some(W::F16(weight_buffer_f16(base, mps, w, rows, cols)?))
+        } else {
+            let (q, sc) = weight_buffer_q8(base, mps, w, rows, cols)?;
+            Some(W::Q8(q, sc))
+        }
+    };
+    let wp = |packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> Option<W> {
+        if f16_arm {
+            Some(W::F16(dequant_buffer(base, mps, packed, scales, rows, cols)?))
+        } else {
+            let (bp, bs) = packed_buffers_fp4(base, mps, packed, scales, rows, cols)?;
+            Some(W::Fp4(bp, bs))
+        }
+    };
+    let mut lw: Vec<LW> = Vec::with_capacity(m.layers.len());
+    for l in &m.layers {
+        match l {
+            DecodeLayerRefs::Linear { w, dm, .. } => {
+                let kt = dm.kv_heads * dm.kd;
+                let vt = dm.heads * dm.vd;
+                let cd = 2 * kt + vt;
+                lw.push(LW::L(LinW {
+                    qkv: wf(w.in_qkv, cd, d)?,
+                    z: wf(w.in_z, vt, d)?,
+                    b: wf(w.in_b, dm.heads, d)?,
+                    a: wf(w.in_a, dm.heads, d)?,
+                    out: wf(w.out_proj, d, vt)?,
+                    g: wp(w.gate.0, w.gate.1, dm.inter, d)?,
+                    u: wp(w.up.0, w.up.1, dm.inter, d)?,
+                    dn: wp(w.down.0, w.down.1, d, dm.inter)?,
+                }));
+            }
+            DecodeLayerRefs::Full { q_proj, k_proj, v_proj, o_proj, gate, up, down, n_heads, n_kv, hd, inter, .. } => {
+                let qw = n_heads * hd;
+                let kvw = n_kv * hd;
+                lw.push(LW::F(FullW {
+                    q: wf(q_proj, qw * 2, d)?,
+                    k: wf(k_proj, kvw, d)?,
+                    v: wf(v_proj, kvw, d)?,
+                    o: wf(o_proj, d, qw)?,
+                    g: wp(gate.0, gate.1, *inter, d)?,
+                    u: wp(up.0, up.1, *inter, d)?,
+                    dn: wp(down.0, down.1, d, *inter)?,
+                }));
+            }
+        }
+    }
+    let head_buf = wf(m.lm_head, vocab, d)?;
+    Some((lw, head_buf))
+}
+
+/// Builds every device weight buffer of the decode graph ahead of the
+/// first token (the q8_0 rows and MXFP4 uploads take seconds for a
+/// billion parameters; done at load, the first token costs a token).
+/// False when the GPU decode is unavailable.
+pub fn gpu_decode_prepare(m: &DecodeModelRefs) -> bool {
+    if !gemm_f16_on() {
+        return false;
+    }
+    let Some((base, _dc)) = decode_ctx() else {
+        return false;
+    };
+    let Some((_, mps)) = mps_ctx() else {
+        return false;
+    };
+    resolve_decode_weights(base, mps, m).is_some()
+}
+
 /// Trace stop point: encoding stops after sub-stage `stage` of layer
 /// `layer` (full-attention layers: 0 qkv projections, 1 qk prep, 2
 /// attention, 3 o_proj), leaving the scratch buffers readable through
@@ -4849,6 +4945,55 @@ impl GpuDecoder {
                 mix_tm: rd(self.mix_tm, self.sizes[2]),
             }
         }
+    }
+
+    /// Copies the resident state back to host layouts: every linear
+    /// layer's (conv, scan) state in f32, and for every full layer the KV
+    /// rows [from, pos) appended (f16 -> f32) to the given vectors, where
+    /// `from` is that cache's current row count. Returns the position.
+    pub fn export(
+        &self,
+        lin_states: &mut [(&mut [f32], &mut [f32])],
+        full_kv: &mut [(&mut Vec<f32>, &mut Vec<f32>, usize)],
+        kv_width: usize,
+    ) -> usize {
+        let (mut li, mut fi) = (0usize, 0usize);
+        // SAFETY: buffers are retained for the decoder's life; row ranges
+        // are within the capacity checked at every step.
+        unsafe {
+            let contents = |b: Id| -> *mut c_void {
+                let f: extern "C" fn(Id, Sel) -> *mut c_void =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                f(b, sel("contents"))
+            };
+            for l in &self.layers {
+                match l {
+                    GpuLayerState::Linear { conv_state, scan_state } => {
+                        let (conv, state) = &mut lin_states[li];
+                        li += 1;
+                        std::ptr::copy_nonoverlapping(contents(*conv_state) as *const f32, conv.as_mut_ptr(), conv.len());
+                        std::ptr::copy_nonoverlapping(contents(*scan_state) as *const f32, state.as_mut_ptr(), state.len());
+                    }
+                    GpuLayerState::Full { kc, vc, cap } => {
+                        let (k, v, from) = &mut full_kv[fi];
+                        fi += 1;
+                        let to = self.pos.min(*cap);
+                        if *from >= to {
+                            continue;
+                        }
+                        let n = (to - *from) * kv_width;
+                        let mut tmp = vec![0.0f32; n];
+                        f16s_to_f32s(std::slice::from_raw_parts((contents(*kc) as *const u16).add(*from * kv_width), n), &mut tmp);
+                        k.truncate(*from * kv_width);
+                        k.extend_from_slice(&tmp);
+                        f16s_to_f32s(std::slice::from_raw_parts((contents(*vc) as *const u16).add(*from * kv_width), n), &mut tmp);
+                        v.truncate(*from * kv_width);
+                        v.extend_from_slice(&tmp);
+                    }
+                }
+            }
+        }
+        self.pos
     }
 
     /// The resident KV cache row `row` of full-attention layer `layer`
@@ -4913,68 +5058,10 @@ fn gpu_decode_step_impl(
     let pos = dec.pos;
     let t_start = std::time::Instant::now();
     // resolve every weight buffer and kernel BEFORE encoding (no partial
-    // state mutation on refusal). Storage per matrix: f16 copies under
-    // MICROKIMI_QWEN_GPU_DEC_F16=1 (the A/B arm), else q8_0 rows for the
-    // f32 tensors and the MXFP4 blobs as stored for the MLP.
-    let f16_arm = decode_f16_arm();
-    let wf = |w: &[f32], rows: usize, cols: usize| -> Option<W> {
-        if f16_arm {
-            Some(W::F16(weight_buffer_f16(base, mps, w, rows, cols)?))
-        } else {
-            let (q, sc) = weight_buffer_q8(base, mps, w, rows, cols)?;
-            Some(W::Q8(q, sc))
-        }
-    };
-    let wp = |packed: &[u8], scales: &[u8], rows: usize, cols: usize| -> Option<W> {
-        if f16_arm {
-            Some(W::F16(dequant_buffer(base, mps, packed, scales, rows, cols)?))
-        } else {
-            let (bp, bs) = packed_buffers_fp4(base, mps, packed, scales, rows, cols)?;
-            Some(W::Fp4(bp, bs))
-        }
-    };
-    struct LinW {
-        qkv: W, z: W, b: W, a: W, out: W, g: W, u: W, dn: W,
-    }
-    struct FullW {
-        q: W, k: W, v: W, o: W, g: W, u: W, dn: W,
-    }
-    enum LW { L(LinW), F(FullW) }
-    let mut lw: Vec<LW> = Vec::with_capacity(m.layers.len());
-    for l in &m.layers {
-        match l {
-            DecodeLayerRefs::Linear { w, dm, .. } => {
-                let kt = dm.kv_heads * dm.kd;
-                let vt = dm.heads * dm.vd;
-                let cd = 2 * kt + vt;
-                lw.push(LW::L(LinW {
-                    qkv: wf(w.in_qkv, cd, d)?,
-                    z: wf(w.in_z, vt, d)?,
-                    b: wf(w.in_b, dm.heads, d)?,
-                    a: wf(w.in_a, dm.heads, d)?,
-                    out: wf(w.out_proj, d, vt)?,
-                    g: wp(w.gate.0, w.gate.1, dm.inter, d)?,
-                    u: wp(w.up.0, w.up.1, dm.inter, d)?,
-                    dn: wp(w.down.0, w.down.1, d, dm.inter)?,
-                }));
-            }
-            DecodeLayerRefs::Full { q_proj, k_proj, v_proj, o_proj, gate, up, down, n_heads, n_kv, hd, inter, .. } => {
-                let qw = n_heads * hd;
-                let kvw = n_kv * hd;
-                lw.push(LW::F(FullW {
-                    q: wf(q_proj, qw * 2, d)?,
-                    k: wf(k_proj, kvw, d)?,
-                    v: wf(v_proj, kvw, d)?,
-                    o: wf(o_proj, d, qw)?,
-                    g: wp(gate.0, gate.1, *inter, d)?,
-                    u: wp(up.0, up.1, *inter, d)?,
-                    dn: wp(down.0, down.1, d, *inter)?,
-                }));
-            }
-        }
-    }
-    let head_buf = wf(m.lm_head, vocab, d)?;
+    // state mutation on refusal)
+    let (lw, head_buf) = resolve_decode_weights(base, mps, m)?;
     let final_norm = m.norm_f;
+
 
     let mut stopped = false;
     // SAFETY: all objects come from the live context; the decoder's buffers

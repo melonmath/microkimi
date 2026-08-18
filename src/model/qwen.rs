@@ -1240,6 +1240,12 @@ pub struct QwenModel {
     /// Logits after the last ingested token (state snapshots resume from
     /// them without re-ingesting anything).
     pub last_logits: Vec<f32>,
+    /// GPU decode (macOS, MICROKIMI_QWEN_GPU=1): the resident decoder,
+    /// live between single-token steps; `gpu_sync` brings its state home.
+    #[cfg(target_os = "macos")]
+    gpu_dec: Option<crate::model::metal::GpuDecoder>,
+    #[cfg(target_os = "macos")]
+    gpu_dec_off: bool,
     adapter_packs: AppliedPacks,
 }
 
@@ -1976,6 +1982,10 @@ impl QwenModel {
             mtp_cache,
             pos: 0,
             last_logits: Vec::new(),
+            #[cfg(target_os = "macos")]
+            gpu_dec: None,
+            #[cfg(target_os = "macos")]
+            gpu_dec_off: false,
             adapter_packs,
         };
         if model.mtp.is_some() {
@@ -1986,10 +1996,27 @@ impl QwenModel {
                 .unwrap_or(32_768usize);
             model.draft_head = DraftHead::from_rows(&model, rows);
         }
+        #[cfg(target_os = "macos")]
+        if crate::model::metal::qwen_gpu_decode_on() && model.cfg.is_dense() {
+            // the decode graph's device weights, built once here rather
+            // than inside the first generated token
+            let t0 = std::time::Instant::now();
+            let ok = crate::model::metal::gpu_decode_prepare(&model.decode_refs());
+            if ok {
+                println!("gpu: decode weights resident ({:.1} s)", t0.elapsed().as_secs_f64());
+            } else {
+                model.gpu_dec_off = true;
+                println!("gpu: decode unavailable - CPU decode");
+            }
+        }
         model
     }
 
     pub fn reset(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.gpu_dec = None;
+        }
         self.caches = (0..self.cfg.n_layers)
             .map(|l| {
                 if self.cfg.is_full_attn(l) {
@@ -2023,8 +2050,11 @@ impl QwenModel {
         self.mtp.is_some()
     }
 
-    /// Captures the rollback point for a speculative batch.
-    pub fn snapshot(&self) -> QwenSnapshot {
+    /// Captures the rollback point for a speculative batch (a live GPU
+    /// decoder is brought home first so the caches are current).
+    pub fn snapshot(&mut self) -> QwenSnapshot {
+        #[cfg(target_os = "macos")]
+        self.gpu_sync();
         QwenSnapshot {
             lin: self
                 .caches
@@ -2050,6 +2080,12 @@ impl QwenModel {
     /// Restores a snapshot: linear states are copied back, append-only
     /// key/value caches are truncated to their recorded lengths.
     pub fn restore(&mut self, snap: &QwenSnapshot) {
+        #[cfg(target_os = "macos")]
+        {
+            // whatever the resident decoder advanced past the snapshot is
+            // being rolled back; it rebuilds from the caches on demand
+            self.gpu_dec = None;
+        }
         let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
         let (mut li, mut fi) = (0usize, 0usize);
         for cache in self.caches.iter_mut() {
@@ -2646,6 +2682,24 @@ impl QwenModel {
     /// (A/B benchmarking toggle; both paths are bit-identical).
     pub fn prefill_collect(&mut self, tokens: &[u32], all_logits: bool) -> QwenPrefillOut {
         assert!(!tokens.is_empty(), "prefill requires at least one token");
+        #[cfg(target_os = "macos")]
+        {
+            // GPU decode: one token at a time after a prefill, the whole
+            // forward in one command buffer against resident state
+            if tokens.len() == 1
+                && !all_logits
+                && self.pos > 0
+                && crate::model::metal::qwen_gpu_decode_on()
+                && !self.gpu_dec_off
+            {
+                if let Some(logits) = self.gpu_decode_token(tokens[0]) {
+                    return QwenPrefillOut { logits: vec![logits], hidden: vec![Vec::new()] };
+                }
+            } else if self.gpu_dec.is_some() {
+                // a batch or a full-logits pass reads the CPU caches
+                self.gpu_sync();
+            }
+        }
         if no_batch_prefill() {
             assert!(
                 self.q8_spine.iter().all(|x| x.is_none()),
@@ -5749,6 +5803,77 @@ impl QwenModel {
         }
         let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
         crate::model::metal::gpu_decoder_new(&refs, &lin_states, &full_kv, kv_width, kv_cap, self.pos)
+    }
+
+    /// One decode token on the resident GPU decoder (built on first use
+    /// from the current caches, grown once when its KV capacity is
+    /// reached). None = the CPU path takes this token; the caches are
+    /// current (a refusal never mutates resident state, and the state is
+    /// exported before the decoder is dropped).
+    fn gpu_decode_token(&mut self, token: u32) -> Option<Vec<f32>> {
+        for attempt in 0..2 {
+            if self.gpu_dec.is_none() {
+                let cap = (self.pos + 1 + 1024).next_power_of_two();
+                self.gpu_dec = self.gpu_decoder(cap);
+                if self.gpu_dec.is_none() {
+                    self.gpu_dec_off = true;
+                    println!("gpu: decode unavailable - CPU decode");
+                    return None;
+                }
+                if attempt == 0 && self.pos <= 1024 {
+                    println!("gpu: decode on (whole token in one command buffer, resident state)");
+                }
+            }
+            let mut dec = self.gpu_dec.take().unwrap();
+            let mut logits = vec![0.0f32; self.cfg.vocab];
+            let ok = {
+                let refs = self.decode_refs();
+                crate::model::metal::gpu_decode_step(&mut dec, &refs, token, &mut logits).is_some()
+            };
+            self.gpu_dec = Some(dec);
+            if ok {
+                self.pos += 1;
+                self.last_logits = logits.clone();
+                return Some(logits);
+            }
+            // refused before any mutation (KV capacity reached, or a
+            // kernel missing): bring the state home and rebuild once
+            self.gpu_sync();
+        }
+        self.gpu_dec_off = true;
+        println!("gpu: decode step refused twice - CPU decode from here");
+        None
+    }
+
+    /// Brings the resident decoder's state back into the CPU caches and
+    /// drops the decoder (no-op without one).
+    pub(crate) fn gpu_sync(&mut self) {
+        let Some(dec) = self.gpu_dec.take() else {
+            return;
+        };
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        {
+            let mut lin: Vec<(&mut [f32], &mut [f32])> = Vec::new();
+            let mut full: Vec<(&mut Vec<f32>, &mut Vec<f32>, usize)> = Vec::new();
+            for cache in self.caches.iter_mut() {
+                match cache {
+                    QwenCache::Linear(c) => lin.push((&mut c.conv, &mut c.state)),
+                    QwenCache::Full(c) => full.push((&mut c.k, &mut c.v, c.len)),
+                }
+            }
+            dec.export(&mut lin, &mut full, kv_width);
+        }
+        let pos = dec.pos();
+        for cache in self.caches.iter_mut() {
+            if let QwenCache::Full(c) = cache {
+                let old = c.len;
+                for row in old..pos {
+                    let k = c.k[row * kv_width..(row + 1) * kv_width].to_vec();
+                    push_k_mirror(c, &k);
+                }
+                c.len = pos;
+            }
+        }
     }
 
     /// The by-reference view of the model the GPU decoder consumes.
