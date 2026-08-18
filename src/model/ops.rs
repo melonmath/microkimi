@@ -1644,7 +1644,10 @@ pub(crate) fn matvec_packed_nt(packed: &[u8], scales: &[u8], rows: usize, cols: 
 /// single-thread tile and the single-lane pooled matvec, in GMAC/s.
 /// The datum that decides whether a prompt-reading gap lives in the
 /// kernel, the threading, or the host.
-pub fn kernbench_cmd(_args: &[String]) {
+pub fn kernbench_cmd(args: &[String]) {
+    if args.iter().any(|a| a == "--dram") {
+        return kernbench_dram();
+    }
     let (rows, cols, lanes_n) = (3072usize, 1024usize, 256usize);
     let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7 + 3) % 23) as f32 * 0.01 - 0.1).collect();
     let head = Q8Head::from_f32(&w, rows, cols);
@@ -1837,6 +1840,62 @@ pub fn kernbench_cmd(_args: &[String]) {
         (rows * cols * 64) as f64 / dt / 1e9,
         dt * 1000.0
     );
+}
+
+/// `microkimi kernbench --dram`: the decode question on a large model,
+/// weight bytes per second when the matrix does not fit any cache. Eight
+/// distinct q8 matrices (rows x cols i8 + scales, ~1 GB total) and their
+/// MXFP4-packed counterparts, streamed round-robin through the pooled
+/// single-lane matvecs; GB/s of weight traffic and the ms per matvec.
+/// Compare with the host's DRAM bandwidth to read the extraction ratio.
+fn kernbench_dram() {
+    let (rows, cols) = (16384usize, 8192usize); // 128 MB i8 per matrix
+    let n_mats = 8usize;
+    let x: Vec<f32> = (0..cols).map(|i| ((i * 5 + 1) % 13) as f32 * 0.02 - 0.1).collect();
+    println!("building {} q8 + fp4 matrices of {} x {} ...", n_mats, rows, cols);
+    let heads: Vec<Q8Head> = (0..n_mats)
+        .map(|m| {
+            let w: Vec<f32> = (0..rows * cols).map(|i| (((i * 7 + 3 + m) % 23) as f32) * 0.01 - 0.1).collect();
+            Q8Head::from_f32(&w, rows, cols)
+        })
+        .collect();
+    let packed: Vec<(Vec<u8>, Vec<u8>)> = (0..n_mats)
+        .map(|m| {
+            let w: Vec<f32> = (0..rows * cols).map(|i| (((i * 7 + 3 + m) % 23) as f32) * 0.01 - 0.1).collect();
+            crate::quant::mxfp4::quantize_naive(&w, rows, cols)
+        })
+        .collect();
+    let threads = crate::model::pool::pool().workers.max(1);
+    let mut out = vec![0.0f32; rows];
+    for round in 0..3 {
+        // q8 spine matvec (Q8Head::matvec, pooled, dynamic rows)
+        let t0 = std::time::Instant::now();
+        for h in &heads {
+            h.matvec(&x, &mut out);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let bytes = (rows * cols + rows * cols / 32 * 4) as f64 * n_mats as f64;
+        println!(
+            "q8  matvec (pooled, 1 lane) round {}: {:>6.1} GB/s  ({:.1} ms per matvec)",
+            round,
+            bytes / dt / 1e9,
+            dt * 1000.0 / n_mats as f64
+        );
+        // fp4 packed matvec (matvec_packed -> matvec_packed_q8, pooled)
+        let t0 = std::time::Instant::now();
+        for (p, sc) in &packed {
+            crate::quant::mxfp4::matvec_packed(p, sc, rows, cols, &x, &mut out, threads);
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let bytes = (rows * cols / 2 + rows * cols / 32) as f64 * n_mats as f64;
+        println!(
+            "fp4 matvec (pooled, 1 lane) round {}: {:>6.1} GB/s  ({:.1} ms per matvec)",
+            round,
+            bytes / dt / 1e9,
+            dt * 1000.0 / n_mats as f64
+        );
+    }
+    println!("sink {:.4}", out[0]);
 }
 
 /// `microkimi scanbench`: same-process A/B of the sequential delta scan
