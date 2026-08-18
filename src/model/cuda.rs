@@ -286,9 +286,11 @@ const KERNEL_NAMES: &[&str] = &[
     "k_gemm_q8_mma64",
     "k_gemm_q8_mma128",
     "k_gemm_q8_mma256",
+    "k_gemm_q8_mma128x128",
     "k_gemm_fp4_mma64",
     "k_gemm_fp4_mma128",
     "k_gemm_fp4_mma256",
+    "k_gemm_fp4_mma128x128",
     "k_add",
     "k_rmsnorm",
     "k_rmsnorm_rows",
@@ -379,7 +381,7 @@ fn compile(nv: &Nvrtc, major: i32, minor: i32) -> Result<Vec<u8>, String> {
     let key = {
         let mut h = crate::sha256::Sha256::new();
         h.update(src.as_bytes());
-        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v6").as_bytes());
+        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v14-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
         let d = h.finalize();
         d.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
     };
@@ -400,7 +402,11 @@ fn compile(nv: &Nvrtc, major: i32, minor: i32) -> Result<Vec<u8>, String> {
     let cname = CString::new("microkimi.cu").unwrap();
     let use_cubin = nv.cubin.is_some() && nv.cubin_size.is_some() && !std::env::var("MICROKIMI_CUDA_PTX").is_ok();
     let arch = if use_cubin { format!("--gpu-architecture=sm_{major}{minor}") } else { format!("--gpu-architecture=compute_{major}{minor}") };
-    let opts: Vec<CString> = ["-default-device", "-std=c++17", "-lineinfo", &arch].iter().map(|s| CString::new(*s).unwrap()).collect();
+    let mut opt_strs: Vec<String> = ["-default-device", "-std=c++17", "-lineinfo", &arch].iter().map(|s| s.to_string()).collect();
+    if std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok() {
+        opt_strs.push("--ptxas-options=-v".to_string());
+    }
+    let opts: Vec<CString> = opt_strs.iter().map(|s| CString::new(s.as_str()).unwrap()).collect();
     let optp: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
     // SAFETY: NVRTC calls with valid pointers; the program is destroyed on every path.
     unsafe {
@@ -724,46 +730,94 @@ impl CudaCtx {
     }
     /// C[t][rows] (row stride `ldc`) = X(q8, t rows of cols) . W(q8 rows x cols)^T.
     pub fn gemm_q8(&self, wq: &DBuf, ws: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, c_off: usize, rows: u32, cols: u32, t: u32, ldc: u32) -> bool {
+        if self.mma_on() {
+            return self.gemm_mma_split(true, wq, ws, xq, xs, c, c_off, rows, cols, t, ldc);
+        }
         let cp = c.ptr + c_off as u64;
         let mut a = args!(wq.ptr, ws.ptr, xq.ptr, xs.ptr, cp, rows, cols, t, ldc);
-        if self.mma_on() {
-            let nt = self.gemm_nt(rows, t);
-            let name = match nt { 64 => "k_gemm_q8_mma64", 128 => "k_gemm_q8_mma128", _ => "k_gemm_q8_mma256" };
-            return self.launch(name, (rows.div_ceil(64), t.div_ceil(nt), 1), (256, 1, 1), 0, &mut a);
-        }
         self.launch("k_gemm_q8", (rows.div_ceil(64), t.div_ceil(64), 1), (256, 1, 1), 0, &mut a)
     }
     /// C[t][rows] = X(q8) . W(MXFP4)^T.
     pub fn gemm_fp4(&self, wp: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, c_off: usize, rows: u32, cols: u32, t: u32, ldc: u32) -> bool {
+        if self.mma_on() {
+            return self.gemm_mma_split(false, wp, wsc, xq, xs, c, c_off, rows, cols, t, ldc);
+        }
         let cp = c.ptr + c_off as u64;
         let mut a = args!(wp.ptr, wsc.ptr, xq.ptr, xs.ptr, cp, rows, cols, t, ldc);
-        if self.mma_on() {
-            let nt = self.gemm_nt(rows, t);
-            let name = match nt { 64 => "k_gemm_fp4_mma64", 128 => "k_gemm_fp4_mma128", _ => "k_gemm_fp4_mma256" };
-            return self.launch(name, (rows.div_ceil(64), t.div_ceil(nt), 1), (256, 1, 1), 0, &mut a);
-        }
         self.launch("k_gemm_fp4", (rows.div_ceil(64), t.div_ceil(64), 1), (256, 1, 1), 0, &mut a)
+    }
+    /// The tensor-core GEMM over `t` tokens as one launch with the chosen
+    /// tile over the whole tiles, plus one launch with a smaller tile
+    /// over the remainder (a remainder of nine tokens must not stage a
+    /// 256-token tile: the weight tile is re-read per token tile).
+    fn gemm_mma_split(&self, q8: bool, w: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, c_off: usize, rows: u32, cols: u32, t: u32, ldc: u32) -> bool {
+        let nb = cols / 32;
+        let one = |t0: u32, tt: u32, mt: u32, nt: u32| -> bool {
+            let name = match (q8, mt, nt) {
+                (true, 128, _) => "k_gemm_q8_mma128x128",
+                (true, _, 64) => "k_gemm_q8_mma64",
+                (true, _, 128) => "k_gemm_q8_mma128",
+                (true, _, _) => "k_gemm_q8_mma256",
+                (false, 128, _) => "k_gemm_fp4_mma128x128",
+                (false, _, 64) => "k_gemm_fp4_mma64",
+                (false, _, 128) => "k_gemm_fp4_mma128",
+                (false, _, _) => "k_gemm_fp4_mma256",
+            };
+            let xqp = xq.ptr + (t0 as u64) * cols as u64;
+            let xsp = xs.ptr + (t0 as u64) * nb as u64 * 4;
+            let cp = c.ptr + c_off as u64 + (t0 as u64) * ldc as u64 * 4;
+            let mut a = args!(w.ptr, wsc.ptr, xqp, xsp, cp, rows, cols, tt, ldc);
+            self.launch(name, (rows.div_ceil(mt), tt.div_ceil(nt), 1), (256, 1, 1), 0, &mut a)
+        };
+        let (mt, nt) = self.gemm_tile(rows, t);
+        let full = t / nt;
+        let rem = t - full * nt;
+        // a tiny tail (a few tokens over a tile boundary) gets its own
+        // small-tile launch when the main launch alone still fills the
+        // SMs; otherwise the last tile is simply partial (its empty n8
+        // tiles skip their mma)
+        let row_tiles = rows.div_ceil(mt);
+        if full >= 1 && rem > 0 && rem <= 32 && row_tiles * full >= (2 * self.sm_count) as u32 {
+            return one(0, full * nt, mt, nt) && one(full * nt, rem, 64, 64);
+        }
+        one(0, t, mt, nt)
     }
     /// Token tile of the tensor-core GEMM: the largest of 256 / 128 / 64
     /// that still puts at least two blocks per SM (the weight tile is
     /// re-read from global once per token tile, so larger is better when
     /// the grid is wide enough).
-    fn gemm_nt(&self, rows: u32, t: u32) -> u32 {
-        static FORCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        if let Some(nt) = *FORCE.get_or_init(|| std::env::var("MICROKIMI_CUDA_NT").ok().and_then(|v| v.parse().ok())) {
-            return nt;
+    /// (row tile, token tile) of the tensor-core GEMM: 128 x 128 when the
+    /// grid still fills the SMs twice over (half the activation re-reads
+    /// of the 64-row tiles), else the largest 64 x NT that does; else 64 x 64.
+    /// MICROKIMI_CUDA_TILE=MTxNT forces one.
+    fn gemm_tile(&self, rows: u32, t: u32) -> (u32, u32) {
+        static FORCE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        if let Some(tile) = *FORCE.get_or_init(|| {
+            std::env::var("MICROKIMI_CUDA_TILE").ok().and_then(|v| {
+                let (a, b) = v.split_once('x')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            })
+        }) {
+            return tile;
+        }
+        let want = (2 * self.sm_count) as u32;
+        if t > 64 && rows.div_ceil(128) * t.div_ceil(128) >= want {
+            return (128, 128);
         }
         let row_tiles = rows.div_ceil(64);
-        let want = (2 * self.sm_count) as u32;
         for nt in [256u32, 128, 64] {
             if t <= nt / 2 && nt > 64 {
                 continue; // a half-empty tile: try the smaller one
             }
             if row_tiles * t.div_ceil(nt) >= want {
-                return nt;
+                return (64, nt);
             }
         }
-        64
+        (64, 64)
+    }
+    #[allow(dead_code)]
+    fn gemm_nt(&self, rows: u32, t: u32) -> u32 {
+        self.gemm_tile(rows, t).1
     }
     /// Tensor-core GEMMs: sm_80 and later, unless MICROKIMI_CUDA_NO_MMA=1.
     pub fn mma_on(&self) -> bool {
@@ -1143,20 +1197,26 @@ __device__ __forceinline__ void mma_s8_16x8x32(int& d0, int& d1, int& d2, int& d
                  : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
 }
-#define MT 64
-#define MKB 2  /* blocks per staging step */
 #define SROW 9 /* shared row stride in ints per block (8 + 1 pad against bank conflicts) */
-#define LDS (MKB * SROW)
+// warps: WM x WN = 8; each warp owns 32 rows and NT / WN tokens
+template <int MTR> struct WMOf { static constexpr int v = MTR / 32; };
+// blocks of 32 columns per staging step, by token tile (static shared memory stays under 48 KB)
+template <int NT> struct KBOf { static constexpr int v = (NT >= 256) ? 2 : (NT >= 128 ? 4 : 8); };
 
-template <int NT>
+template <int MTR, int NT>
 __device__ __forceinline__ void gemm_mma_body(const int* sw, const int* sxt, const float* sws, const float* sxs,
-                                              float (&acc)[2][NT / 32][4], unsigned warp, unsigned lane) {
-    // warp tile: rows wr0 = (warp & 1) * 32, tokens wt0 = (warp >> 1) * (NT / 4)
-    constexpr int NW = NT / 32; // n8 tiles per warp
-    const unsigned wr0 = (warp & 1) * 32, wt0 = (warp >> 1) * (NT / 4);
+                                              float (&acc)[2][NT / (8 / WMOf<MTR>::v) / 8][4], unsigned warp, unsigned lane, unsigned n_valid) {
+    constexpr int KB = KBOf<NT>::v; constexpr int LDS = KB * SROW;
+    constexpr int WM = WMOf<MTR>::v, WN = 8 / WM;
+    constexpr int WT = NT / WN;  // tokens per warp
+    constexpr int NW = WT / 8;   // n8 tiles per warp
+    // n8 tiles past n_valid (the block's valid tokens) are skipped, so a
+    // prompt a few tokens over a tile boundary does not pay a whole tile
+    const unsigned wr0 = (warp % WM) * 32, wt0 = (warp / WM) * WT;
     const unsigned gid = lane >> 2, tig = lane & 3;
+    if (wt0 >= n_valid) return;
     #pragma unroll
-    for (int kb = 0; kb < MKB; kb++) {
+    for (int kb = 0; kb < KB; kb++) {
         int a[2][4], b[NW][2];
         #pragma unroll
         for (int mi = 0; mi < 2; mi++) {
@@ -1174,10 +1234,11 @@ __device__ __forceinline__ void gemm_mma_body(const int* sw, const int* sxt, con
         }
         #pragma unroll
         for (int mi = 0; mi < 2; mi++) {
-            float ws0 = sws[kb * MT + wr0 + mi * 16 + gid];
-            float ws1 = sws[kb * MT + wr0 + mi * 16 + gid + 8];
+            float ws0 = sws[kb * MTR + wr0 + mi * 16 + gid];
+            float ws1 = sws[kb * MTR + wr0 + mi * 16 + gid + 8];
             #pragma unroll
             for (int ni = 0; ni < NW; ni++) {
+                if (wt0 + ni * 8 >= n_valid) break;
                 int d0, d1, d2, d3;
                 mma_s8_16x8x32(d0, d1, d2, d3, a[mi][0], a[mi][1], a[mi][2], a[mi][3], b[ni][0], b[ni][1]);
                 float xs0 = sxs[kb * NT + wt0 + ni * 8 + tig * 2];
@@ -1190,11 +1251,12 @@ __device__ __forceinline__ void gemm_mma_body(const int* sw, const int* sxt, con
         }
     }
 }
-template <int NT>
-__device__ __forceinline__ void gemm_mma_store(float (&acc)[2][NT / 32][4], float* __restrict__ C, unsigned r0, unsigned t0,
+template <int MTR, int NT>
+__device__ __forceinline__ void gemm_mma_store(float (&acc)[2][NT / (8 / WMOf<MTR>::v) / 8][4], float* __restrict__ C, unsigned r0, unsigned t0,
                                                unsigned rows, unsigned t, unsigned ldc, unsigned warp, unsigned lane) {
-    constexpr int NW = NT / 32;
-    const unsigned wr0 = (warp & 1) * 32, wt0 = (warp >> 1) * (NT / 4);
+    constexpr int WM = WMOf<MTR>::v, WN = 8 / WM;
+    constexpr int WT = NT / WN, NW = WT / 8;
+    const unsigned wr0 = (warp % WM) * 32, wt0 = (warp / WM) * WT;
     const unsigned gid = lane >> 2, tig = lane & 3;
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
@@ -1213,118 +1275,120 @@ __device__ __forceinline__ void gemm_mma_store(float (&acc)[2][NT / 32][4], floa
         }
     }
 }
-// staging of the X tile (NT tokens x MKB blocks) and its scales
-template <int NT>
-__device__ __forceinline__ void stage_x(int* sxt, float* sxs, const i8* __restrict__ xq, const float* __restrict__ xs,
-                                        unsigned t0, unsigned t, unsigned cols, unsigned nb, unsigned g0, unsigned tid) {
-    #pragma unroll
-    for (int rep = 0; rep < (NT * MKB * 8) / 256; rep++) {
-        unsigned idx = tid + rep * 256;
-        unsigned rr = idx / (MKB * 8), kk = idx % (MKB * 8);
-        unsigned kb = kk >> 3, k = kk & 7;
-        unsigned g = g0 + kb;
-        int xv = 0;
-        unsigned gtok = t0 + rr;
-        if (g < nb && gtok < t) xv = ((const int*)(xq + (size_t)gtok * cols + g * 32))[k];
-        sxt[rr * LDS + kb * SROW + k] = xv;
-    }
-    for (unsigned i = tid; i < MKB * NT; i += 256) {
-        unsigned kb = i / NT, rr = i % NT;
-        unsigned g = g0 + kb, gtok = t0 + rr;
-        sxs[i] = (g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
-    }
-}
-template <int NT>
+template <int MTR, int NT>
 __device__ __forceinline__ void gemm_q8_mma_t(const i8* __restrict__ wq, const float* __restrict__ ws,
                                               const i8* __restrict__ xq, const float* __restrict__ xs,
                                               float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
-    __shared__ __align__(16) int sw[MT * LDS];
+    constexpr int KB = KBOf<NT>::v; constexpr int LDS = KB * SROW;
+    __shared__ __align__(16) int sw[MTR * LDS];
     __shared__ __align__(16) int sxt[NT * LDS];
-    __shared__ float sws[MKB * MT], sxs[MKB * NT];
+    __shared__ float sws[KB * MTR], sxs[KB * NT];
     const unsigned nb = cols >> 5;
-    const unsigned r0 = blockIdx.x * MT, t0 = blockIdx.y * NT;
+    const unsigned r0 = blockIdx.x * MTR, t0 = blockIdx.y * NT;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    float acc[2][NT / 32][4];
+    float acc[2][NT / (8 / WMOf<MTR>::v) / 8][4];
     #pragma unroll
     for (int i = 0; i < 2; i++)
         #pragma unroll
-        for (int j = 0; j < NT / 32; j++)
+        for (int j = 0; j < NT / (8 / WMOf<MTR>::v) / 8; j++)
             #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
-    for (unsigned g0 = 0; g0 < nb; g0 += MKB) {
+    for (unsigned g0 = 0; g0 < nb; g0 += KB) {
         #pragma unroll
-        for (int rep = 0; rep < (MT * MKB * 8) / 256; rep++) {
+        for (int rep = 0; rep < (MTR * KB * 8) / 256; rep++) {
             unsigned idx = tid + rep * 256;
-            unsigned rr = idx / (MKB * 8), kk = idx % (MKB * 8);
+            unsigned rr = idx / (KB * 8), kk = idx % (KB * 8);
             unsigned kb = kk >> 3, k = kk & 7;
-            unsigned g = g0 + kb;
-            int wv = 0;
-            unsigned grow = r0 + rr;
-            if (g < nb && grow < rows) wv = ((const int*)(wq + (size_t)grow * cols + g * 32))[k];
-            sw[rr * LDS + kb * SROW + k] = wv;
-        }
-        if (tid < MKB * MT) {
-            unsigned kb = tid / MT, rr = tid % MT;
             unsigned g = g0 + kb, grow = r0 + rr;
-            sws[tid] = (g < nb && grow < rows) ? ws[(size_t)grow * nb + g] : 0.0f;
+            sw[rr * LDS + kb * SROW + k] = (g < nb && grow < rows) ? ((const int*)(wq + (size_t)grow * cols + g * 32))[k] : 0;
         }
-        stage_x<NT>(sxt, sxs, xq, xs, t0, t, cols, nb, g0, tid);
+        #pragma unroll
+        for (int rep = 0; rep < (NT * KB * 8) / 256; rep++) {
+            unsigned idx = tid + rep * 256;
+            unsigned rr = idx / (KB * 8), kk = idx % (KB * 8);
+            unsigned kb = kk >> 3, k = kk & 7;
+            unsigned g = g0 + kb, gtok = t0 + rr;
+            sxt[rr * LDS + kb * SROW + k] = (g < nb && gtok < t) ? ((const int*)(xq + (size_t)gtok * cols + g * 32))[k] : 0;
+        }
+        for (unsigned i = tid; i < KB * MTR; i += 256) {
+            unsigned kb = i / MTR, rr = i % MTR;
+            unsigned g = g0 + kb, grow = r0 + rr;
+            sws[i] = (g < nb && grow < rows) ? ws[(size_t)grow * nb + g] : 0.0f;
+        }
+        for (unsigned i = tid; i < KB * NT; i += 256) {
+            unsigned kb = i / NT, rr = i % NT;
+            unsigned g = g0 + kb, gtok = t0 + rr;
+            sxs[i] = (g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
+        }
         __syncthreads();
-        gemm_mma_body<NT>(sw, sxt, sws, sxs, acc, warp, lane);
+        gemm_mma_body<MTR, NT>(sw, sxt, sws, sxs, acc, warp, lane, t - t0);
         __syncthreads();
     }
-    gemm_mma_store<NT>(acc, C, r0, t0, rows, t, ldc, warp, lane);
+    gemm_mma_store<MTR, NT>(acc, C, r0, t0, rows, t, ldc, warp, lane);
 }
-template <int NT>
+template <int MTR, int NT>
 __device__ __forceinline__ void gemm_fp4_mma_t(const u8* __restrict__ wp, const u8* __restrict__ wsc,
                                                const i8* __restrict__ xq, const float* __restrict__ xs,
                                                float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
-    __shared__ __align__(16) int sw[MT * LDS];
+    constexpr int KB = KBOf<NT>::v; constexpr int LDS = KB * SROW;
+    __shared__ __align__(16) int sw[MTR * LDS];
     __shared__ __align__(16) int sxt[NT * LDS];
-    __shared__ float sws[MKB * MT], sxs[MKB * NT];
+    __shared__ float sws[KB * MTR], sxs[KB * NT];
     const unsigned nb = cols >> 5;
-    const unsigned r0 = blockIdx.x * MT, t0 = blockIdx.y * NT;
+    const unsigned r0 = blockIdx.x * MTR, t0 = blockIdx.y * NT;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    float acc[2][NT / 32][4];
+    float acc[2][NT / (8 / WMOf<MTR>::v) / 8][4];
     #pragma unroll
     for (int i = 0; i < 2; i++)
         #pragma unroll
-        for (int j = 0; j < NT / 32; j++)
+        for (int j = 0; j < NT / (8 / WMOf<MTR>::v) / 8; j++)
             #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
-    for (unsigned g0 = 0; g0 < nb; g0 += MKB) {
+    for (unsigned g0 = 0; g0 < nb; g0 += KB) {
         #pragma unroll
-        for (int rep = 0; rep < (MT * MKB * 4) / 256; rep++) {
+        for (int rep = 0; rep < (MTR * KB * 4) / 256; rep++) {
             unsigned idx = tid + rep * 256;
-            unsigned rr = idx / (MKB * 4), kk = idx % (MKB * 4);
+            unsigned rr = idx / (KB * 4), kk = idx % (KB * 4);
             unsigned kb = kk >> 2, k = kk & 3;
-            unsigned g = g0 + kb;
-            unsigned pk = 0u;
-            unsigned grow = r0 + rr;
-            if (g < nb && grow < rows) pk = ((const unsigned*)(wp + (size_t)grow * (cols >> 1) + g * 16))[k];
+            unsigned g = g0 + kb, grow = r0 + rr;
+            unsigned pk = (g < nb && grow < rows) ? ((const unsigned*)(wp + (size_t)grow * (cols >> 1) + g * 16))[k] : 0u;
             int lo, hi;
             fp4_decode8(pk, lo, hi);
             sw[rr * LDS + kb * SROW + k * 2] = lo;
             sw[rr * LDS + kb * SROW + k * 2 + 1] = hi;
         }
-        if (tid < MKB * MT) {
-            unsigned kb = tid / MT, rr = tid % MT;
-            unsigned g = g0 + kb, grow = r0 + rr;
-            sws[tid] = (g < nb && grow < rows) ? e8m0_x2(wsc[(size_t)grow * nb + g]) : 0.0f;
+        #pragma unroll
+        for (int rep = 0; rep < (NT * KB * 8) / 256; rep++) {
+            unsigned idx = tid + rep * 256;
+            unsigned rr = idx / (KB * 8), kk = idx % (KB * 8);
+            unsigned kb = kk >> 3, k = kk & 7;
+            unsigned g = g0 + kb, gtok = t0 + rr;
+            sxt[rr * LDS + kb * SROW + k] = (g < nb && gtok < t) ? ((const int*)(xq + (size_t)gtok * cols + g * 32))[k] : 0;
         }
-        stage_x<NT>(sxt, sxs, xq, xs, t0, t, cols, nb, g0, tid);
+        for (unsigned i = tid; i < KB * MTR; i += 256) {
+            unsigned kb = i / MTR, rr = i % MTR;
+            unsigned g = g0 + kb, grow = r0 + rr;
+            sws[i] = (g < nb && grow < rows) ? e8m0_x2(wsc[(size_t)grow * nb + g]) : 0.0f;
+        }
+        for (unsigned i = tid; i < KB * NT; i += 256) {
+            unsigned kb = i / NT, rr = i % NT;
+            unsigned g = g0 + kb, gtok = t0 + rr;
+            sxs[i] = (g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
+        }
         __syncthreads();
-        gemm_mma_body<NT>(sw, sxt, sws, sxs, acc, warp, lane);
+        gemm_mma_body<MTR, NT>(sw, sxt, sws, sxs, acc, warp, lane, t - t0);
         __syncthreads();
     }
-    gemm_mma_store<NT>(acc, C, r0, t0, rows, t, ldc, warp, lane);
+    gemm_mma_store<MTR, NT>(acc, C, r0, t0, rows, t, ldc, warp, lane);
 }
-extern "C" __global__ void k_gemm_q8_mma64(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void k_gemm_q8_mma128(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void k_gemm_q8_mma256(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<256>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void k_gemm_fp4_mma64(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void k_gemm_fp4_mma128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
-extern "C" __global__ void k_gemm_fp4_mma256(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<256>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma64(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 64>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma256(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<64, 256>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_q8_mma128x128(const i8* __restrict__ wq, const float* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_q8_mma_t<128, 128>(wq, ws, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma64(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 64>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma256(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<64, 256>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
+extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128x128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<128, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 
 // ── elementwise ──
 extern "C" __global__ void k_add(float* __restrict__ x, const float* __restrict__ y, unsigned n) {
@@ -2066,6 +2130,36 @@ pub fn cudabench_cmd(args: &[String]) {
     assert!(c.gemm_fp4(&dpk, &dsc, &dxqa, &dxsa, &dc, 0, rows as u32, cols as u32, t as u32, rows as u32));
     c.read(&dc, 0, &mut c_gpu);
     println!("gemm_fp4 vs CPU fp4: rel err {:.2e}", rel(&c_gpu, &c4_cpu));
+    // --gemm ROWS COLS T: the tensor-core GEMMs on one shape, then out
+    if let Some(i) = args.iter().position(|a| a == "--gemm") {
+        let gr: usize = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(17408);
+        let gc: usize = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(5120);
+        let gt: usize = args.get(i + 3).and_then(|v| v.parse().ok()).unwrap_or(256);
+        let gw: Vec<i8> = (0..gr * gc).map(|i| ((i * 7 + 3) % 23) as i8 - 11).collect();
+        let gs: Vec<f32> = vec![0.01; gr * gc / 32];
+        let dgw = c.upload(&gw).unwrap();
+        let dgs = c.upload(&gs).unwrap();
+        let gx: Vec<i8> = (0..gt * gc).map(|i| ((i * 5 + 1) % 13) as i8 - 6).collect();
+        let gxs: Vec<f32> = vec![0.02; gt * gc / 32];
+        let dgx = c.upload(&gx).unwrap();
+        let dgxs = c.upload(&gxs).unwrap();
+        let dgc = c.alloc(gt * gr * 4).unwrap();
+        let gp: Vec<u8> = (0..gr * gc / 2).map(|i| (i * 37 % 251) as u8).collect();
+        let gsc: Vec<u8> = vec![120u8; gr * gc / 32];
+        let dgp = c.upload_bytes(&gp).unwrap();
+        let dgsc = c.upload_bytes(&gsc).unwrap();
+        let macs = (gr * gc * gt) as f64;
+        for round in 0..3 {
+            let ms = c.timed(|| {
+                c.gemm_q8(&dgw, &dgs, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
+            });
+            let ms4 = c.timed(|| {
+                c.gemm_fp4(&dgp, &dgsc, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
+            });
+            println!("gemm {}x{} t={} round {}: q8 {:.0} GMAC/s ({:.3} ms) | fp4 {:.0} GMAC/s ({:.3} ms) | nt {}", gr, gc, gt, round, macs / (ms as f64 * 1e-3) / 1e9, ms, macs / (ms4 as f64 * 1e-3) / 1e9, ms4, c.gemm_nt(gr as u32, gt as u32));
+        }
+        return;
+    }
     // --shape ROWS COLS: bandwidth of the two matvecs on one shape (many copies), then out
     if let Some(i) = args.iter().position(|a| a == "--shape") {
         let sr: usize = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(5120);
