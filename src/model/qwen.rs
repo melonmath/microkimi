@@ -5173,47 +5173,7 @@ mod model_tests {
             ))
             .to_string_lossy()
             .into_owned();
-        let layout = crate::tools::convert_qwen::output_layout(c);
-        let mut writer = crate::quant::weights::BinWriter::new();
-        for (name, dtype, dims) in &layout {
-            writer.add(name, *dtype, dims.clone());
-        }
-        let mut file = std::fs::File::create(&path).unwrap();
-        let offsets = writer.write_header_v2(
-            &mut file,
-            &crate::tools::convert_qwen::config_json(c, "qwen.tokenizer.json"),
-        );
-        for ((name, dtype, dims), offset) in layout.iter().zip(offsets) {
-            let n: usize = dims.iter().map(|&d| d as usize).product();
-            let blob = if *dtype == DTYPE_MXFP4 {
-                let values: Vec<f32> = (0..n).map(|i| ((i % 9) as f32 - 4.0) * 0.004).collect();
-                let (packed, scales) =
-                    crate::quant::mxfp4::quantize(&values, dims[0] as usize, dims[1] as usize);
-                [packed, scales].concat()
-            } else {
-                let mut values = if name.contains(".linear_attn.norm.weight") {
-                    vec![1.0f32; n]
-                } else if name.ends_with("norm.weight")
-                    || name.ends_with("layernorm.weight")
-                    || name.ends_with("A_log")
-                    || name.ends_with("dt_bias")
-                    || name.ends_with("shared_expert_gate.weight")
-                {
-                    vec![0.0f32; n]
-                } else {
-                    (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.002).collect()
-                };
-                if name.ends_with("linear_attn.conv1d.weight") {
-                    values.fill(0.0);
-                    for channel in 0..(n / c.conv_kernel) {
-                        values[channel * c.conv_kernel + c.conv_kernel - 1] = 1.0;
-                    }
-                }
-                crate::quant::weights::f32_to_bytes(&values)
-            };
-            writer.write_blob_at(&mut file, offset, &blob);
-        }
-        file.sync_all().unwrap();
+        crate::tools::convert_qwen::write_synthetic_checkpoint(c, &path);
         path
     }
 
@@ -5224,6 +5184,28 @@ mod model_tests {
         c.moe_inter = 0;
         c.shared_inter = 0;
         c.dense_inter = 64;
+        c
+    }
+
+    /// The Qwen3.8-27B shape signature at toy size: 48 value heads over 16
+    /// key heads (each key head serves three), 24 query heads over 4 kv
+    /// heads (six per group), head dim 256 with a quarter rotary, untied
+    /// embeddings, dense MLP - here 6/2, 6/1, 32, 0.25, untied, 4 layers
+    /// (three linear, one full).
+    pub(super) fn bin_tiny_qwen38() -> QwenConfig {
+        let mut c = bin_tiny_dense();
+        c.d = 32;
+        c.vocab = 64;
+        c.n_heads = 6;
+        c.n_kv_heads = 1;
+        c.head_dim = 32;
+        c.partial_rotary = 0.25;
+        c.lin_k_heads = 2;
+        c.lin_v_heads = 6;
+        c.lin_k_dim = 16;
+        c.lin_v_dim = 16;
+        c.dense_inter = 64;
+        c.tied_embeddings = false;
         c
     }
 
@@ -5519,7 +5501,7 @@ mod model_tests {
 
     #[test]
     fn lane_batched_decode_matches_single_stream_bitwise() {
-        for c in [bin_tiny(), bin_tiny_dense()] {
+        for c in [bin_tiny(), bin_tiny_dense(), bin_tiny_qwen38()] {
             let path = checkpoint_fixture(&c);
             let model = QwenModel::load(&path);
             // four lanes with different prompts and continuations
@@ -5631,7 +5613,7 @@ mod model_tests {
 
     #[test]
     fn batched_prefill_is_bit_identical_to_sequential_forwards() {
-        for c in [bin_tiny(), bin_tiny_dense()] {
+        for c in [bin_tiny(), bin_tiny_dense(), bin_tiny_qwen38()] {
             let path = checkpoint_fixture(&c);
             let tokens = [3u32, 5, 7, 11, 2, 9, 13];
 

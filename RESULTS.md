@@ -1,9 +1,32 @@
 # The numbers
 
-One machine. One model. Two engines.
+One machine. Two engines. Two models: Qwen3.8-27B is the reference
+model of the Qwen runtime; Qwen3.5-0.8B is the small model every row
+below is measured on, because a 16 GB host cannot hold the 27B.
 
-Apple M5 (16 GB, plugged in, bare metal). Qwen3.5-0.8B. microkimi
-against llama.cpp (build 4df29be, Q8_0). Higher is better.
+Apple M5 (16 GB, plugged in, bare metal). microkimi against llama.cpp
+(build 4df29be, Q8_0). Higher is better.
+
+## Qwen3.8-27B (the reference model)
+
+| | microkimi | llama.cpp |
+|---|---:|---:|
+| generation | pending | pending |
+| prompt reading | pending | pending |
+
+What is measured on the 27B so far (2026-08-18): the converter accepts
+the published checkpoint as is (`convert-qwen --audit-only` against its
+18 shard headers: 866 tensors, all shapes and dtypes accepted, the MTP
+head found; 49.00 GB payload - f32 attention spine and embeddings,
+MXFP4 MLP), and the GPU graphs agree with the CPU on the 27B's head
+geometry (`qwen-fixture --profile 27b --scale 8`: head dim 256, three
+value heads per key head, six query heads per kv head, untied
+embeddings; per-layer hidden within 8e-3 relative, last-position
+logits within 4.7e-3). The rows themselves want a host with ~110 GB of
+disk and, for numbers about the engine rather than the disk, ~64 GB of
+RAM: `bench-27b.sh` (BENCH.md).
+
+## Qwen3.5-0.8B (the small model)
 
 ## On the CPU
 

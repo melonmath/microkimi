@@ -28,6 +28,13 @@ reference implementations.
 
 ## Convert and run
 
+The reference model is Qwen3.8-27B; converted as `qwen3.8-27b.bin` in
+the repo root or `models/`, it is the default model of `run`, `chat` and
+`serve`. The published checkpoint converts as is (`--audit-only`: 866
+tensors, 49 GB payload); its own battery is `qwenbench --light`
+(BENCH.md). Qwen3.5-0.8B is the small model the CPU and GPU rows in
+RESULTS.md are measured on.
+
 The source must be a local Hugging Face checkpoint directory containing
 `config.json`, a safetensors index or one safetensors file, and optionally
 `tokenizer.json`:

@@ -77,6 +77,11 @@ pub fn run(args: &[String]) {
     let rounds: usize = crate::value_flag(args, "--rounds")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
+    // --light: the battery a large model paging from disk can afford - the
+    // q8 spine decode and the q8 batched prefill of a 256-token prompt,
+    // plus the GPU arms on macOS; the A/B arms (sdot, threads, sequential
+    // prefill, accel, lanes, mtp, kernels) are skipped
+    let light = args.iter().any(|a| a == "--light");
     let cfg = crate::quant::weights::read_config(&model);
     let Some(qcfg) = cfg.qwen.clone() else {
         eprintln!("error: {} is not a Qwen model", model);
@@ -100,14 +105,18 @@ pub fn run(args: &[String]) {
     let mut q8_ms = Vec::new();
     let mut fp4_ms = Vec::new();
     for _ in 0..rounds {
-        if let Some(v) = ms_per_token(&run_self(&base, &[])) {
-            f32_ms.push(v);
+        if !light {
+            if let Some(v) = ms_per_token(&run_self(&base, &[])) {
+                f32_ms.push(v);
+            }
         }
         if let Some(v) = ms_per_token(&run_self(&base, &[("MICROKIMI_Q8_SPINE", "1")])) {
             q8_ms.push(v);
         }
-        if let Some(v) = ms_per_token(&run_self(&base, &[("MICROKIMI_FP4_SPINE", "1")])) {
-            fp4_ms.push(v);
+        if !light {
+            if let Some(v) = ms_per_token(&run_self(&base, &[("MICROKIMI_FP4_SPINE", "1")])) {
+                fp4_ms.push(v);
+            }
         }
     }
     let report_decode = |label: &str, xs: &Vec<f64>| {
@@ -124,10 +133,26 @@ pub fn run(args: &[String]) {
             );
         }
     };
-    println!("decode (single stream, {} tokens):", steps);
-    report_decode("f32 spine", &f32_ms);
+    println!("decode (single stream, {} tokens{}):", steps, if light { ", light battery" } else { "" });
+    if !light {
+        report_decode("f32 spine", &f32_ms);
+    }
     report_decode("q8 spine", &q8_ms);
-    report_decode("fp4 spine", &fp4_ms);
+    if !light {
+        report_decode("fp4 spine", &fp4_ms);
+    }
+    if light {
+        // prefill: the q8 batched arm on a 256-token prompt, then out
+        let long_prompt = "The history of computing spans mechanical calculators, vacuum tubes, transistors, integrated circuits, and modern accelerators. ".repeat(10);
+        let pre: Vec<&str> = vec!["run", &long_prompt, "--model", &model, "--raw", "--max-new", "2", "--debug"];
+        println!("prefill (~256-token prompt, light battery):");
+        match prefill_ms(&run_self(&pre, &[("MICROKIMI_Q8_SPINE", "1")])) {
+            Some(q) => println!("  q8 spine {:>6.1} ms/token ({:.0} tok/s)", q, 1000.0 / q),
+            None => println!("  unavailable"),
+        }
+        println!("compare with llama.cpp on this machine per BENCH.md (same checkpoint, Q8_0, llama-bench).");
+        return;
+    }
 
     // ── sdot A/B under q8 ──
     let mut nosdot_ms = Vec::new();

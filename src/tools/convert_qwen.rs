@@ -816,6 +816,15 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
         Some(0.0),
         "attention dropout is unsupported"
     );
+    // Qwen3.8 names the Gated DeltaNet output gate's activation; the
+    // runtime applies SiLU (swish) there, so only that spelling passes.
+    if let Some(gate) = t.get("output_gate_type").and_then(|x| x.as_str()) {
+        assert!(
+            matches!(gate, "swish" | "silu"),
+            "config.json: output_gate_type {:?} is unsupported (swish/silu only)",
+            gate
+        );
+    }
     let mut c = QwenConfig::from_json(t);
     c.tied_embeddings = tied;
     assert_eq!(
@@ -867,6 +876,130 @@ pub fn read_hf_config(dir: &str) -> QwenConfig {
         "MXFP4 dimensions must be multiples of 32"
     );
     c
+}
+
+/// Writes a synthetic checkpoint of configuration `c` at `path`: the
+/// converter's own output layout, deterministic patterned weights (norms
+/// neutral, the causal conv an identity tap), MXFP4 MLP blocks quantized
+/// from the pattern. Shape checks (batched vs sequential prefill, GPU vs
+/// CPU decode) run on it; it says nothing about language.
+pub fn write_synthetic_checkpoint(c: &QwenConfig, path: &str) {
+    use crate::quant::weights::DTYPE_MXFP4;
+    let layout = crate::tools::convert_qwen::output_layout(c);
+    let mut writer = crate::quant::weights::BinWriter::new();
+    for (name, dtype, dims) in &layout {
+        writer.add(name, *dtype, dims.clone());
+    }
+    let mut file = std::fs::File::create(&path).unwrap();
+    let offsets = writer.write_header_v2(
+        &mut file,
+        &crate::tools::convert_qwen::config_json(c, "qwen.tokenizer.json"),
+    );
+    for ((name, dtype, dims), offset) in layout.iter().zip(offsets) {
+        let n: usize = dims.iter().map(|&d| d as usize).product();
+        let blob = if *dtype == DTYPE_MXFP4 {
+            let values: Vec<f32> = (0..n).map(|i| ((i % 9) as f32 - 4.0) * 0.004).collect();
+            let (packed, scales) =
+                crate::quant::mxfp4::quantize(&values, dims[0] as usize, dims[1] as usize);
+            [packed, scales].concat()
+        } else {
+            let mut values = if name.contains(".linear_attn.norm.weight") {
+                vec![1.0f32; n]
+            } else if name.ends_with("norm.weight")
+                || name.ends_with("layernorm.weight")
+                || name.ends_with("A_log")
+                || name.ends_with("dt_bias")
+                || name.ends_with("shared_expert_gate.weight")
+            {
+                vec![0.0f32; n]
+            } else {
+                (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.002).collect()
+            };
+            if name.ends_with("linear_attn.conv1d.weight") {
+                values.fill(0.0);
+                for channel in 0..(n / c.conv_kernel) {
+                    values[channel * c.conv_kernel + c.conv_kernel - 1] = 1.0;
+                }
+            }
+            crate::quant::weights::f32_to_bytes(&values)
+        };
+        writer.write_blob_at(&mut file, offset, &blob);
+    }
+    file.sync_all().unwrap();
+}
+
+/// `microkimi qwen-fixture --out X.bin [--profile 27b|0.8b] [--layers N]
+/// [--scale S]`: a synthetic checkpoint carrying a real model's shape
+/// signature at toy size. `27b` is Qwen3.8-27B's: three value heads per key
+/// head, six query heads per kv head, a quarter rotary, untied embeddings,
+/// dense MLP; `0.8b` is Qwen3.5-0.8B's (one-to-one heads, tied). `--scale`
+/// multiplies the toy widths (1 = d 32, head dim 32; 4 = d 128, head dim
+/// 128), `--layers` the depth (default 4: three linear, one full).
+pub fn fixture_cmd(args: &[String]) {
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let out = value("--out").unwrap_or_else(|| {
+        eprintln!("error: qwen-fixture requires --out X.bin");
+        std::process::exit(2);
+    });
+    let profile = value("--profile").unwrap_or_else(|| "27b".to_string());
+    let scale: usize = value("--scale").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let layers: usize = value("--layers").and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
+    let mut c = QwenConfig::qwen35_moe();
+    c.n_experts = 0;
+    c.top_k = 0;
+    c.moe_inter = 0;
+    c.shared_inter = 0;
+    c.n_layers = layers;
+    c.vocab = 64;
+    match profile.as_str() {
+        "27b" => {
+            c.d = 32 * scale;
+            c.n_heads = 6;
+            c.n_kv_heads = 1;
+            c.head_dim = 32 * scale;
+            c.partial_rotary = 0.25;
+            c.lin_k_heads = 2;
+            c.lin_v_heads = 6;
+            c.lin_k_dim = 16 * scale;
+            c.lin_v_dim = 16 * scale;
+            c.dense_inter = 64 * scale;
+            c.tied_embeddings = false;
+        }
+        "0.8b" => {
+            c.d = 32 * scale;
+            c.n_heads = 2;
+            c.n_kv_heads = 1;
+            c.head_dim = 32 * scale;
+            c.partial_rotary = 0.25;
+            c.lin_k_heads = 2;
+            c.lin_v_heads = 2;
+            c.lin_k_dim = 16 * scale;
+            c.lin_v_dim = 16 * scale;
+            c.dense_inter = 64 * scale;
+            c.tied_embeddings = true;
+        }
+        other => {
+            eprintln!("error: unknown profile {:?} (27b or 0.8b)", other);
+            std::process::exit(2);
+        }
+    }
+    write_synthetic_checkpoint(&c, &out);
+    println!(
+        "qwen-fixture: {} ({} profile) - {} layers, d {}, heads {}/{} (hd {}), linear {}v/{}k (kd {}, vd {}), rotary {}, {} embeddings",
+        out,
+        profile,
+        c.n_layers,
+        c.d,
+        c.n_heads,
+        c.n_kv_heads,
+        c.head_dim,
+        c.lin_v_heads,
+        c.lin_k_heads,
+        c.lin_k_dim,
+        c.lin_v_dim,
+        c.partial_rotary,
+        if c.tied_embeddings { "tied" } else { "untied" }
+    );
 }
 
 fn expected_sources(c: &QwenConfig) -> HashMap<String, Vec<usize>> {

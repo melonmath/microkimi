@@ -60,6 +60,7 @@ fn main() {
         "qwengpubench" => tools::qwenbench::gpu_prefill_cmd(&args),
         "prefillbench" => tools::qwenbench::prefill_bench_cmd(&args),
         "gpudecodebench" => model::qwen::gpu_decode_bench_cmd(&args),
+        "qwen-fixture" => tools::convert_qwen::fixture_cmd(&args),
         "kernbench" => model::kernbench_cmd(&args),
         "scanbench" => model::scanbench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
@@ -392,6 +393,9 @@ fn main() {
             println!("                                         one turn with the routing sketch armed, sketch saved on exit");
             println!("  microkimi cmsinfo sketch.bin           top-50 (layer, expert, count) + coverage curve of a sketch");
             println!("  microkimi metaltest | metaltest-packed | gputest | dstest | gpubench   Metal GPU checks (macOS only)");
+            println!("  microkimi qwen-fixture --out X.bin [--profile 27b|0.8b] [--layers N] [--scale S]");
+            println!("                                         synthetic Qwen checkpoint with a real model's shape signature at toy");
+            println!("                                         size (head ratios, rotary, tied/untied), for shape checks and the GPU verifiers");
         }
     }
     let _ = t0;
@@ -1692,10 +1696,12 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
-    // Default model: nanokimi-0.2b (the pretrained demo shipped in the GitHub
+    // Default model: qwen3.8-27b.bin (Qwen3.8-27B converted with
+    // convert-qwen, the reference model of the Qwen runtime) when it is
+    // there, then nanokimi-0.2b (the pretrained demo shipped in the GitHub
     // release), then microkimi-debug (the 93-layer architecture demo from
     // `build`). Legacy file names are kept as fallbacks.
-    for name in ["nanokimi-0.2b.bin", "nanokimi.bin", "microkimi-debug.bin", "microkimi.bin"] {
+    for name in ["qwen3.8-27b.bin", "nanokimi-0.2b.bin", "nanokimi.bin", "microkimi-debug.bin", "microkimi.bin"] {
         let candidates = [
             std::path::PathBuf::from(name),
             std::path::PathBuf::from(format!("models/{}", name)),
@@ -1709,7 +1715,8 @@ pub fn bin_path() -> String {    let exe_dir = std::env::current_exe()
         }
     }
     eprintln!("error: no model found.");
-    eprintln!("  download nanokimi-0.2b.bin + vocab_nano.json from the GitHub Releases page into the repo root,");
+    eprintln!("  convert Qwen3.8-27B (convert-qwen --source Qwen/Qwen3.8-27B --out qwen3.8-27b.bin) into the repo root or models/,");
+    eprintln!("  or download nanokimi-0.2b.bin + vocab_nano.json from the GitHub Releases page into the repo root,");
     eprintln!("  or run 'microkimi build' to assemble microkimi-debug.bin (93-layer architecture demo).");
     std::process::exit(1);
 }

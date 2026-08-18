@@ -2,7 +2,7 @@
 
 **A large-model engine in pure Rust. Zero dependencies. Measured, not promised.**
 
-One small binary runs Kimi K3, DeepSeek-V4, and the Qwen3.5 family. No Python. No CUDA. No crates. `cargo build`, point it at a model, go.
+One small binary runs Kimi K3, DeepSeek-V4, and the Qwen3.5 family (Qwen3.8-27B is its default model when converted). No Python. No CUDA. No crates. `cargo build`, point it at a model, go.
 
 - **Fast.** On an Apple M5, microkimi ingests prompts at over 1,000 tokens per second - ahead of llama.cpp on CPU, on the same machine and model. [The numbers.](RESULTS.md)
 - **Exact.** The default path is bit-exact f32. Every speed mode is measured against it and quoted honestly.

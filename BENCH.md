@@ -3,10 +3,29 @@
 Numbers live in [RESULTS.md](RESULTS.md). This file is how to produce
 them.
 
-## microkimi
+## Qwen3.8-27B, the reference model
 
 ```bash
 cargo build --release
+./target/release/microkimi convert-qwen --source /path/to/Qwen3.8-27B --out qwen3.8-27b.bin --audit-only   # 866 tensors, 49 GB payload
+./target/release/microkimi convert-qwen --source /path/to/Qwen3.8-27B --out qwen3.8-27b.bin
+./target/release/microkimi qwenbench --model qwen3.8-27b.bin --light --rounds 2 --steps 16
+```
+
+`--light` is the battery a model this size can afford: the q8 spine
+decode and the q8 batched prefill of a 256-token prompt (the A/B arms
+stay off). The checkpoint is 56 GB (18 safetensors shards) and the
+converted model 49 GB (f32 attention spine and embeddings, MXFP4 MLP);
+under about 64 GB of RAM the model pages from disk and the numbers
+measure the disk. `bench-27b.sh` at the workspace root runs the whole
+thing (download, audit, conversion, the light battery, the llama.cpp
+Q8_0 head-to-head with the ggml-org GGUF) on macOS or Linux, with disk
+guards. `qwen3.8-27b.bin` in the repo root or `models/` is the default
+model of `run`, `chat` and `serve` when it is there.
+
+## Qwen3.5-0.8B, the small model
+
+```bash
 ./target/release/microkimi convert-qwen --source /path/to/Qwen3.5-0.8B --out q08.bin
 ./target/release/microkimi qwenbench --model q08.bin
 ```
@@ -60,6 +79,17 @@ WORK=/path/with/q08.bin+q08.gguf+llama.cpp bash scripts/cpu-duel.sh 7
 
 The macOS runner script also brackets its qwenbench battery with two
 llama.cpp CPU rows for the same reason.
+
+## Shape checks without the weights
+
+`microkimi qwen-fixture --out X.bin --profile 27b --scale 8 --layers 8`
+writes a synthetic checkpoint with Qwen3.8-27B's shape signature (three
+value heads per key head, six query heads per kv head, head dim 256,
+quarter rotary, untied embeddings) and `gpudecodebench --model X.bin
+--trace` / `qwengpubench --model X.bin` then read the GPU graphs against
+the CPU on that geometry (per-layer error and last-position logits; the
+greedy line is meaningless on synthetic ties). It says nothing about
+speed or language.
 
 ## Honesty notes
 
