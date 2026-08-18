@@ -3269,46 +3269,61 @@ fn lin_attn_prefill(
     }
     let t_scan = std::time::Instant::now();
     if !scan_done {
-        // heads chunk across workers - one spawn per worker rather than
-        // one per head (32 spawns/layer dominated small verify batches);
-        // per-head math unchanged, bit-identical.
+        // heads chunk across the PERSISTENT pool's workers (a scoped
+        // spawn set per layer competed with the pool's spinning workers
+        // for the same cores: the scan ran at ~7 of 24 threads on the
+        // 27B); per-head math unchanged, bit-identical.
         let hworkers = prefill_workers(heads);
-        let hchunk = heads.div_ceil(hworkers);
-        std::thread::scope(|s| {
-            let mut state_rest = cache.state.as_mut_slice();
-            let mut mixed_rest = mixed_hm.as_mut_slice();
-            let conved = &conved;
-            let b_raw = &b_raw;
-            let a_raw = &a_raw;
-            let use_chunked = q8.is_some() && t_count >= 32 && chunked_scan_on();
-            for h0 in (0..heads).step_by(hchunk.max(1)) {
-                let h1 = (h0 + hchunk).min(heads);
-                let (state_c, sr) = state_rest.split_at_mut((h1 - h0) * kd * vd);
-                let (mixed_c, mr) = mixed_rest.split_at_mut((h1 - h0) * t_count * vd);
-                state_rest = sr;
-                mixed_rest = mr;
-                let qn_all = &qn_all;
-                let kn_all = &kn_all;
-                let beta_all = &beta_all;
-                let decay_all = &decay_all;
-                s.spawn(move || {
-                    // chunked-scan prep buffers (spine modes): normalized
-                    // q/k, contiguous v, per-token beta and decay
+        let use_chunked = q8.is_some() && t_count >= 32 && chunked_scan_on();
+        let p = crate::model::pool::pool();
+        let st_ptr = crate::model::pool::MPtr(cache.state.as_mut_ptr());
+        let mx_ptr = crate::model::pool::MPtr(mixed_hm.as_mut_ptr());
+        let (qn_p, kn_p) = (crate::model::pool::SPtr(qn_all.as_ptr()), crate::model::pool::SPtr(kn_all.as_ptr()));
+        let (bt_p, dc_p) = (crate::model::pool::SPtr(beta_all.as_ptr()), crate::model::pool::SPtr(decay_all.as_ptr()));
+        let (cv_p, br_p, ar_p) = (
+            crate::model::pool::SPtr(conved.as_ptr()),
+            crate::model::pool::SPtr(b_raw.as_ptr()),
+            crate::model::pool::SPtr(a_raw.as_ptr()),
+        );
+        let (db_p, al_p) = (crate::model::pool::SPtr(dt_bias.as_ptr()), crate::model::pool::SPtr(a_log.as_ptr()));
+        let (qn_len, kn_len, bt_len, dc_len, cv_len, br_len, ar_len, db_len, al_len) = (
+            qn_all.len(),
+            kn_all.len(),
+            beta_all.len(),
+            decay_all.len(),
+            conved.len(),
+            b_raw.len(),
+            a_raw.len(),
+            dt_bias.len(),
+            a_log.len(),
+        );
+        let mut jobs: Vec<crate::model::pool::Job> = Vec::new();
+        for (h0, h1) in ranges(heads, hworkers) {
+            jobs.push(Box::new(move || {
+                let (st_ptr, mx_ptr, qn_p, kn_p, bt_p, dc_p, cv_p, br_p, ar_p, db_p, al_p) =
+                    (st_ptr, mx_ptr, qn_p, kn_p, bt_p, dc_p, cv_p, br_p, ar_p, db_p, al_p);
+                // SAFETY: head ranges are disjoint (each job owns its heads'
+                // state and mixed rows); the pool barrier outlives every
+                // captured pointer; the shared inputs are read-only.
+                unsafe {
+                    let qn_all = std::slice::from_raw_parts(qn_p.0, qn_len);
+                    let kn_all = std::slice::from_raw_parts(kn_p.0, kn_len);
+                    let beta_all = std::slice::from_raw_parts(bt_p.0, bt_len);
+                    let decay_all = std::slice::from_raw_parts(dc_p.0, dc_len);
+                    let conved = std::slice::from_raw_parts(cv_p.0, cv_len);
+                    let b_raw = std::slice::from_raw_parts(br_p.0, br_len);
+                    let a_raw = std::slice::from_raw_parts(ar_p.0, ar_len);
+                    let dt_bias = std::slice::from_raw_parts(db_p.0, db_len);
+                    let a_log = std::slice::from_raw_parts(al_p.0, al_len);
                     for h in h0..h1 {
-                        let state_h =
-                            &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
-                        let mixed_h =
-                            &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
+                        let state_h = std::slice::from_raw_parts_mut(st_ptr.0.add(h * kd * vd), kd * vd);
+                        let mixed_h = std::slice::from_raw_parts_mut(mx_ptr.0.add(h * t_count * vd), t_count * vd);
                         let kh = h / rep.max(1);
                         if use_chunked {
                             // WY chunked scan, zero per-head copies: q/k from
                             // the hoisted per-KV-head arrays, v straight from
                             // the conv output, beta/decay from the per-layer
                             // tables - all read with strides.
-                            let state_h =
-                                &mut state_c[(h - h0) * kd * vd..(h - h0 + 1) * kd * vd];
-                            let mixed_h =
-                                &mut mixed_c[(h - h0) * t_count * vd..(h - h0 + 1) * t_count * vd];
                             chunked_scan_head_strided(
                                 state_h,
                                 mixed_h,
@@ -3353,9 +3368,10 @@ fn lin_attn_prefill(
                             );
                         }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
+        p.run(jobs);
     }
 
     dprof_add(8, t_scan.elapsed());
