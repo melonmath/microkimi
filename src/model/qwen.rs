@@ -2035,6 +2035,19 @@ impl QwenModel {
                 println!("gpu: decode unavailable - CPU decode");
             }
         }
+        #[cfg(target_os = "linux")]
+        if crate::model::cuda::qwen_cuda_on() && model.cfg.is_dense() {
+            // the resident decoder (weights quantized and uploaded) built
+            // here rather than inside the first measured prefill
+            let t0 = std::time::Instant::now();
+            model.cuda_dec = model.cuda_decoder(4096);
+            if model.cuda_dec.is_some() {
+                println!("cuda: weights resident ({:.1} s)", t0.elapsed().as_secs_f64());
+            } else {
+                model.cuda_dec_off = true;
+                println!("cuda: unavailable - CPU path (MICROKIMI_CUDA_VERBOSE=1 for the reason)");
+            }
+        }
         model
     }
 
@@ -2728,16 +2741,16 @@ impl QwenModel {
         }
         #[cfg(target_os = "linux")]
         {
-            // CUDA decode: one token at a time after a prefill, the whole
-            // forward as one stream of kernels against resident state
-            if tokens.len() == 1
-                && !all_logits
-                && self.pos > 0
-                && crate::model::cuda::qwen_cuda_on()
-                && !self.cuda_dec_off
-            {
-                if let Some(logits) = self.cuda_decode_token(tokens[0]) {
-                    return QwenPrefillOut { logits: vec![logits], hidden: vec![Vec::new()] };
+            // CUDA: single tokens after a prefill decode against the
+            // resident state; prompts run whole on the GPU (GEMMs, the
+            // scan and attention in time); full-logits passes stay on the CPU
+            if !all_logits && crate::model::cuda::qwen_cuda_on() && !self.cuda_dec_off {
+                if tokens.len() == 1 && self.pos > 0 {
+                    if let Some(logits) = self.cuda_decode_token(tokens[0]) {
+                        return QwenPrefillOut { logits: vec![logits], hidden: vec![Vec::new()] };
+                    }
+                } else if let Some(logits) = self.cuda_prefill_tokens(tokens) {
+                    return QwenPrefillOut { logits: vec![logits], hidden: vec![Vec::new(); tokens.len()] };
                 }
             } else if self.cuda_dec.is_some() {
                 self.cuda_sync();
@@ -6048,6 +6061,46 @@ impl QwenModel {
         None
     }
 
+    /// A whole prompt on the resident CUDA decoder (built on first use
+    /// from the current caches, sized for the prompt). None = the CPU
+    /// path takes it; the caches are current.
+    fn cuda_prefill_tokens(&mut self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let need = self.pos + tokens.len();
+        if self.cuda_dec.as_ref().map(|d| d.pos() + tokens.len() > d.cap()).unwrap_or(false) {
+            self.cuda_sync();
+        }
+        if self.cuda_dec.is_none() {
+            let cap = (need + 1024).next_power_of_two().max(2048);
+            let t0 = std::time::Instant::now();
+            self.cuda_dec = self.cuda_decoder(cap);
+            if self.cuda_dec.is_none() {
+                self.cuda_dec_off = true;
+                println!("cuda: unavailable - CPU path");
+                return None;
+            }
+            println!("cuda: on (resident weights and state, {:.1} s to build)", t0.elapsed().as_secs_f64());
+        }
+        let mut dec = self.cuda_dec.take().unwrap();
+        let res = {
+            let refs = self.decode_refs();
+            dec.prefill(&refs, tokens)
+        };
+        self.cuda_dec = Some(dec);
+        match res {
+            Some(logits) => {
+                self.pos += tokens.len();
+                self.last_logits = logits.clone();
+                Some(logits)
+            }
+            None => {
+                self.cuda_sync();
+                self.cuda_dec_off = true;
+                println!("cuda: prefill refused - CPU path from here");
+                None
+            }
+        }
+    }
+
     /// Brings the resident decoder's state back into the CPU caches and
     /// drops the decoder (no-op without one).
     pub(crate) fn cuda_sync(&mut self) {
@@ -6527,20 +6580,50 @@ pub fn cuda_decode_bench_cmd(args: &[String]) {
         let mut model = QwenModel::load(&model_path);
         let vocab = (model.cfg.vocab as u32).min(50_000);
         let prompt: Vec<u32> = (0..ptoks as u32).map(|i| (i * 7 + 3) % vocab).collect();
-        let t0 = std::time::Instant::now();
-        let out = model.prefill_collect(&prompt, false);
-        println!("cpu prefill of {} tokens: {:.2} s", prompt.len(), t0.elapsed().as_secs_f64());
-        let logits = out.logits.last().cloned().unwrap();
-        let snap = model.snapshot();
-        let saved_pos = model.pos;
-        let first = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+        // GPU prefill first, from the empty caches (the decoder built at
+        // position 0), so the two arms are end to end
         let t0 = std::time::Instant::now();
         let Some(mut dec) = model.cuda_decoder(prompt.len() + steps + 8) else {
             println!("cudadecodebench: CUDA decoder unavailable (memory?)");
             return;
         };
         println!("cuda decoder built in {:.1} s", t0.elapsed().as_secs_f64());
+        let gpu_prefill_logits = if trace {
+            None
+        } else {
+            let refs = model.decode_refs();
+            let t0 = std::time::Instant::now();
+            let l = dec.prefill(&refs, &prompt);
+            let dt = t0.elapsed().as_secs_f64();
+            match &l {
+                Some(_) => println!("gpu prefill of {} tokens: {:.3} s ({:.0} tok/s)", prompt.len(), dt, prompt.len() as f64 / dt),
+                None => println!("gpu prefill refused"),
+            }
+            l
+        };
+        let t0 = std::time::Instant::now();
+        let out = model.prefill_collect(&prompt, false);
+        println!("cpu prefill of {} tokens: {:.2} s ({:.0} tok/s)", prompt.len(), t0.elapsed().as_secs_f64(), prompt.len() as f64 / t0.elapsed().as_secs_f64());
+        let logits = out.logits.last().cloned().unwrap();
+        if let Some(gl) = &gpu_prefill_logits {
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            for i in 0..logits.len() {
+                max_abs = max_abs.max((gl[i] - logits[i]).abs());
+                max_ref = max_ref.max(logits[i].abs());
+            }
+            println!("prefill logits gpu vs cpu: max abs {:.3e} (rel {:.2e}); top-5 gpu {:?} cpu {:?}", max_abs, max_abs / max_ref.max(1e-30), crate::model::top_k_probs(gl, 5), crate::model::top_k_probs(&logits, 5));
+        }
+        let snap = model.snapshot();
+        let saved_pos = model.pos;
+        let first = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
         if trace {
+            // trace compares one token from the CPU-prefilled state on both sides
+            drop(dec);
+            let Some(mut dec) = model.cuda_decoder(prompt.len() + steps + 8) else {
+                println!("cudadecodebench: CUDA decoder unavailable");
+                return;
+            };
             let mut gpu_tr: Vec<Vec<f32>> = Vec::new();
             let mut gl = vec![0.0f32; model.cfg.vocab];
             {

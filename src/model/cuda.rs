@@ -1004,8 +1004,8 @@ extern "C" __global__ void k_conv_silu(const float* __restrict__ x, const float*
     st[k - 2] = x[i];
 }
 // prefill: t tokens (x [t][conv_dim] -> out [t][conv_dim]), thread per channel, sequential in t
-extern "C" __global__ void k_conv_prefill(const float* __restrict__ x, const float* __restrict__ w, unsigned k,
-                                          float* __restrict__ state, float* __restrict__ out, unsigned conv_dim, unsigned t) {
+extern "C" __global__ void k_conv_prefill(const float* __restrict__ x, unsigned ldx, const float* __restrict__ w, unsigned k,
+                                          float* __restrict__ state, float* __restrict__ out, unsigned ldo, unsigned conv_dim, unsigned t) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= conv_dim) return;
     float* st = state + (size_t)i * (k - 1);
@@ -1014,11 +1014,11 @@ extern "C" __global__ void k_conv_prefill(const float* __restrict__ x, const flo
     float s[8];
     for (unsigned j = 0; j < k - 1; j++) s[j] = st[j];
     for (unsigned tok = 0; tok < t; tok++) {
-        float xi = x[(size_t)tok * conv_dim + i];
+        float xi = x[(size_t)tok * ldx + i];
         float acc = 0.0f;
         for (unsigned j = 0; j < k - 1; j++) acc += s[j] * wt[j];
         acc += xi * wt[k - 1];
-        out[(size_t)tok * conv_dim + i] = acc / (1.0f + expf(-acc));
+        out[(size_t)tok * ldo + i] = acc / (1.0f + expf(-acc));
         for (unsigned j = 0; j + 2 < k; j++) s[j] = s[j + 1];
         s[k - 2] = xi;
     }
@@ -1027,17 +1027,17 @@ extern "C" __global__ void k_conv_prefill(const float* __restrict__ x, const flo
 
 // per (token, head): q = l2norm(conved[kh*kd..]) / sqrt(kd), k = l2norm(...), beta, decay
 // conved [t][conv_dim]; b_raw/a_raw [t][heads]; qn/kn [t][heads][kd]; beta/decay [t][heads]
-extern "C" __global__ void k_lin_prep(const float* __restrict__ conved, const float* __restrict__ b_raw, const float* __restrict__ a_raw,
+extern "C" __global__ void k_lin_prep(const float* __restrict__ conved, unsigned ldc, const float* __restrict__ b_raw, const float* __restrict__ a_raw, unsigned ldba,
                                       const float* __restrict__ a_log, const float* __restrict__ dt_bias,
                                       float* __restrict__ qn, float* __restrict__ kn, float* __restrict__ beta, float* __restrict__ decay,
-                                      unsigned t, unsigned heads, unsigned kv_heads, unsigned kd, unsigned conv_dim) {
+                                      unsigned t, unsigned heads, unsigned kv_heads, unsigned kd) {
     __shared__ float red[32];
     unsigned tok = blockIdx.x, h = blockIdx.y;
     if (tok >= t || h >= heads) return;
     unsigned rep = heads / kv_heads;
     unsigned kh = h / rep;
     unsigned kt = kv_heads * kd;
-    const float* row = conved + (size_t)tok * conv_dim;
+    const float* row = conved + (size_t)tok * ldc;
     const float* qsrc = row + kh * kd;
     const float* ksrc = row + kt + kh * kd;
     float sq = 0.0f, sk = 0.0f;
@@ -1050,9 +1050,9 @@ extern "C" __global__ void k_lin_prep(const float* __restrict__ conved, const fl
     float* kdst = kn + ((size_t)tok * heads + h) * kd;
     for (unsigned i = threadIdx.x; i < kd; i += blockDim.x) { qd[i] = (qsrc[i] / nq) * scale; kdst[i] = ksrc[i] / nk; }
     if (threadIdx.x == 0) {
-        float b = b_raw[(size_t)tok * heads + h];
+        float b = b_raw[(size_t)tok * ldba + h];
         beta[(size_t)tok * heads + h] = 1.0f / (1.0f + expf(-b));
-        float a = a_raw[(size_t)tok * heads + h] + dt_bias[h];
+        float a = a_raw[(size_t)tok * ldba + h] + dt_bias[h];
         float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
         decay[(size_t)tok * heads + h] = expf(-expf(a_log[h]) * sp);
     }
@@ -1063,8 +1063,8 @@ extern "C" __global__ void k_lin_prep(const float* __restrict__ conved, const fl
 // state [heads][kd][vd]; qn/kn [t][heads][kd]; v from conved [t][conv_dim] at 2*kt + h*vd;
 // out [t][heads*vd] (token-major, gated-norm input)
 extern "C" __global__ void k_delta_scan(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
-                                        const float* __restrict__ conved, const float* __restrict__ beta, const float* __restrict__ decay,
-                                        float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned kd, unsigned vd, unsigned conv_dim) {
+                                        const float* __restrict__ conved, unsigned ldc, const float* __restrict__ beta, const float* __restrict__ decay,
+                                        float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned kd, unsigned vd) {
     extern __shared__ float sh[]; // q[kd], k[kd]
     float* sq = sh;
     float* sk = sh + kd;
@@ -1082,7 +1082,7 @@ extern "C" __global__ void k_delta_scan(float* __restrict__ state, const float* 
         __syncthreads();
         float dec = decay[(size_t)tok * heads + h];
         float bt = beta[(size_t)tok * heads + h];
-        float vj = conved[(size_t)tok * conv_dim + 2 * kt + h * vd + j];
+        float vj = conved[(size_t)tok * ldc + 2 * kt + h * vd + j];
         float pred = 0.0f;
         for (unsigned i = 0; i < kd; i++) {
             float s = S[(size_t)i * vd + j] * dec;
@@ -1131,13 +1131,13 @@ extern "C" __global__ void k_delta_step(float* __restrict__ state, const float* 
     out[(size_t)h * vd + j] = o;
 }
 // gated rms norm per (token, head): x[t][heads*vd] normalized per head, * w[vd] * silu(z[t][heads*vd])
-extern "C" __global__ void k_gated_norm_rows(float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ z,
+extern "C" __global__ void k_gated_norm_rows(float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ z, unsigned ldz,
                                              unsigned t, unsigned heads, unsigned vd, float eps) {
     __shared__ float red[32];
     unsigned tok = blockIdx.x, h = blockIdx.y;
     if (tok >= t || h >= heads) return;
     float* xr = x + ((size_t)tok * heads + h) * vd;
-    const float* zr = z + ((size_t)tok * heads + h) * vd;
+    const float* zr = z + (size_t)tok * ldz + h * vd;
     float ss = 0.0f;
     for (unsigned i = threadIdx.x; i < vd; i += blockDim.x) ss += xr[i] * xr[i];
     ss = block_sum(ss, red);
@@ -1649,12 +1649,40 @@ pub struct CudaDecoder {
     decay: DBuf,   // [heads]
     logits: DBuf,  // [vocab] f32
     trace_buf: DBuf, // [n_layers * d] f32
+    /// prefill workspace, grown to the largest prompt seen
+    ws: Option<PrefillWs>,
+    max_rows: usize,
+    max_cols: usize,
+    max_qw: usize,
+    max_mixed: usize,
+    max_heads: usize,
 }
 unsafe impl Send for CudaDecoder {}
+
+/// Token-major scratch of a prefill: rows of the per-token vectors.
+struct PrefillWs {
+    t_cap: usize,
+    hidden: DBuf, // [t][d]
+    normed: DBuf, // [t][d]
+    xq: DBuf,     // [t][max_cols] i8
+    xs: DBuf,     // [t][max_cols/32]
+    big_a: DBuf,  // [t][max_rows]
+    big_b: DBuf,  // [t][max_rows]
+    y: DBuf,      // [t][d]
+    q: DBuf,      // [t][max_qw]
+    gate: DBuf,   // [t][max_qw]
+    mixed: DBuf,  // [t][max_mixed]
+    beta: DBuf,   // [t][heads]
+    decay: DBuf,  // [t][heads]
+}
 
 impl CudaDecoder {
     pub fn pos(&self) -> usize {
         self.pos
+    }
+    /// KV capacity in positions.
+    pub fn cap(&self) -> usize {
+        self.cap
     }
 }
 
@@ -1854,6 +1882,12 @@ pub fn cuda_decoder_new(
         decay: c.alloc(max_heads.max(1) * 4)?,
         logits: c.alloc(m.vocab * 4)?,
         trace_buf: c.alloc(m.layers.len().max(1) * d * 4)?,
+        ws: None,
+        max_rows,
+        max_cols,
+        max_qw,
+        max_mixed,
+        max_heads,
     };
     if !c.sync() {
         return None;
@@ -1920,8 +1954,8 @@ impl CudaDecoder {
                     {
                         let bp = self.big_a.ptr + ((cd + vt) * 4) as u64;
                         let ap = self.big_a.ptr + ((cd + vt + heads) * 4) as u64;
-                        let (t1, hh, kvh, kdd, cdim) = (1u32, *heads as u32, *kv_heads as u32, *kd as u32, cd as u32);
-                        let mut a = args!(self.big_b.ptr, bp, ap, a_log.ptr, dt_bias.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.beta.ptr, self.decay.ptr, t1, hh, kvh, kdd, cdim);
+                        let (t1, hh, kvh, kdd, cdim, ldba) = (1u32, *heads as u32, *kv_heads as u32, *kd as u32, cd as u32, *heads as u32);
+                        let mut a = args!(self.big_b.ptr, cdim, bp, ap, ldba, a_log.ptr, dt_bias.ptr, self.q_buf.ptr, self.gate_buf.ptr, self.beta.ptr, self.decay.ptr, t1, hh, kvh, kdd);
                         chk(c.launch("k_lin_prep", (1, *heads as u32, 1), ((*kd as u32).max(32), 1, 1), 0, &mut a));
                     }
                     // delta step per head -> mixed [heads*vd]
@@ -2004,6 +2038,165 @@ impl CudaDecoder {
         }
         self.pos += 1;
         Some(())
+    }
+
+    fn workspace(&mut self, t: usize) -> Option<()> {
+        if self.ws.as_ref().map(|w| w.t_cap >= t).unwrap_or(false) {
+            return Some(());
+        }
+        let c = ctx()?;
+        self.ws = None;
+        let cap = t.next_power_of_two().max(64);
+        let d = self.d;
+        let ws = PrefillWs {
+            t_cap: cap,
+            hidden: c.alloc(cap * d * 4)?,
+            normed: c.alloc(cap * d * 4)?,
+            xq: c.alloc(cap * self.max_cols)?,
+            xs: c.alloc(cap * self.max_cols / 32 * 4)?,
+            big_a: c.alloc(cap * self.max_rows * 4)?,
+            big_b: c.alloc(cap * self.max_rows * 4)?,
+            y: c.alloc(cap * d * 4)?,
+            q: c.alloc(cap * self.max_qw.max(1) * 4)?,
+            gate: c.alloc(cap * self.max_qw.max(1) * 4)?,
+            mixed: c.alloc(cap * self.max_mixed.max(1) * 4)?,
+            beta: c.alloc(cap * self.max_heads.max(1) * 4)?,
+            decay: c.alloc(cap * self.max_heads.max(1) * 4)?,
+        };
+        self.ws = Some(ws);
+        Some(())
+    }
+
+    /// The whole prompt on the GPU: every layer over `tokens` (GEMMs,
+    /// the conv and the delta scan sequential in time, causal attention
+    /// with the new rows appended to the resident KV cache), the state
+    /// advanced by `tokens.len()`, the last position's logits returned.
+    /// None = refused before any state mutation (capacity, memory).
+    pub fn prefill(&mut self, m: &DecodeModelRefs, tokens: &[u32]) -> Option<Vec<f32>> {
+        let c = ctx()?;
+        let t = tokens.len();
+        if t == 0 {
+            return None;
+        }
+        let d = self.d;
+        let pos0 = self.pos;
+        if pos0 + t > self.cap {
+            return None;
+        }
+        self.workspace(t)?;
+        let ws = self.ws.as_ref()?;
+        // embeddings, gathered on the host
+        let mut emb = vec![0f32; t * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            emb[i * d..(i + 1) * d].copy_from_slice(&m.embed[tok as usize * d..(tok as usize + 1) * d]);
+        }
+        if !c.write(&ws.hidden, 0, &emb) {
+            return None;
+        }
+        let eps = self.eps;
+        let tu = t as u32;
+        let ok = std::cell::Cell::new(true);
+        let chk = |b: bool| {
+            if !b {
+                ok.set(false);
+            }
+        };
+        let mut first = true;
+        for l in self.layers.iter() {
+            match l {
+                LayerDev::Linear { in_norm, post_norm, proj, out, gu, dn, conv_w, a_log, dt_bias, gated_w, conv_state, scan_state, heads, kv_heads, kd, vd, conv_k, inter } => {
+                    let kt = kv_heads * kd;
+                    let vt = heads * vd;
+                    let cd = 2 * kt + vt;
+                    let pr = proj.rows;
+                    // (residual of the previous MLP) + input norm
+                    chk(c.add_rmsnorm_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, &ws.normed, tu, d as u32, eps, true));
+                    chk(c.quantize_q8(&ws.normed, 0, &ws.xq, &ws.xs, tu, d as u32));
+                    chk(c.gemm_q8(&proj.q, &proj.s, &ws.xq, &ws.xs, &ws.big_a, 0, pr as u32, d as u32, tu, pr as u32));
+                    // conv + silu over time -> big_b [t][cd]
+                    {
+                        let (k, cdim, ldx, ldo) = (*conv_k as u32, cd as u32, pr as u32, cd as u32);
+                        let mut a = args!(ws.big_a.ptr, ldx, conv_w.ptr, k, conv_state.ptr, ws.big_b.ptr, ldo, cdim, tu);
+                        chk(c.launch("k_conv_prefill", (cdim.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut a));
+                    }
+                    // q/k norms, beta, decay per (token, head)
+                    {
+                        let bp = ws.big_a.ptr + ((cd + vt) * 4) as u64;
+                        let ap = ws.big_a.ptr + ((cd + vt + heads) * 4) as u64;
+                        let (hh, kvh, kdd, ldc, ldba) = (*heads as u32, *kv_heads as u32, *kd as u32, cd as u32, pr as u32);
+                        let mut a = args!(ws.big_b.ptr, ldc, bp, ap, ldba, a_log.ptr, dt_bias.ptr, ws.q.ptr, ws.gate.ptr, ws.beta.ptr, ws.decay.ptr, tu, hh, kvh, kdd);
+                        chk(c.launch("k_lin_prep", (tu, *heads as u32, 1), ((*kd as u32).max(32), 1, 1), 0, &mut a));
+                    }
+                    // delta scan per head over time -> mixed [t][heads*vd]
+                    {
+                        let (hh, kvh, kdd, vdd, ldc) = (*heads as u32, *kv_heads as u32, *kd as u32, *vd as u32, cd as u32);
+                        let mut a = args!(scan_state.ptr, ws.q.ptr, ws.gate.ptr, ws.big_b.ptr, ldc, ws.beta.ptr, ws.decay.ptr, ws.mixed.ptr, tu, hh, kvh, kdd, vdd);
+                        chk(c.launch("k_delta_scan", (*heads as u32, 1, 1), (*vd as u32, 1, 1), (2 * kd * 4) as u32, &mut a));
+                    }
+                    // gated norm with z = big_a[.., cd..cd+vt]
+                    {
+                        let zp = ws.big_a.ptr + (cd * 4) as u64;
+                        let (hh, vdd, ldz) = (*heads as u32, *vd as u32, pr as u32);
+                        let mut a = args!(ws.mixed.ptr, gated_w.ptr, zp, ldz, tu, hh, vdd, eps);
+                        chk(c.launch("k_gated_norm_rows", (tu, *heads as u32, 1), ((*vd as u32).max(32), 1, 1), 0, &mut a));
+                    }
+                    chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, vt as u32));
+                    chk(c.gemm_q8(&out.q, &out.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, vt as u32, tu, d as u32));
+                    chk(c.add_rmsnorm_rows(&ws.hidden, Some(&ws.y), post_norm, &ws.normed, tu, d as u32, eps, true));
+                    chk(c.quantize_q8(&ws.normed, 0, &ws.xq, &ws.xs, tu, d as u32));
+                    chk(c.gemm_fp4(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, 0, (2 * inter) as u32, d as u32, tu, (2 * inter) as u32));
+                    chk(c.silu_mul_rows(&ws.big_a, &ws.big_b, tu, *inter as u32));
+                    chk(c.quantize_q8(&ws.big_b, 0, &ws.xq, &ws.xs, tu, *inter as u32));
+                    chk(c.gemm_fp4(&dn.p, &dn.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, *inter as u32, tu, d as u32));
+                }
+                LayerDev::Full { in_norm, post_norm, proj, o, gu, dn, q_norm, k_norm, kc, vc, n_heads, n_kv, hd, rope_dim, theta, inter } => {
+                    let qw = n_heads * hd;
+                    let kvw = n_kv * hd;
+                    let pr = proj.rows;
+                    chk(c.add_rmsnorm_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, &ws.normed, tu, d as u32, eps, true));
+                    chk(c.quantize_q8(&ws.normed, 0, &ws.xq, &ws.xs, tu, d as u32));
+                    chk(c.gemm_q8(&proj.q, &proj.s, &ws.xq, &ws.xs, &ws.big_a, 0, pr as u32, d as u32, tu, pr as u32));
+                    {
+                        let (ldq, kvw_, p0, nh, nkv, hdd, rd) = (pr as u32, kvw as u32, pos0 as u32, *n_heads as u32, *n_kv as u32, *hd as u32, *rope_dim as u32);
+                        let mut a = args!(ws.big_a.ptr, ldq, q_norm.ptr, k_norm.ptr, ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, kvw_, tu, p0, nh, nkv, hdd, rd, *theta, eps);
+                        chk(c.launch("k_qk_prep_rows", (tu, (*n_heads + *n_kv) as u32, 1), (*hd as u32, 1, 1), 0, &mut a));
+                    }
+                    {
+                        let (kvw_, p0, nh, nkv, hdd) = (kvw as u32, pos0 as u32, *n_heads as u32, *n_kv as u32, *hd as u32);
+                        let mut a = args!(ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, ws.mixed.ptr, kvw_, p0, tu, nh, nkv, hdd);
+                        chk(c.launch("k_attn_prefill", (tu, *n_heads as u32, 1), (*hd as u32, 1, 1), ((pos0 + t) * 4) as u32, &mut a));
+                    }
+                    chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, qw as u32));
+                    chk(c.gemm_q8(&o.q, &o.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, qw as u32, tu, d as u32));
+                    chk(c.add_rmsnorm_rows(&ws.hidden, Some(&ws.y), post_norm, &ws.normed, tu, d as u32, eps, true));
+                    chk(c.quantize_q8(&ws.normed, 0, &ws.xq, &ws.xs, tu, d as u32));
+                    chk(c.gemm_fp4(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, 0, (2 * inter) as u32, d as u32, tu, (2 * inter) as u32));
+                    chk(c.silu_mul_rows(&ws.big_a, &ws.big_b, tu, *inter as u32));
+                    chk(c.quantize_q8(&ws.big_b, 0, &ws.xq, &ws.xs, tu, *inter as u32));
+                    chk(c.gemm_fp4(&dn.p, &dn.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, *inter as u32, tu, d as u32));
+                }
+            }
+            first = false;
+        }
+        // last residual, final norm of the last position, head
+        chk(c.add(&ws.hidden, (t - 1) * d * 4, &ws.y, (t - 1) * d * 4, d as u32));
+        {
+            let hp = ws.hidden.ptr + ((t - 1) * d * 4) as u64;
+            let (n, op) = (d as u32, 1u32);
+            let mut a = args!(hp, self.norm_f.ptr, self.normed.ptr, n, eps, op);
+            chk(c.launch("k_rmsnorm", (1, 1, 1), (1024, 1, 1), 0, &mut a));
+        }
+        chk(c.quantize_q8(&self.normed, 0, &self.xq, &self.xs, 1, d as u32));
+        chk(c.matvec_q8(&self.lm_head.q, &self.lm_head.s, &self.xq, &self.xs, &self.logits, 0, self.vocab as u32, d as u32));
+        if !ok.get() {
+            return None;
+        }
+        let mut logits = vec![0f32; self.vocab];
+        if !c.read(&self.logits, 0, &mut logits) {
+            return None;
+        }
+        self.pos += t;
+        Some(logits)
     }
 
     /// Copies the resident state back to host layouts: every linear
