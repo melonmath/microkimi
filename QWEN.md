@@ -287,11 +287,22 @@ What moves and why:
   convert once, activations at the staging boundary via fcvtn/fcvtl
   inline asm); accumulation is wider. `MICROKIMI_QWEN_GPU_F32=1`
   restores f32 storage. The scan is always f32.
-- **Whole layers**: a dense linear-attention layer encodes as one
-  command buffer (input norm, projections, causal conv + SiLU, scan
-  prep, delta scan, gated norm, out_proj, residual, post-norm, MLP) so
-  the CPU tissue between GPU ops all but disappears (`split:` line of
-  `qwengpubench`).
+- **Whole layers, chained**: the run of consecutive dense
+  linear-attention layers between two full-attention layers encodes as
+  ONE command buffer (per layer: input norm, projections, causal conv +
+  SiLU, scan prep, delta scan, gated norm, out_proj, residual,
+  post-norm, MLP), the f32 residual stream resident on the device for
+  the run, so the CPU tissue between GPU ops all but disappears
+  (`split:` and `by op:` lines of `qwengpubench`). The delta scan keeps
+  its recurrent state in registers (lanes split the state rows of a few
+  columns; shuffle reductions; no barrier).
+- **Command buffers and memory**: what a prompt touches once (the f16
+  weight copies) can be paged out between prompts on a host short of
+  memory, and the driver pages it back inside the next submission;
+  `MICROKIMI_GPU_LAYER_PROF=2` shows that as kernel span before GPU
+  start. `MICROKIMI_GPU_RESIDENCY=1` wires every long-lived buffer in
+  a residency set (measured neutral to worse on a swapping 16 GB host,
+  hence opt-in).
 
 The offload is not bit-exact against the CPU path (GPU reassociation,
 no q8 activation quantization); `qwengpubench` prints the measured
