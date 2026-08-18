@@ -111,14 +111,17 @@ pub(crate) fn lane_block() -> usize {
     })
 }
 
-/// x86 four-row tile dispatch: AVX-512 VNNI when the CPU has it, the
-/// AVX2/FMA tile otherwise. Both produce the same bits.
+/// x86 four-row tile dispatch: the AVX-512 VNNI tile for the single-lane
+/// call (decode: it streams weights at the DRAM ceiling), the AVX2/FMA
+/// tile for lane batches (its per-block reduction is cheaper per lane;
+/// the VNNI form measured 223 vs 284 GMAC/s on 256 lanes and cost the
+/// 27B prefill 3x). Both produce the same bits.
 /// SAFETY: caller guarantees avx2/fma; slices hold nb blocks each.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn x86_rows4_tile(w: [&[i8]; 4], s: [&[f32]; 4], xqs: &[(&[i8], &[f32])]) -> [[f32; 4]; 16] {
     unsafe {
-        if crate::quant::q8::vnni512_available() {
+        if xqs.len() == 1 && crate::quant::q8::vnni512_available() {
             crate::quant::q8::rows4_dot_fma_vnni(w, s, xqs)
         } else {
             crate::quant::q8::rows4_dot_fma_x86(w, s, xqs)
