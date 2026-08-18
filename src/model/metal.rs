@@ -1462,6 +1462,11 @@ struct MpsCtx {
     wq8: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, u32)>>,
     // (packed ptr, rows, cols) → (retained raw nibble bytes, retained scale bytes, tag)
     fp4raw: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, [u8; 16])>>,
+    // concatenations for the fused decode matvecs, keyed by the first
+    // part's pointer, total rows and cols: (int8 rows, f16 scales, tag) /
+    // (nibbles, scale bytes, tag)
+    wq8cat: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, u32)>>,
+    fp4cat: std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (Id, Id, [u8; 16])>>,
 }
 
 // SAFETY: same argument as MetalCtx - kernel objects and buffers are
@@ -1492,6 +1497,8 @@ fn mps_ctx() -> Option<(&'static MetalCtx, &'static MpsCtx)> {
                 w16: std::sync::Mutex::new(std::collections::HashMap::new()),
                 wq8: std::sync::Mutex::new(std::collections::HashMap::new()),
                 fp4raw: std::sync::Mutex::new(std::collections::HashMap::new()),
+                wq8cat: std::sync::Mutex::new(std::collections::HashMap::new()),
+                fp4cat: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         })
         .as_ref()?;
@@ -2160,6 +2167,142 @@ fn weight_buffer_f16(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols
 /// matvec: int8 rows + one f16 scale per block of 32 (dx = max|w|/127,
 /// rounded to f16 first so the reconstruction uses the stored scale).
 /// Returns (rows buffer, scales buffer). Cached like weight_buffer_f16.
+/// q8_0 rows of an f32 [rows, cols] matrix (int8 + one f16 scale per
+/// block of 32; dx = max|w|/127 rounded to f16 first so the
+/// reconstruction uses the stored scale), appended to `q` and `sc`.
+fn quantize_q8_rows(w: &[f32], rows: usize, cols: usize, q: &mut Vec<i8>, sc: &mut Vec<u16>) {
+    let nb = cols / 32;
+    let base_q = q.len();
+    let base_s = sc.len();
+    q.resize(base_q + rows * cols, 0);
+    sc.resize(base_s + rows * nb, 0);
+    for r in 0..rows {
+        for g in 0..nb {
+            let blk = &w[r * cols + g * 32..r * cols + (g + 1) * 32];
+            let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let s16 = f32_to_f16_scalar(amax / 127.0);
+            let s = f16_to_f32_scalar(s16);
+            sc[base_s + r * nb + g] = s16;
+            if s > 0.0 {
+                let inv = 1.0 / s;
+                for (i, v) in blk.iter().enumerate() {
+                    q[base_q + r * cols + g * 32 + i] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+    }
+}
+
+/// Uploads q8_0 rows and scales as two retained device buffers.
+fn upload_q8(base: &MetalCtx, q: &[i8], sc: &[u16]) -> Option<(Id, Id)> {
+    // SAFETY: the slices are alive for the whole call; the buffers copy the bytes.
+    unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bq = f(base.device, sel("newBufferWithBytes:length:options:"), q.as_ptr() as *const c_void, q.len() as u64, 0);
+        let bs = f(base.device, sel("newBufferWithBytes:length:options:"), sc.as_ptr() as *const c_void, (sc.len() * 2) as u64, 0);
+        if bq.is_null() || bs.is_null() {
+            return None;
+        }
+        retain(bq);
+        retain(bs);
+        residency_add(base, bq);
+        residency_add(base, bs);
+        Some((bq, bs))
+    }
+}
+
+/// The q8_0 rows of several f32 matrices with the same `cols`,
+/// concatenated (one fused decode matvec instead of one per matrix).
+/// Keyed by the first part's pointer, the total rows and cols.
+fn weight_buffer_q8_cat(base: &MetalCtx, mps: &MpsCtx, parts: &[(&[f32], usize)], cols: usize) -> Option<(Id, Id)> {
+    if cols % 32 != 0 || parts.is_empty() {
+        return None;
+    }
+    let rows: usize = parts.iter().map(|p| p.1).sum();
+    for (w, r) in parts {
+        if w.len() < r * cols {
+            return None;
+        }
+    }
+    let key = (parts[0].0.as_ptr() as usize, rows, cols);
+    let tag = parts[0].0.first().map(|v| v.to_bits()).unwrap_or(0);
+    let mut cache = mps.wq8cat.lock().unwrap();
+    if let Some(&(bq, bs, seen)) = cache.get(&key) {
+        if seen == tag {
+            return Some((bq, bs));
+        }
+        cache.remove(&key);
+        // SAFETY: the stale buffers are owned by this cache (retained at insert).
+        unsafe {
+            msg_void(bq, sel("release"));
+            msg_void(bs, sel("release"));
+        }
+    }
+    let mut q = Vec::with_capacity(rows * cols);
+    let mut sc = Vec::with_capacity(rows * cols / 32);
+    for (w, r) in parts {
+        quantize_q8_rows(w, *r, cols, &mut q, &mut sc);
+    }
+    let (bq, bs) = upload_q8(base, &q, &sc)?;
+    cache.insert(key, (bq, bs, tag));
+    Some((bq, bs))
+}
+
+/// The MXFP4 blobs of several matrices with the same `cols`, concatenated
+/// as stored (rows are contiguous in the packed layout, so the bytes just
+/// follow each other). Keyed like weight_buffer_q8_cat.
+fn packed_buffers_fp4_cat(base: &MetalCtx, mps: &MpsCtx, parts: &[(&[u8], &[u8], usize)], cols: usize) -> Option<(Id, Id)> {
+    if cols % 32 != 0 || parts.is_empty() {
+        return None;
+    }
+    let rows: usize = parts.iter().map(|p| p.2).sum();
+    for (pk, sc, r) in parts {
+        if pk.len() < r * cols / 2 || sc.len() < r * cols / 32 {
+            return None;
+        }
+    }
+    let key = (parts[0].0.as_ptr() as usize, rows, cols);
+    let mut tag = [0u8; 16];
+    let n = parts[0].0.len().min(16);
+    tag[..n].copy_from_slice(&parts[0].0[..n]);
+    let mut cache = mps.fp4cat.lock().unwrap();
+    if let Some(&(bp, bs, seen)) = cache.get(&key) {
+        if seen == tag {
+            return Some((bp, bs));
+        }
+        cache.remove(&key);
+        // SAFETY: the stale buffers are owned by this cache (retained at insert).
+        unsafe {
+            msg_void(bp, sel("release"));
+            msg_void(bs, sel("release"));
+        }
+    }
+    let mut pk_all = Vec::with_capacity(rows * cols / 2);
+    let mut sc_all = Vec::with_capacity(rows * cols / 32);
+    for (pk, sc, r) in parts {
+        pk_all.extend_from_slice(&pk[..r * cols / 2]);
+        sc_all.extend_from_slice(&sc[..r * cols / 32]);
+    }
+    // SAFETY: the vecs are alive for the whole call; the buffers copy the bytes.
+    let (bp, bs) = unsafe {
+        let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bp = f(base.device, sel("newBufferWithBytes:length:options:"), pk_all.as_ptr() as *const c_void, pk_all.len() as u64, 0);
+        let bs = f(base.device, sel("newBufferWithBytes:length:options:"), sc_all.as_ptr() as *const c_void, sc_all.len() as u64, 0);
+        if bp.is_null() || bs.is_null() {
+            return None;
+        }
+        retain(bp);
+        retain(bs);
+        (bp, bs)
+    };
+    residency_add(base, bp);
+    residency_add(base, bs);
+    cache.insert(key, (bp, bs, tag));
+    Some((bp, bs))
+}
+
 fn weight_buffer_q8(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols: usize) -> Option<(Id, Id)> {
     if cols % 32 != 0 || w.len() < rows * cols {
         return None;
@@ -4216,6 +4359,9 @@ kernel void dec_matvec(device const half* W   [[buffer(0)]],
 // accumulate. One simdgroup per row; a lane takes 8 columns per step
 // (one 32-bit word of nibbles, one scale byte, two half4 of x). Exact
 // against the CPU dequantization (e2m1 x 2^k values are exact in f32).
+// (An arithmetic e2m1 decode with 16 columns per lane measured slower
+// streaming: 45 -> 30 GB/s on [7168x1024]; the small dispatches are
+// bound by launch and drain, not by the nibble table.)
 constant float DEC_FP4_LUT[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
@@ -4812,10 +4958,66 @@ pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps
 /// small dispatch (dec_add over 1024 floats), committed and waited one
 /// by one; prints the mean commit-to-done wall and GPU busy per buffer.
 pub fn cmdbuf_latency_probe(n: usize) -> Option<()> {
-    for gap_ms in [0u64, 1, 3, 10] {
+    for gap_ms in [0u64, 10] {
         cmdbuf_latency_probe_gap(n, gap_ms)?;
     }
-    Some(())
+    dispatch_cost_probe(256)
+}
+
+/// One command buffer of `n` tiny dispatches (dec_add over 1024 floats,
+/// serial): the GPU time per dispatch is the launch overhead a fused
+/// kernel saves.
+fn dispatch_cost_probe(n: usize) -> Option<()> {
+    let (base, dc) = decode_ctx()?;
+    // SAFETY: buffer creation, dispatches, wait, releases.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let f: extern "C" fn(Id, Sel, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bh = f(base.device, sel("newBufferWithLength:options:"), 4096, 0);
+        let ba = f(base.device, sel("newBufferWithLength:options:"), 2048, 0);
+        if bh.is_null() || ba.is_null() {
+            msg_void(pool, sel("drain"));
+            return None;
+        }
+        let set_pipe: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_bytes: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_th: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let getf: extern "C" fn(Id, Sel) -> f64 =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            for _ in 0..n {
+                set_pipe(e, sel("setComputePipelineState:"), dc.add);
+                set_buf(e, sel("setBuffer:offset:atIndex:"), bh, 0, 0);
+                set_buf(e, sel("setBuffer:offset:atIndex:"), ba, 0, 1);
+                let cnt: u32 = 1024;
+                set_bytes(e, sel("setBytes:length:atIndex:"), (&cnt) as *const u32 as *const c_void, 4, 2);
+                disp_th(
+                    e,
+                    sel("dispatchThreads:threadsPerThreadgroup:"),
+                    MTLSize { width: 1024, height: 1, depth: 1 },
+                    MTLSize { width: 256, height: 1, depth: 1 },
+                );
+            }
+            msg_void(e, sel("endEncoding"));
+            msg_void(cmdbuf, sel("commit"));
+            msg_void(cmdbuf, sel("waitUntilCompleted"));
+            best = best.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+        }
+        msg_void(bh, sel("release"));
+        msg_void(ba, sel("release"));
+        msg_void(pool, sel("drain"));
+        println!("gpu: dispatch cost ({} tiny serial dispatches in one buffer): {:.2} us per dispatch", n, best * 1e6 / n as f64);
+        Some(())
+    }
 }
 
 /// The probe with a CPU idle gap of `gap_ms` before every command buffer
@@ -4887,9 +5089,14 @@ fn cmdbuf_latency_probe_gap(n: usize, gap_ms: u64) -> Option<()> {
     }
 }
 
-/// Streams a [rows, cols] f16 matrix through `dec_matvec` `reps` times
-/// in one command buffer and prints the achieved GB/s (GPU time).
+/// Streams a [rows, cols] matrix through the decode matvec of the given
+/// storage (0 f16, 1 q8_0, 2 MXFP4) `reps` times in one command buffer
+/// and prints the achieved GB/s (GPU time, bytes as stored).
 pub fn dec_matvec_bench(rows: usize, cols: usize, reps: usize) -> Option<f64> {
+    dec_matvec_bench_kind(rows, cols, reps, 0)
+}
+
+pub fn dec_matvec_bench_kind(rows: usize, cols: usize, reps: usize, kind: u8) -> Option<f64> {
     let (base, dc) = decode_ctx()?;
     let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
     let x: Vec<f32> = (0..cols).map(|i| ((i * 31) % 100) as f32 / 100.0).collect();
@@ -4903,10 +5110,50 @@ pub fn dec_matvec_bench(rows: usize, cols: usize, reps: usize) -> Option<f64> {
                 std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
             f(base.device, sel("newBufferWithBytes:length:options:"), h.as_ptr() as *const c_void, (h.len() * 2) as u64, 0)
         };
-        let bw = mkbuf(&w);
         let bx = mkbuf(&x);
         let by = mkbuf(&vec![0.0f32; rows]);
-        if [bw, bx, by].iter().any(|b| b.is_null()) {
+        // the weight in the requested storage - enough distinct copies to
+        // exceed the on-chip caches (the graph streams every weight once
+        // per token), cycled through the passes
+        let bytes_one = match kind {
+            1 => rows * cols + rows * cols / 32 * 2,
+            2 => rows * cols / 2 + rows * cols / 32,
+            _ => rows * cols * 2,
+        };
+        let copies = (96 * 1024 * 1024 / bytes_one.max(1)).clamp(1, 24);
+        let mut ws: Vec<(Id, Id)> = Vec::with_capacity(copies);
+        let (pipe, bytes_per_pass) = match kind {
+            1 => (dc.matvec_q8, bytes_one),
+            2 => (dc.matvec_fp4, bytes_one),
+            _ => (dc.matvec, bytes_one),
+        };
+        for ci in 0..copies {
+            // vary the values so nothing dedups
+            let wc: Vec<f32> = w.iter().map(|v| v + ci as f32 * 1e-3).collect();
+            let pair = match kind {
+                1 => {
+                    let mut q = Vec::new();
+                    let mut sc = Vec::new();
+                    quantize_q8_rows(&wc, rows, cols, &mut q, &mut sc);
+                    upload_q8(base, &q, &sc)?
+                }
+                2 => {
+                    let (packed, scales) = crate::quant::mxfp4::quantize(&wc, rows, cols);
+                    let f: extern "C" fn(Id, Sel, *const c_void, u64, u64) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    let bp = f(base.device, sel("newBufferWithBytes:length:options:"), packed.as_ptr() as *const c_void, packed.len() as u64, 0);
+                    let bsc = f(base.device, sel("newBufferWithBytes:length:options:"), scales.as_ptr() as *const c_void, scales.len() as u64, 0);
+                    (bp, bsc)
+                }
+                _ => (mkbuf(&wc), std::ptr::null_mut()),
+            };
+            if pair.0.is_null() {
+                msg_void(pool, sel("drain"));
+                return None;
+            }
+            ws.push(pair);
+        }
+        if [bx, by].iter().any(|b| b.is_null()) {
             msg_void(pool, sel("drain"));
             return None;
         }
@@ -4924,13 +5171,22 @@ pub fn dec_matvec_bench(rows: usize, cols: usize, reps: usize) -> Option<f64> {
         for _ in 0..3 {
             let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
-            for _ in 0..reps {
-                set_pipe(e, sel("setComputePipelineState:"), dc.matvec);
-                set_buf(e, sel("setBuffer:offset:atIndex:"), bw, 0, 0);
-                set_buf(e, sel("setBuffer:offset:atIndex:"), bx, 0, 1);
-                set_buf(e, sel("setBuffer:offset:atIndex:"), by, 0, 2);
+            for r in 0..reps {
+                let (bw, bs) = ws[r % ws.len()];
+                set_pipe(e, sel("setComputePipelineState:"), pipe);
                 let dims: [u32; 2] = [rows as u32, cols as u32];
-                set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 8, 3);
+                if kind == 0 {
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), bw, 0, 0);
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), bx, 0, 1);
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), by, 0, 2);
+                    set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 8, 3);
+                } else {
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), bw, 0, 0);
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), bs, 0, 1);
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), bx, 0, 2);
+                    set_buf(e, sel("setBuffer:offset:atIndex:"), by, 0, 3);
+                    set_bytes(e, sel("setBytes:length:atIndex:"), dims.as_ptr() as *const c_void, 8, 4);
+                }
                 disp_th(
                     e,
                     sel("dispatchThreads:threadsPerThreadgroup:"),
@@ -4944,17 +5200,25 @@ pub fn dec_matvec_bench(rows: usize, cols: usize, reps: usize) -> Option<f64> {
             let t = getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime"));
             best = best.min(t);
         }
-        for b in [bw, bx, by] {
+        for b in [bx, by] {
             msg_void(b, sel("release"));
         }
+        for (bw, bs) in &ws {
+            msg_void(*bw, sel("release"));
+            if !bs.is_null() {
+                msg_void(*bs, sel("release"));
+            }
+        }
         msg_void(pool, sel("drain"));
-        let bytes = (rows * cols * 2) as f64 * reps as f64;
+        let bytes = bytes_per_pass as f64 * reps as f64;
         let gbs = bytes / best / 1e9;
         println!(
-            "gpu: dec_matvec [{}x{}] f16 x{}: {:.2} ms per pass, {:.1} GB/s",
+            "gpu: dec_matvec [{}x{}] {} x{} ({} copies): {:.3} ms per pass, {:.1} GB/s",
             rows,
             cols,
+            ["f16", "q8_0", "fp4"][kind as usize],
             reps,
+            ws.len(),
             best * 1000.0 / reps as f64,
             gbs
         );
@@ -5218,7 +5482,7 @@ pub fn gpu_decoder_new(
                 let kt = dm.kv_heads * dm.kd;
                 let vt = dm.heads * dm.vd;
                 let cd = 2 * kt + vt;
-                max_a = max_a.max(cd).max(2 * dm.inter);
+                max_a = max_a.max(cd + vt + 2 * dm.heads).max(2 * dm.inter);
                 max_b = max_b.max(cd).max(dm.inter);
                 scan_max = scan_max.max(2 * dm.heads * dm.kd + dm.heads * dm.vd + 2 * dm.heads);
                 mix_max = mix_max.max(dm.heads * dm.vd);
@@ -5237,7 +5501,7 @@ pub fn gpu_decoder_new(
             }
             DecodeLayerRefs::Full { n_heads, n_kv, hd, inter, .. } => {
                 let qw = n_heads * hd;
-                max_a = max_a.max(qw * 2).max(2 * inter);
+                max_a = max_a.max(qw * 2 + 2 * n_kv * hd).max(2 * inter);
                 max_b = max_b.max(qw).max(2 * n_kv * hd).max(*inter);
                 // q | gate ride in mix_tm during attention
                 vt_max = vt_max.max(2 * qw);
@@ -5391,12 +5655,26 @@ fn decode_f16_arm() -> bool {
     *ON.get_or_init(|| std::env::var("MICROKIMI_QWEN_GPU_DEC_F16").map(|v| v == "1").unwrap_or(false))
 }
 
-/// Per-layer device weights of the decode graph.
+/// Per-layer device weights of the decode graph. The projections that
+/// share an input fuse into one matvec (rows concatenated) in the
+/// q8/fp4 storage; the f16 arm keeps them apart.
+enum LinProj {
+    Fused(W), // [qkv | z | b | a] rows
+    Split { qkv: W, z: W, b: W, a: W },
+}
+enum FullProj {
+    Fused(W), // [q|gate | k | v] rows
+    Split { q: W, k: W, v: W },
+}
+enum MlpGU {
+    Fused(W), // [gate | up] rows
+    Split { g: W, u: W },
+}
 struct LinW {
-    qkv: W, z: W, b: W, a: W, out: W, g: W, u: W, dn: W,
+    proj: LinProj, out: W, gu: MlpGU, dn: W,
 }
 struct FullW {
-    q: W, k: W, v: W, o: W, g: W, u: W, dn: W,
+    proj: FullProj, o: W, gu: MlpGU, dn: W,
 }
 enum LW { L(LinW), F(FullW) }
 
@@ -5426,33 +5704,46 @@ fn resolve_decode_weights(base: &MetalCtx, mps: &MpsCtx, m: &DecodeModelRefs) ->
         }
     };
     let mut lw: Vec<LW> = Vec::with_capacity(m.layers.len());
+    let gu = |gate: (&[u8], &[u8]), up: (&[u8], &[u8]), inter: usize| -> Option<MlpGU> {
+        if f16_arm {
+            Some(MlpGU::Split { g: wp(gate.0, gate.1, inter, d)?, u: wp(up.0, up.1, inter, d)? })
+        } else {
+            let (bp, bs) = packed_buffers_fp4_cat(base, mps, &[(gate.0, gate.1, inter), (up.0, up.1, inter)], d)?;
+            Some(MlpGU::Fused(W::Fp4(bp, bs)))
+        }
+    };
     for l in &m.layers {
         match l {
             DecodeLayerRefs::Linear { w, dm, .. } => {
                 let kt = dm.kv_heads * dm.kd;
                 let vt = dm.heads * dm.vd;
                 let cd = 2 * kt + vt;
+                let proj = if f16_arm {
+                    LinProj::Split { qkv: wf(w.in_qkv, cd, d)?, z: wf(w.in_z, vt, d)?, b: wf(w.in_b, dm.heads, d)?, a: wf(w.in_a, dm.heads, d)? }
+                } else {
+                    let (q, sc) = weight_buffer_q8_cat(base, mps, &[(w.in_qkv, cd), (w.in_z, vt), (w.in_b, dm.heads), (w.in_a, dm.heads)], d)?;
+                    LinProj::Fused(W::Q8(q, sc))
+                };
                 lw.push(LW::L(LinW {
-                    qkv: wf(w.in_qkv, cd, d)?,
-                    z: wf(w.in_z, vt, d)?,
-                    b: wf(w.in_b, dm.heads, d)?,
-                    a: wf(w.in_a, dm.heads, d)?,
+                    proj,
                     out: wf(w.out_proj, d, vt)?,
-                    g: wp(w.gate.0, w.gate.1, dm.inter, d)?,
-                    u: wp(w.up.0, w.up.1, dm.inter, d)?,
+                    gu: gu(w.gate, w.up, dm.inter)?,
                     dn: wp(w.down.0, w.down.1, d, dm.inter)?,
                 }));
             }
             DecodeLayerRefs::Full { q_proj, k_proj, v_proj, o_proj, gate, up, down, n_heads, n_kv, hd, inter, .. } => {
                 let qw = n_heads * hd;
                 let kvw = n_kv * hd;
+                let proj = if f16_arm {
+                    FullProj::Split { q: wf(q_proj, qw * 2, d)?, k: wf(k_proj, kvw, d)?, v: wf(v_proj, kvw, d)? }
+                } else {
+                    let (q, sc) = weight_buffer_q8_cat(base, mps, &[(q_proj, qw * 2), (k_proj, kvw), (v_proj, kvw)], d)?;
+                    FullProj::Fused(W::Q8(q, sc))
+                };
                 lw.push(LW::F(FullW {
-                    q: wf(q_proj, qw * 2, d)?,
-                    k: wf(k_proj, kvw, d)?,
-                    v: wf(v_proj, kvw, d)?,
+                    proj,
                     o: wf(o_proj, d, qw)?,
-                    g: wp(gate.0, gate.1, *inter, d)?,
-                    u: wp(up.0, up.1, *inter, d)?,
+                    gu: gu(*gate, *up, *inter)?,
                     dn: wp(down.0, down.1, d, *inter)?,
                 }));
             }
@@ -6058,9 +6349,14 @@ fn gpu_decode_step_impl(
             disp_th(e, sel_dth, MTLSize { width: (rows * 32) as u64, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
         };
         // helper: MLP from `normed` -> tmp_a[..d] (f16): gate|up in tmp_a, silu, down into tmp_b[..d]
-        let mlp_enc = |g: &W, u: &W, dn: &W, inter: usize| -> Id {
-            mv_enc(g, inter, d, dec.normed, 0, dec.tmp_a, 0);
-            mv_enc(u, inter, d, dec.normed, 0, dec.tmp_a, inter * 2);
+        let mlp_enc = |gu: &MlpGU, dn: &W, inter: usize| -> Id {
+            match gu {
+                MlpGU::Fused(w) => mv_enc(w, 2 * inter, d, dec.normed, 0, dec.tmp_a, 0),
+                MlpGU::Split { g, u } => {
+                    mv_enc(g, inter, d, dec.normed, 0, dec.tmp_a, 0);
+                    mv_enc(u, inter, d, dec.normed, 0, dec.tmp_a, inter * 2);
+                }
+            }
             let e = enc.get();
             set_pipe(e, sel_pipe, sm.pipeline);
             set_buf(e, sel_sb, dec.tmp_a, 0, 0);
@@ -6084,11 +6380,21 @@ fn gpu_decode_step_impl(
                     let heads = dm.heads;
                     // input norm (folds the previous MLP output)
                     norm_enc(prev_add, o[0]);
-                    // projections: qkv -> tmp_a[..cd], z -> mix_tm (as z buffer), b|a -> ba
-                    mv_enc(&w.qkv, cd, d, dec.normed, 0, dec.tmp_a, 0);
-                    mv_enc(&w.z, vt, d, dec.normed, 0, dec.mix_tm, 0);
-                    mv_enc(&w.b, heads, d, dec.normed, 0, dec.ba, 0);
-                    mv_enc(&w.a, heads, d, dec.normed, 0, dec.ba, heads * 2);
+                    // projections: fused -> tmp_a = [qkv cd | z vt | b heads | a heads];
+                    // split -> qkv in tmp_a, z in mix_tm, b|a in ba
+                    let (z_buf, z_off, ba_buf, b_off, a_off) = match &w.proj {
+                        LinProj::Fused(p) => {
+                            mv_enc(p, cd + vt + 2 * heads, d, dec.normed, 0, dec.tmp_a, 0);
+                            (dec.tmp_a, cd * 2, dec.tmp_a, (cd + vt) * 2, (cd + vt + heads) * 2)
+                        }
+                        LinProj::Split { qkv, z, b, a } => {
+                            mv_enc(qkv, cd, d, dec.normed, 0, dec.tmp_a, 0);
+                            mv_enc(z, vt, d, dec.normed, 0, dec.mix_tm, 0);
+                            mv_enc(b, heads, d, dec.normed, 0, dec.ba, 0);
+                            mv_enc(a, heads, d, dec.normed, 0, dec.ba, heads * 2);
+                            (dec.mix_tm, 0usize, dec.ba, 0usize, heads * 2)
+                        }
+                    };
                     // conv + silu: tmp_a[..cd] -> tmp_b[..cd]
                     {
                         let e = enc.get();
@@ -6111,8 +6417,8 @@ fn gpu_decode_step_impl(
                         let e = enc.get();
                         set_pipe(e, sel_pipe, tis.scanprep);
                         set_buf(e, sel_sb, dec.tmp_b, 0, 0);
-                        set_buf(e, sel_sb, dec.ba, 0, 1);
-                        set_buf(e, sel_sb, dec.ba, (heads * 2) as u64, 2);
+                        set_buf(e, sel_sb, ba_buf, b_off as u64, 1);
+                        set_buf(e, sel_sb, ba_buf, a_off as u64, 2);
                         set_buf(e, sel_sb, dec.small, (o[2] * 4) as u64, 3);
                         set_buf(e, sel_sb, dec.small, (o[3] * 4) as u64, 4);
                         set_buf(e, sel_sb, dec.scan_in, (sq * 4) as u64, 5);
@@ -6146,7 +6452,7 @@ fn gpu_decode_step_impl(
                         let e = enc.get();
                         set_pipe(e, sel_pipe, tis.gnorm);
                         set_buf(e, sel_sb, dec.mix_hm, 0, 0);
-                        set_buf(e, sel_sb, dec.mix_tm, 0, 1);
+                        set_buf(e, sel_sb, z_buf, z_off as u64, 1);
                         set_buf(e, sel_sb, dec.small, (o[5] * 4) as u64, 2);
                         set_buf(e, sel_sb, dec.tmp_a, 0, 3);
                         let dims: [u32; 3] = [1, heads as u32, dm.vd as u32];
@@ -6157,7 +6463,7 @@ fn gpu_decode_step_impl(
                     // out_proj: tmp_a[..vt] -> tmp_b[..d]; residual add; post-norm; MLP
                     mv_enc(&w.out, d, vt, dec.tmp_a, 0, dec.tmp_b, 0);
                     norm_enc(Some(dec.tmp_b), o[1]);
-                    prev_add = Some(mlp_enc(&w.g, &w.u, &w.dn, dm.inter));
+                    prev_add = Some(mlp_enc(&w.gu, &w.dn, dm.inter));
                 }
                 (DecodeLayerRefs::Full { n_heads, n_kv, hd, rope_dim, theta, inter, .. }, LW::F(w), GpuLayerState::Full { kc, vc, cap }) => {
                     if pos >= *cap {
@@ -6167,10 +6473,20 @@ fn gpu_decode_step_impl(
                     let qw = n_heads * hd;
                     let kvw = n_kv * hd;
                     norm_enc(prev_add, o[0]);
-                    // qg -> tmp_a[..2qw], k -> tmp_b[..kvw], v -> tmp_b[kvw..2kvw]
-                    mv_enc(&w.q, qw * 2, d, dec.normed, 0, dec.tmp_a, 0);
-                    mv_enc(&w.k, kvw, d, dec.normed, 0, dec.tmp_b, 0);
-                    mv_enc(&w.v, kvw, d, dec.normed, 0, dec.tmp_b, kvw * 2);
+                    // fused: tmp_a = [q|gate 2qw | k kvw | v kvw]; split: qg -> tmp_a,
+                    // k -> tmp_b[..kvw], v -> tmp_b[kvw..2kvw]
+                    let (kv_buf, k_off, v_off) = match &w.proj {
+                        FullProj::Fused(p) => {
+                            mv_enc(p, qw * 2 + 2 * kvw, d, dec.normed, 0, dec.tmp_a, 0);
+                            (dec.tmp_a, qw * 2 * 2, (qw * 2 + kvw) * 2)
+                        }
+                        FullProj::Split { q, k, v } => {
+                            mv_enc(q, qw * 2, d, dec.normed, 0, dec.tmp_a, 0);
+                            mv_enc(k, kvw, d, dec.normed, 0, dec.tmp_b, 0);
+                            mv_enc(v, kvw, d, dec.normed, 0, dec.tmp_b, kvw * 2);
+                            (dec.tmp_b, 0usize, kvw * 2)
+                        }
+                    };
                     if stop_at(li, 0) {
                         stopped = true;
                         break 'layers;
@@ -6180,8 +6496,8 @@ fn gpu_decode_step_impl(
                         let e = enc.get();
                         set_pipe(e, sel_pipe, dc.qk_prep);
                         set_buf(e, sel_sb, dec.tmp_a, 0, 0);
-                        set_buf(e, sel_sb, dec.tmp_b, 0, 1);
-                        set_buf(e, sel_sb, dec.tmp_b, (kvw * 2) as u64, 2);
+                        set_buf(e, sel_sb, kv_buf, k_off as u64, 1);
+                        set_buf(e, sel_sb, kv_buf, v_off as u64, 2);
                         set_buf(e, sel_sb, dec.small, (o[2] * 4) as u64, 3);
                         set_buf(e, sel_sb, dec.small, (o[3] * 4) as u64, 4);
                         set_buf(e, sel_sb, dec.mix_tm, 0, 5);
@@ -6226,7 +6542,7 @@ fn gpu_decode_step_impl(
                         break 'layers;
                     }
                     norm_enc(Some(dec.tmp_b), o[1]);
-                    prev_add = Some(mlp_enc(&w.g, &w.u, &w.dn, *inter));
+                    prev_add = Some(mlp_enc(&w.gu, &w.dn, *inter));
                 }
                 _ => {
                     msg_void(pool, sel("drain"));

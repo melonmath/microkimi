@@ -5998,8 +5998,14 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
         }
         if args.iter().any(|a| a == "--kern") {
             crate::model::metal::cmdbuf_latency_probe(50);
-            for (r, c) in [(248320usize, 1024usize), (3584, 1024), (1024, 3584), (6144, 1024), (1024, 2048)] {
-                crate::model::metal::dec_matvec_bench(r, c, 10);
+            for (r, c) in [(248320usize, 1024usize), (3584, 1024), (1024, 3584)] {
+                crate::model::metal::dec_matvec_bench(r, c, 24);
+            }
+            for (r, c) in [(248320usize, 1024usize), (8224, 1024), (1024, 2048), (5120, 1024)] {
+                crate::model::metal::dec_matvec_bench_kind(r, c, 24, 1);
+            }
+            for (r, c) in [(7168usize, 1024usize), (1024, 3584)] {
+                crate::model::metal::dec_matvec_bench_kind(r, c, 24, 2);
             }
             // the delta scan alone: geometry sweep (concurrency vs per-step latency)
             for (t, h, kd, vd) in [(1024usize, 16usize, 128usize, 128usize), (256, 16, 128, 128), (1024, 4, 128, 128), (1024, 64, 128, 128), (1024, 16, 128, 32)] {
