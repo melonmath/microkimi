@@ -425,8 +425,9 @@ pub fn gpu_prefill_cmd(args: &[String]) {
         let gm = median(gemm_ms.clone());
         println!("gpu prefill (MPS GEMM), {} tokens, paired rounds:", n_tokens);
         println!(
-            "  gpu {:>6.2} ms/token | cpu batched {:>6.2} ms/token | {:.2}x  (gpu rounds: {:?}, cpu rounds: {:?})",
+            "  gpu {:>6.3} ms/token ({:.0} tok/s) | cpu batched {:>6.2} ms/token | {:.2}x  (gpu rounds: {:?}, cpu rounds: {:?})",
             g,
+            1000.0 / g,
             c,
             c / g,
             gpu_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),

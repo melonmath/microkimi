@@ -22,6 +22,17 @@ decode arm alone: kernel checks, then N tokens decoded on the GPU and
 the CPU from the same state, ms/token for both (first step apart) and
 the greedy agreement. Read `tg64` against its median.
 
+GPU rows on macOS: `microkimi qwengpubench --model q08.bin --gpu-only
+--rounds 8` (prompt reading, GPU rounds back to back, like
+`llama-bench`'s repetitions) and `microkimi gpudecodebench --model
+q08.bin --steps 64` (generation), both under `MICROKIMI_QWEN_GPU=1`
+semantics. The paired protocol of `qwengpubench` (a CPU round between
+GPU rounds) is the fair one on a throttling host but punishes the GPU
+row on a host short of memory: the weight copies a prompt touches once
+get paged out between rounds and paged back inside the next command
+buffer (`MICROKIMI_GPU_LAYER_PROF=2` shows it as kernel span before
+GPU start). Quote which protocol you ran.
+
 ## llama.cpp, same machine
 
 ```bash

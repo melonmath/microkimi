@@ -16,19 +16,30 @@ Both rows from one bracketed run on the plugged-in M5 (2026-08-18):
 microkimi q8 spine, all cores; llama.cpp `-ngl 0`, brackets 651-682
 tok/s pp1024 and 85.6-86.9 tg64 before and after. Same warm,
 repeated protocol on both sides (`prefillbench` / `llama-bench -r`).
+The same battery on the same day under a foreign CPU load (a trading
+terminal at one core) read 83 vs 86-87 on generation and 742 vs
+657-675 on prompt reading: the loaded host takes the generation win
+back to level and leaves the prompt row.
 
 ## On the GPU (Metal)
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | 100 tok/s * | 112 tok/s |
-| prompt reading (1k tokens) | **~1230 tok/s** | ~4650 tok/s |
+| generation | **139 tok/s** | 112 tok/s |
+| prompt reading (1k tokens) | 4520 tok/s | 4740 tok/s |
+
+Same M5, same window, paired (2026-08-18): microkimi decodes the whole
+token in one command buffer against resident q8_0 rows and the MXFP4
+MLP as stored (`MICROKIMI_QWEN_GPU=1`), 64/64 greedy tokens in
+agreement with the CPU forward; llama.cpp Metal, Q8_0, `tg64` 110-115
+and `pp1024` 4700-4740 across the brackets. Prompt reading is the warm,
+back-to-back protocol on both sides (`qwengpubench --gpu-only`,
+`llama-bench`); under the paired protocol on a host 10 GB into swap the
+GPU prompt row reads 2400-2800 tok/s - the difference is the paging of
+weight copies between rounds, not the GPU (BENCH.md).
 
 (The GPU rows barely move on battery - Apple throttles the CPU much
 harder than the GPU - so these hold across power states.)
-
-\* microkimi generates on the CPU in both columns: its GPU path
-accelerates prompt reading only (for now).
 
 ## On battery (ratios, not absolutes)
 
@@ -51,8 +62,10 @@ chunked-scan work.
 - Quantization differs: microkimi runs a 4-bit MLP with an 8-bit
   attention spine; llama.cpp runs 8-bit everywhere. microkimi reads
   less memory per token.
-- microkimi's GPU prompt reading stays within 1.4e-2 of its CPU
-  output. The default engine path is bit-exact f32.
+- microkimi's GPU paths stay within 1.4e-2 of the CPU logits (prompt
+  reading) and agree on every greedy token over the measured runs
+  (decode); neither is bit-exact. The default engine path is bit-exact
+  f32.
 - Every number is the median of paired rounds on the same day,
   measured plugged in; battery runs are read as within-window ratios
   only (the bench script brackets for that).
