@@ -511,6 +511,36 @@ unsafe fn multi_rows_q8(
         return;
     }
     let mut r = r0;
+    #[cfg(target_arch = "x86_64")]
+    if crate::quant::q8::x86_tiles_available() {
+        while r + 4 <= r1 {
+            let w4 = [
+                &q[r * cols..(r + 1) * cols],
+                &q[(r + 1) * cols..(r + 2) * cols],
+                &q[(r + 2) * cols..(r + 3) * cols],
+                &q[(r + 3) * cols..(r + 4) * cols],
+            ];
+            let s4 = [
+                &scales[r * nb..(r + 1) * nb],
+                &scales[(r + 1) * nb..(r + 2) * nb],
+                &scales[(r + 2) * nb..(r + 3) * nb],
+                &scales[(r + 3) * nb..(r + 4) * nb],
+            ];
+            let mut l0 = 0usize;
+            while l0 < lanes.len() {
+                let width = (lanes.len() - l0).min(16);
+                // SAFETY: avx2/fma checked; slices hold nb blocks each.
+                let tile = unsafe { crate::quant::q8::rows4_dot_fma_x86(w4, s4, &lanes[l0..l0 + width]) };
+                for (dl, lane_out) in tile.iter().take(width).enumerate() {
+                    for k in 0..4 {
+                        unsafe { *(out_ptrs[l0 + dl] as *mut f32).add(r + k) = lane_out[k] };
+                    }
+                }
+                l0 += width;
+            }
+            r += 4;
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     if crate::quant::q8::sdot4_available() {
         while r + 4 <= r1 {

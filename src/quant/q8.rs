@@ -506,6 +506,12 @@ pub fn row_dot_fp4(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
                 return row_dot_fp4_sdot;
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return row_dot_fp4_x86;
+            }
+        }
         row_dot_fp4_generic
     }
     let f = F.get_or_init(pick);
@@ -1045,5 +1051,137 @@ pub unsafe fn rows4_x8_smmla(
             out[p * 2][3] = t[2];
             out[p * 2 + 1][3] = t[3];
         }
+    }
+}
+
+// ── x86: whole-row and four-row q8 kernels (AVX2, VNNI when present) ──
+//
+// The per-block dispatch + horizontal reduction that made the ARM path
+// slow before the fused kernels was still the ONLY x86 path: every
+// 32-column block paid an indirect call and a five-instruction
+// reduction, and none of the multi-row tiles ran (they are gated on
+// SDOT). These are their x86 counterparts: one vector accumulator per
+// row across the whole row, one reduction at the end, the per-block
+// scale folded as a fused multiply-add in the same block-sequential
+// order as rows4_dot_fma - so results are bit-identical to the ARM
+// kernels and to the scalar reference.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn i8_block_dot_vec(w: std::arch::x86_64::__m256i, x: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ax = _mm256_sign_epi8(x, x);
+        let aw = _mm256_sign_epi8(w, x);
+        let pairs = _mm256_maddubs_epi16(ax, aw);
+        _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
+        let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32(s64, 0xB1));
+        _mm_cvtsi128_si32(s32)
+    }
+}
+
+/// Four rows x N lanes on x86: per block, the four rows' i8 words load
+/// once and each lane's block dot is an AVX2 maddubs/madd pair; the
+/// four block sums collapse to a __m128 and one FMA applies the four
+/// row scales times the lane scale - the exact rows4_dot_fma order.
+/// Returns [lane][row].
+///
+/// SAFETY: caller guarantees avx2/fma; slices hold nb blocks each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn rows4_dot_fma_x86(
+    w: [&[i8]; 4],
+    s: [&[f32]; 4],
+    xqs: &[(&[i8], &[f32])],
+) -> [[f32; 4]; 16] {
+    use std::arch::x86_64::*;
+    let nb = xqs[0].1.len();
+    let mut out = [[0.0f32; 4]; 16];
+    unsafe {
+        let mut acc = [_mm_setzero_ps(); 16];
+        for g in 0..nb {
+            let w0 = _mm256_loadu_si256(w[0].as_ptr().add(g * 32) as *const __m256i);
+            let w1 = _mm256_loadu_si256(w[1].as_ptr().add(g * 32) as *const __m256i);
+            let w2 = _mm256_loadu_si256(w[2].as_ptr().add(g * 32) as *const __m256i);
+            let w3 = _mm256_loadu_si256(w[3].as_ptr().add(g * 32) as *const __m256i);
+            let ws = _mm_set_ps(s[3][g], s[2][g], s[1][g], s[0][g]);
+            for (l, xq) in xqs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.0.as_ptr().add(g * 32) as *const __m256i);
+                let d0 = hsum_i32(i8_block_dot_vec(w0, x));
+                let d1 = hsum_i32(i8_block_dot_vec(w1, x));
+                let d2 = hsum_i32(i8_block_dot_vec(w2, x));
+                let d3 = hsum_i32(i8_block_dot_vec(w3, x));
+                let sums = _mm_cvtepi32_ps(_mm_set_epi32(d3, d2, d1, d0));
+                let sv = _mm_mul_ps(ws, _mm_set1_ps(xq.1[g]));
+                acc[l] = _mm_fmadd_ps(sums, sv, acc[l]);
+            }
+        }
+        for l in 0..xqs.len() {
+            _mm_storeu_ps(out[l].as_mut_ptr(), acc[l]);
+        }
+    }
+    out
+}
+
+/// True on x86 with AVX2+FMA (the four-row tiles' gate there).
+pub fn x86_tiles_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ON.get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// x86 whole-row fp4-x-q8 kernel: block nibbles decode with the shuffle
+/// LUT, dots through maddubs/madd, and the block sums stay VECTOR (one
+/// i32 lane group per block) with the scale folded per block through a
+/// scalar-free path: we accumulate f32 lanes of (block_sum * scale) in
+/// groups of four blocks - the same 4-lane structure and pairwise
+/// collapse as row_dot_fp4_generic, so it is bit-identical to it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_dot_fp4_x86(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = srow.len();
+    unsafe {
+        let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(E2M1_X2.as_ptr() as *const __m128i));
+        let msk = _mm256_set1_epi8(0x0F);
+        let mut lanes = [0.0f32; 4];
+        let mut g = 0usize;
+        while g + 4 <= nb {
+            for (b, lane) in lanes.iter_mut().enumerate() {
+                let i = g + b;
+                let bytes = _mm256_broadcastsi128_si256(_mm_loadu_si128(prow.as_ptr().add(i * 16) as *const __m128i));
+                let lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(bytes, msk));
+                let hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(bytes, 4), msk));
+                let ilo = _mm256_unpacklo_epi8(lo, hi);
+                let ihi = _mm256_unpackhi_epi8(lo, hi);
+                let w = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+                let x = _mm256_loadu_si256(xq.q.as_ptr().add(i * 32) as *const __m256i);
+                let idot = hsum_i32(i8_block_dot_vec(w, x));
+                let s = crate::quant::mxfp4::exp2_i(srow[i] as i32 - 128) * xq.scales[i];
+                *lane = (idot as f32).mul_add(s, *lane);
+            }
+            g += 4;
+        }
+        let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        while g < nb {
+            let idot = block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
+            total += idot as f32 * (crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+            g += 1;
+        }
+        total
     }
 }
