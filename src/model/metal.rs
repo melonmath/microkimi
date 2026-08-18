@@ -399,6 +399,11 @@ pub fn metaltest() {
 pub struct MetalCtx {
     device: Id,
     queue: Id,
+    /// The process-wide residency set (macOS 15+): every long-lived
+    /// device buffer joins it so the driver keeps them wired instead of
+    /// re-mapping what each command buffer touches (null when the API is
+    /// missing - the buffers then rely on per-submission residency).
+    residency: Id,
     pipeline: Id,
     pipeline_fp4: Id, // null if the fp4 pipeline failed to build (fp4 path then stays CPU)
     max_ttg: u64,
@@ -564,9 +569,36 @@ fn init_ctx() -> Option<MetalCtx> {
         // The context lives in a static for the whole process: retain every
         // long-lived object so per-call autorelease pools can never free them
         // (intentional, bounded "leak" of a handful of singletons).
+        // residency set (MICROKIMI_GPU_RESIDENCY=1, macOS 15+): every
+        // long-lived buffer wired for the queue. Measured neutral to worse
+        // on a swapping 16 GB host (the wired set fights the pager), so
+        // off by default; kept for hosts with memory to spare.
+        let residency = {
+            let desc_class = class("MTLResidencySetDescriptor");
+            let want = std::env::var("MICROKIMI_GPU_RESIDENCY").map(|v| v == "1").unwrap_or(false);
+            if desc_class.is_null() || !want {
+                std::ptr::null_mut()
+            } else {
+                let desc = msg_id(msg_id(desc_class, sel("alloc")), sel("init"));
+                let mut err: Id = std::ptr::null_mut();
+                let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                let set = f(device, sel("newResidencySetWithDescriptor:error:"), desc, &mut err);
+                if set.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    let g: extern "C" fn(Id, Sel, Id) =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    g(queue, sel("addResidencySet:"), set);
+                    println!("gpu: residency set attached to the queue");
+                    retain(set)
+                }
+            }
+        };
         let ctx = MetalCtx {
             device: retain(device),
             queue: retain(queue),
+            residency,
             pipeline: retain(pipeline),
             pipeline_fp4,
             max_ttg,
@@ -732,6 +764,7 @@ unsafe fn ensure_buf(ctx: &MetalCtx, slot: &mut (Id, usize), bytes: usize) -> (*
         let b = f(ctx.device, sel("newBufferWithLength:options:"), bytes as u64, 0);
         if !b.is_null() {
             retain(b);
+            residency_add(ctx, b);
             if !slot.0.is_null() {
                 // release the old, too-small buffer (it is retained by us)
                 unsafe { msg_void(slot.0, sel("release")) };
@@ -1507,6 +1540,25 @@ fn gemm_kernel(base: &MetalCtx, mps: &MpsCtx, m: usize, n: usize, k: usize, tran
     Some(kernel)
 }
 
+/// Adds a device buffer to the process residency set (no-op without one):
+/// the driver keeps it wired, so command buffers that touch it do not pay
+/// a re-mapping at submission. Commit + requestResidency each time (the
+/// additions are rare: weights at load, arena slots on growth).
+fn residency_add(base: &MetalCtx, buf: Id) {
+    if base.residency.is_null() || buf.is_null() {
+        return;
+    }
+    // SAFETY: the set and buffer are live Metal objects; the selectors
+    // take one object / no argument.
+    unsafe {
+        let g: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        g(base.residency, sel("addAllocation:"), buf);
+        msg_void(base.residency, sel("commit"));
+        msg_void(base.residency, sel("requestResidency"));
+    }
+}
+
 /// One-shot numeric sanity line, printed on the first successful GEMM:
 /// recomputes row 0 of lane 0 on the CPU and reports the relative error.
 fn gemm_check_once(kind: &str, w_row0: &[f32], x0: &[f32], got: f32, rows: usize, cols: usize, t: usize) {
@@ -1701,6 +1753,7 @@ fn dequant_buffer(base: &MetalCtx, mps: &MpsCtx, packed: &[u8], scales: &[u8], r
     if buf.is_null() {
         return None;
     }
+    residency_add(base, buf);
     cache.insert(key, (buf, tag));
     Some(buf)
 }
@@ -1723,8 +1776,52 @@ static GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static GEMM_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn gemm_account(micros: u64) {
+    gemm_account_cat(0, micros);
+}
+
+/// GPU op categories for the split: 0 gemm, 1 batched gemm, 2 scan,
+/// 3 fused attention, 4 fused mlp, 5 multi-weight gemm, 6 linear layer,
+/// 7 decode token.
+pub const GPU_CATS: [&str; 8] = ["gemm", "batched", "scan", "attn", "mlp", "multi_w", "layer", "decode"];
+static GEMM_CAT_CALLS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static GEMM_CAT_MICROS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn gemm_account_cat(cat: usize, micros: u64) {
     GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GEMM_MICROS.fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+    GEMM_CAT_CALLS[cat].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GEMM_CAT_MICROS[cat].fetch_add(micros, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns and resets the per-category (calls, milliseconds) of GPU ops.
+pub fn gemm_cat_stats_take() -> Vec<(&'static str, u64, f64)> {
+    (0..8)
+        .map(|i| {
+            (
+                GPU_CATS[i],
+                GEMM_CAT_CALLS[i].swap(0, std::sync::atomic::Ordering::Relaxed),
+                GEMM_CAT_MICROS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+            )
+        })
+        .collect()
 }
 
 /// Returns and resets the (calls, milliseconds) spent inside GPU GEMMs
@@ -1863,7 +1960,7 @@ pub fn gpu_gemm_batched(
         drop(io);
         msg_void(pool, sel("drain"));
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(1, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -2054,6 +2151,7 @@ fn weight_buffer_f16(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols
     if buf.is_null() {
         return None;
     }
+    residency_add(base, buf);
     cache.insert(key, (buf, tag));
     Some(buf)
 }
@@ -2111,6 +2209,8 @@ fn weight_buffer_q8(base: &MetalCtx, mps: &MpsCtx, w: &[f32], rows: usize, cols:
         retain(bs);
         (bq, bs)
     };
+    residency_add(base, bq);
+    residency_add(base, bs);
     cache.insert(key, (bq, bs, tag));
     Some((bq, bs))
 }
@@ -2150,6 +2250,8 @@ fn packed_buffers_fp4(base: &MetalCtx, mps: &MpsCtx, packed: &[u8], scales: &[u8
         retain(bs);
         (bp, bs)
     };
+    residency_add(base, bp);
+    residency_add(base, bs);
     cache.insert(key, (bp, bs, tag));
     Some((bp, bs))
 }
@@ -2439,7 +2541,7 @@ pub fn gpu_delta_scan(
         drop(io);
         msg_void(pool, sel("drain"));
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(2, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -2707,7 +2809,7 @@ pub fn gpu_attention_fused(
         drop(io);
         msg_void(pool, sel("drain"));
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(3, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -2968,7 +3070,7 @@ pub fn gpu_mlp_fused(
         drop(io);
         msg_void(pool, sel("drain"));
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(4, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -3086,7 +3188,7 @@ pub fn gpu_gemm_multi_w(
         drop(io);
         msg_void(pool, sel("drain"));
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(5, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -3327,6 +3429,55 @@ kernel void gated_rmsnorm_f16(device const float* mixed_hm [[buffer(0)]], // [he
         o[i] = half(xin[i] * inv * w[i] * g);
     }
 }
+
+// The chained layers' residual stream: hidden (f32, resident) gets the
+// previous layer's attention and MLP outputs (f16) folded in, then the
+// row's input norm and an f16 copy of the updated row leave for the
+// next layer. dims: d, n_adds (0..2), do_norm. One threadgroup per row.
+kernel void chain_add_norm(device float* hidden      [[buffer(0)]], // [t, d] f32
+                           device const half* add_a  [[buffer(1)]], // [t, d]
+                           device const half* add_b  [[buffer(2)]], // [t, d]
+                           device const float* w     [[buffer(3)]], // [d]
+                           device half* normed       [[buffer(4)]], // [t, d]
+                           device half* hidden16     [[buffer(5)]], // [t, d]
+                           constant uint3& dims      [[buffer(6)]],
+                           constant float& eps       [[buffer(7)]],
+                           uint row   [[threadgroup_position_in_grid]],
+                           uint lane  [[thread_position_in_threadgroup]],
+                           uint lanes [[threads_per_threadgroup]]) {
+    uint d = dims.x, n_adds = dims.y, do_norm = dims.z;
+    device float* h = hidden + (size_t)row * d;
+    device const half* a = add_a + (size_t)row * d;
+    device const half* b = add_b + (size_t)row * d;
+    threadgroup float partial[32];
+    float ss = 0.0f;
+    for (uint i = lane; i < d; i += lanes) {
+        float v = h[i];
+        if (n_adds >= 1u) { v += float(a[i]); }
+        if (n_adds >= 2u) { v += float(b[i]); }
+        if (n_adds != 0u) { h[i] = v; }
+        ss += v * v;
+    }
+    if (do_norm == 0u) { return; }
+    ss = simd_sum(ss);
+    if ((lane & 31u) == 0u) partial[lane / 32u] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (lanes + 31u) / 32u;
+    if (lane < 32u) {
+        float v = (lane < nsg) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt(partial[0] / float(d) + eps);
+    device half* n = normed + (size_t)row * d;
+    device half* h16 = hidden16 + (size_t)row * d;
+    for (uint i = lane; i < d; i += lanes) {
+        float v = h[i];
+        h16[i] = half(v);
+        n[i] = half(v * inv * (1.0f + w[i]));
+    }
+}
 "#;
 
 #[allow(dead_code)] // pipelines consumed by the per-layer encoder (phase 3 wiring)
@@ -3334,6 +3485,7 @@ pub(crate) struct TissueCtx {
     pub(crate) conv: Id,
     pub(crate) gnorm: Id,
     pub(crate) scanprep: Id,
+    pub(crate) chainnorm: Id,
 }
 unsafe impl Send for TissueCtx {}
 unsafe impl Sync for TissueCtx {}
@@ -3392,12 +3544,13 @@ pub(crate) fn tissue_ctx() -> Option<(&'static MetalCtx, &'static TissueCtx)> {
                 let conv = mk("causal_conv_silu_f16");
                 let gnorm = mk("gated_rmsnorm_f16");
                 let scanprep = mk("scan_prep_f16");
+                let chainnorm = mk("chain_add_norm");
                 retain(library);
                 msg_void(pool, sel("drain"));
-                if conv.is_null() || gnorm.is_null() || scanprep.is_null() {
+                if conv.is_null() || gnorm.is_null() || scanprep.is_null() || chainnorm.is_null() {
                     return None;
                 }
-                Some(TissueCtx { conv, gnorm, scanprep })
+                Some(TissueCtx { conv, gnorm, scanprep, chainnorm })
             }
         })
         .as_ref()?;
@@ -3443,15 +3596,13 @@ const A_HID2: usize = 10; // hidden + attn f16 [t, d] (post-norm input)
 const A_NORM2: usize = 11; // post-normed f16 [t, d]
 const A_H: usize = 12; // gate|up f16 [t, inter]x2
 const A_OUT: usize = 13; // mlp out f16 [t, d]
-const A_STATE: usize = 14; // scan state f32 [heads, kd, vd]
-const A_CONVST: usize = 15; // conv state f32 [conv_dim, k-1]
-const A_SMALL: usize = 16; // small f32 params: norm weights, a_log, dt_bias, conv w
-const A_N: usize = 17;
+const A_HID32: usize = 14; // resident hidden f32 [t, d] (the chain's residual stream)
+const A_N: usize = 15; // per-layer slots of a chain follow: A_N + 3*i + {0 scan state, 1 conv state, 2 small params}
 
 /// Ensures arena slot `i` holds at least `bytes`; returns (contents, buffer).
 /// SAFETY: caller holds the ARENA lock for the whole layer encode.
 unsafe fn arena_buf(base: &MetalCtx, arena: &mut LayerArena, i: usize, bytes: usize) -> (*mut c_void, Id) {
-    while arena.bufs.len() < A_N {
+    while arena.bufs.len() <= i.max(A_N - 1) {
         arena.bufs.push((std::ptr::null_mut(), 0));
     }
     unsafe { ensure_buf(base, &mut arena.bufs[i], bytes) }
@@ -3515,9 +3666,71 @@ fn layer_prof_on() -> bool {
     *ON.get_or_init(|| std::env::var("MICROKIMI_GPU_LAYER_PROF").map(|v| v == "1").unwrap_or(false))
 }
 
+/// MICROKIMI_GPU_LAYER_PROF=1 or 2: the CPU-wall split of the linear
+/// layer call (staging | GPU wait | readback), one command buffer.
+fn layer_wall_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MICROKIMI_GPU_LAYER_PROF").map(|v| v == "1" || v == "2").unwrap_or(false))
+}
+
+/// Wall micros of gpu_linear_layer: 0 staging (entry to commit), 1 GPU
+/// (commit to completion), 2 readback (completion to return), 3 GPU busy
+/// (GPUStartTime to GPUEndTime), 4 queue wait (commit to GPUStartTime).
+static LAYER_WALL: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// The command buffers' GPUStartTime clock (CACurrentMediaTime): seconds
+/// from mach_absolute_time.
+fn media_time_now() -> f64 {
+    static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (n, d) = *TB.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+        // SAFETY: plain libSystem call filling a POD struct.
+        unsafe {
+            mach_timebase_info(&mut info);
+        }
+        (info.numer.max(1), info.denom.max(1))
+    });
+    // SAFETY: plain libSystem call.
+    let t = unsafe { mach_absolute_time() };
+    t as f64 * n as f64 / d as f64 / 1e9
+}
+
 /// Prints and resets the per-stage split of the linear-layer command
 /// buffer (when MICROKIMI_GPU_LAYER_PROF=1), in ms total since the last print.
 pub fn layer_prof_print() {
+    if layer_wall_on() {
+        let v: Vec<u64> = LAYER_WALL.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+        println!(
+            "  layer wall (ms, all linear layers): staging {:.2} | gpu commit-to-done {:.2} (commit call {:.2}, commit-to-kernel-start {:.2}, kernel span {:.2}, commit-to-GPU-start {:.2}, GPU busy {:.2}) | readback {:.2}",
+            v[0] as f64 / 1000.0,
+            v[1] as f64 / 1000.0,
+            v[5] as f64 / 1000.0,
+            v[7] as f64 / 1000.0,
+            v[6] as f64 / 1000.0,
+            v[4] as f64 / 1000.0,
+            v[3] as f64 / 1000.0,
+            v[2] as f64 / 1000.0
+        );
+    }
     if !layer_prof_on() {
         return;
     }
@@ -3528,18 +3741,34 @@ pub fn layer_prof_print() {
     println!("  layer stages (ms, GPU, all linear layers): {} | total {:.2}", parts.join(" | "), total as f64 / 1000.0);
 }
 
-pub fn gpu_linear_layer(
-    w: &LinLayerRefs,
-    gated_w: &[f32], // the DeltaNet output norm weight [vd]
-    dm: LinDims,
-    hidden: &[f32],
-    t: usize,
-    conv_state: &mut [f32],
-    scan_state: &mut [f32],
-    attn_plus_mlp: &mut [f32],
-) -> bool {
+/// One linear layer of a chain, by reference.
+pub struct ChainLayer<'a> {
+    pub w: LinLayerRefs<'a>,
+    pub gated_w: &'a [f32], // the DeltaNet output norm weight [vd]
+    pub dm: LinDims,
+}
+
+/// A run of consecutive dense linear-attention layers as ONE command
+/// buffer: the f32 residual stream lives on the device for the whole
+/// chain (uploaded once, read back once), each layer's input norm,
+/// projections, conv, scan, gated norm, out_proj, residual, post-norm
+/// and MLP encode in sequence, and the per-layer states ride in their
+/// own buffers. `hidden` [t, d] is updated in place; `states` holds
+/// each layer's (conv_state, scan_state), updated in place. False (with
+/// nothing mutated) when any piece is unavailable.
+pub fn gpu_linear_chain(layers: &[ChainLayer], hidden: &mut [f32], t: usize, states: &mut [(&mut [f32], &mut [f32])]) -> bool {
+    if layers.is_empty() || states.len() != layers.len() {
+        return false;
+    }
+    let dm = layers[0].dm;
     if !gemm_f16_on() || dm.kd > 128 || !scan_kd_ok(dm.kd) || dm.vd > 128 || dm.conv_k > 9 {
         return false;
+    }
+    for l in layers {
+        let o = l.dm;
+        if o.d != dm.d || o.heads != dm.heads || o.kv_heads != dm.kv_heads || o.kd != dm.kd || o.vd != dm.vd || o.conv_k != dm.conv_k || o.inter != dm.inter {
+            return false;
+        }
     }
     let (d, heads, kd, vd, inter) = (dm.d, dm.heads, dm.kd, dm.vd, dm.inter);
     let kt = dm.kv_heads * kd;
@@ -3561,15 +3790,23 @@ pub fn gpu_linear_layer(
     let Some((_, sc)) = scan_ctx() else {
         return false;
     };
-    // weights on device
-    let Some(b_qkv) = weight_buffer_f16(base, mps, w.in_qkv, conv_dim, d) else { return false };
-    let Some(b_z) = weight_buffer_f16(base, mps, w.in_z, vt, d) else { return false };
-    let Some(b_b) = weight_buffer_f16(base, mps, w.in_b, heads, d) else { return false };
-    let Some(b_a) = weight_buffer_f16(base, mps, w.in_a, heads, d) else { return false };
-    let Some(b_out) = weight_buffer_f16(base, mps, w.out_proj, d, vt) else { return false };
-    let Some(b_g) = dequant_buffer(base, mps, w.gate.0, w.gate.1, inter, d) else { return false };
-    let Some(b_u) = dequant_buffer(base, mps, w.up.0, w.up.1, inter, d) else { return false };
-    let Some(b_dn) = dequant_buffer(base, mps, w.down.0, w.down.1, d, inter) else { return false };
+    // weights on device, every layer of the chain before any encode
+    struct LayerBufs {
+        qkv: Id, z: Id, b: Id, a: Id, out: Id, g: Id, u: Id, dn: Id,
+    }
+    let mut wbufs: Vec<LayerBufs> = Vec::with_capacity(layers.len());
+    for l in layers {
+        let w = &l.w;
+        let Some(qkv) = weight_buffer_f16(base, mps, w.in_qkv, conv_dim, d) else { return false };
+        let Some(z) = weight_buffer_f16(base, mps, w.in_z, vt, d) else { return false };
+        let Some(b) = weight_buffer_f16(base, mps, w.in_b, heads, d) else { return false };
+        let Some(a) = weight_buffer_f16(base, mps, w.in_a, heads, d) else { return false };
+        let Some(out) = weight_buffer_f16(base, mps, w.out_proj, d, vt) else { return false };
+        let Some(g) = dequant_buffer(base, mps, w.gate.0, w.gate.1, inter, d) else { return false };
+        let Some(u) = dequant_buffer(base, mps, w.up.0, w.up.1, inter, d) else { return false };
+        let Some(dn) = dequant_buffer(base, mps, w.down.0, w.down.1, d, inter) else { return false };
+        wbufs.push(LayerBufs { qkv, z, b, a, out, g, u, dn });
+    }
     // kernels
     let Some(k_qkv) = gemm_kernel(base, mps, t, conv_dim, d, true, 1.0) else { return false };
     let Some(k_z) = gemm_kernel(base, mps, t, vt, d, true, 1.0) else { return false };
@@ -3597,7 +3834,8 @@ pub fn gpu_linear_layer(
                 (p, b)
             }};
         }
-        let (p_hid, b_hid) = slot!(A_HID, t * d * 2);
+        let (_, b_hid) = slot!(A_HID, t * d * 2);
+        let (p_hid32, b_hid32) = slot!(A_HID32, t * d * 4);
         let (_, b_norm) = slot!(A_NORM, t * d * 2);
         let (_, b_qkvo) = slot!(A_QKV, t * conv_dim * 2);
         let (_, b_zo) = slot!(A_Z, t * vt * 2);
@@ -3612,14 +3850,12 @@ pub fn gpu_linear_layer(
         let (_, b_scanin) = slot!(A_SCANIN, scan_total * 4);
         let (_, b_mixhm) = slot!(A_MIXHM, heads * t * vd * 4);
         let (_, b_mixtm) = slot!(A_MIXTM, t * vt * 2);
-        let (p_attn, b_attn) = slot!(A_ATTN, t * d * 2);
+        let (_, b_attn) = slot!(A_ATTN, t * d * 2);
         let (_, b_hid2) = slot!(A_HID2, t * d * 2);
         let (_, b_norm2) = slot!(A_NORM2, t * d * 2);
         let (_, b_h) = slot!(A_H, t * inter * 2 * 2);
-        let (p_out, b_out_mlp) = slot!(A_OUT, t * d * 2);
-        let (p_state, b_state) = slot!(A_STATE, scan_state.len() * 4);
-        let (p_convst, b_convst) = slot!(A_CONVST, conv_state.len() * 4);
-        // small params packed: [norm_w d | post_norm_w d | a_log heads | dt_bias heads | conv_w conv_dim*k]
+        let (_, b_out_mlp) = slot!(A_OUT, t * d * 2);
+        // small params packed per layer: [norm_w d | post_norm_w d | a_log heads | dt_bias heads | conv_w conv_dim*k | gated vd]
         let off_norm = 0usize;
         let off_post = d;
         let off_alog = 2 * d;
@@ -3627,19 +3863,30 @@ pub fn gpu_linear_layer(
         let off_convw = 2 * d + 2 * heads;
         let off_gated = off_convw + conv_dim * dm.conv_k;
         let small_total = off_gated + vd;
-        let (p_small, b_small) = slot!(A_SMALL, small_total * 4);
-
-        // uploads
-        f32s_to_f16s(hidden, std::slice::from_raw_parts_mut(p_hid as *mut u16, t * d));
-        std::ptr::copy_nonoverlapping(scan_state.as_ptr(), p_state as *mut f32, scan_state.len());
-        std::ptr::copy_nonoverlapping(conv_state.as_ptr(), p_convst as *mut f32, conv_state.len());
-        let sm_ptr = p_small as *mut f32;
-        std::ptr::copy_nonoverlapping(w.norm_w.as_ptr(), sm_ptr.add(off_norm), d.min(w.norm_w.len()));
-        std::ptr::copy_nonoverlapping(w.post_norm_w.as_ptr(), sm_ptr.add(off_post), d);
-        std::ptr::copy_nonoverlapping(w.a_log.as_ptr(), sm_ptr.add(off_alog), heads);
-        std::ptr::copy_nonoverlapping(w.dt_bias.as_ptr(), sm_ptr.add(off_dtb), heads);
-        std::ptr::copy_nonoverlapping(w.conv_w.as_ptr(), sm_ptr.add(off_convw), conv_dim * dm.conv_k);
-        std::ptr::copy_nonoverlapping(gated_w.as_ptr(), sm_ptr.add(off_gated), vd.min(gated_w.len()));
+        // per-layer buffers: state, conv state, small params
+        struct LayerSlots {
+            p_state: *mut c_void, b_state: Id, p_convst: *mut c_void, b_convst: Id, b_small: Id,
+        }
+        let mut lslots: Vec<LayerSlots> = Vec::with_capacity(layers.len());
+        for (i, l) in layers.iter().enumerate() {
+            let (conv_state, scan_state) = &states[i];
+            let (p_state, b_state) = slot!(A_N + 3 * i, scan_state.len() * 4);
+            let (p_convst, b_convst) = slot!(A_N + 3 * i + 1, conv_state.len() * 4);
+            let (p_small, b_small) = slot!(A_N + 3 * i + 2, small_total * 4);
+            std::ptr::copy_nonoverlapping(scan_state.as_ptr(), p_state as *mut f32, scan_state.len());
+            std::ptr::copy_nonoverlapping(conv_state.as_ptr(), p_convst as *mut f32, conv_state.len());
+            let w = &l.w;
+            let sm_ptr = p_small as *mut f32;
+            std::ptr::copy_nonoverlapping(w.norm_w.as_ptr(), sm_ptr.add(off_norm), d.min(w.norm_w.len()));
+            std::ptr::copy_nonoverlapping(w.post_norm_w.as_ptr(), sm_ptr.add(off_post), d);
+            std::ptr::copy_nonoverlapping(w.a_log.as_ptr(), sm_ptr.add(off_alog), heads);
+            std::ptr::copy_nonoverlapping(w.dt_bias.as_ptr(), sm_ptr.add(off_dtb), heads);
+            std::ptr::copy_nonoverlapping(w.conv_w.as_ptr(), sm_ptr.add(off_convw), conv_dim * dm.conv_k);
+            std::ptr::copy_nonoverlapping(l.gated_w.as_ptr(), sm_ptr.add(off_gated), vd.min(l.gated_w.len()));
+            lslots.push(LayerSlots { p_state, b_state, p_convst, b_convst, b_small });
+        }
+        // the residual stream, once
+        std::ptr::copy_nonoverlapping(hidden.as_ptr(), p_hid32 as *mut f32, t * d);
 
         // helpers
         let desc16 = |r: usize, c: usize| -> Id {
@@ -3693,21 +3940,30 @@ pub fn gpu_linear_layer(
             };
         }
 
-        // 1. input norm: normed = rmsnorm(hidden) * (1 + norm_w)   [hidden f16 view]
-        {
+        // residual fold + input norm from the resident f32 stream: the
+        // previous layer's attn and mlp (f16) join hidden, normed and the
+        // f16 copy of hidden leave; after the last layer, the fold alone
+        let chain_norm = |cmdbuf: Id, n_adds: u32, do_norm: u32, b_small: Id| {
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
-            set_pipe(e, sel_pipe, an.pipeline);
-            set_buf(e, sel_sb, b_hid, 0, 0);
-            set_buf(e, sel_sb, b_hid, 0, 1);
-            set_buf(e, sel_sb, b_small, (off_norm * 4) as u64, 2);
-            set_buf(e, sel_sb, b_norm, 0, 3);
-            set_buf(e, sel_sb, b_norm, 0, 6);
-            let dims: [u32; 2] = [d as u32, 0];
-            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 8, 4);
-            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 5);
+            set_pipe(e, sel_pipe, tis.chainnorm);
+            set_buf(e, sel_sb, b_hid32, 0, 0);
+            set_buf(e, sel_sb, b_attn, 0, 1);
+            set_buf(e, sel_sb, b_out_mlp, 0, 2);
+            set_buf(e, sel_sb, b_small, (off_norm * 4) as u64, 3);
+            set_buf(e, sel_sb, b_norm, 0, 4);
+            set_buf(e, sel_sb, b_hid, 0, 5);
+            let dims: [u32; 3] = [d as u32, n_adds, do_norm];
+            set_bytes(e, sel_by, dims.as_ptr() as *const c_void, 12, 6);
+            set_bytes(e, sel_by, (&dm.eps) as *const f32 as *const c_void, 4, 7);
             disp_tg(e, sel_dtg, MTLSize { width: t as u64, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
             msg_void(e, sel_end);
-        }
+        };
+        for li in 0..layers.len() {
+        let wb = &wbufs[li];
+        let (b_qkv, b_z, b_b, b_a, b_out, b_g, b_u, b_dn) = (wb.qkv, wb.z, wb.b, wb.a, wb.out, wb.g, wb.u, wb.dn);
+        let (b_state, b_convst, b_small) = (lslots[li].b_state, lslots[li].b_convst, lslots[li].b_small);
+        // 1. residual fold (layers after the first) + input norm
+        chain_norm(cmdbuf, if li == 0 { 0 } else { 2 }, 1, b_small);
         stage!(0);
         // 2. projections from normed: qkv, z, b, a
         let mx = m(b_norm, 0, t, d);
@@ -3825,31 +4081,47 @@ pub fn gpu_linear_layer(
             msg_void(e, sel_end);
         }
         enc_gemm(k_dn, sel_enc, cmdbuf, m(b_h, 0, t, inter), m(b_dn, 0, d, inter), m(b_out_mlp, 0, t, d));
-
         stage!(8);
-        msg_void(cmdbuf, sel("commit"));
-        msg_void(cmdbuf, sel("waitUntilCompleted"));
-
-        // readback: attn + mlp (both f16) summed into the caller's f32 buffer,
-        // and the two states
-        {
-            let a16 = std::slice::from_raw_parts(p_attn as *const u16, t * d);
-            let o16 = std::slice::from_raw_parts(p_out as *const u16, t * d);
-            let mut tmp = vec![0.0f32; t * d];
-            f16s_to_f32s(a16, attn_plus_mlp);
-            f16s_to_f32s(o16, &mut tmp);
-            for (x, y) in attn_plus_mlp.iter_mut().zip(&tmp) {
-                *x += y;
-            }
         }
-        scan_state.copy_from_slice(std::slice::from_raw_parts(p_state as *const f32, scan_state.len()));
-        conv_state.copy_from_slice(std::slice::from_raw_parts(p_convst as *const f32, conv_state.len()));
+        // the last layer's attn + mlp join the resident stream
+        chain_norm(cmdbuf, 2, 0, lslots[0].b_small);
+        let t_commit = std::time::Instant::now();
+        let mt_commit = media_time_now();
+        msg_void(cmdbuf, sel("commit"));
+        let t_committed = std::time::Instant::now();
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+        let t_done = std::time::Instant::now();
+        if layer_wall_on() {
+            LAYER_WALL[5].fetch_add((t_committed - t_commit).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            LAYER_WALL[0].fetch_add((t_commit - t_start).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            LAYER_WALL[1].fetch_add((t_done - t_commit).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            let getf: extern "C" fn(Id, Sel) -> f64 =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            let g0 = getf(cmdbuf, sel("GPUStartTime"));
+            let busy = getf(cmdbuf, sel("GPUEndTime")) - g0;
+            LAYER_WALL[3].fetch_add((busy * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+            LAYER_WALL[4].fetch_add(((g0 - mt_commit).max(0.0) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+            let k0 = getf(cmdbuf, sel("kernelStartTime"));
+            let k1 = getf(cmdbuf, sel("kernelEndTime"));
+            LAYER_WALL[6].fetch_add(((k1 - k0).max(0.0) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+            LAYER_WALL[7].fetch_add(((k0 - mt_commit).max(0.0) * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // readback: the residual stream and every layer's states
+        hidden[..t * d].copy_from_slice(std::slice::from_raw_parts(p_hid32 as *const f32, t * d));
+        for (i, (conv_state, scan_state)) in states.iter_mut().enumerate() {
+            scan_state.copy_from_slice(std::slice::from_raw_parts(lslots[i].p_state as *const f32, scan_state.len()));
+            conv_state.copy_from_slice(std::slice::from_raw_parts(lslots[i].p_convst as *const f32, conv_state.len()));
+        }
         for x in &mats {
             msg_void(*x, sel("release"));
         }
         msg_void(pool, sel("drain"));
+        if layer_wall_on() {
+            LAYER_WALL[2].fetch_add(t_done.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(6, t_start.elapsed().as_micros() as u64);
     true
 }
 
@@ -4536,6 +4808,85 @@ pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps
     }
 }
 
+/// Command-buffer latency probe: `n` command buffers each carrying one
+/// small dispatch (dec_add over 1024 floats), committed and waited one
+/// by one; prints the mean commit-to-done wall and GPU busy per buffer.
+pub fn cmdbuf_latency_probe(n: usize) -> Option<()> {
+    for gap_ms in [0u64, 1, 3, 10] {
+        cmdbuf_latency_probe_gap(n, gap_ms)?;
+    }
+    Some(())
+}
+
+/// The probe with a CPU idle gap of `gap_ms` before every command buffer
+/// (a sleeping GPU pays its wake-up on the next buffer).
+fn cmdbuf_latency_probe_gap(n: usize, gap_ms: u64) -> Option<()> {
+    let (base, dc) = decode_ctx()?;
+    // SAFETY: buffer creation, dispatches, waits, releases.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let f: extern "C" fn(Id, Sel, u64, u64) -> Id =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let bh = f(base.device, sel("newBufferWithLength:options:"), 4096, 0);
+        let ba = f(base.device, sel("newBufferWithLength:options:"), 2048, 0);
+        if bh.is_null() || ba.is_null() {
+            msg_void(pool, sel("drain"));
+            return None;
+        }
+        let set_pipe: extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_buf: extern "C" fn(Id, Sel, Id, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let set_bytes: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let disp_th: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let getf: extern "C" fn(Id, Sel) -> f64 =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let mut wall = 0.0f64;
+        let mut busy = 0.0f64;
+        let mut wall_min = f64::MAX;
+        for _ in 0..n {
+            let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+            let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            set_pipe(e, sel("setComputePipelineState:"), dc.add);
+            set_buf(e, sel("setBuffer:offset:atIndex:"), bh, 0, 0);
+            set_buf(e, sel("setBuffer:offset:atIndex:"), ba, 0, 1);
+            let cnt: u32 = 1024;
+            set_bytes(e, sel("setBytes:length:atIndex:"), (&cnt) as *const u32 as *const c_void, 4, 2);
+            disp_th(
+                e,
+                sel("dispatchThreads:threadsPerThreadgroup:"),
+                MTLSize { width: 1024, height: 1, depth: 1 },
+                MTLSize { width: 256, height: 1, depth: 1 },
+            );
+            msg_void(e, sel("endEncoding"));
+            if gap_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            }
+            let t0 = std::time::Instant::now();
+            msg_void(cmdbuf, sel("commit"));
+            msg_void(cmdbuf, sel("waitUntilCompleted"));
+            let w = t0.elapsed().as_secs_f64();
+            wall += w;
+            wall_min = wall_min.min(w);
+            busy += getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime"));
+        }
+        msg_void(bh, sel("release"));
+        msg_void(ba, sel("release"));
+        msg_void(pool, sel("drain"));
+        println!(
+            "gpu: command buffer latency ({} tiny buffers, {} ms idle before each): commit-to-done mean {:.3} ms (min {:.3}) | GPU busy mean {:.3} ms",
+            n,
+            gap_ms,
+            wall / n as f64 * 1000.0,
+            wall_min * 1000.0,
+            busy / n as f64 * 1000.0
+        );
+        Some(())
+    }
+}
+
 /// Streams a [rows, cols] f16 matrix through `dec_matvec` `reps` times
 /// in one command buffer and prints the achieved GB/s (GPU time).
 pub fn dec_matvec_bench(rows: usize, cols: usize, reps: usize) -> Option<f64> {
@@ -4904,6 +5255,7 @@ pub fn gpu_decoder_new(
             let b = f(base.device, sel("newBufferWithLength:options:"), bytes.max(16) as u64, 0);
             if !b.is_null() {
                 retain(b);
+                residency_add(base, b);
             }
             b
         };
@@ -5327,6 +5679,7 @@ pub fn tgemm_check_bench(t: usize, rows: usize, cols: usize, reps: usize) -> Opt
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         // tensor GEMM: reps in one command buffer, best of 3
         let mut best_t = f64::MAX;
+        let mut lat_t = f64::MAX;
         for _ in 0..3 {
             let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
@@ -5334,9 +5687,11 @@ pub fn tgemm_check_bench(t: usize, rows: usize, cols: usize, reps: usize) -> Opt
                 tgemm_encode(tg, e, bw, 0, bx, 0, cols, by1, 0, t, rows, cols);
             }
             msg_void(e, sel("endEncoding"));
+            let mt = media_time_now();
             msg_void(cmdbuf, sel("commit"));
             msg_void(cmdbuf, sel("waitUntilCompleted"));
             best_t = best_t.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+            lat_t = lat_t.min(getf(cmdbuf, sel("GPUStartTime")) - mt);
         }
         // MPS GEMM: same
         let desc16 = |r: usize, c: usize| -> Id {
@@ -5355,14 +5710,17 @@ pub fn tgemm_check_bench(t: usize, rows: usize, cols: usize, reps: usize) -> Opt
         let enc_gemm: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let mut best_m = f64::MAX;
+        let mut lat_m = f64::MAX;
         for _ in 0..3 {
             let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
             for _ in 0..reps {
                 enc_gemm(k_mps, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mw, my);
             }
+            let mt = media_time_now();
             msg_void(cmdbuf, sel("commit"));
             msg_void(cmdbuf, sel("waitUntilCompleted"));
             best_m = best_m.min(getf(cmdbuf, sel("GPUEndTime")) - getf(cmdbuf, sel("GPUStartTime")));
+            lat_m = lat_m.min(getf(cmdbuf, sel("GPUStartTime")) - mt);
         }
         let mut out_t = vec![0.0f32; t * rows];
         let mut out_m = vec![0.0f32; t * rows];
@@ -5393,11 +5751,11 @@ pub fn tgemm_check_bench(t: usize, rows: usize, cols: usize, reps: usize) -> Opt
         let (rm, _) = rel(&out_m);
         let flops = 2.0 * t as f64 * rows as f64 * cols as f64 * reps as f64;
         println!(
-            "gpu: tensor GEMM check [{}x{}]x[{}x{}]^T: rel {:.2e} (at [{}] gpu {:.4} cpu {:.4}) - {} | tensor {:.2} ms/pass {:.2} TFLOP/s | MPS rel {:.2e} {:.2} ms/pass {:.2} TFLOP/s",
+            "gpu: tensor GEMM check [{}x{}]x[{}x{}]^T: rel {:.2e} (at [{}] gpu {:.4} cpu {:.4}) - {} | tensor {:.2} ms/pass {:.2} TFLOP/s (commit-to-start {:.2} ms) | MPS rel {:.2e} {:.2} ms/pass {:.2} TFLOP/s (commit-to-start {:.2} ms)",
             t, cols, rows, cols, rt, wt, out_t[wt], reference[wt],
             if rt < 5e-3 { "MATCH" } else { "MISMATCH" },
-            best_t * 1000.0 / reps as f64, flops / best_t / 1e12,
-            rm, best_m * 1000.0 / reps as f64, flops / best_m / 1e12
+            best_t * 1000.0 / reps as f64, flops / best_t / 1e12, lat_t * 1000.0,
+            rm, best_m * 1000.0 / reps as f64, flops / best_m / 1e12, lat_m * 1000.0
         );
         Some(())
     }
@@ -5948,6 +6306,6 @@ fn gpu_decode_step_impl(
         return Some(());
     }
     dec.pos += 1;
-    gemm_account(t_start.elapsed().as_micros() as u64);
+    gemm_account_cat(7, t_start.elapsed().as_micros() as u64);
     Some(())
 }

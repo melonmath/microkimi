@@ -58,6 +58,10 @@ fn prefill_ms(output: &str) -> Option<f64> {
 }
 
 fn median(mut xs: Vec<f64>) -> f64 {
+    xs.retain(|v| !v.is_nan());
+    if xs.is_empty() {
+        return f64::NAN;
+    }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]
 }
@@ -356,6 +360,9 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             eprintln!("error: qwengpubench requires --model MODEL.bin");
             std::process::exit(2);
         });
+        // --gpu-only: GPU rounds back to back (no CPU arm between them; the
+        // paired protocol otherwise lets a swapping host cool the GPU copies)
+        let gpu_only = args.iter().any(|a| a == "--gpu-only");
         let rounds: usize = crate::value_flag(args, "--rounds")
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
@@ -398,6 +405,7 @@ pub fn gpu_prefill_cmd(args: &[String]) {
         };
         let (mut gpu_ms, mut cpu_ms, mut gemm_ms) = (Vec::new(), Vec::new(), Vec::new());
         let mut gemm_calls = 0u64;
+        let mut cat_stats: Vec<(&'static str, u64, f64)> = Vec::new();
         for _ in 0..rounds {
             crate::model::metal::set_qwen_gpu(true);
             crate::model::metal::gemm_stats_take();
@@ -405,6 +413,11 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             let (calls, ms) = crate::model::metal::gemm_stats_take();
             gemm_calls = calls;
             gemm_ms.push(ms / n_tokens as f64);
+            cat_stats = crate::model::metal::gemm_cat_stats_take();
+            if gpu_only {
+                cpu_ms.push(f64::NAN);
+                continue;
+            }
             crate::model::metal::set_qwen_gpu(false);
             cpu_ms.push(time_prefill(&mut model));
         }
@@ -425,6 +438,14 @@ pub fn gpu_prefill_cmd(args: &[String]) {
             gemm_calls,
             (g - gm).max(0.0)
         );
+        let cats: Vec<String> = cat_stats
+            .iter()
+            .filter(|(_, c, _)| *c > 0)
+            .map(|(n, c, ms)| format!("{} {} ops {:.3} ms/token", n, c, ms / n_tokens as f64))
+            .collect();
+        if !cats.is_empty() {
+            println!("  by op: {}", cats.join(" | "));
+        }
         crate::model::metal::layer_prof_print();
         println!("  last-position logits: max rel diff {:.2e} vs the CPU path", max_rel);
         println!(
