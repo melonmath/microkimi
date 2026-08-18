@@ -406,8 +406,13 @@ unsafe fn multi_rows_q8_packed(
         }
         return;
     }
+    #[cfg(target_arch = "aarch64")]
     let smmla = crate::quant::q8::smmla_available() && !xp.is_empty();
+    #[cfg(target_arch = "aarch64")]
     let all_scales: Vec<&[f32]> = if smmla { lanes.iter().map(|l| l.1).collect() } else { Vec::new() };
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = xp;
+    #[allow(unused_mut)]
     let mut r = r0;
     #[cfg(target_arch = "aarch64")]
     if crate::quant::q8::sdot4_available() && r % 4 == 0 {
@@ -975,6 +980,7 @@ impl Q8Head {
         let step = dyn_step(rows, njobs);
         let ctr = std::sync::atomic::AtomicUsize::new(0);
         let out_ptrs: Vec<usize> = outs.iter_mut().map(|o| o.as_mut_ptr() as usize).collect();
+        #[cfg(target_arch = "aarch64")]
         let nb = cols / 32;
         std::thread::scope(|scope| {
             for _ in 0..njobs {

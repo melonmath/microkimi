@@ -201,6 +201,7 @@ pub fn sdot4_available() -> bool {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
 pub fn sdot4_available() -> bool {
     false
 }
@@ -446,6 +447,36 @@ mod q8_tests {
         assert_eq!(block_dot(&packed, &x), dot_block_scalar(&packed, &x));
     }
 
+    /// Every architecture's fp4 row kernel must equal the reduction-order
+    /// reference bit for bit (integer block dots, fused four-lane order).
+    #[test]
+    fn row_dot_fp4_kernels_match_reference() {
+        let mut rng = Rng(0xC0FFEE);
+        for &nb in &[1usize, 3, 4, 7, 8, 13, 64, 65] {
+            for _ in 0..40 {
+                let prow: Vec<u8> = (0..nb * 16).map(|_| rng.u8()).collect();
+                let srow: Vec<u8> = (0..nb).map(|_| 120 + rng.u8() % 16).collect();
+                let q: Vec<i8> = (0..nb * 32).map(|_| (rng.u8() % 255) as i8).collect();
+                let scales: Vec<f32> = (0..nb).map(|_| 0.001 + (rng.u8() as f32) / 300.0).collect();
+                let xq = Q8Vec { q, scales };
+                let want = unsafe { row_dot_fp4_generic(&prow, &srow, &xq) };
+                let got = row_dot_fp4(&prow, &srow, &xq);
+                assert_eq!(got.to_bits(), want.to_bits(), "nb={nb}: {got} vs {want}");
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                        let v = unsafe { row_dot_fp4_x86(&prow, &srow, &xq) };
+                        assert_eq!(v.to_bits(), want.to_bits(), "avx2 nb={nb}");
+                    }
+                    if vnni512_available() {
+                        let v = unsafe { row_dot_fp4_vnni(&prow, &srow, &xq) };
+                        assert_eq!(v.to_bits(), want.to_bits(), "vnni nb={nb}");
+                    }
+                }
+            }
+        }
+    }
+
     /// The i8 x i8 KV dot must equal the scalar kernel EXACTLY (integer
     /// arithmetic, including the maddubs sign-trick extremes).
     #[test]
@@ -511,6 +542,9 @@ pub fn row_dot_fp4(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
         }
         #[cfg(target_arch = "x86_64")]
         {
+            if vnni512_available() {
+                return row_dot_fp4_vnni;
+            }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 return row_dot_fp4_x86;
             }
@@ -1073,26 +1107,22 @@ pub unsafe fn rows4_x8_smmla(
 #[target_feature(enable = "avx2")]
 unsafe fn i8_block_dot_vec(w: std::arch::x86_64::__m256i, x: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
-    unsafe {
-        // exact widening form (see dot_i8_avx2)
-        let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
-        let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
-        let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
-        let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
-        _mm256_add_epi32(_mm256_madd_epi16(w_lo, x_lo), _mm256_madd_epi16(w_hi, x_hi))
-    }
+    // exact widening form (see dot_i8_avx2)
+    let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+    let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+    let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
+    let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
+    _mm256_add_epi32(_mm256_madd_epi16(w_lo, x_lo), _mm256_madd_epi16(w_hi, x_hi))
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hsum_i32(v: std::arch::x86_64::__m256i) -> i32 {
     use std::arch::x86_64::*;
-    unsafe {
-        let s128 = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
-        let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
-        let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32(s64, 0xB1));
-        _mm_cvtsi128_si32(s32)
-    }
+    let s128 = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
+    let s32 = _mm_add_epi32(s64, _mm_shuffle_epi32(s64, 0xB1));
+    _mm_cvtsi128_si32(s32)
 }
 
 /// Four rows x N lanes on x86: per block, the four rows' i8 words load
@@ -1139,6 +1169,7 @@ pub unsafe fn rows4_dot_fma_x86(
 }
 
 /// True on x86 with AVX2+FMA (the four-row tiles' gate there).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn x86_tiles_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1193,6 +1224,7 @@ unsafe fn row_dot_fp4_x86(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
 
 /// True with AVX-512 VNNI (Cascade Lake and later): vpdpbusd on 512-bit
 /// vectors, 64 int8 MACs per instruction.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn vnni512_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1298,4 +1330,73 @@ pub unsafe fn rows4_dot_fma_vnni(
         }
     }
     out
+}
+
+/// One MXFP4 row against a q8 activation with AVX-512 (BW + VNNI): four
+/// 32-column blocks per iteration. The 64 packed bytes decode through
+/// the LUT2 shuffle in all four 128-bit lanes at once, each lane one
+/// block; per lane the exact u8 x s8 form (dot(x + 128, w) - 128 sum(w))
+/// gives the block's integer dot in four i32 partials, reduced inside
+/// the lane (exact), converted and FMA'd against 2^(e-128) * dx as the
+/// scalar kernel does. Bit-identical to row_dot_fp4_x86 / _generic:
+/// same integer block dots, same fused four-lane f32 order.
+///
+/// SAFETY: caller guarantees avx512f/bw/vnni; prow has 16*nb bytes,
+/// srow nb bytes, xq nb blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,fma")]
+unsafe fn row_dot_fp4_vnni(prow: &[u8], srow: &[u8], xq: &Q8Vec) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = srow.len();
+    unsafe {
+        let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(E2M1_X2.as_ptr() as *const __m128i));
+        let msk = _mm512_set1_epi8(0x0F);
+        let c128 = _mm512_set1_epi8(-128);
+        let mut lanes = [0.0f32; 4];
+        let mut g = 0usize;
+        while g + 4 <= nb {
+            // 64 bytes = 4 blocks of 16 packed bytes: lane k = block g+k
+            let bytes = _mm512_loadu_si512(prow.as_ptr().add(g * 16) as *const _);
+            let lo = _mm512_shuffle_epi8(lut, _mm512_and_si512(bytes, msk));
+            let hi = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(bytes, 4), msk));
+            // per lane: bytes 0..16 = even columns' first 16 / odd ... interleave
+            let ilo = _mm512_unpacklo_epi8(lo, hi); // per lane: columns 0..15 of the block
+            let ihi = _mm512_unpackhi_epi8(lo, hi); // per lane: columns 16..31
+            // activation blocks g..g+4: 128 bytes; regroup so that lane k
+            // holds block g+k's first 16 (xa) / last 16 (xb) columns
+            let x0 = _mm512_loadu_si512(xq.q.as_ptr().add(g * 32) as *const _); // blocks g, g+1
+            let x1 = _mm512_loadu_si512(xq.q.as_ptr().add(g * 32 + 64) as *const _); // blocks g+2, g+3
+            // x0 lanes: [g:0-15][g:16-31][g+1:0-15][g+1:16-31]; x1 same for g+2,g+3
+            let xa = _mm512_permutex2var_epi64(x0, _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0), x1);
+            let xb = _mm512_permutex2var_epi64(x0, _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2), x1);
+            let uxa = _mm512_xor_si512(xa, c128);
+            let uxb = _mm512_xor_si512(xb, c128);
+            let d = _mm512_add_epi32(
+                _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), uxa, ilo), _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, ilo)),
+                _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), uxb, ihi), _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, ihi)),
+            );
+            // reduce the four i32 partials inside each 128-bit lane (exact)
+            let d2 = _mm512_add_epi32(d, _mm512_shuffle_epi32(d, _MM_PERM_BADC));
+            let d1 = _mm512_add_epi32(d2, _mm512_shuffle_epi32(d2, _MM_PERM_CDAB));
+            // lane k element 0 = idot of block g+k
+            let idx = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 8, 4, 0);
+            let idots = _mm512_castsi512_si128(_mm512_permutexvar_epi32(idx, d1));
+            let sc = _mm_set_ps(
+                crate::quant::mxfp4::exp2_i(srow[g + 3] as i32 - 128) * xq.scales[g + 3],
+                crate::quant::mxfp4::exp2_i(srow[g + 2] as i32 - 128) * xq.scales[g + 2],
+                crate::quant::mxfp4::exp2_i(srow[g + 1] as i32 - 128) * xq.scales[g + 1],
+                crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128) * xq.scales[g],
+            );
+            let acc = _mm_loadu_ps(lanes.as_ptr());
+            _mm_storeu_ps(lanes.as_mut_ptr(), _mm_fmadd_ps(_mm_cvtepi32_ps(idots), sc, acc));
+            g += 4;
+        }
+        let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+        while g < nb {
+            let idot = block_dot(&prow[g * 16..(g + 1) * 16], &xq.q[g * 32..(g + 1) * 32]);
+            total += idot as f32 * (crate::quant::mxfp4::exp2_i(srow[g] as i32 - 128) * xq.scales[g]);
+            g += 1;
+        }
+        total
+    }
 }
