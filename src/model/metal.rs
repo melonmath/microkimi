@@ -2556,3 +2556,332 @@ pub fn gpu_attention_fused(
     gemm_account(t_start.elapsed().as_micros() as u64);
     true
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fused MLP: gate GEMM, up GEMM, SiLU(gate)*up in MSL, down GEMM - one
+// command buffer, the intermediate activation never leaves the GPU
+// ════════════════════════════════════════════════════════════════════════════
+
+const SILU_MUL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// h[i] = silu(g[i]) * u[i], in place into g (f16 storage, f32 math)
+kernel void silu_mul_f16(device half* g       [[buffer(0)]],
+                         device const half* u [[buffer(1)]],
+                         constant uint& n     [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) { return; }
+    float x = float(g[i]);
+    float s = x / (1.0f + exp(-x));
+    g[i] = half(s * float(u[i]));
+}
+"#;
+
+static SILU: std::sync::OnceLock<Option<ScanCtx>> = std::sync::OnceLock::new();
+
+fn silu_ctx() -> Option<(&'static MetalCtx, &'static ScanCtx)> {
+    let base = ctx()?;
+    let sm = SILU
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(SILU_MUL_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: silu shader error: {} - MLP stays three-step", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let function = {
+                    let f: extern "C" fn(Id, Sel, Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(library, sel("newFunctionWithName:"), ns_string("silu_mul_f16"))
+                };
+                let mut perr: Id = std::ptr::null_mut();
+                let pipeline = {
+                    let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                };
+                if pipeline.is_null() {
+                    println!("gpu: silu pipeline error: {} - MLP stays three-step", err_desc(perr));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                retain(pipeline);
+                retain(function);
+                retain(library);
+                msg_void(pool, sel("drain"));
+                Some(ScanCtx { pipeline })
+            }
+        })
+        .as_ref()?;
+    Some((base, sm))
+}
+
+/// Whole dense MLP for one layer in ONE command buffer: gate and up
+/// GEMMs from the same staged X, SiLU(gate)*up in place on the GPU,
+/// down GEMM into the output. Three device-resident MXFP4 dequant
+/// copies (f16 mode only). False = caller runs its three-GEMM path.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_mlp_fused(
+    gate: (&[u8], &[u8]),
+    up: (&[u8], &[u8]),
+    down: (&[u8], &[u8]),
+    inter: usize,
+    d: usize,
+    xs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> bool {
+    if !gemm_f16_on() {
+        return false;
+    }
+    let t = xs.len();
+    if t * inter * 2 * 2 + t * d * 2 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
+    let Some((base, sm)) = silu_ctx() else {
+        return false;
+    };
+    let Some((_, mps)) = mps_ctx() else {
+        return false;
+    };
+    let Some(bg) = dequant_buffer(base, mps, gate.0, gate.1, inter, d) else {
+        return false;
+    };
+    let Some(bu) = dequant_buffer(base, mps, up.0, up.1, inter, d) else {
+        return false;
+    };
+    let Some(bd) = dequant_buffer(base, mps, down.0, down.1, d, inter) else {
+        return false;
+    };
+    let Some(k_up) = gemm_kernel(base, mps, t, inter, d, true, 1.0) else {
+        return false;
+    };
+    let Some(k_down) = gemm_kernel(base, mps, t, d, inter, true, 1.0) else {
+        return false;
+    };
+    let t_start = std::time::Instant::now();
+    // SAFETY: same invariants as the other offload paths.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (x_ptr, buf_x) = ensure_buf(base, &mut io.x, t * d * 2);
+        // [gate | up] halves in one staging buffer, output in y
+        let (h_ptr, buf_h) = ensure_buf(base, &mut io.z, t * inter * 2 * 2);
+        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * d * 2);
+        if buf_x.is_null() || buf_h.is_null() || buf_y.is_null() || x_ptr.is_null() || h_ptr.is_null() || y_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        for (l, x) in xs.iter().enumerate() {
+            let dst = std::slice::from_raw_parts_mut((x_ptr as *mut u16).add(l * d), d);
+            f32s_to_f16s(x, dst);
+        }
+        let desc = |r: usize, c: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                class("MPSMatrixDescriptor"),
+                sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"),
+                r as u64,
+                c as u64,
+                (c * 2) as u64,
+                MPS_FLOAT16,
+            )
+        };
+        let matrix_at = |buf: Id, off: usize, dsc: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:offset:descriptor:"), buf, off as u64, dsc)
+        };
+        let mx = matrix_at(buf_x, 0, desc(t, d));
+        let mwg = matrix_at(bg, 0, desc(inter, d));
+        let mwu = matrix_at(bu, 0, desc(inter, d));
+        let mwd = matrix_at(bd, 0, desc(d, inter));
+        let mg = matrix_at(buf_h, 0, desc(t, inter));
+        let mu = matrix_at(buf_h, t * inter * 2, desc(t, inter));
+        let my = matrix_at(buf_y, 0, desc(t, d));
+        let all = [mx, mwg, mwu, mwd, mg, mu, my];
+        if all.iter().any(|m| m.is_null()) {
+            for m in all {
+                if !m.is_null() {
+                    msg_void(m, sel("release"));
+                }
+            }
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        let enc: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        enc(k_up, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mwg, mg);
+        enc(k_up, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mx, mwu, mu);
+        {
+            let encoder = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            let f1: extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f1(encoder, sel("setComputePipelineState:"), sm.pipeline);
+            let f2: extern "C" fn(Id, Sel, Id, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_h, 0, 0);
+            f2(encoder, sel("setBuffer:offset:atIndex:"), buf_h, (t * inter * 2) as u64, 1);
+            let n = (t * inter) as u32;
+            let f3: extern "C" fn(Id, Sel, *const c_void, u64, u64) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f3(encoder, sel("setBytes:length:atIndex:"), (&n) as *const u32 as *const c_void, 4, 2);
+            let f4: extern "C" fn(Id, Sel, MTLSize, MTLSize) =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f4(
+                encoder,
+                sel("dispatchThreads:threadsPerThreadgroup:"),
+                MTLSize { width: (t * inter) as u64, height: 1, depth: 1 },
+                MTLSize { width: 256, height: 1, depth: 1 },
+            );
+            msg_void(encoder, sel("endEncoding"));
+        }
+        enc(k_down, sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cmdbuf, mg, mwd, my);
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+
+        for (l, out) in outs.iter_mut().enumerate() {
+            let src = std::slice::from_raw_parts((y_ptr as *const u16).add(l * d), d);
+            f16s_to_f32s(src, out);
+        }
+        for m in all {
+            msg_void(m, sel("release"));
+        }
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
+}
+
+/// Several f32 weight matrices against ONE staged input, one command
+/// buffer, one wait: X uploads once, each GEMM writes its own region of
+/// the output staging. For the attention projections (q/k/v, in_qkv/in_z)
+/// that share the normed hidden. f16 mode only; false = per-GEMM path.
+pub fn gpu_gemm_multi_w(
+    ws: &[(&[f32], usize)], // (weights, rows), all with the same cols
+    cols: usize,
+    xs: &[&[f32]],
+    outs: &mut [&mut [&mut [f32]]], // outs[k][lane] -> rows_k
+) -> bool {
+    if !gemm_f16_on() || ws.is_empty() {
+        return false;
+    }
+    let t = xs.len();
+    let total_rows: usize = ws.iter().map(|w| w.1).sum();
+    if t * total_rows * 2 > GEMM_MAX_OUT_BYTES {
+        return false;
+    }
+    let Some((base, mps)) = mps_ctx() else {
+        return false;
+    };
+    let mut bufs = Vec::with_capacity(ws.len());
+    let mut kernels = Vec::with_capacity(ws.len());
+    for (w, rows) in ws {
+        let Some(b) = weight_buffer_f16(base, mps, w, *rows, cols) else {
+            return false;
+        };
+        let Some(k) = gemm_kernel(base, mps, t, *rows, cols, true, 1.0) else {
+            return false;
+        };
+        bufs.push(b);
+        kernels.push(k);
+    }
+    let t_start = std::time::Instant::now();
+    // SAFETY: same invariants as run_gemm.
+    unsafe {
+        let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+        let mut io = base.io.lock().unwrap();
+        let (x_ptr, buf_x) = ensure_buf(base, &mut io.x, t * cols * 2);
+        let (y_ptr, buf_y) = ensure_buf(base, &mut io.y, t * total_rows * 2);
+        if buf_x.is_null() || buf_y.is_null() || x_ptr.is_null() || y_ptr.is_null() {
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        for (l, x) in xs.iter().enumerate() {
+            let dst = std::slice::from_raw_parts_mut((x_ptr as *mut u16).add(l * cols), cols);
+            f32s_to_f16s(x, dst);
+        }
+        let desc = |r: usize, c: usize| -> Id {
+            let f: extern "C" fn(Id, Sel, u64, u64, u64, u32) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(
+                class("MPSMatrixDescriptor"),
+                sel("matrixDescriptorWithRows:columns:rowBytes:dataType:"),
+                r as u64,
+                c as u64,
+                (c * 2) as u64,
+                MPS_FLOAT16,
+            )
+        };
+        let matrix_at = |buf: Id, off: usize, dsc: Id| -> Id {
+            let f: extern "C" fn(Id, Sel, Id, u64, Id) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(msg_id(class("MPSMatrix"), sel("alloc")), sel("initWithBuffer:offset:descriptor:"), buf, off as u64, dsc)
+        };
+        let mx = matrix_at(buf_x, 0, desc(t, cols));
+        let mut mats = vec![mx];
+        let mut y_off = 0usize;
+        let mut y_offs = Vec::with_capacity(ws.len());
+        for (i, (_, rows)) in ws.iter().enumerate() {
+            mats.push(matrix_at(bufs[i], 0, desc(*rows, cols)));
+            mats.push(matrix_at(buf_y, y_off * 2, desc(t, *rows)));
+            y_offs.push(y_off);
+            y_off += t * rows;
+        }
+        if mats.iter().any(|m| m.is_null()) {
+            for m in &mats {
+                if !m.is_null() {
+                    msg_void(*m, sel("release"));
+                }
+            }
+            drop(io);
+            msg_void(pool, sel("drain"));
+            return false;
+        }
+        let cmdbuf = msg_id(base.queue, sel("commandBuffer"));
+        let enc: extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        for i in 0..ws.len() {
+            enc(
+                kernels[i],
+                sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"),
+                cmdbuf,
+                mx,
+                mats[1 + 2 * i],
+                mats[2 + 2 * i],
+            );
+        }
+        msg_void(cmdbuf, sel("commit"));
+        msg_void(cmdbuf, sel("waitUntilCompleted"));
+        for (i, (_, rows)) in ws.iter().enumerate() {
+            let base_off = y_offs[i];
+            for (l, out) in outs[i].iter_mut().enumerate() {
+                let src = std::slice::from_raw_parts((y_ptr as *const u16).add(base_off + l * rows), *rows);
+                f16s_to_f32s(src, out);
+            }
+        }
+        for m in &mats {
+            msg_void(*m, sel("release"));
+        }
+        drop(io);
+        msg_void(pool, sel("drain"));
+    }
+    gemm_account(t_start.elapsed().as_micros() as u64);
+    true
+}

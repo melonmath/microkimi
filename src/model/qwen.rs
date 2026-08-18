@@ -2883,12 +2883,30 @@ fn lin_attn_prefill(
                 q_z.matvec_multi(&xs, &mut outs);
             }
             None => {
-                let mut outs: Vec<&mut [f32]> = qkv.chunks_mut(conv_dim).collect();
-                crate::model::ops::matvec_multi(in_qkv, conv_dim, d, &xs, &mut outs);
-                let mut outs: Vec<&mut [f32]> = z.chunks_mut(vt).collect();
-                crate::model::ops::matvec_multi(in_z, vt, d, &xs, &mut outs);
+                // GPU: in_qkv and in_z from one staged X, one command buffer
+                #[allow(unused_mut)]
+                let mut done = false;
+                #[cfg(target_os = "macos")]
+                if crate::model::metal::qwen_gpu_on() && t_count >= crate::model::metal::GEMM_MIN_T {
+                    let mut o1: Vec<&mut [f32]> = qkv.chunks_mut(conv_dim).collect();
+                    let mut o2: Vec<&mut [f32]> = z.chunks_mut(vt).collect();
+                    let mut outs: [&mut [&mut [f32]]; 2] = [&mut o1, &mut o2];
+                    done = crate::model::metal::gpu_gemm_multi_w(
+                        &[(in_qkv, conv_dim), (in_z, vt)],
+                        d,
+                        &xs,
+                        &mut outs,
+                    );
+                }
+                if !done {
+                    let mut outs: Vec<&mut [f32]> = qkv.chunks_mut(conv_dim).collect();
+                    crate::model::ops::matvec_multi(in_qkv, conv_dim, d, &xs, &mut outs);
+                    let mut outs: Vec<&mut [f32]> = z.chunks_mut(vt).collect();
+                    crate::model::ops::matvec_multi(in_z, vt, d, &xs, &mut outs);
+                }
             }
         }
+        // the small b/a projections stay on the CPU (below the GEMM size floor)
         let mut outs: Vec<&mut [f32]> = b_raw.chunks_mut(heads).collect();
         crate::model::ops::matvec_multi(in_b, heads, d, &xs, &mut outs);
         let mut outs: Vec<&mut [f32]> = a_raw.chunks_mut(heads).collect();
@@ -3308,12 +3326,30 @@ fn full_attn_prefill(
                 qv.matvec_multi(&xs, &mut outs);
             }
             None => {
-                let mut outs: Vec<&mut [f32]> = qg_all.chunks_mut(q_width * 2).collect();
-                crate::model::ops::matvec_multi(q_proj, q_width * 2, d, &xs, &mut outs);
-                let mut outs: Vec<&mut [f32]> = k_all.chunks_mut(kv_width).collect();
-                crate::model::ops::matvec_multi(k_proj, kv_width, d, &xs, &mut outs);
-                let mut outs: Vec<&mut [f32]> = v_all.chunks_mut(kv_width).collect();
-                crate::model::ops::matvec_multi(v_proj, kv_width, d, &xs, &mut outs);
+                // GPU: q, k, v from one staged X in one command buffer
+                #[allow(unused_mut)]
+                let mut done = false;
+                #[cfg(target_os = "macos")]
+                if crate::model::metal::qwen_gpu_on() && t_count >= crate::model::metal::GEMM_MIN_T {
+                    let mut oq: Vec<&mut [f32]> = qg_all.chunks_mut(q_width * 2).collect();
+                    let mut ok: Vec<&mut [f32]> = k_all.chunks_mut(kv_width).collect();
+                    let mut ov: Vec<&mut [f32]> = v_all.chunks_mut(kv_width).collect();
+                    let mut outs: [&mut [&mut [f32]]; 3] = [&mut oq, &mut ok, &mut ov];
+                    done = crate::model::metal::gpu_gemm_multi_w(
+                        &[(q_proj, q_width * 2), (k_proj, kv_width), (v_proj, kv_width)],
+                        d,
+                        &xs,
+                        &mut outs,
+                    );
+                }
+                if !done {
+                    let mut outs: Vec<&mut [f32]> = qg_all.chunks_mut(q_width * 2).collect();
+                    crate::model::ops::matvec_multi(q_proj, q_width * 2, d, &xs, &mut outs);
+                    let mut outs: Vec<&mut [f32]> = k_all.chunks_mut(kv_width).collect();
+                    crate::model::ops::matvec_multi(k_proj, kv_width, d, &xs, &mut outs);
+                    let mut outs: Vec<&mut [f32]> = v_all.chunks_mut(kv_width).collect();
+                    crate::model::ops::matvec_multi(v_proj, kv_width, d, &xs, &mut outs);
+                }
             }
         }
     }
@@ -3741,6 +3777,26 @@ fn mlp_prefill(
             let inter = c.dense_inter;
             let threads = crate::model::pool::pool().workers.max(1);
             let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
+            // GPU: the whole MLP in one command buffer (gate, up, SiLU*up
+            // on device, down); falls through to the per-GEMM path
+            #[cfg(target_os = "macos")]
+            if crate::model::metal::qwen_gpu_on()
+                && t_count >= crate::model::metal::GEMM_MIN_T
+                && !crate::model::accel::accel_on()
+            {
+                let mut outs: Vec<&mut [f32]> = out[..t_count * d].chunks_mut(d).collect();
+                if crate::model::metal::gpu_mlp_fused(
+                    packed_parts(data, gate),
+                    packed_parts(data, up),
+                    packed_parts(data, down),
+                    inter,
+                    d,
+                    &xs,
+                    &mut outs,
+                ) {
+                    return;
+                }
+            }
             let mut h_gate = vec![0.0f32; t_count * inter];
             let mut h_up = vec![0.0f32; t_count * inter];
             let t_gemm = std::time::Instant::now();
