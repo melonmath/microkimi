@@ -6008,8 +6008,11 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
                 crate::model::metal::dec_matvec_bench_kind(r, c, 24, 2);
             }
             // the delta scan alone: geometry sweep (concurrency vs per-step latency)
-            for (t, h, kd, vd) in [(1024usize, 16usize, 128usize, 128usize), (256, 16, 128, 128), (1024, 4, 128, 128), (1024, 64, 128, 128), (1024, 16, 128, 32)] {
+            for (t, h, kd, vd) in [(1024usize, 16usize, 128usize, 128usize), (256, 16, 128, 128), (1024, 16, 128, 32)] {
                 crate::model::metal::delta_scan_check_bench(t, h, kd, vd, 3);
+            }
+            for (t, h, kd, vd) in [(1024usize, 16usize, 128usize, 128usize), (100, 16, 128, 128), (1024, 4, 128, 128), (777, 16, 128, 32)] {
+                crate::model::metal::delta_chunk_check_bench(t, h, kd, vd, 3);
             }
             // prefill GEMM shapes: tensor ops vs MPS
             for (t, r, c) in [(1024usize, 3584usize, 1024usize), (1024, 1024, 3584), (1024, 6144, 1024), (1024, 4096, 1024), (1024, 1024, 2048), (256, 3584, 1024), (64, 3584, 1024)] {

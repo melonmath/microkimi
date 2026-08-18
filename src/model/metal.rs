@@ -2499,6 +2499,363 @@ kernel void delta_scan(device const float* q     [[buffer(0)]],
 }
 "#;
 
+// ════════════════════════════════════════════════════════════════════════════
+// Chunked delta scan (prefill): the recurrence per 32-token chunk as dense
+// tiles, only the chunk boundary walk stays sequential
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Certified (delta_chunk check, 6e-7 against the sequential CPU
+// reference) and NOT wired: on the M5 it measured 6.2 ms per layer on the
+// 1024-token shape against the register scan's 3.6 (one 1024-thread
+// threadgroup per head, 32 KB of threadgroup memory: one threadgroup per
+// core; a column-split variant with k/q read from device memory 9.0 ms).
+// At C = 32 the chunked form does not cut the FLOPs (S0'k, S0'q and the
+// state update are 3 kd per column-token against the recurrence's 4 kd),
+// so without the tensor units it cannot beat a recurrence that already
+// runs near the scalar FMA rate; a C >= 128 form on MPS batched GEMMs is
+// the remaining route (fewer, fatter dispatches). gpudecodebench --kern
+// prints both. MICROKIMI_CHUNK_SKIP=<mask> times the phases.
+//
+// The same WY form as the CPU chunked_scan_head (qwen.rs): per chunk of
+// C = 32 tokens and per head, with gamma the per-token decay, G(a..b) the
+// product of gammas over positions a..b, S0 the state at chunk start:
+//   b_t   = beta_t (v_t - G(1..t) S0' k_t)
+//   u_t   = b_t - sum_{s<t} beta_t G(s+1..t) (k_s . k_t) u_s      (forward substitution)
+//   out_t = G(1..t) S0' q_t + sum_{s<=t} G(s+1..t) (q_t . k_s) u_s
+//   S     = G(1..n) S0 + sum_s G(s+1..n) k_s (x) u_s
+// Kernel A (one threadgroup per (chunk, head), 32x32 threads) writes per
+// chunk the two weighted 32x32 matrices a[t][s] = beta_t G(s+1..t) k_s.k_t
+// (s < t) and w[t][s] = G(s+1..t) q_t.k_s (s <= t), the cumulative decays
+// G(1..t), the state-update weights G(s+1..n) and G(1..n). Kernel B (one
+// threadgroup per (head, 32 value columns), the chunks in sequence
+// inside): every phase is column-separable, so a thread owns one column
+// and four tokens - S0'k and S0'q in registers, b into U (threadgroup
+// memory), one thread per column runs the substitution over the chunk
+// (no barrier: columns are independent), the outputs from U and the
+// state update from k and U. All f32. Chunk decays are running products,
+// never divided cumulatives (the CPU version's rule).
+
+const DELTA_CHUNK_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint CH = 32u;      // chunk length
+constant uint KDM = 128u;    // kd, vd budget of the register/tile plan
+
+// Per (chunk, head): a, w (CH x CH), gcum[CH], gk[CH], beta[CH], gtot -> scratch
+// layout per (head, chunk): [a CH*CH | w CH*CH | gcum CH | gk CH | beta CH | gtot (padded to CH)]
+constant uint SCR = 2u * CH * CH + 4u * CH;
+
+kernel void delta_chunk_prep(device const float* q     [[buffer(0)]],  // [t, heads, kd]
+                             device const float* k     [[buffer(1)]],
+                             device const float* beta  [[buffer(2)]],  // [t, heads]
+                             device const float* decay [[buffer(3)]],  // [t, heads]
+                             device float* scratch     [[buffer(4)]],
+                             constant uint4& dims      [[buffer(5)]],  // t, heads, kd, nchunks
+                             uint tg    [[threadgroup_position_in_grid]],
+                             uint lane  [[thread_position_in_threadgroup]]) {
+    uint t_count = dims.x, heads = dims.y, kd = dims.z, nchunks = dims.w;
+    uint c = tg / heads, h = tg % heads;
+    if (c >= nchunks) { return; }
+    uint c0 = c * CH;
+    uint n = min(CH, t_count - c0);
+    uint tt = lane / CH, ss = lane % CH; // (t, s) of this thread
+    device float* base = scratch + ((size_t)h * nchunks + c) * SCR;
+    device float* a = base;
+    device float* w = base + CH * CH;
+    device float* gcum = base + 2u * CH * CH;
+    device float* gk = gcum + CH;
+    device float* bet = gk + CH;
+    device float* gtot = bet + CH;
+    // decays: G(s+1..t) as a running product from t down to s+1
+    float grel = 1.0f;
+    if (tt < n && ss < n) {
+        for (uint i = tt; i > ss; i--) { grel *= decay[(c0 + i) * heads + h]; }
+    }
+    // gram entries
+    float kk = 0.0f, qk = 0.0f;
+    if (tt < n && ss <= tt) {
+        device const float* kt = k + (size_t)((c0 + tt) * heads + h) * kd;
+        device const float* qt = q + (size_t)((c0 + tt) * heads + h) * kd;
+        device const float* ks = k + (size_t)((c0 + ss) * heads + h) * kd;
+        for (uint i = 0; i < kd; i += 4) {
+            float4 kv = *(device const float4*)(ks + i);
+            float4 ktv = *(device const float4*)(kt + i);
+            float4 qtv = *(device const float4*)(qt + i);
+            kk += dot(kv, ktv);
+            qk += dot(kv, qtv);
+        }
+    }
+    float bt = (tt < n) ? beta[(c0 + tt) * heads + h] : 0.0f;
+    a[tt * CH + ss] = (tt < n && ss < tt) ? bt * grel * kk : 0.0f;
+    w[tt * CH + ss] = (tt < n && ss <= tt) ? grel * qk : 0.0f;
+    if (lane < CH) {
+        // gcum[t] = G(1..t) (running), gk[s] = G(s+1..n), gtot = G(1..n)
+        float g = 1.0f;
+        for (uint i = 0; i <= lane && i < n; i++) { g *= decay[(c0 + i) * heads + h]; }
+        gcum[lane] = (lane < n) ? g : 0.0f;
+        float p = 1.0f;
+        for (uint i = lane + 1u; i < n; i++) { p *= decay[(c0 + i) * heads + h]; }
+        gk[lane] = (lane < n) ? p : 0.0f;
+        bet[lane] = (lane < n) ? beta[(c0 + lane) * heads + h] : 0.0f;
+        if (lane == 0u) {
+            float tot = 1.0f;
+            for (uint i = 0; i < n; i++) { tot *= decay[(c0 + i) * heads + h]; }
+            gtot[0] = tot;
+        }
+    }
+}
+
+// One threadgroup per (head, CJ value columns): 256 threads = CJ columns
+// x 8 token groups of 4, the chunks in sequence inside. Every phase is
+// column-separable (only the Gram matrices couple positions, and kernel A
+// precomputed them), so the head's columns spread over vd/CJ threadgroups.
+// k/q rows are read from device memory (uniform across a simdgroup);
+// only U [CH x CJ] lives in threadgroup memory.
+constant uint CJ = 32u;
+
+kernel void delta_chunk_scan(device const float* q     [[buffer(0)]],
+                             device const float* k     [[buffer(1)]],
+                             device const float* v     [[buffer(2)]],  // [t, heads, vd]
+                             device const float* scratch [[buffer(3)]],
+                             device float* state       [[buffer(4)]],  // [heads, kd, vd]
+                             device float* out         [[buffer(5)]],  // [heads, t, vd]
+                             constant uint4& dims      [[buffer(6)]],  // t, heads, kd, vd
+                             constant uint& nchunks    [[buffer(7)]],
+                             constant uint& skip       [[buffer(8)]],  // debug: phases to skip (1 s0kq, 2 subst, 4 out, 8 state)
+                             uint tg    [[threadgroup_position_in_grid]],
+                             uint tid   [[thread_position_in_threadgroup]]) {
+    uint t_count = dims.x, heads = dims.y, kd = dims.z, vd = dims.w;
+    threadgroup float U[CH * CJ];
+    uint groups = (vd + CJ - 1u) / CJ;
+    uint h = tg / groups;
+    uint j0 = (tg % groups) * CJ;
+    uint jl = tid % CJ;          // local column
+    uint j = j0 + jl;            // value column of this thread
+    uint tg4 = tid / CJ;         // token group: tokens tg4*4 .. tg4*4+3
+    bool colok = j < vd;
+    device float* S = state + (size_t)h * kd * vd;
+    for (uint c = 0; c < nchunks; c++) {
+        uint c0 = c * CH;
+        uint n = min(CH, t_count - c0);
+        device const float* a = scratch + ((size_t)h * nchunks + c) * SCR;
+        device const float* w = a + CH * CH;
+        device const float* gcum = a + 2u * CH * CH;
+        device const float* gk = gcum + CH;
+        device const float* bet = gk + CH;
+        float gtot = bet[CH];
+        // s0k[t][j] = sum_i S[i][j] k_t[i], s0q likewise, this thread's 4 tokens
+        float s0k[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float s0q[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (colok && (skip & 1u) == 0u) {
+            device const float* kt0 = k + (size_t)((c0 + tg4 * 4u) * heads + h) * kd;
+            device const float* qt0 = q + (size_t)((c0 + tg4 * 4u) * heads + h) * kd;
+            uint step = heads * kd;
+            uint mmax = min(4u, n - min(n, tg4 * 4u));
+            for (uint i = 0; i < kd; i++) {
+                float sv = S[i * vd + j];
+                for (uint m = 0; m < mmax; m++) {
+                    s0k[m] += sv * kt0[m * step + i];
+                    s0q[m] += sv * qt0[m * step + i];
+                }
+            }
+        }
+        // b_t[j] = beta_t (v_t[j] - G(1..t) s0k[t][j]) into U
+        for (uint m = 0; m < 4u; m++) {
+            uint t = tg4 * 4u + m;
+            if (t < n && colok) {
+                float vt = v[(size_t)((c0 + t) * heads + h) * vd + j];
+                U[t * CJ + jl] = bet[t] * (vt - gcum[t] * s0k[m]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // forward substitution, one thread per column (columns are
+        // independent, so no barrier inside): u_t = b_t - sum_{s<t} a[t][s] u_s
+        if (tid < CJ && colok && (skip & 2u) == 0u) {
+            for (uint t = 1; t < n; t++) {
+                float acc = U[t * CJ + jl];
+                for (uint s = 0; s < t; s++) { acc -= a[t * CH + s] * U[s * CJ + jl]; }
+                U[t * CJ + jl] = acc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // outputs: out_t[j] = G(1..t) s0q[t][j] + sum_{s<=t} w[t][s] u_s[j]
+        for (uint m = 0; m < 4u; m++) {
+            uint t = tg4 * 4u + m;
+            if (t < n && colok && (skip & 4u) == 0u) {
+                float acc = gcum[t] * s0q[m];
+                for (uint s = 0; s <= t; s++) { acc += w[t * CH + s] * U[s * CJ + jl]; }
+                out[((size_t)h * t_count + c0 + t) * vd + j] = acc;
+            }
+        }
+        // S[i][j] = gtot S[i][j] + sum_s gk[s] k_s[i] u_s[j]; thread: column j, rows i = tg4 + 8m
+        if (colok && (skip & 8u) == 0u) {
+            device const float* ks0 = k + (size_t)(c0 * heads + h) * kd;
+            uint step = heads * kd;
+            for (uint i = tg4; i < kd; i += 8u) {
+                float acc = gtot * S[i * vd + j];
+                for (uint s = 0; s < n; s++) { acc += gk[s] * ks0[s * step + i] * U[s * CJ + jl]; }
+                S[i * vd + j] = acc;
+            }
+        }
+        // the next chunk's s0k/s0q read S written by other threads, and
+        // rewrite U
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+pub(crate) struct ChunkCtx {
+    pub(crate) prep: Id,
+    pub(crate) scan: Id,
+}
+unsafe impl Send for ChunkCtx {}
+unsafe impl Sync for ChunkCtx {}
+
+static CHUNK: std::sync::OnceLock<Option<ChunkCtx>> = std::sync::OnceLock::new();
+
+/// Chunk length of the chunked scan (CH in the shader) and its kd/vd budget.
+const CHUNK_LEN: usize = 32;
+const CHUNK_KDM: usize = 128;
+/// Value columns per threadgroup of the chunked scan (CJ in the shader).
+const CHUNK_CJ: usize = 32;
+/// Scratch floats per (head, chunk): a, w (CH x CH), gcum, gk, beta, gtot block.
+const CHUNK_SCR: usize = 2 * CHUNK_LEN * CHUNK_LEN + 4 * CHUNK_LEN;
+/// Prompts at least this long would take the chunked scan; kept for the
+/// day it beats the register scan (see the section note).
+#[allow(dead_code)]
+pub(crate) const CHUNK_MIN_T: usize = 64;
+
+/// The chunked-scan pipelines, compiled once; None (with a `gpu:` line)
+/// when the shader or a 1024-thread threadgroup is unavailable.
+pub(crate) fn chunk_ctx() -> Option<(&'static MetalCtx, &'static ChunkCtx)> {
+    let base = ctx()?;
+    let c = CHUNK
+        .get_or_init(|| {
+            // SAFETY: same shader-compilation sequence as init_ctx.
+            unsafe {
+                let pool = msg_id(msg_id(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+                let src = ns_string(DELTA_CHUNK_MSL);
+                let mut err: Id = std::ptr::null_mut();
+                let library = {
+                    let f: extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
+                        std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                    f(base.device, sel("newLibraryWithSource:options:error:"), src, std::ptr::null_mut(), &mut err)
+                };
+                if library.is_null() {
+                    println!("gpu: chunked-scan shader error: {} - register scan stays", err_desc(err));
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let mk = |name: &str| -> Id {
+                    let function = {
+                        let f: extern "C" fn(Id, Sel, Id) -> Id =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(library, sel("newFunctionWithName:"), ns_string(name))
+                    };
+                    let mut perr: Id = std::ptr::null_mut();
+                    let p = {
+                        let f: extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                        f(base.device, sel("newComputePipelineStateWithFunction:error:"), function, &mut perr)
+                    };
+                    if p.is_null() {
+                        println!("gpu: {} pipeline error: {} - register scan stays", name, err_desc(perr));
+                    } else {
+                        retain(p);
+                        retain(function);
+                    }
+                    p
+                };
+                let prep = mk("delta_chunk_prep");
+                let scan = mk("delta_chunk_scan");
+                retain(library);
+                if prep.is_null() || scan.is_null() {
+                    msg_void(pool, sel("drain"));
+                    return None;
+                }
+                let maxt: extern "C" fn(Id, Sel) -> u64 =
+                    std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+                let m = maxt(scan, sel("maxTotalThreadsPerThreadgroup"));
+                msg_void(pool, sel("drain"));
+                if (m as usize) < CHUNK_CJ * 8 {
+                    println!("gpu: chunked scan needs {} threads per threadgroup, pipeline allows {} - register scan stays", CHUNK_CJ * 8, m);
+                    return None;
+                }
+                Some(ChunkCtx { prep, scan })
+            }
+        })
+        .as_ref()?;
+    Some((base, c))
+}
+
+/// Encodes the chunked scan (prep + scan) on the given encoder over the
+/// same buffers/offsets as the register scan; `scratch` holds at least
+/// heads * ceil(t/CH) * CHUNK_SCR floats. Requires kd, vd <= 128, kd % 4 == 0.
+/// SAFETY: `e` is a live compute encoder; the buffers outlive the command.
+#[allow(clippy::too_many_arguments)]
+unsafe fn delta_chunk_encode(
+    ck: &ChunkCtx,
+    e: Id,
+    q: (Id, usize),
+    k: (Id, usize),
+    v: (Id, usize),
+    beta: (Id, usize),
+    decay: (Id, usize),
+    state: Id,
+    out: Id,
+    scratch: Id,
+    t: usize,
+    heads: usize,
+    kd: usize,
+    vd: usize,
+) {
+    // SAFETY: typed objc_msgSend signatures matching the Metal selectors.
+    let (set_pipe, set_buf, set_bytes, disp_tg) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, Id)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, Id, u64, u64)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, *const c_void, u64, u64)>(objc_msgSend),
+            std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, extern "C" fn(Id, Sel, MTLSize, MTLSize)>(objc_msgSend),
+        )
+    };
+    let sb = sel("setBuffer:offset:atIndex:");
+    let by = sel("setBytes:length:atIndex:");
+    let dtg = sel("dispatchThreadgroups:threadsPerThreadgroup:");
+    let nchunks = t.div_ceil(CHUNK_LEN);
+    // A: per (chunk, head)
+    set_pipe(e, sel("setComputePipelineState:"), ck.prep);
+    set_buf(e, sb, q.0, q.1 as u64, 0);
+    set_buf(e, sb, k.0, k.1 as u64, 1);
+    set_buf(e, sb, beta.0, beta.1 as u64, 2);
+    set_buf(e, sb, decay.0, decay.1 as u64, 3);
+    set_buf(e, sb, scratch, 0, 4);
+    let d0: [u32; 4] = [t as u32, heads as u32, kd as u32, nchunks as u32];
+    set_bytes(e, by, d0.as_ptr() as *const c_void, 16, 5);
+    disp_tg(e, dtg, MTLSize { width: (nchunks * heads) as u64, height: 1, depth: 1 }, MTLSize { width: (CHUNK_LEN * CHUNK_LEN) as u64, height: 1, depth: 1 });
+    // B: per head, chunks in sequence
+    set_pipe(e, sel("setComputePipelineState:"), ck.scan);
+    set_buf(e, sb, q.0, q.1 as u64, 0);
+    set_buf(e, sb, k.0, k.1 as u64, 1);
+    set_buf(e, sb, v.0, v.1 as u64, 2);
+    set_buf(e, sb, scratch, 0, 3);
+    set_buf(e, sb, state, 0, 4);
+    set_buf(e, sb, out, 0, 5);
+    let d1: [u32; 4] = [t as u32, heads as u32, kd as u32, vd as u32];
+    set_bytes(e, by, d1.as_ptr() as *const c_void, 16, 6);
+    let nc = nchunks as u32;
+    set_bytes(e, by, (&nc) as *const u32 as *const c_void, 4, 7);
+    let skip: u32 = std::env::var("MICROKIMI_CHUNK_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    set_bytes(e, by, (&skip) as *const u32 as *const c_void, 4, 8);
+    disp_tg(e, dtg, MTLSize { width: (heads * vd.div_ceil(CHUNK_CJ)) as u64, height: 1, depth: 1 }, MTLSize { width: (CHUNK_CJ * 8) as u64, height: 1, depth: 1 });
+}
+
+/// The chunked scan applies: long enough, within the tile budgets.
+#[allow(dead_code)]
+fn chunk_scan_ok(t: usize, kd: usize, vd: usize) -> bool {
+    t >= CHUNK_MIN_T && kd <= CHUNK_KDM && vd <= CHUNK_KDM && kd % 4 == 0
+}
+
 /// Lanes per column set and columns per lane group in `delta_scan`
 /// (SCAN_L / SCAN_C in the shader); kd must be a multiple of SCAN_L with
 /// kd / SCAN_L <= 16.
@@ -4819,7 +5176,18 @@ pub fn dec_matvec_check(rows: usize, cols: usize) -> Option<(f32, f32)> {
 /// delta_step order; prints the max relative error of out and state, the
 /// GPU time per pass and the per-token-step latency.
 pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps: usize) -> Option<()> {
+    delta_scan_check_bench_kind(t, heads, kd, vd, reps, false)
+}
+
+/// The chunked scan against the same sequential CPU reference (its
+/// per-chunk reassociation is expected within ~1e-4 relative).
+pub fn delta_chunk_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps: usize) -> Option<()> {
+    delta_scan_check_bench_kind(t, heads, kd, vd, reps, true)
+}
+
+fn delta_scan_check_bench_kind(t: usize, heads: usize, kd: usize, vd: usize, reps: usize, chunked: bool) -> Option<()> {
     let (base, sc) = scan_ctx()?;
+    let ck = if chunked { Some(chunk_ctx()?.1) } else { None };
     let mut seed = 0x5eed_1234u32;
     let mut rnd = || {
         seed ^= seed << 13;
@@ -4886,8 +5254,21 @@ pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
         let contents: extern "C" fn(Id, Sel) -> *mut c_void =
             std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+        let scratch = if chunked {
+            let n = heads * t.div_ceil(CHUNK_LEN) * CHUNK_SCR;
+            let f: extern "C" fn(Id, Sel, u64, u64) -> Id =
+                std::mem::transmute::<unsafe extern "C" fn(Id, Sel, ...) -> Id, _>(objc_msgSend);
+            f(base.device, sel("newBufferWithLength:options:"), (n * 4) as u64, 0)
+        } else {
+            std::ptr::null_mut()
+        };
         let encode = |cmdbuf: Id, state_buf: Id| {
             let e = msg_id(cmdbuf, sel("computeCommandEncoder"));
+            if let Some(ck) = ck {
+                delta_chunk_encode(ck, e, (bq, 0), (bk, 0), (bv, 0), (bb, 0), (bd, 0), state_buf, bo, scratch, t, heads, kd, vd);
+                msg_void(e, sel("endEncoding"));
+                return;
+            }
             set_pipe(e, sel("setComputePipelineState:"), sc.pipeline);
             let sb = sel("setBuffer:offset:atIndex:");
             set_buf(e, sb, bq, 0, 0);
@@ -4929,6 +5310,9 @@ pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps
         for b in [bq, bk, bv, bb, bd, bs, bo, bs2] {
             msg_void(b, sel("release"));
         }
+        if !scratch.is_null() {
+            msg_void(scratch, sel("release"));
+        }
         msg_void(pool, sel("drain"));
         let rel = |g: &[f32], c: &[f32]| -> f32 {
             let mut max_abs = 0.0f32;
@@ -4944,10 +5328,12 @@ pub fn delta_scan_check_bench(t: usize, heads: usize, kd: usize, vd: usize, reps
         };
         let (ro, rs) = (rel(&out_gpu, &out_ref), rel(&st_gpu, &st));
         let per_pass = best / reps as f64;
+        let tol = if chunked { 2e-3 } else { 1e-4 };
         println!(
-            "gpu: delta_scan check (t {}, heads {}, kd {}, vd {}): out rel {:.2e} state rel {:.2e} - {} | {:.2} ms/pass, {:.2} us per token step",
+            "gpu: {} check (t {}, heads {}, kd {}, vd {}): out rel {:.2e} state rel {:.2e} - {} | {:.2} ms/pass, {:.2} us per token step",
+            if chunked { "delta_chunk" } else { "delta_scan" },
             t, heads, kd, vd, ro, rs,
-            if ro < 1e-4 && rs < 1e-4 { "MATCH" } else { "MISMATCH" },
+            if ro < tol && rs < tol { "MATCH" } else { "MISMATCH" },
             per_pass * 1000.0, per_pass * 1e6 / t as f64
         );
         Some(())
