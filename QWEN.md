@@ -370,6 +370,65 @@ convolution, causally weighted token ranges), and the pooled row
 kernels use dynamic chunk scheduling (`MICROKIMI_NO_DYNROWS=1` for the
 A/B) so a straggler core delays one chunk, not a fixed range.
 
+## CUDA (Linux, NVIDIA)
+
+`MICROKIMI_QWEN_CUDA=1` runs the whole model on one NVIDIA GPU, still
+with zero crates and nothing to install at build time: `libcuda.so.1`
+(the driver) and `libnvrtc.so.12` (the toolkit's runtime compiler) are
+opened with `dlopen` when a GPU is first asked for, and the kernels -
+plain CUDA C inside `src/model/cuda.rs` - are compiled for the device's
+own architecture at that moment (SASS, cached under
+`~/.cache/microkimi/`). Without the libraries every entry point returns
+None and the CPU paths run. The counterpart of the Metal backend.
+
+- **Resident, one GPU**: at load the model goes up once - the MLP as
+  the file's MXFP4 bytes untouched, the attention spine and the head as
+  q8_0 rows (int8 + f32 scale per block of 32, quantized on the host
+  from the f32 tensors: the CPU spine's numbers), the norms and small
+  parameters in f32. Qwen3.8-27B is 18.4 GB resident and fits an L4
+  (24 GB). Linear conv/scan states and the KV cache live on the device;
+  the CPU caches are authoritative for everything else: a full-logits
+  pass or a snapshot first brings the state home (`cuda_sync`) and
+  drops the decoder, which rebuilds on demand.
+- **Decode**: a token is one CUDA graph - captured on the first step,
+  launched as one unit after that: add + norm + block quantization in
+  one kernel, one warp per row for the q8 and fp4 matvecs (exact int8
+  dots per block with `dp4a`, the two block scales in float; 240-260
+  GB/s of weight traffic on the L4's 300), the conv, the delta step per
+  head with the state column in registers, the gated norm, q/k norms
+  with the partial rotary, GQA attention over the resident cache, SiLU
+  * up + quantization in one kernel, the head, the logits back through
+  pinned memory. The position travels through device memory so the
+  graph is identical from one token to the next.
+- **Prompt**: the same layers over all tokens - the q8 and fp4 GEMMs on
+  tensor cores (`mma.sync m16n8k32` int8: one instruction is one
+  32-column block of a 16 x 8 tile, so its s32 result is the exact
+  block dot; 128 x 128 tiles, 19-21 TMAC/s on the L4), the conv and the
+  delta scan sequential in time with the state in registers, attention
+  per (token, head), the K/V rows appended to the resident cache; the
+  last position's logits come back.
+- **Verifiers**: `cudabench` checks every kernel against the CPU
+  kernels on random data (matvecs within 3e-7 relative, the q8 GEMM
+  bit-identical, activation quantization identical) and measures GB/s
+  and TMAC/s; `cudadecodebench` runs a prompt on both sides from empty
+  caches, prints the logits difference, then decodes N tokens on both
+  and prints the greedy agreement (`--trace`: the hidden state after
+  every layer). `MICROKIMI_CUDA_PROF=1` prints the per-phase split of a
+  token and of a prompt (with syncs).
+- **Knobs**: `MICROKIMI_CUDA_DEVICE=n` (or `CUDA_VISIBLE_DEVICES`),
+  `MICROKIMI_CUDA_VERBOSE=1` (device, compile time, refusals),
+  `MICROKIMI_CUDA_NO_GRAPH=1`, `MICROKIMI_CUDA_NO_MMA=1` (dp4a GEMMs, the
+  pre-sm_80 path), `MICROKIMI_CUDA_TILE=MTxNT`, `MICROKIMI_CUDA_MV_WARPS`,
+  `MICROKIMI_NVRTC=/path/to/libnvrtc.so`.
+- **Limits**: dense Qwen3.5-family models only; one GPU (no split); the
+  multi-token drafter and full-logits passes stay on the CPU; the KV
+  capacity is 4096 positions at load and grows by rebuilding.
+
+Not bit-exact against the CPU (q8 rows on both sides, float sums in a
+different order): the prompt's logits stay within 1e-2 relative and the
+greedy tokens agree over the measured runs (48/48 on the 27B); the
+numbers are in [RESULTS.md](RESULTS.md).
+
 ## Chained drafting and lane-batched decoding
 
 Two throughput mechanisms, both bit-identical to plain decoding and both

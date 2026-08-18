@@ -2,9 +2,9 @@
 
 **A large-model engine in pure Rust. Zero dependencies. Measured, not promised.**
 
-One small binary runs Kimi K3, DeepSeek-V4, and the Qwen3.5 family (Qwen3.8-27B is its default model when converted). No Python. No CUDA. No crates. `cargo build`, point it at a model, go.
+One small binary runs Kimi K3, DeepSeek-V4, and the Qwen3.5 family (Qwen3.8-27B is its default model when converted). No Python. No crates. No SDK to install: the GPU paths open Metal and the CUDA driver at run time. `cargo build`, point it at a model, go.
 
-- **Fast.** On an Apple M5, microkimi ingests prompts at over 1,000 tokens per second - ahead of llama.cpp on CPU, on the same machine and model. [The numbers.](RESULTS.md)
+- **Fast.** Qwen3.8-27B on one NVIDIA L4: 12 tokens per second, the whole model resident on a single 24 GB GPU - where llama.cpp's Q8_0 needs four. On an Apple M5, prompts read at over 1,000 tokens per second, ahead of llama.cpp on CPU. [The numbers.](RESULTS.md)
 - **Exact.** The default path is bit-exact f32. Every speed mode is measured against it and quoted honestly.
 - **Time travel.** Conversations are version-controlled. Fork any past state. Diff two answers. Merge two branches back into one mind.
 - **Serve it.** An OpenAI-compatible API lives in the same binary: `microkimi serve`.
@@ -55,7 +55,7 @@ To run a real Qwen checkpoint:
 
 - [RESULTS.md](RESULTS.md) - benchmarks vs llama.cpp, same machine, same model.
 - [BENCH.md](BENCH.md) - how to reproduce every number.
-- [QWEN.md](QWEN.md) - the Qwen runtime: conversion, GPU offload, speculative decoding, serving, conversation version control.
+- [QWEN.md](QWEN.md) - the Qwen runtime: conversion, Metal and CUDA, speculative decoding, serving, conversation version control.
 - [KIMI.md](KIMI.md) - the K3 engine: expert streaming, memory packs, slicing, adapters.
 - [DEEPSEEK.md](DEEPSEEK.md) - the DeepSeek-V4 runtime.
 

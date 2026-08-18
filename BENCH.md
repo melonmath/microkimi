@@ -23,6 +23,26 @@ Q8_0 head-to-head with the ggml-org GGUF) on macOS or Linux, with disk
 guards. `qwen3.8-27b.bin` in the repo root or `models/` is the default
 model of `run`, `chat` and `serve` when it is there.
 
+### On NVIDIA GPUs (Linux)
+
+```bash
+MICROKIMI_QWEN_CUDA=1 ./target/release/microkimi run "<prompt>" --model qwen3.8-27b.bin --raw --max-new 32 --debug
+./target/release/microkimi cudabench                       # every kernel against the CPU kernels, GB/s and TMAC/s
+./target/release/microkimi cudadecodebench --model qwen3.8-27b.bin --steps 48 --prompt-tokens 241
+```
+
+`--debug` prints the prompt time (`for N tokens (ms/token)`) and
+`generation: ms/token`; the model loads onto the first GPU
+(`MICROKIMI_CUDA_DEVICE`, or `CUDA_VISIBLE_DEVICES`) at load, so the
+first measured prompt is the GPU's. `cudadecodebench` runs the prompt
+on the GPU and on the CPU from empty caches, prints the logits
+difference, then decodes N tokens on both and prints ms/token and the
+greedy agreement (`--trace` compares the hidden state after every
+layer). Needs `libcuda.so.1` (the driver) and `libnvrtc.so.12` (the
+toolkit's runtime compiler; `MICROKIMI_NVRTC=/path` if it is not on
+the loader path); nothing at build time. `scripts/cuda-duel-27b.sh`
+runs the paired GPU duel of RESULTS.md (`MK`, `LB`, `M`, `G4`, `G8`).
+
 ## Qwen3.5-0.8B, the small model
 
 ```bash
@@ -55,10 +75,14 @@ GPU start). Quote which protocol you ran.
 ## llama.cpp, same machine
 
 ```bash
-# in a llama.cpp checkout (cmake -B build && cmake --build build -t llama-bench)
+# in a llama.cpp checkout (cmake -B build && cmake --build build -t llama-bench; -DGGML_CUDA=ON on NVIDIA hosts)
 curl -fLO https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf
 ./build/bin/llama-bench -m Qwen3.5-0.8B-Q8_0.gguf -p 1024 -n 64          # Metal GPU (macOS default)
 ./build/bin/llama-bench -m Qwen3.5-0.8B-Q8_0.gguf -p 1024 -n 64 -ngl 0  # CPU-only
+# the 27B: Q8_0 (28.6 GB) and Q4_K_M (19 GB) from ggml-org/Qwen3.8-27B-GGUF
+./build/bin/llama-bench -m Qwen3.8-27B-Q8_0.gguf -p 256 -n 32 -ngl 0 -t 24                    # CPU
+CUDA_VISIBLE_DEVICES=0 ./build/bin/llama-bench -m Qwen3.8-27B-Q4_K_M.gguf -p 256 -n 32 -ngl 99  # one GPU
+./build/bin/llama-bench -m Qwen3.8-27B-Q8_0.gguf -p 256 -n 32 -ngl 99                            # all GPUs
 ```
 
 Trap: on macOS llama-bench uses the Metal GPU **by default** (backend
@@ -94,7 +118,13 @@ speed or language.
 ## Honesty notes
 
 - microkimi's MLP is MXFP4 (4-bit) while Q8_0 is 8-bit everywhere, so
-  microkimi reads less weight per token than llama.cpp at Q8_0.
+  microkimi reads less weight per token than llama.cpp at Q8_0; against
+  Q4_K_M (4-bit everywhere) the bytes per token are about equal.
+- On the GPU rows the 27B fits one L4 for microkimi and for llama.cpp's
+  Q4_K_M; llama.cpp's Q8_0 needs several. Quote the GPU count.
+- A prompt a few tokens past a multiple of 128 pays a partial GEMM
+  tile on the CUDA path (2.3 instead of 2.1 ms/token at 265 tokens);
+  quote the prompt length.
 - the q8 spine and the GPU paths are opt-in; the default engine path
   is bit-exact f32. Quote the arm that matches the property you need,
   with the NLL deltas from [QWEN.md](QWEN.md) next to any speed claim.

@@ -1,34 +1,50 @@
 # The numbers
 
-One machine. Two engines. Two models: Qwen3.8-27B is the reference
-model of the Qwen runtime; Qwen3.5-0.8B is the small model every row
-below is measured on, because a 16 GB host cannot hold the 27B.
-
-Apple M5 (16 GB, plugged in, bare metal). microkimi against llama.cpp
-(build 4df29be, Q8_0). Higher is better.
+Two engines, same machine, same model. Two models: Qwen3.8-27B, the
+reference model, measured on a 24-core cloud host with four L4s;
+Qwen3.5-0.8B, the small model, measured on an Apple M5 (16 GB, plugged
+in, bare metal) against llama.cpp build 4df29be, Q8_0. Higher is
+better.
 
 ## Qwen3.8-27B (the reference model)
 
+Measured on a cloud host: Intel Cascade Lake, 24 cores (48 threads),
+188 GB, and four NVIDIA L4 (23 GB each) - microkimi at 6ee4236,
+llama.cpp at 169e4a7 with CUDA. Paired, alternating, three rounds,
+medians. The model is 49 GB converted; every number below is with the
+model in RAM.
+
+### On the CPU (24 cores)
+
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | pending | pending |
-| prompt reading | pending | pending |
+| generation | **3.4 tok/s** | 2.9 tok/s |
+| prompt reading (241 tokens) | 41 tok/s | 43 tok/s |
 
-What is measured on the 27B so far (2026-08-18): the converter accepts
-the published checkpoint as is (`convert-qwen --audit-only` against its
-18 shard headers: 866 tensors, all shapes and dtypes accepted, the MTP
-head found; 49.00 GB payload - f32 attention spine and embeddings,
-MXFP4 MLP), and the GPU graphs agree with the CPU on the 27B's head
-geometry (`qwen-fixture --profile 27b --scale 8`: head dim 256, three
-value heads per key head, six query heads per kv head, untied
-embeddings; per-layer hidden within 8e-3 relative, last-position
-logits within 4.7e-3). The rows themselves want a host with ~110 GB of
-disk and, for numbers about the engine rather than the disk, ~64 GB of
-RAM: `bench-27b.sh` (BENCH.md).
+microkimi: q8 spine, fp4 MLP read as stored, one thread per physical
+core; llama.cpp: Q8_0, `-ngl 0 -t 24`. Generation 298 vs 350 ms/token;
+prompt reading 24.3 vs 23.4 ms/token.
+
+### On the GPU (CUDA)
+
+| | microkimi, one L4 | llama.cpp Q4_K_M, one L4 | llama.cpp Q8_0, four L4s |
+|---|---:|---:|---:|
+| generation | **12.0 tok/s** | 12.7 tok/s | 8.8 tok/s |
+| prompt reading | 430 tok/s | 679 tok/s | 781 tok/s |
+
+microkimi (`MICROKIMI_QWEN_CUDA=1`) holds the whole model on ONE L4:
+the MLP as the file's MXFP4 bytes, the attention spine and the head as
+q8_0 rows, 18.4 GB resident; the CPU keeps nothing. llama.cpp's Q8_0
+(27 GB) does not fit one L4 and runs split across four; its Q4_K_M
+(19 GB) fits one, and is the fair single-GPU row. Generation 83 vs 79
+vs 113 ms/token; prompt reading of a 265-token prompt at 2.3 vs 1.5 vs
+1.3 ms/token (a 241-token prompt reads at 483 tok/s: the GEMM's
+128-token tile shows just past a multiple of it). 48/48 greedy tokens
+of the GPU decode agree with the CPU forward after a GPU prompt.
 
 ## Qwen3.5-0.8B (the small model)
 
-## On the CPU
+### On the CPU
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
@@ -44,7 +60,7 @@ terminal at one core) read 83 vs 86-87 on generation and 742 vs
 657-675 on prompt reading: the loaded host takes the generation win
 back to level and leaves the prompt row.
 
-## On the GPU (Metal)
+### On the GPU (Metal)
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
@@ -66,7 +82,7 @@ weight copies between rounds, not the GPU (BENCH.md).
 (The GPU rows barely move on battery - Apple throttles the CPU much
 harder than the GPU - so these hold across power states.)
 
-## On battery (ratios, not absolutes)
+### On battery (ratios, not absolutes)
 
 macOS throttles hard and unevenly on battery, so these read as
 microkimi-to-llama.cpp ratios inside the same thermal window
@@ -85,8 +101,11 @@ chunked-scan work.
 ## The fine print
 
 - Quantization differs: microkimi runs a 4-bit MLP with an 8-bit
-  attention spine; llama.cpp runs 8-bit everywhere. microkimi reads
-  less memory per token.
+  attention spine; llama.cpp's Q8_0 is 8-bit everywhere (microkimi
+  reads less memory per token) and its Q4_K_M is 4-bit everywhere
+  (about the same bytes per token on the 27B: 18.4 GB against 19.0).
+- The CUDA rows are one GPU against one GPU where the model fits;
+  microkimi has no multi-GPU split, llama.cpp does.
 - microkimi's GPU paths stay within 1.4e-2 of the CPU logits (prompt
   reading) and agree on every greedy token over the measured runs
   (decode); neither is bit-exact. The default engine path is bit-exact
