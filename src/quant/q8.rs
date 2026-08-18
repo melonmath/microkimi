@@ -1713,3 +1713,30 @@ pub unsafe fn tile16_vnni<const L: usize>(
     }
     out
 }
+
+/// Raw vpdpbusd throughput of one core (register-only, sixteen
+/// independent chains): the ceiling any int8 GEMM tile on this host can
+/// approach. Returns GMAC/s.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn vnni_peak_probe(iters: usize) -> f64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut acc = [_mm512_set1_epi32(1); 16];
+        let a = _mm512_set1_epi8(3);
+        let b = _mm512_set1_epi8(-2);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for c in acc.iter_mut() {
+                *c = _mm512_dpbusd_epi32(*c, a, b);
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let mut sink = 0i32;
+        for c in acc.iter() {
+            sink = sink.wrapping_add(_mm512_reduce_add_epi32(*c));
+        }
+        std::hint::black_box(sink);
+        (iters * 16 * 64) as f64 / dt / 1e9
+    }
+}

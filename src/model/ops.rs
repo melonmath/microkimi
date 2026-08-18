@@ -1992,6 +1992,9 @@ pub fn kernbench_cmd(args: &[String]) {
             }
         }
         let dt = t0.elapsed().as_secs_f64();
+        // SAFETY: vnni checked above.
+        let peak = unsafe { crate::quant::q8::vnni_peak_probe(2_000_000) };
+        println!("vnni dpbusd peak (single thread, registers): {:>7.1} GMAC/s", peak);
         println!(
             "vnni tile16x8 (single thread): {:>7.1} GMAC/s  ({:.1} ms, sink {:.3})",
             (pack.tiles * 16 * cols * 8 * 4) as f64 / dt / 1e9,
