@@ -5848,6 +5848,15 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
         for (nh, nkv, hd, len) in [(2usize, 1usize, 256usize, 1usize), (2, 1, 256, 17), (8, 2, 256, 300), (4, 1, 128, 1000)] {
             crate::model::metal::dec_attn_check(nh, nkv, hd, len);
         }
+        for (r, c) in [(64usize, 1024usize), (100, 3584), (37, 2048)] {
+            crate::model::metal::dec_matvec_check(r, c);
+        }
+        if args.iter().any(|a| a == "--kern") {
+            for (r, c) in [(248320usize, 1024usize), (3584, 1024), (1024, 3584), (6144, 1024), (1024, 2048)] {
+                crate::model::metal::dec_matvec_bench(r, c, 10);
+            }
+            return;
+        }
         let mut model = QwenModel::load(&model_path);
         let vocab = (model.cfg.vocab as u32).min(50_000);
         let prompt: Vec<u32> = (0..16u32).map(|i| (i * 7 + 3) % vocab).collect();
@@ -6103,9 +6112,14 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
                     return;
                 }
                 per_step.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if per_step.len() == 1 {
+                    // the first step (weight upload) is reported apart
+                    crate::model::metal::decode_timing_print();
+                }
                 tok = crate::model::top_k_probs(&gl, 5)[0].0 as u32;
                 gpu_tokens.push(tok);
             }
+            crate::model::metal::decode_timing_print();
             // the first step uploads the f16 weights (one-time); the
             // steady state is the median of the rest
             let mut rest: Vec<f64> = per_step[1.min(per_step.len() - 1)..].to_vec();
