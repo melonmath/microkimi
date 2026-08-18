@@ -25,14 +25,14 @@ back to level and leaves the prompt row.
 
 | | microkimi | llama.cpp |
 |---|---:|---:|
-| generation | **139 tok/s** | 112 tok/s |
+| generation | **143 tok/s** | 114 tok/s |
 | prompt reading (1k tokens) | 4520 tok/s | 4740 tok/s |
 
 Same M5, same window, paired (2026-08-18): microkimi decodes the whole
 token in one command buffer against resident q8_0 rows and the MXFP4
 MLP as stored (`MICROKIMI_QWEN_GPU=1`), 64/64 greedy tokens in
-agreement with the CPU forward; llama.cpp Metal, Q8_0, `tg64` 110-115
-and `pp1024` 4700-4740 across the brackets. Prompt reading is the warm,
+agreement with the CPU forward (141-146 tok/s over the pairs); llama.cpp
+Metal, Q8_0, `tg64` 110-115 and `pp1024` 4700-4740 across the brackets. Prompt reading is the warm,
 back-to-back protocol on both sides (`qwengpubench --gpu-only`,
 `llama-bench`); under the paired protocol on a host 10 GB into swap the
 GPU prompt row reads 2400-2800 tok/s - the difference is the paging of
