@@ -265,12 +265,18 @@ unsafe fn dot_i8_neon(w32: &[i8], x32: &[i8]) -> i32 {
 unsafe fn dot_i8_avx2(w32: &[i8], x32: &[i8]) -> i32 {
     use std::arch::x86_64::*;
     unsafe {
+        // Widen to i16 and use madd_epi16 (exact: |a*b| <= 128*128 and two
+        // such products fit i32). The maddubs sign-trick saturates in i16
+        // when both operands reach -128 (128*128*2 = 32768 > 32767), which
+        // the exactness test caught on this architecture; production
+        // quantizers emit -127..127, but the kernel must be exact anyway.
         let w = _mm256_loadu_si256(w32.as_ptr() as *const __m256i);
         let x = _mm256_loadu_si256(x32.as_ptr() as *const __m256i);
-        let ax = _mm256_sign_epi8(x, x);
-        let aw = _mm256_sign_epi8(w, x);
-        let pairs = _mm256_maddubs_epi16(ax, aw);
-        let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+        let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+        let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+        let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
+        let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
+        let quads = _mm256_add_epi32(_mm256_madd_epi16(w_lo, x_lo), _mm256_madd_epi16(w_hi, x_hi));
         // exact i32 horizontal sum
         let s128 = _mm_add_epi32(_mm256_castsi256_si128(quads), _mm256_extracti128_si256(quads, 1));
         let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
@@ -398,10 +404,7 @@ unsafe fn dot_block_avx2(packed16: &[u8], x32: &[i8]) -> i32 {
         let ihi = _mm256_unpackhi_epi8(lo, hi);
         let w = _mm256_permute2x128_si256(ilo, ihi, 0x20);
         let x = _mm256_loadu_si256(x32.as_ptr() as *const __m256i);
-        let ax = _mm256_sign_epi8(x, x);
-        let aw = _mm256_sign_epi8(w, x);
-        let pairs = _mm256_maddubs_epi16(ax, aw);
-        let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+        let quads = i8_block_dot_vec(w, x);
         // exact i32 horizontal sum
         let s128 = _mm_add_epi32(_mm256_castsi256_si128(quads), _mm256_extracti128_si256(quads, 1));
         let s64 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
@@ -1071,10 +1074,12 @@ pub unsafe fn rows4_x8_smmla(
 unsafe fn i8_block_dot_vec(w: std::arch::x86_64::__m256i, x: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     unsafe {
-        let ax = _mm256_sign_epi8(x, x);
-        let aw = _mm256_sign_epi8(w, x);
-        let pairs = _mm256_maddubs_epi16(ax, aw);
-        _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+        // exact widening form (see dot_i8_avx2)
+        let w_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+        let w_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+        let x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
+        let x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
+        _mm256_add_epi32(_mm256_madd_epi16(w_lo, x_lo), _mm256_madd_epi16(w_hi, x_hi))
     }
 }
 
@@ -1236,14 +1241,21 @@ pub unsafe fn rows4_dot_fma_vnni(
             let ws_b = _mm_set_ps(s[3][g + 1], s[2][g + 1], s[1][g + 1], s[0][g + 1]);
             for (l, xq) in xqs.iter().enumerate() {
                 let x = _mm512_loadu_si512(xq.0.as_ptr().add(g * 32) as *const _);
-                // |x| unsigned, sign folded into each row: w' = w * sign(x)
-                let ax = _mm512_abs_epi8(x);
-                let neg = _mm512_movepi8_mask(x); // lanes where x < 0
-                let sx = |wv: __m512i| _mm512_mask_sub_epi8(wv, neg, _mm512_setzero_si512(), wv);
-                let d0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w0));
-                let d1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w1));
-                let d2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w2));
-                let d3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sx(w3));
+                // exact unsigned x signed: u = x + 128 (0..255), then
+                // dot(u, w) - 128 * sum(w) = dot(x, w); the correction is a
+                // dpbusd against a constant 128 vector - no saturation, no
+                // sign folding, exact for the full i8 range.
+                let ux = _mm512_xor_si512(x, _mm512_set1_epi8(-128)); // x + 128 as u8
+                let c128 = _mm512_set1_epi8(-128); // 128 as u8
+                let d = |wv: __m512i| -> __m512i {
+                    let a = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, wv);
+                    let b = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, wv);
+                    _mm512_sub_epi32(a, b)
+                };
+                let d0 = d(w0);
+                let d1 = d(w1);
+                let d2 = d(w2);
+                let d3 = d(w3);
                 // per-row: sum of low 8 i32 lanes = block g, high 8 = block g+1
                 let half = |v: __m512i| -> (i32, i32) {
                     let lo = _mm512_castsi512_si256(v);
