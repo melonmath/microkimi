@@ -169,13 +169,14 @@ mod affinity {
         }
         Some(cpus)
     }
-    /// Pins the calling thread to one CPU (best effort).
-    pub fn pin_current(cpu: usize) {
-        if cpu >= 1024 {
-            return;
-        }
+    /// Restricts the calling thread to a CPU set (best effort).
+    pub fn pin_set(cpus: &[usize]) {
         let mut mask = [0u64; SET_WORDS];
-        mask[cpu / 64] |= 1u64 << (cpu % 64);
+        for &cpu in cpus {
+            if cpu < 1024 {
+                mask[cpu / 64] |= 1u64 << (cpu % 64);
+            }
+        }
         // SAFETY: mask is SET_WORDS * 8 bytes, as declared.
         unsafe {
             sched_setaffinity(0, SET_WORDS * 8, mask.as_ptr());
@@ -183,10 +184,14 @@ mod affinity {
     }
 }
 
-/// The pinning plan for `n` participants (the calling thread runs jobs
-/// too): with SMT and n <= physical cores, the caller sits on core 0
-/// and worker i on core i + 1 - every participant its own core, no
-/// sibling sharing; otherwise no pinning. MICROKIMI_NO_PIN=1 disables it.
+/// The affinity plan for `n` participants (the calling thread runs jobs
+/// too): with SMT and n <= physical cores, every participant is
+/// restricted to the set of one hardware thread per core - the
+/// scheduler still migrates freely inside that set (a thread clamped to
+/// one core stalls every barrier the moment anything else lands there:
+/// measured 2x slower than taskset's set-wide mask), but two of ours
+/// can no longer share a core's siblings. Otherwise no restriction.
+/// MICROKIMI_NO_PIN=1 disables it.
 fn pin_plan(n: usize) -> Option<Vec<usize>> {
     if std::env::var("MICROKIMI_NO_PIN").map(|v| v == "1").unwrap_or(false) {
         return None;
@@ -202,13 +207,13 @@ fn pin_plan(n: usize) -> Option<Vec<usize>> {
 impl Pool {
     fn new(n: usize) -> Pool {
         let plan = pin_plan(n);
-        // pinned: the caller is one of the n participants, so n - 1
-        // workers; unpinned: n workers as before (the caller's share of
-        // the tickets is whatever it claims)
+        // restricted: the caller is one of the n participants, so n - 1
+        // workers; unrestricted: n workers as before (the caller's share
+        // of the tickets is whatever it claims)
         let spawn = if plan.is_some() { n.saturating_sub(1) } else { n };
         #[cfg(target_os = "linux")]
         if let Some(cores) = &plan {
-            affinity::pin_current(cores[0]);
+            affinity::pin_set(cores);
         }
         let board = Arc::new(Board {
             word: Padded(AtomicU64::new(0)),
@@ -218,14 +223,14 @@ impl Pool {
             handles: Mutex::new(Vec::new()),
             runner: Mutex::new(()),
         });
-        for i in 0..spawn {
+        for _ in 0..spawn {
             let b = board.clone();
-            let pin = plan.as_ref().map(|cores| cores[(i + 1) % cores.len()]);
+            let pin = plan.clone();
             let h = std::thread::spawn(move || {
                 IN_POOL.with(|c| c.set(true));
                 #[cfg(target_os = "linux")]
-                if let Some(cpu) = pin {
-                    affinity::pin_current(cpu);
+                if let Some(cores) = &pin {
+                    affinity::pin_set(cores);
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = pin;
