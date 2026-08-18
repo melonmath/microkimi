@@ -4260,34 +4260,7 @@ unsafe fn arena_buf(base: &MetalCtx, arena: &mut LayerArena, i: usize, bytes: us
 /// Everything a linear layer needs, by reference (weights as slices of the
 /// mapping or the q8/dequant caches).
 #[allow(clippy::too_many_arguments)]
-pub struct LinLayerRefs<'a> {
-    pub in_qkv: &'a [f32],
-    pub in_z: &'a [f32],
-    pub in_b: &'a [f32],
-    pub in_a: &'a [f32],
-    pub conv_w: &'a [f32],
-    pub a_log: &'a [f32],
-    pub dt_bias: &'a [f32],
-    pub norm_w: &'a [f32],
-    pub out_proj: &'a [f32],
-    pub post_norm_w: &'a [f32],
-    pub gate: (&'a [u8], &'a [u8]),
-    pub up: (&'a [u8], &'a [u8]),
-    pub down: (&'a [u8], &'a [u8]),
-}
-
-/// Dimensions of a linear layer.
-#[derive(Clone, Copy)]
-pub struct LinDims {
-    pub d: usize,
-    pub heads: usize,
-    pub kv_heads: usize,
-    pub kd: usize,
-    pub vd: usize,
-    pub conv_k: usize,
-    pub inter: usize,
-    pub eps: f32,
-}
+pub use crate::model::decode_refs::{LinDims, LinLayerRefs};
 
 /// One whole linear layer on the GPU. `hidden` [t, d] f32 in; on return
 /// `attn_plus_mlp` [t, d] holds (attention output + MLP output) so the
@@ -6251,45 +6224,7 @@ impl GpuDecoder {
     }
 }
 
-/// What the decoder needs from the model, by reference.
-pub struct DecodeModelRefs<'a> {
-    pub layers: Vec<DecodeLayerRefs<'a>>,
-    pub embed: &'a [f32],     // [vocab, d]
-    pub norm_f: &'a [f32],    // [d]
-    pub lm_head: &'a [f32],   // [vocab, d]
-    pub d: usize,
-    pub vocab: usize,
-    pub eps: f32,
-}
-
-pub enum DecodeLayerRefs<'a> {
-    Linear {
-        in_norm: &'a [f32],
-        post_norm: &'a [f32],
-        w: LinLayerRefs<'a>,
-        gated_w: &'a [f32],
-        dm: LinDims,
-    },
-    Full {
-        in_norm: &'a [f32],
-        post_norm: &'a [f32],
-        q_proj: &'a [f32],
-        k_proj: &'a [f32],
-        v_proj: &'a [f32],
-        o_proj: &'a [f32],
-        q_norm: &'a [f32],
-        k_norm: &'a [f32],
-        gate: (&'a [u8], &'a [u8]),
-        up: (&'a [u8], &'a [u8]),
-        down: (&'a [u8], &'a [u8]),
-        n_heads: usize,
-        n_kv: usize,
-        hd: usize,
-        rope_dim: usize,
-        theta: f32,
-        inter: usize,
-    },
-}
+pub use crate::model::decode_refs::{DecodeLayerRefs, DecodeModelRefs};
 
 /// Builds the resident decoder for a model whose prefill state (conv,
 /// scan, KV caches) is passed in f32 host layouts. `kv_cap` sizes the

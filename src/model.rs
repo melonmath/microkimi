@@ -23,8 +23,11 @@ pub mod qwen;
 pub mod qwentok;
 mod seam;
 pub(crate) mod kda_chunk;
+pub mod decode_refs;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(target_os = "linux")]
+pub mod cuda;
 #[cfg(target_os = "macos")]
 pub mod accel;
 pub mod pool;

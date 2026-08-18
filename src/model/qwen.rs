@@ -1246,6 +1246,12 @@ pub struct QwenModel {
     gpu_dec: Option<crate::model::metal::GpuDecoder>,
     #[cfg(target_os = "macos")]
     gpu_dec_off: bool,
+    /// CUDA decode (Linux, MICROKIMI_QWEN_CUDA=1): the resident decoder,
+    /// live between single-token steps; `cuda_sync` brings its state home.
+    #[cfg(target_os = "linux")]
+    cuda_dec: Option<crate::model::cuda::CudaDecoder>,
+    #[cfg(target_os = "linux")]
+    cuda_dec_off: bool,
     adapter_packs: AppliedPacks,
 }
 
@@ -2002,6 +2008,10 @@ impl QwenModel {
             gpu_dec: None,
             #[cfg(target_os = "macos")]
             gpu_dec_off: false,
+            #[cfg(target_os = "linux")]
+            cuda_dec: None,
+            #[cfg(target_os = "linux")]
+            cuda_dec_off: false,
             adapter_packs,
         };
         if model.mtp.is_some() {
@@ -2716,6 +2726,23 @@ impl QwenModel {
                 self.gpu_sync();
             }
         }
+        #[cfg(target_os = "linux")]
+        {
+            // CUDA decode: one token at a time after a prefill, the whole
+            // forward as one stream of kernels against resident state
+            if tokens.len() == 1
+                && !all_logits
+                && self.pos > 0
+                && crate::model::cuda::qwen_cuda_on()
+                && !self.cuda_dec_off
+            {
+                if let Some(logits) = self.cuda_decode_token(tokens[0]) {
+                    return QwenPrefillOut { logits: vec![logits], hidden: vec![Vec::new()] };
+                }
+            } else if self.cuda_dec.is_some() {
+                self.cuda_sync();
+            }
+        }
         if no_batch_prefill() {
             assert!(
                 self.q8_spine.iter().all(|x| x.is_none()),
@@ -2804,7 +2831,7 @@ impl QwenModel {
                     n += 1;
                 }
                 if n > 0 {
-                    let dm = crate::model::metal::LinDims {
+                    let dm = crate::model::decode_refs::LinDims {
                         d,
                         heads: c.lin_v_heads,
                         kv_heads: c.lin_k_heads,
@@ -2844,7 +2871,7 @@ impl QwenModel {
                         }
                         let QwenAttnW::Linear(w) = &li.attn else { unreachable!() };
                         chain.push(crate::model::metal::ChainLayerRef::Linear(crate::model::metal::ChainLayer {
-                            w: crate::model::metal::LinLayerRefs {
+                            w: crate::model::decode_refs::LinLayerRefs {
                                 in_qkv: tensor(data, &w.in_qkv),
                                 in_z: tensor(data, &w.in_z),
                                 in_b: tensor(data, &w.in_b),
@@ -5964,9 +5991,98 @@ impl QwenModel {
             }
         }
     }
+}
 
+/// CUDA decode: builds the resident decoder from this model's current
+/// caches (Linux; None when unavailable), steps it, brings it home.
+#[cfg(target_os = "linux")]
+impl QwenModel {
+    pub(crate) fn cuda_decoder(&self, kv_cap: usize) -> Option<crate::model::cuda::CudaDecoder> {
+        let refs = self.decode_refs();
+        let mut lin_states: Vec<(&[f32], &[f32])> = Vec::new();
+        let mut full_kv: Vec<(&[f32], &[f32], usize)> = Vec::new();
+        for cache in &self.caches {
+            match cache {
+                QwenCache::Linear(c) => lin_states.push((&c.conv, &c.state)),
+                QwenCache::Full(c) => full_kv.push((&c.k, &c.v, c.len)),
+            }
+        }
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        crate::model::cuda::cuda_decoder_new(&refs, &lin_states, &full_kv, kv_width, kv_cap, self.pos)
+    }
+
+    /// One decode token on the resident CUDA decoder (built on first use
+    /// from the current caches, rebuilt once when its KV capacity is
+    /// reached). None = the CPU path takes this token.
+    fn cuda_decode_token(&mut self, token: u32) -> Option<Vec<f32>> {
+        for attempt in 0..2 {
+            if self.cuda_dec.is_none() {
+                let cap = (self.pos + 1 + 1024).next_power_of_two().max(2048);
+                let t0 = std::time::Instant::now();
+                self.cuda_dec = self.cuda_decoder(cap);
+                if self.cuda_dec.is_none() {
+                    self.cuda_dec_off = true;
+                    println!("cuda: decode unavailable - CPU decode");
+                    return None;
+                }
+                if attempt == 0 && self.pos <= 1024 {
+                    println!("cuda: decode on (resident weights and state, {:.1} s to build)", t0.elapsed().as_secs_f64());
+                }
+            }
+            let mut dec = self.cuda_dec.take().unwrap();
+            let mut logits = vec![0.0f32; self.cfg.vocab];
+            let ok = {
+                let refs = self.decode_refs();
+                dec.step(&refs, token, &mut logits).is_some()
+            };
+            self.cuda_dec = Some(dec);
+            if ok {
+                self.pos += 1;
+                self.last_logits = logits.clone();
+                return Some(logits);
+            }
+            self.cuda_sync();
+        }
+        self.cuda_dec_off = true;
+        println!("cuda: decode step refused twice - CPU decode from here");
+        None
+    }
+
+    /// Brings the resident decoder's state back into the CPU caches and
+    /// drops the decoder (no-op without one).
+    pub(crate) fn cuda_sync(&mut self) {
+        let Some(dec) = self.cuda_dec.take() else {
+            return;
+        };
+        let kv_width = self.cfg.n_kv_heads * self.cfg.head_dim;
+        {
+            let mut lin: Vec<(&mut [f32], &mut [f32])> = Vec::new();
+            let mut full: Vec<(&mut Vec<f32>, &mut Vec<f32>, usize)> = Vec::new();
+            for cache in self.caches.iter_mut() {
+                match cache {
+                    QwenCache::Linear(c) => lin.push((&mut c.conv, &mut c.state)),
+                    QwenCache::Full(c) => full.push((&mut c.k, &mut c.v, c.len)),
+                }
+            }
+            dec.export(&mut lin, &mut full, kv_width);
+        }
+        let pos = dec.pos();
+        for cache in self.caches.iter_mut() {
+            if let QwenCache::Full(c) = cache {
+                let old = c.len;
+                for row in old..pos {
+                    let k = c.k[row * kv_width..(row + 1) * kv_width].to_vec();
+                    push_k_mirror(c, &k);
+                }
+                c.len = pos;
+            }
+        }
+    }
+}
+
+impl QwenModel {
     /// The by-reference view of the model the GPU decoder consumes.
-    pub(crate) fn decode_refs(&self) -> crate::model::metal::DecodeModelRefs<'_> {
+    pub(crate) fn decode_refs(&self) -> crate::model::decode_refs::DecodeModelRefs<'_> {
         let c = &self.cfg;
         let data = &self.bin.data;
         let d = c.d;
@@ -5977,10 +6093,10 @@ impl QwenModel {
                 QwenMlpW::Moe { .. } => panic!("GPU decode: dense MLP only"),
             };
             match &layer.attn {
-                QwenAttnW::Linear(w) => layers.push(crate::model::metal::DecodeLayerRefs::Linear {
+                QwenAttnW::Linear(w) => layers.push(crate::model::decode_refs::DecodeLayerRefs::Linear {
                     in_norm: tensor(data, &layer.input_norm),
                     post_norm: tensor(data, &layer.post_norm),
-                    w: crate::model::metal::LinLayerRefs {
+                    w: crate::model::decode_refs::LinLayerRefs {
                         in_qkv: tensor(data, &w.in_qkv),
                         in_z: tensor(data, &w.in_z),
                         in_b: tensor(data, &w.in_b),
@@ -5996,7 +6112,7 @@ impl QwenModel {
                         down: packed_parts(data, down),
                     },
                     gated_w: tensor(data, &w.norm),
-                    dm: crate::model::metal::LinDims {
+                    dm: crate::model::decode_refs::LinDims {
                         d,
                         heads: c.lin_v_heads,
                         kv_heads: c.lin_k_heads,
@@ -6007,7 +6123,7 @@ impl QwenModel {
                         eps: c.norm_eps as f32,
                     },
                 }),
-                QwenAttnW::Full(w) => layers.push(crate::model::metal::DecodeLayerRefs::Full {
+                QwenAttnW::Full(w) => layers.push(crate::model::decode_refs::DecodeLayerRefs::Full {
                     in_norm: tensor(data, &layer.input_norm),
                     post_norm: tensor(data, &layer.post_norm),
                     q_proj: tensor(data, &w.q_proj),
@@ -6028,7 +6144,7 @@ impl QwenModel {
                 }),
             }
         }
-        crate::model::metal::DecodeModelRefs {
+        crate::model::decode_refs::DecodeModelRefs {
             layers,
             embed: tensor(data, &self.embed),
             norm_f: tensor(data, &self.norm_f),
@@ -6161,7 +6277,7 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
             model.restore(&snap);
             model.pos = saved_pos;
             let refs = model.decode_refs();
-            let crate::model::metal::DecodeLayerRefs::Full {
+            let crate::model::decode_refs::DecodeLayerRefs::Full {
                 in_norm, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, n_heads, n_kv, hd, rope_dim, theta, ..
             } = &refs.layers[li]
             else {
@@ -6383,6 +6499,149 @@ pub fn gpu_decode_bench_cmd(args: &[String]) {
         println!(
             "gpudecodebench: {} steps | gpu {:.2} ms/token ({:.1} tok/s) | cpu {:.2} ms/token ({:.1} tok/s) | greedy agreement {}/{} tokens",
             steps, gpu_ms, 1000.0 / gpu_ms, cpu_ms, 1000.0 / cpu_ms, agree, steps
+        );
+    }
+}
+
+/// `microkimi cudadecodebench --model X.bin [--steps N] [--trace] [--prompt-tokens P]`:
+/// prefill a short prompt on the CPU, then decode N tokens on the CUDA
+/// decoder and the same N on the CPU from the same state; ms/token for
+/// both and the greedy agreement. `--trace` compares the hidden state
+/// after every layer for one token instead.
+pub fn cuda_decode_bench_cmd(args: &[String]) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        println!("cudadecodebench: Linux only");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let model_path = crate::value_flag(args, "--model").expect("cudadecodebench requires --model");
+        let steps: usize = crate::value_flag(args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(32);
+        let ptoks: usize = crate::value_flag(args, "--prompt-tokens").and_then(|v| v.parse().ok()).unwrap_or(16);
+        let trace = args.iter().any(|a| a == "--trace");
+        if crate::model::cuda::ctx().is_none() {
+            println!("cudadecodebench: no CUDA device (MICROKIMI_CUDA_VERBOSE=1 for the reason)");
+            return;
+        }
+        let mut model = QwenModel::load(&model_path);
+        let vocab = (model.cfg.vocab as u32).min(50_000);
+        let prompt: Vec<u32> = (0..ptoks as u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let t0 = std::time::Instant::now();
+        let out = model.prefill_collect(&prompt, false);
+        println!("cpu prefill of {} tokens: {:.2} s", prompt.len(), t0.elapsed().as_secs_f64());
+        let logits = out.logits.last().cloned().unwrap();
+        let snap = model.snapshot();
+        let saved_pos = model.pos;
+        let first = crate::model::top_k_probs(&logits, 5)[0].0 as u32;
+        let t0 = std::time::Instant::now();
+        let Some(mut dec) = model.cuda_decoder(prompt.len() + steps + 8) else {
+            println!("cudadecodebench: CUDA decoder unavailable (memory?)");
+            return;
+        };
+        println!("cuda decoder built in {:.1} s", t0.elapsed().as_secs_f64());
+        if trace {
+            let mut gpu_tr: Vec<Vec<f32>> = Vec::new();
+            let mut gl = vec![0.0f32; model.cfg.vocab];
+            {
+                let refs = model.decode_refs();
+                if dec.step_trace(&refs, first, &mut gl, &mut gpu_tr).is_none() {
+                    println!("cudadecodebench: GPU step refused");
+                    return;
+                }
+            }
+            model.restore(&snap);
+            model.pos = saved_pos;
+            let mut cpu_tr: Vec<Vec<f32>> = Vec::new();
+            let cl = model.forward_traced(first, Some(&mut cpu_tr));
+            for (li, (g, c)) in gpu_tr.iter().zip(&cpu_tr).enumerate() {
+                let mut max_abs = 0.0f32;
+                let mut max_ref = 0.0f32;
+                let mut nan = 0usize;
+                let mut worst = 0usize;
+                for i in 0..c.len() {
+                    if !g[i].is_finite() {
+                        nan += 1;
+                    }
+                    let e = (g[i] - c[i]).abs();
+                    if e > max_abs || e.is_nan() {
+                        max_abs = e;
+                        worst = i;
+                    }
+                    max_ref = max_ref.max(c[i].abs());
+                }
+                println!(
+                    "  layer {:2}: max abs {:.3e} (rel {:.2e}) at [{}] gpu {:.5} cpu {:.5} | non-finite {}",
+                    li, max_abs, max_abs / max_ref.max(1e-30), worst, g[worst], c[worst], nan
+                );
+            }
+            let mut max_abs = 0.0f32;
+            let mut max_ref = 0.0f32;
+            for i in 0..cl.len() {
+                max_abs = max_abs.max((gl[i] - cl[i]).abs());
+                max_ref = max_ref.max(cl[i].abs());
+            }
+            println!("  logits: max abs {:.3e} (rel {:.2e})", max_abs, max_abs / max_ref.max(1e-30));
+            println!("  logits top-5 gpu {:?}", crate::model::top_k_probs(&gl, 5));
+            println!("  logits top-5 cpu {:?}", crate::model::top_k_probs(&cl, 5));
+            return;
+        }
+        let (gpu_tokens, gpu_ms) = {
+            let refs = model.decode_refs();
+            let mut gpu_tokens = Vec::new();
+            let mut gl = vec![0.0f32; model.cfg.vocab];
+            let mut tok = first;
+            let mut per_step = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                let t0 = std::time::Instant::now();
+                if dec.step(&refs, tok, &mut gl).is_none() {
+                    println!("cudadecodebench: GPU step refused");
+                    return;
+                }
+                per_step.push(t0.elapsed().as_secs_f64() * 1000.0);
+                tok = crate::model::top_k_probs(&gl, 1)[0].0 as u32;
+                gpu_tokens.push(tok);
+            }
+            (gpu_tokens, per_step)
+        };
+        drop(dec);
+        model.restore(&snap);
+        model.pos = saved_pos;
+        let mut cpu_tokens = Vec::new();
+        let mut cpu_ms = Vec::with_capacity(steps);
+        let mut tok = first;
+        for _ in 0..steps {
+            let t0 = std::time::Instant::now();
+            let l = model.forward(tok);
+            cpu_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            tok = crate::model::top_k_probs(&l, 1)[0].0 as u32;
+            cpu_tokens.push(tok);
+        }
+        let agree = gpu_tokens.iter().zip(&cpu_tokens).filter(|(a, b)| a == b).count();
+        let first_diff = gpu_tokens.iter().zip(&cpu_tokens).position(|(a, b)| a != b);
+        let med = |v: &[f64]| {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let g_first = gpu_ms.first().cloned().unwrap_or(0.0);
+        let g_rest: Vec<f64> = gpu_ms.iter().skip(1).cloned().collect();
+        println!(
+            "gpu decode: {:.1} ms/token median (first step {:.1} ms; {} steps) = {:.1} tok/s",
+            med(if g_rest.is_empty() { &gpu_ms } else { &g_rest }),
+            g_first,
+            steps,
+            1000.0 / med(if g_rest.is_empty() { &gpu_ms } else { &g_rest })
+        );
+        println!("cpu decode: {:.1} ms/token median = {:.1} tok/s", med(&cpu_ms), 1000.0 / med(&cpu_ms));
+        println!(
+            "greedy agreement: {}/{} tokens{}",
+            agree,
+            steps,
+            match first_diff {
+                Some(i) => format!(" (first divergence at step {i}: gpu {} cpu {})", gpu_tokens[i], cpu_tokens[i]),
+                None => String::new(),
+            }
         );
     }
 }

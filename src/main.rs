@@ -60,8 +60,11 @@ fn main() {
         "qwengpubench" => tools::qwenbench::gpu_prefill_cmd(&args),
         "prefillbench" => tools::qwenbench::prefill_bench_cmd(&args),
         "gpudecodebench" => model::qwen::gpu_decode_bench_cmd(&args),
+        "cudadecodebench" => model::qwen::cuda_decode_bench_cmd(&args),
         "qwen-fixture" => tools::convert_qwen::fixture_cmd(&args),
         "kernbench" => model::kernbench_cmd(&args),
+        #[cfg(target_os = "linux")]
+        "cudabench" => model::cuda::cudabench_cmd(&args),
         "scanbench" => model::scanbench_cmd(&args),
         "qwen-tok" => model::qwentok::dump_cmd(&args),
         "gpubench" => gpubench_cmd(&args),
