@@ -3710,7 +3710,10 @@ kernel void dec_matvec(device const half* W   [[buffer(0)]],
     if (row >= rows) { return; }
     device const half* w = W + (size_t)row * cols;
     float acc = 0.0f;
-    uint c8 = cols / 8u;
+    // vector loads only when both bases are 8-half aligned (they are for
+    // every shape in the model; the scalar loop is the safety net)
+    bool aligned = ((cols & 7u) == 0u) && ((((size_t)x) & 15u) == 0u) && ((((size_t)W) & 15u) == 0u);
+    uint c8 = aligned ? (cols / 8u) : 0u;
     for (uint i = lane; i < c8; i += 32u) {
         half4 w0 = *(device const half4*)(w + i * 8u);
         half4 w1 = *(device const half4*)(w + i * 8u + 4u);
