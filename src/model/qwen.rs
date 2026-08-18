@@ -2461,7 +2461,11 @@ fn no_batch_prefill() -> bool {
 /// Decode/prefill phase profiler (MICROKIMI_PROF=1): accumulates wall
 /// micros per phase (0 lin attn, 1 full attn, 2 mlp, 3 lm_head) and
 /// prints once at process exit via dprof_print (called by `run`).
-pub(crate) static DPROF: [std::sync::atomic::AtomicU64; 9] = [
+pub(crate) static DPROF: [std::sync::atomic::AtomicU64; 13] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2506,6 +2510,13 @@ pub fn dprof_print() {
         v[6] as f64 / 1000.0,
         v[7] as f64 / 1000.0,
         v[8] as f64 / 1000.0
+    );
+    println!(
+        "prof3 (full attention): qkv gemm {:.1} ms | norms+rope+append {:.1} ms | attention {:.1} ms | o_proj {:.1} ms",
+        v[9] as f64 / 1000.0,
+        v[10] as f64 / 1000.0,
+        v[11] as f64 / 1000.0,
+        v[12] as f64 / 1000.0
     );
 }
 
@@ -3605,6 +3616,7 @@ fn full_attn_prefill(
     let mut gate_all = vec![0.0f32; t_count * q_width];
     let mut k_all = vec![0.0f32; t_count * kv_width];
     let mut v_all = vec![0.0f32; t_count * kv_width];
+    let t_fa = std::time::Instant::now();
     {
         let xs: Vec<&[f32]> = normed.chunks(d).take(t_count).collect();
         match q8_mats {
@@ -3644,6 +3656,8 @@ fn full_attn_prefill(
             }
         }
     }
+    dprof_add(9, t_fa.elapsed());
+    let t_fa = std::time::Instant::now();
     {
         // on the persistent pool, with one reusable head scratch per job
         // (the per-(head, token) to_vec allocations added up to ~24 per
@@ -3699,6 +3713,8 @@ fn full_attn_prefill(
     push_k_mirror(cache, &k_all);
     cache.len += t_count;
 
+    dprof_add(10, t_fa.elapsed());
+    let t_fa = std::time::Instant::now();
     // each position attends over its causal prefix, parallel over tokens;
     // gated mixes land token-major for the single multi o_proj below
     let mut mixed_all = vec![0.0f32; t_count * q_width];
@@ -3792,6 +3808,8 @@ fn full_attn_prefill(
             }
         });
     }
+    dprof_add(11, t_fa.elapsed());
+    let t_fa = std::time::Instant::now();
     {
         let xs: Vec<&[f32]> = mixed_all.chunks(q_width).collect();
         let mut outs: Vec<&mut [f32]> = attn_out[..t_count * d].chunks_mut(d).collect();
@@ -3800,6 +3818,7 @@ fn full_attn_prefill(
             None => crate::model::ops::matvec_multi(o_proj, d, q_width, &xs, &mut outs),
         }
     }
+    dprof_add(12, t_fa.elapsed());
 }
 
 /// Prepares the delta-scan inputs exactly as the CPU scan computes them
@@ -5820,24 +5839,65 @@ pub(crate) fn chunked_scan_head_strided(
         // sums over the state's kd rows; k/q weights are per-row scalars)
         s0k[..n * vd].fill(0.0);
         s0q[..n * vd].fill(0.0);
-        for i in 0..kd {
+        // four state rows per visit of an accumulator row (the one-row
+        // form was L1-bandwidth-bound: three memory operations per
+        // multiply-add); the additions stay in row order, mul then add -
+        // bit-identical to the one-row form
+        let mut i = 0usize;
+        while i + 4 <= kd {
+            let r0 = &state[i * vd..(i + 1) * vd];
+            let r1 = &state[(i + 1) * vd..(i + 2) * vd];
+            let r2 = &state[(i + 2) * vd..(i + 3) * vd];
+            let r3 = &state[(i + 3) * vd..(i + 4) * vd];
+            for t in 0..n {
+                let (k0, k1, k2, k3) = (
+                    kn[(c0 + t) * k_stride + i],
+                    kn[(c0 + t) * k_stride + i + 1],
+                    kn[(c0 + t) * k_stride + i + 2],
+                    kn[(c0 + t) * k_stride + i + 3],
+                );
+                let (q0, q1, q2, q3) = (
+                    qn[(c0 + t) * q_stride + i],
+                    qn[(c0 + t) * q_stride + i + 1],
+                    qn[(c0 + t) * q_stride + i + 2],
+                    qn[(c0 + t) * q_stride + i + 3],
+                );
+                let dk = &mut s0k[t * vd..(t + 1) * vd];
+                for j in 0..vd {
+                    let mut a = dk[j];
+                    a += k0 * r0[j];
+                    a += k1 * r1[j];
+                    a += k2 * r2[j];
+                    a += k3 * r3[j];
+                    dk[j] = a;
+                }
+                let dq = &mut s0q[t * vd..(t + 1) * vd];
+                for j in 0..vd {
+                    let mut a = dq[j];
+                    a += q0 * r0[j];
+                    a += q1 * r1[j];
+                    a += q2 * r2[j];
+                    a += q3 * r3[j];
+                    dq[j] = a;
+                }
+            }
+            i += 4;
+        }
+        while i < kd {
             let row = &state[i * vd..(i + 1) * vd];
             for t in 0..n {
                 let kw = kn[(c0 + t) * k_stride + i];
                 let qw = qn[(c0 + t) * q_stride + i];
                 let dk = &mut s0k[t * vd..(t + 1) * vd];
-                if kw != 0.0 {
-                    for j in 0..vd {
-                        dk[j] += kw * row[j];
-                    }
+                for j in 0..vd {
+                    dk[j] += kw * row[j];
                 }
-                if qw != 0.0 {
-                    let dq = &mut s0q[t * vd..(t + 1) * vd];
-                    for j in 0..vd {
-                        dq[j] += qw * row[j];
-                    }
+                let dq = &mut s0q[t * vd..(t + 1) * vd];
+                for j in 0..vd {
+                    dq[j] += qw * row[j];
                 }
             }
+            i += 1;
         }
         // relative decay products G(s+1..t), built multiplicatively per
         // row (never by dividing cumulative products: real decays reach
@@ -5865,14 +5925,34 @@ pub(crate) fn chunked_scan_head_strided(
             let ut = &mut ut_row[..vd];
             ut.copy_from_slice(&b[t * vd..(t + 1) * vd]);
             let bt = beta[(c0 + t) * bg_stride];
-            for s in 0..t {
-                let a = bt * grel[t * C + s] * kk[t * C + s];
-                if a != 0.0 {
-                    let us = &ready[s * vd..(s + 1) * vd];
-                    for j in 0..vd {
-                        ut[j] -= a * us[j];
-                    }
+            // four earlier tokens per visit of u_t (same order of subtraction)
+            let mut s = 0usize;
+            while s + 4 <= t {
+                let a0 = bt * grel[t * C + s] * kk[t * C + s];
+                let a1 = bt * grel[t * C + s + 1] * kk[t * C + s + 1];
+                let a2 = bt * grel[t * C + s + 2] * kk[t * C + s + 2];
+                let a3 = bt * grel[t * C + s + 3] * kk[t * C + s + 3];
+                let u0 = &ready[s * vd..(s + 1) * vd];
+                let u1 = &ready[(s + 1) * vd..(s + 2) * vd];
+                let u2 = &ready[(s + 2) * vd..(s + 3) * vd];
+                let u3 = &ready[(s + 3) * vd..(s + 4) * vd];
+                for j in 0..vd {
+                    let mut x = ut[j];
+                    x -= a0 * u0[j];
+                    x -= a1 * u1[j];
+                    x -= a2 * u2[j];
+                    x -= a3 * u3[j];
+                    ut[j] = x;
                 }
+                s += 4;
+            }
+            while s < t {
+                let a = bt * grel[t * C + s] * kk[t * C + s];
+                let us = &ready[s * vd..(s + 1) * vd];
+                for j in 0..vd {
+                    ut[j] -= a * us[j];
+                }
+                s += 1;
             }
         }
         // outputs: out_t = G(1..t) s0q[t] + sum_{s<=t} G(s+1..t) qk[t][s] u_s
@@ -5883,14 +5963,33 @@ pub(crate) fn chunked_scan_head_strided(
             for j in 0..vd {
                 out[j] = g1t * sq[j];
             }
-            for s in 0..=t {
-                let w = grel[t * C + s] * qk[t * C + s];
-                if w != 0.0 {
-                    let us = &u[s * vd..(s + 1) * vd];
-                    for j in 0..vd {
-                        out[j] += w * us[j];
-                    }
+            let mut s = 0usize;
+            while s + 4 <= t + 1 {
+                let w0 = grel[t * C + s] * qk[t * C + s];
+                let w1 = grel[t * C + s + 1] * qk[t * C + s + 1];
+                let w2 = grel[t * C + s + 2] * qk[t * C + s + 2];
+                let w3 = grel[t * C + s + 3] * qk[t * C + s + 3];
+                let u0 = &u[s * vd..(s + 1) * vd];
+                let u1 = &u[(s + 1) * vd..(s + 2) * vd];
+                let u2 = &u[(s + 2) * vd..(s + 3) * vd];
+                let u3 = &u[(s + 3) * vd..(s + 4) * vd];
+                for j in 0..vd {
+                    let mut x = out[j];
+                    x += w0 * u0[j];
+                    x += w1 * u1[j];
+                    x += w2 * u2[j];
+                    x += w3 * u3[j];
+                    out[j] = x;
                 }
+                s += 4;
+            }
+            while s <= t {
+                let w = grel[t * C + s] * qk[t * C + s];
+                let us = &u[s * vd..(s + 1) * vd];
+                for j in 0..vd {
+                    out[j] += w * us[j];
+                }
+                s += 1;
             }
         }
         // state update: S = G(1..C) S0 + sum_s G(s+1..C) k_s (x) u_s
@@ -5898,19 +5997,47 @@ pub(crate) fn chunked_scan_head_strided(
         for x in state.iter_mut() {
             *x *= gtot;
         }
-        for s in 0..n {
+        // four tokens per visit of a state row (same order of addition)
+        let mut s = 0usize;
+        while s + 4 <= n {
+            let w0 = grel[(n - 1) * C + s];
+            let w1 = grel[(n - 1) * C + s + 1];
+            let w2 = grel[(n - 1) * C + s + 2];
+            let w3 = grel[(n - 1) * C + s + 3];
+            let k0 = &kn[(c0 + s) * k_stride..(c0 + s) * k_stride + kd];
+            let k1 = &kn[(c0 + s + 1) * k_stride..(c0 + s + 1) * k_stride + kd];
+            let k2 = &kn[(c0 + s + 2) * k_stride..(c0 + s + 2) * k_stride + kd];
+            let k3 = &kn[(c0 + s + 3) * k_stride..(c0 + s + 3) * k_stride + kd];
+            let u0 = &u[s * vd..(s + 1) * vd];
+            let u1 = &u[(s + 1) * vd..(s + 2) * vd];
+            let u2 = &u[(s + 2) * vd..(s + 3) * vd];
+            let u3 = &u[(s + 3) * vd..(s + 4) * vd];
+            for i in 0..kd {
+                let (f0, f1, f2, f3) = (w0 * k0[i], w1 * k1[i], w2 * k2[i], w3 * k3[i]);
+                let row = &mut state[i * vd..(i + 1) * vd];
+                for j in 0..vd {
+                    let mut x = row[j];
+                    x += f0 * u0[j];
+                    x += f1 * u1[j];
+                    x += f2 * u2[j];
+                    x += f3 * u3[j];
+                    row[j] = x;
+                }
+            }
+            s += 4;
+        }
+        while s < n {
             let w = grel[(n - 1) * C + s];
             let ks = &kn[(c0 + s) * k_stride..(c0 + s) * k_stride + kd];
             let us = &u[s * vd..(s + 1) * vd];
             for i in 0..kd {
                 let f = w * ks[i];
-                if f != 0.0 {
-                    let row = &mut state[i * vd..(i + 1) * vd];
-                    for j in 0..vd {
-                        row[j] += f * us[j];
-                    }
+                let row = &mut state[i * vd..(i + 1) * vd];
+                for j in 0..vd {
+                    row[j] += f * us[j];
                 }
             }
+            s += 1;
         }
         c0 = c1;
     }

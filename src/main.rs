@@ -17,7 +17,36 @@ mod unicode_nfc;
 
 use std::time::Instant;
 
+/// glibc malloc tuning (Linux): keep freed large buffers in the heap
+/// instead of returning them to the OS. The prefill allocates tens of MB
+/// of per-layer scratch; with glibc's defaults those go through mmap,
+/// come back as fresh zero pages every layer, and 24 threads then fault
+/// them in under one lock - measured 0.7 s of a 5.7 s prompt on the 27B
+/// (the delta scan phase alone 924 -> 230 ms). MICROKIMI_NO_MALLOPT=1
+/// restores the defaults.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_malloc() {
+    if std::env::var("MICROKIMI_NO_MALLOPT").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    unsafe extern "C" {
+        fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    const M_TRIM_THRESHOLD: std::ffi::c_int = -1;
+    const M_TOP_PAD: std::ffi::c_int = -2;
+    const M_MMAP_THRESHOLD: std::ffi::c_int = -3;
+    // SAFETY: glibc mallopt with documented parameters, before any thread exists.
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 32 << 20);
+        mallopt(M_TRIM_THRESHOLD, i32::MAX);
+        mallopt(M_TOP_PAD, 256 << 20);
+    }
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_malloc() {}
+
 fn main() {
+    tune_malloc();
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let t0 = Instant::now();
