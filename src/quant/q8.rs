@@ -57,6 +57,12 @@ pub fn quantize_q8_into(x: &[f32], out: &mut Q8Vec) {
     out.scales.clear();
     out.scales.resize(nb, 0.0);
     let (q, scales) = (&mut out.q, &mut out.scales);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        // SAFETY: avx512f/bw checked; q and scales sized above.
+        unsafe { quantize_q8_avx512(x, q, scales) };
+        return;
+    }
     for g in 0..nb {
         let b = &x[g * 32..(g + 1) * 32];
         let max = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
@@ -67,6 +73,58 @@ pub fn quantize_q8_into(x: &[f32], out: &mut Q8Vec) {
         }
         for (j, &v) in b.iter().enumerate() {
             q[g * 32 + j] = (v / dx).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// AVX-512 form of the block quantizer, bit-identical to the scalar loop:
+/// the same |v| max (max_ps ignores a NaN operand the way f32::max does),
+/// the same IEEE division v / dx, f32::round's half-away-from-zero via
+/// trunc + (|v - trunc v| >= 0.5) * sign, the same clamp.
+/// SAFETY: caller guarantees avx512f/bw; q.len() == x.len(), scales.len() == x.len() / 32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn quantize_q8_avx512(x: &[f32], q: &mut [i8], scales: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = x.len() / 32;
+    unsafe {
+        let signbit = _mm512_set1_ps(-0.0);
+        let half = _mm512_set1_ps(0.5);
+        let one = _mm512_set1_ps(1.0);
+        let lim = _mm512_set1_ps(127.0);
+        let nlim = _mm512_set1_ps(-127.0);
+        for g in 0..nb {
+            let p = x.as_ptr().add(g * 32);
+            let a = _mm512_loadu_ps(p);
+            let b = _mm512_loadu_ps(p.add(16));
+            let aa = _mm512_andnot_ps(signbit, a);
+            let ab = _mm512_andnot_ps(signbit, b);
+            // fold(0, max(m, |v|)): a NaN |v| leaves m (max_ps returns its
+            // second operand when the first is NaN)
+            let m = _mm512_max_ps(ab, _mm512_max_ps(aa, _mm512_setzero_ps()));
+            let max = _mm512_reduce_max_ps(m);
+            let dx = max / 127.0;
+            scales[g] = dx;
+            if dx == 0.0 {
+                continue;
+            }
+            let dxv = _mm512_set1_ps(dx);
+            let round_clamp = |v: __m512| -> __m512i {
+                let s = _mm512_div_ps(v, dxv);
+                let t = _mm512_roundscale_ps(s, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                let frac = _mm512_andnot_ps(signbit, _mm512_sub_ps(s, t));
+                let away = _mm512_cmp_ps_mask(frac, half, _CMP_GE_OQ);
+                let sgn = _mm512_or_ps(_mm512_and_ps(s, signbit), one); // +-1
+                let r = _mm512_mask_add_ps(t, away, t, sgn);
+                let c = _mm512_min_ps(_mm512_max_ps(r, nlim), lim);
+                _mm512_cvtps_epi32(c) // exact: c is integral
+            };
+            let ia = round_clamp(a);
+            let ib = round_clamp(b);
+            let qa = _mm512_cvtsepi32_epi8(ia);
+            let qb = _mm512_cvtsepi32_epi8(ib);
+            _mm_storeu_si128(q.as_mut_ptr().add(g * 32) as *mut __m128i, qa);
+            _mm_storeu_si128(q.as_mut_ptr().add(g * 32 + 16) as *mut __m128i, qb);
         }
     }
 }
@@ -448,6 +506,60 @@ mod q8_tests {
         assert_eq!(block_dot(&packed, &x), dot_block_scalar(&packed, &x));
         let packed = vec![0xFFu8; 16]; // -6 and -6
         assert_eq!(block_dot(&packed, &x), dot_block_scalar(&packed, &x));
+    }
+
+    /// The block quantizer's vector form must equal the scalar reference
+    /// bit for bit: |v| max, IEEE division, half-away-from-zero rounding
+    /// (including the 0.5 boundary and values just under it), the clamp,
+    /// zero blocks.
+    #[test]
+    fn quantize_q8_matches_scalar_reference() {
+        fn reference(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+            let nb = x.len() / 32;
+            let mut q = vec![0i8; x.len()];
+            let mut s = vec![0f32; nb];
+            for g in 0..nb {
+                let b = &x[g * 32..(g + 1) * 32];
+                let max = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let dx = max / 127.0;
+                s[g] = dx;
+                if dx == 0.0 {
+                    continue;
+                }
+                for (j, &v) in b.iter().enumerate() {
+                    q[g * 32 + j] = (v / dx).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            (q, s)
+        }
+        let mut rng = Rng(0xABCDEF);
+        for round in 0..300 {
+            let n = 32 * (1 + round % 9);
+            let mut x: Vec<f32> = (0..n).map(|_| (rng.u8() as f32 - 127.5) * (1.0 + (rng.u8() as f32) / 64.0)).collect();
+            if round % 7 == 0 {
+                // exact .5 boundaries and just-under values in units of dx
+                let max = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let dx = max / 127.0;
+                for (i, v) in x.iter_mut().enumerate().take(32) {
+                    *v = match i % 4 {
+                        0 => dx * (i as f32 + 0.5),
+                        1 => -dx * (i as f32 + 0.5),
+                        2 => dx * 0.49999997,
+                        _ => -dx * 2.5,
+                    };
+                }
+            }
+            if round % 11 == 0 {
+                for v in x.iter_mut().skip(32).take(32) {
+                    *v = 0.0;
+                }
+            }
+            let (rq, rs) = reference(&x);
+            let mut out = Q8Vec::new();
+            quantize_q8_into(&x, &mut out);
+            assert_eq!(out.q, rq, "round {round}");
+            assert_eq!(out.scales.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), rs.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "round {round}");
+        }
     }
 
     /// Every architecture's fp4 row kernel must equal the reduction-order
