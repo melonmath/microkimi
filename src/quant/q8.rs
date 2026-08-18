@@ -1681,19 +1681,28 @@ pub unsafe fn tile16_vnni<const L: usize>(
         let sbase = pack.scales.as_ptr().add(t * nb * 16);
         let rbase = pack.rowsum128.as_ptr().add(t * nb * 16);
         for g in 0..nb {
+            // two accumulator chains per lane (even / odd column groups):
+            // dpbusd latency is ~5 cycles, so eight lanes x one chain
+            // exposed it; the integer sums are order-free (exact)
             let mut acc = [_mm512_setzero_si512(); L];
+            let mut acc2 = [_mm512_setzero_si512(); L];
             let wg = wbase.add(g * 8 * 64);
-            for k in 0..8 {
+            let mut k = 0usize;
+            while k < 8 {
                 let wv = _mm512_loadu_si512(wg.add(k * 64) as *const _);
+                let wv2 = _mm512_loadu_si512(wg.add((k + 1) * 64) as *const _);
                 for l in 0..L {
                     let xb = _mm512_set1_epi32((xu[l].as_ptr().add(g * 32 + k * 4) as *const i32).read_unaligned());
+                    let xb2 = _mm512_set1_epi32((xu[l].as_ptr().add(g * 32 + (k + 1) * 4) as *const i32).read_unaligned());
                     acc[l] = _mm512_dpbusd_epi32(acc[l], xb, wv);
+                    acc2[l] = _mm512_dpbusd_epi32(acc2[l], xb2, wv2);
                 }
+                k += 2;
             }
             let corr = _mm512_loadu_si512(rbase.add(g * 16) as *const _);
             let ws = _mm512_loadu_ps(sbase.add(g * 16));
             for l in 0..L {
-                let sums = _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[l], corr));
+                let sums = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_add_epi32(acc[l], acc2[l]), corr));
                 let sv = _mm512_mul_ps(ws, _mm512_set1_ps(*xs[l].get_unchecked(g)));
                 accf[l] = _mm512_fmadd_ps(sums, sv, accf[l]);
             }
