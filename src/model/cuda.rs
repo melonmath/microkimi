@@ -293,6 +293,7 @@ const KERNEL_NAMES: &[&str] = &[
     "k_gemm_fp4_mma128x128",
     "k_gemm_q8_pipe",
     "k_gemm_fp4_pipe",
+    "k_gemm_fp4_pipe_h",
     "k_add",
     "k_rmsnorm",
     "k_rmsnorm_rows",
@@ -304,18 +305,23 @@ const KERNEL_NAMES: &[&str] = &[
     "k_qk_prep",
     "k_attn_decode",
     "k_attn_prefill",
+    "k_attn_prefill_grouped",
     "k_gated_norm",
     "k_scale_rows",
     "k_lin_prep",
     "k_conv_prefill",
     "k_delta_scan",
     "k_delta_scan128",
+    "k_delta_scan4x128",
+    "k_delta_scan4x64",
     "k_delta_scan64",
     "k_gated_norm_rows",
+    "k_gated_norm_quant_rows",
     "k_silu_mul_rows",
     "k_add_rmsnorm_rows",
     "k_add_rmsnorm_quant_rows",
     "k_silu_mul_quant_rows",
+    "k_silu_mul_quant_rows_h",
     "k_qk_prep_rows",
 ];
 
@@ -383,7 +389,7 @@ fn compile(nv: &Nvrtc, major: i32, minor: i32) -> Result<Vec<u8>, String> {
     let key = {
         let mut h = crate::sha256::Sha256::new();
         h.update(src.as_bytes());
-        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v30-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
+        h.update(format!("sm{major}{minor}-nvrtc{nmaj}.{nmin}-v48-{}", std::env::var("MICROKIMI_CUDA_PTXAS_V").is_ok()).as_bytes());
         let d = h.finalize();
         d.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
     };
@@ -758,6 +764,25 @@ impl CudaCtx {
         let mut a = args!(wq.ptr, ws.ptr, xq.ptr, xs.ptr, cp, rows, cols, t, ldc);
         self.launch("k_gemm_q8", (rows.div_ceil(64), t.div_ceil(64), 1), (256, 1, 1), 0, &mut a)
     }
+    /// The gate|up GEMM with an f16 output when the pipelined kernel runs
+    /// (returns true in .1 when the output is f16), the f32 form otherwise.
+    pub fn gemm_fp4_gu(&self, wp: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, rows: u32, cols: u32, t: u32) -> (bool, bool) {
+        static PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pipe = *PIPE.get_or_init(|| !std::env::var("MICROKIMI_CUDA_NO_PIPE").map(|v| v == "1").unwrap_or(false));
+        if self.mma_on() && pipe && t >= 64 {
+            let mut a = args!(wp.ptr, wsc.ptr, xq.ptr, xs.ptr, c.ptr, rows, cols, t, rows);
+            let stage = 128 * 32 + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4;
+            let shared = (3 * stage) as u32;
+            let ok = self.launch("k_gemm_fp4_pipe_h", (rows.div_ceil(128), t.div_ceil(128), 1), (256, 1, 1), shared, &mut a);
+            return (ok, true);
+        }
+        (self.gemm_fp4(wp, wsc, xq, xs, c, 0, rows, cols, t, rows), false)
+    }
+    /// h = silu(gate) * up from an f16 gate|up, quantized into xq/xs.
+    pub fn silu_mul_quant_rows_h(&self, gu: &DBuf, h: &DBuf, xq: &DBuf, xs: &DBuf, rows: u32, inter: u32) -> bool {
+        let mut a = args!(gu.ptr, h.ptr, xq.ptr, xs.ptr, rows, inter);
+        self.launch("k_silu_mul_quant_rows_h", (inter.div_ceil(1024), rows, 1), (1024, 1, 1), 0, &mut a)
+    }
     /// C[t][rows] = X(q8) . W(MXFP4)^T.
     pub fn gemm_fp4(&self, wp: &DBuf, wsc: &DBuf, xq: &DBuf, xs: &DBuf, c: &DBuf, c_off: usize, rows: u32, cols: u32, t: u32, ldc: u32) -> bool {
         if self.mma_on() {
@@ -779,9 +804,22 @@ impl CudaCtx {
             let cp = c.ptr + c_off as u64;
             let mut a = args!(w.ptr, wsc.ptr, xq.ptr, xs.ptr, cp, rows, cols, t, ldc);
             let name = if q8 { "k_gemm_q8_pipe" } else { "k_gemm_fp4_pipe" };
-            let stage = if q8 { 128 * 64 + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4 } else { 128 * 32 + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4 };
+            let wrow = if q8 { 64usize } else { 32usize };
+            let stage = 128 * wrow + 128 * 64 + 2 * 128 * 2 + 2 * 128 * 4;
             let shared = (3 * stage) as u32;
-            return self.launch(name, (rows.div_ceil(128), t.div_ceil(128), 1), (256, 1, 1), shared, &mut a);
+            let (gx, gy) = (rows.div_ceil(128), t.div_ceil(128));
+            // a grid under two blocks per SM (the 5120-row projections: 80
+            // blocks on 58 SMs) splits K in two: both halves add into a zeroed
+            // C - an exact, order-free sum of two terms
+            let mut splits = 1u32;
+            if gx * gy < (2 * self.sm_count) as u32 && ldc == rows && cols / 32 >= 8 {
+                splits = 2;
+                // SAFETY: c holds t rows of ldc floats from c_off (checked by the caller's sizing).
+                unsafe {
+                    (self.drv.memset_d8_async)(cp, 0, (t as usize) * (ldc as usize) * 4, self.stream);
+                }
+            }
+            return self.launch(name, (gx, gy, splits), (256, 1, 1), shared, &mut a);
         }
         let one = |t0: u32, tt: u32, mt: u32, nt: u32| -> bool {
             let name = match (q8, mt, nt) {
@@ -862,10 +900,11 @@ impl CudaCtx {
         self.launch("k_add", (n.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut a)
     }
     /// out = rmsnorm(x + add?) * (1+w | w), quantized into xq/xs as well.
-    pub fn add_rmsnorm_quant_rows(&self, x: &DBuf, add: Option<&DBuf>, w: &DBuf, out: &DBuf, xq: &DBuf, xs: &DBuf, rows: u32, n: u32, eps: f32, one_plus: bool) -> bool {
+    pub fn add_rmsnorm_quant_rows(&self, x: &DBuf, add: Option<&DBuf>, w: &DBuf, out: Option<&DBuf>, xq: &DBuf, xs: &DBuf, rows: u32, n: u32, eps: f32, one_plus: bool) -> bool {
         let ap: CUdeviceptr = add.map(|b| b.ptr).unwrap_or(0);
+        let outp: CUdeviceptr = out.map(|b| b.ptr).unwrap_or(0);
         let op: u32 = if one_plus { 1 } else { 0 };
-        let mut a = args!(x.ptr, ap, w.ptr, out.ptr, xq.ptr, xs.ptr, rows, n, eps, op);
+        let mut a = args!(x.ptr, ap, w.ptr, outp, xq.ptr, xs.ptr, rows, n, eps, op);
         self.launch("k_add_rmsnorm_quant_rows", (rows, 1, 1), (1024, 1, 1), 0, &mut a)
     }
     /// h = silu(gate) * up, quantized into xq/xs as well.
@@ -1518,19 +1557,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma256(const u8*
 extern "C" __global__ void __launch_bounds__(256, 2) k_gemm_fp4_mma128x128(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) { gemm_fp4_mma_t<128, 128>(wp, wsc, xq, xs, C, rows, cols, t, ldc); }
 
 
-// ── pipelined tensor-core GEMM (sm_80+): cp.async three-stage staging ──
-// Tile 128 rows x 128 tokens, 8 warps as 4 x 2 (32 rows x 64 tokens
-// each), 64 columns (two blocks) per stage, three stages in flight: the
-// loads of step s+2 are in the air while step s computes, so the DRAM
-// latency of a weight tile is hidden instead of paid at every step (the
-// synchronous kernels above are latency-bound in their staging). Rows
-// are stored as 16-byte chunks XOR-swizzled by the row for the fragment
-// loads; the fp4 weights stay packed in shared memory and decode at
-// fragment load. Same exact block dots, same scale application.
-#define PM 128
-#define PN 128
-#define PKB 2       /* blocks per stage */
-#define PSTAGES 3
+// ── pipelined tensor-core GEMM (sm_80+): cp.async multi-stage staging ──
+// Tile 128 rows x PN tokens, 8 warps as 4 x 2 (32 rows x PN/2 tokens
+// each), KBS blocks (KBS*32 columns) per stage, STAGES stages in flight:
+// the loads of a later step are in the air while this step computes, so
+// the DRAM latency of a weight tile is hidden instead of paid at every
+// step. Rows are stored as 16-byte chunks XOR-swizzled by the row for
+// the fragment loads (zero bank conflicts); the fp4 weights stay packed
+// in shared memory and decode at fragment load. Same exact block dots,
+// same scale application.
+#define PIPE_STAGES 3
 __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gsrc, bool valid) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
     int n = valid ? 16 : 0;
@@ -1551,51 +1587,59 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #endif
 }
-// shared layout of one stage (bytes): W tile [PM][WROW] | X tile [PN][64] | ws [PKB*PM] u16 | xs [PKB*PN] f32
-// q8: WROW = 64 (two 32-byte blocks); fp4: WROW = 32 (two 16-byte packed blocks)
-template <bool Q8>
+// shared layout of one stage (bytes): W tile [PM][WROW] | X tile [PN][XROW] | ws [KBS*PM] u16 | xs [KBS*PN] f32
+template <bool Q8, int PM, int PN, int KBS>
 struct PipeLayout {
-    static constexpr int WROW = Q8 ? 64 : 32;
+    static constexpr int WROW = Q8 ? KBS * 32 : KBS * 16;   // bytes per row per stage
+    static constexpr int XROW = KBS * 32;
+    static constexpr int WCH = WROW / 16;                   // 16-byte chunks per W row
+    static constexpr int XCH = XROW / 16;                   // ... per X row
     static constexpr int W_BYTES = PM * WROW;
-    static constexpr int X_BYTES = PN * 64;
-    static constexpr int WS_BYTES = PKB * PM * 2;
-    static constexpr int XS_BYTES = PKB * PN * 4;
+    static constexpr int X_BYTES = PN * XROW;
+    static constexpr int WS_BYTES = KBS * PM * 2;
+    static constexpr int XS_BYTES = KBS * PN * 4;
     static constexpr int STAGE = W_BYTES + X_BYTES + WS_BYTES + XS_BYTES;
+    static constexpr int WM = PM / 32;                      // warp rows
+    static constexpr int WN = 8 / WM;                       // warp columns
+    static constexpr int WT = PN / WN;                      // tokens per warp
+    static constexpr int NW = WT / 8;                       // n8 tiles per warp
 };
-// swizzled int index of (row, 16-byte chunk c, int within chunk) for a row of `chunks` chunks
-// (bank-conflict-free for the fragment loads: eight consecutive rows read
-// eight distinct bank groups when the chunk is XORed with (row >> 1) & 3
-// for four-chunk rows and (row >> 2) & 1 for two-chunk rows)
-__device__ __forceinline__ unsigned swz(unsigned row, unsigned c, unsigned chunks_log2) {
-    unsigned mask = (1u << chunks_log2) - 1u;
-    return (row << chunks_log2) + ((c ^ ((row >> (3 - chunks_log2)) & mask)) & mask);
+__device__ __forceinline__ constexpr int log2c(int n) { return n <= 1 ? 0 : 1 + log2c(n / 2); }
+// swizzled chunk index of (row, chunk c) for rows of 2^log2 chunks: the chunk
+// XORed with row bits chosen so that eight consecutive rows of a fragment
+// load hit eight distinct bank groups
+__device__ __forceinline__ unsigned swz(unsigned row, unsigned c, unsigned log2) {
+    unsigned mask = (1u << log2) - 1u;
+    unsigned shift = log2 >= 3 ? 0u : (3u - log2);
+    return (row << log2) + ((c ^ ((row >> shift) & mask)) & mask);
 }
-
-template <bool Q8, bool FULL>
+template <bool Q8, int PM, int PN, int KBS, bool FULL>
 __device__ __forceinline__ void pipe_step(const unsigned char* base, unsigned wr0, unsigned wt0, unsigned gid, unsigned tig, unsigned nw,
-                                          float (&acc)[2][8][4], int zero) {
-    typedef PipeLayout<Q8> L;
+                                          float (&acc)[2][PipeLayout<Q8, PM, PN, KBS>::NW][4], int zero) {
+    typedef PipeLayout<Q8, PM, PN, KBS> L;
+    constexpr int NW = L::NW;
+    constexpr int WL = log2c(L::WCH), XL = log2c(L::XCH);
     const int* sw = (const int*)base;
     const int* sx = (const int*)(base + L::W_BYTES);
     const unsigned short* sw16 = (const unsigned short*)base;
     const unsigned short* sws = (const unsigned short*)(base + L::W_BYTES + L::X_BYTES);
     const float* sxs = (const float*)(base + L::W_BYTES + L::X_BYTES + L::WS_BYTES);
     #pragma unroll
-    for (int kb = 0; kb < PKB; kb++) {
-        int a[2][4], b[8][2];
+    for (int kb = 0; kb < KBS; kb++) {
+        int a[2][4], b[NW][2];
         #pragma unroll
         for (int mi = 0; mi < 2; mi++) {
             unsigned r = wr0 + mi * 16 + gid;
             if (Q8) {
-                unsigned s4 = (r >> 1) & 3, s4b = ((r + 8) >> 1) & 3;
-                a[mi][0] = sw[(r << 2) * 4 + (((kb * 2) ^ s4) & 3) * 4 + tig];
-                a[mi][1] = sw[((r + 8) << 2) * 4 + (((kb * 2) ^ s4b) & 3) * 4 + tig];
-                a[mi][2] = sw[(r << 2) * 4 + (((kb * 2 + 1) ^ s4) & 3) * 4 + tig];
-                a[mi][3] = sw[((r + 8) << 2) * 4 + (((kb * 2 + 1) ^ s4b) & 3) * 4 + tig];
+                // block kb of a q8 row = chunks kb*2 (ints k 0..3), kb*2+1 (ints 4..7)
+                a[mi][0] = sw[swz(r, kb * 2, WL) * 4 + tig];
+                a[mi][1] = sw[swz(r + 8, kb * 2, WL) * 4 + tig];
+                a[mi][2] = sw[swz(r, kb * 2 + 1, WL) * 4 + tig];
+                a[mi][3] = sw[swz(r + 8, kb * 2 + 1, WL) * 4 + tig];
             } else {
-                unsigned s2 = (r >> 2) & 1, s2b = ((r + 8) >> 2) & 1;
-                const unsigned short* p0 = sw16 + ((r << 1) + ((kb ^ s2) & 1)) * 8;
-                const unsigned short* p1 = sw16 + (((r + 8) << 1) + ((kb ^ s2b) & 1)) * 8;
+                // block kb of a packed row = chunk kb (eight u16: half-words tig, 4 + tig)
+                const unsigned short* p0 = sw16 + swz(r, kb, WL) * 8;
+                const unsigned short* p1 = sw16 + swz(r + 8, kb, WL) * 8;
                 a[mi][0] = fp4_decode4(p0[tig]);
                 a[mi][1] = fp4_decode4(p1[tig]);
                 a[mi][2] = fp4_decode4(p0[4 + tig]);
@@ -1603,11 +1647,10 @@ __device__ __forceinline__ void pipe_step(const unsigned char* base, unsigned wr
             }
         }
         #pragma unroll
-        for (int ni = 0; ni < 8; ni++) {
+        for (int ni = 0; ni < NW; ni++) {
             unsigned tt = wt0 + ni * 8 + gid;
-            unsigned s4 = (tt >> 1) & 3;
-            b[ni][0] = sx[(tt << 2) * 4 + (((kb * 2) ^ s4) & 3) * 4 + tig];
-            b[ni][1] = sx[(tt << 2) * 4 + (((kb * 2 + 1) ^ s4) & 3) * 4 + tig];
+            b[ni][0] = sx[swz(tt, kb * 2, XL) * 4 + tig];
+            b[ni][1] = sx[swz(tt, kb * 2 + 1, XL) * 4 + tig];
         }
         #pragma unroll
         for (int mi = 0; mi < 2; mi++) {
@@ -1616,7 +1659,7 @@ __device__ __forceinline__ void pipe_step(const unsigned char* base, unsigned wr
             if (Q8) { ws0 = h2f(sws[kb * PM + rr0]); ws1 = h2f(sws[kb * PM + rr0 + 8]); }
             else { ws0 = e8m0_x2(sws[kb * PM + rr0]); ws1 = e8m0_x2(sws[kb * PM + rr0 + 8]); }
             #pragma unroll
-            for (int ni = 0; ni < 8; ni++) {
+            for (int ni = 0; ni < NW; ni++) {
                 if (FULL || (unsigned)ni < nw) {
                     int d0, d1, d2, d3;
                     mma_s8_16x8x32_z(d0, d1, d2, d3, a[mi][0], a[mi][1], a[mi][2], a[mi][3], b[ni][0], b[ni][1], zero);
@@ -1631,50 +1674,63 @@ __device__ __forceinline__ void pipe_step(const unsigned char* base, unsigned wr
         }
     }
 }
-template <bool Q8>
+__device__ __forceinline__ unsigned short f2h(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+template <bool Q8, int PM, int PN, int KBS, int STAGES, bool OUT_HALF>
 __device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const void* __restrict__ wsc,
                                             const i8* __restrict__ xq, const float* __restrict__ xs,
                                             float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
-    typedef PipeLayout<Q8> L;
+    typedef PipeLayout<Q8, PM, PN, KBS> L;
+    constexpr int NW = L::NW;
+    constexpr int WL = log2c(L::WCH), XL = log2c(L::XCH);
     extern __shared__ __align__(16) unsigned char pipe_smem[];
     const unsigned nb = cols >> 5;
-    const unsigned nsteps = (nb + PKB - 1) / PKB;
+    // split-K: blockIdx.z of gridDim.z splits owns steps [step_lo, step_hi);
+    // partial tiles are added into a zeroed C (two splits: an exact, order-
+    // free sum)
+    const unsigned nsteps_all = (nb + KBS - 1) / KBS;
+    const unsigned splits = gridDim.z, split = blockIdx.z;
+    const unsigned step_lo = (nsteps_all * split) / splits, step_hi = (nsteps_all * (split + 1)) / splits;
+    const unsigned nsteps = step_hi - step_lo;
     const unsigned r0 = blockIdx.x * PM, t0 = blockIdx.y * PN;
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const unsigned wr0 = (warp & 3) * 32, wt0 = (warp >> 2) * 64;   // 4 x 2 warps
+    const unsigned wr0 = (warp % L::WM) * 32, wt0 = (warp / L::WM) * L::WT;   // WM x WN warps
     const unsigned gid = lane >> 2, tig = lane & 3;
     const unsigned n_valid = t - t0;
     const unsigned wrow_bytes = Q8 ? cols : (cols >> 1);           // global row stride
     const unsigned wblk_bytes = Q8 ? 32 : 16;                        // bytes per 32-column block
-    float acc[2][8][4];
+    float acc[2][NW][4];
     #pragma unroll
     for (int i = 0; i < 2; i++)
         #pragma unroll
-        for (int j = 0; j < 8; j++)
+        for (int j = 0; j < NW; j++)
             #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
     // one stage's asynchronous part: W chunks and X chunks (16-byte
     // cp.async). Every thread owns fixed chunks whose global sources only
     // advance by one stage's columns per step and whose shared
     // destinations are fixed per stage: addresses are computed once
-    constexpr int WCH = L::WROW / 16;             // chunks per row (4 q8, 2 fp4)
-    constexpr int WCH_LOG2 = Q8 ? 2 : 1;
-    constexpr int WREPS = (PM * WCH) / 256;       // W chunks per thread per stage (2 q8, 1 fp4)
-    constexpr int XREPS = (PN * 4) / 256;         // X chunks per thread per stage (2)
+    // (the tile shapes instantiated below keep PM * WCH and PN * XCH multiples of 256)
+    constexpr int WREPS = (PM * L::WCH) / 256;
+    constexpr int XREPS = (PN * L::XCH) / 256;
+    static_assert(WREPS * 256 == PM * L::WCH && XREPS * 256 == PN * L::XCH, "chunk counts must divide the block");
     const u8* wsrc[WREPS];
     unsigned wdst[WREPS];
-    unsigned wblk[WREPS];       // block offset of the chunk within a stage (0..PKB-1)
+    unsigned wblk[WREPS];       // block offset of the chunk within a stage
     bool wok[WREPS];
     #pragma unroll
     for (int rep = 0; rep < WREPS; rep++) {
         unsigned i = tid + rep * 256;
-        unsigned rr = i / WCH, cc = i % WCH;
+        unsigned rr = i / L::WCH, cc = i % L::WCH;
         unsigned grow = r0 + rr;
         wblk[rep] = cc * 16 / wblk_bytes;
         unsigned off = (cc * 16) % wblk_bytes;
         wok[rep] = grow < rows;
         wsrc[rep] = wbytes + (size_t)(wok[rep] ? grow : 0) * wrow_bytes + off;
-        wdst[rep] = swz(rr, cc, WCH_LOG2) * 16;
+        wdst[rep] = swz(rr, cc, WL) * 16;
     }
     const i8* xsrc[XREPS];
     unsigned xdst[XREPS];
@@ -1683,16 +1739,16 @@ __device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const
     #pragma unroll
     for (int rep = 0; rep < XREPS; rep++) {
         unsigned i = tid + rep * 256;
-        unsigned tt = i >> 2, cc = i & 3;
+        unsigned tt = i / L::XCH, cc = i % L::XCH;
         unsigned gtok = t0 + tt;
         xblk[rep] = cc >> 1;
         xok[rep] = gtok < t;
         xsrc[rep] = xq + (size_t)(xok[rep] ? gtok : 0) * cols + (cc & 1) * 16;
-        xdst[rep] = swz(tt, cc, 2) * 16;
+        xdst[rep] = swz(tt, cc, XL) * 16;
     }
     auto issue = [&](unsigned step, unsigned stage) {
         unsigned char* base = pipe_smem + stage * L::STAGE;
-        unsigned g0 = step * PKB;
+        unsigned g0 = (step_lo + step) * KBS;
         #pragma unroll
         for (int rep = 0; rep < WREPS; rep++) {
             unsigned g = g0 + wblk[rep];
@@ -1710,19 +1766,19 @@ __device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const
     // the scales are gathered per (block, row) - not contiguous in global
     // memory - so they travel through registers one step ahead: loaded
     // during a step's compute, stored into the stage before its sync
-    constexpr int WSR = (PKB * PM + 255) / 256;   // W scales per thread per stage
-    constexpr int XSR = (PKB * PN + 255) / 256;   // X scales per thread per stage
+    constexpr int WSR = (KBS * PM + 255) / 256;
+    constexpr int XSR = (KBS * PN + 255) / 256;
     unsigned short wsreg[WSR];
     float xsreg[XSR];
     auto load_scales = [&](unsigned step) {
-        unsigned g0 = step * PKB;
+        unsigned g0 = (step_lo + step) * KBS;
         #pragma unroll
         for (int rep = 0; rep < WSR; rep++) {
             unsigned i = tid + rep * 256;
             unsigned kb = i / PM, rr = i % PM;
             unsigned g = g0 + kb, grow = r0 + rr;
             unsigned short v = 0;
-            if (i < PKB * PM && g < nb && grow < rows) {
+            if (i < KBS * PM && g < nb && grow < rows) {
                 if (Q8) v = ((const unsigned short*)wsc)[(size_t)grow * nb + g];
                 else v = (unsigned short)((const u8*)wsc)[(size_t)grow * nb + g];
             }
@@ -1733,7 +1789,7 @@ __device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const
             unsigned i = tid + rep * 256;
             unsigned kb = i / PN, tt = i % PN;
             unsigned g = g0 + kb, gtok = t0 + tt;
-            xsreg[rep] = (i < PKB * PN && g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
+            xsreg[rep] = (i < KBS * PN && g < nb && gtok < t) ? xs[(size_t)gtok * nb + g] : 0.0f;
         }
     };
     auto store_scales = [&](unsigned stage) {
@@ -1743,67 +1799,93 @@ __device__ __forceinline__ void gemm_pipe_t(const u8* __restrict__ wbytes, const
         #pragma unroll
         for (int rep = 0; rep < WSR; rep++) {
             unsigned i = tid + rep * 256;
-            if (i < PKB * PM) sws[i] = wsreg[rep];
+            if (i < KBS * PM) sws[i] = wsreg[rep];
         }
         #pragma unroll
         for (int rep = 0; rep < XSR; rep++) {
             unsigned i = tid + rep * 256;
-            if (i < PKB * PN) sxs[i] = xsreg[rep];
+            if (i < KBS * PN) sxs[i] = xsreg[rep];
         }
     };
     const int zero = 0;
-    // prologue: stages 0 .. PSTAGES-2 in flight, the scales of step 0 in registers
+    // prologue: stages 0 .. STAGES-2 in flight, the scales of step 0 in registers
     #pragma unroll
-    for (int s = 0; s < PSTAGES - 1; s++) {
+    for (int s = 0; s < STAGES - 1; s++) {
         if ((unsigned)s < nsteps) issue(s, s);
         else cp_async_commit();
     }
     load_scales(0);
     for (unsigned step = 0; step < nsteps; step++) {
-        cp_async_wait<PSTAGES - 2>();
-        store_scales(step % PSTAGES);
+        cp_async_wait<STAGES - 2>();
+        store_scales(step % STAGES);
         __syncthreads();
         {
-            unsigned nxt = step + PSTAGES - 1;
-            if (nxt < nsteps) issue(nxt, nxt % PSTAGES);
+            unsigned nxt = step + STAGES - 1;
+            if (nxt < nsteps) issue(nxt, nxt % STAGES);
             else cp_async_commit();
         }
         if (step + 1 < nsteps) load_scales(step + 1);
-        // a warp whose 64 tokens are all valid runs the unrolled tile; a
-        // warp on the prompt's tail runs only its valid n8 tiles (uniform
-        // per warp and step: no divergence inside the mma loop); X rows past
-        // the prompt are zero-filled by the staging and never stored
-        const unsigned nw = (wt0 >= n_valid) ? 0u : min(8u, (n_valid - wt0 + 7) / 8);
+        // a warp whose tokens are all valid runs the unrolled tile; a warp on
+        // the prompt's tail runs only its valid n8 tiles (uniform per warp and
+        // step); X rows past the prompt are zero-filled and never stored
+        const unsigned nw = (wt0 >= n_valid) ? 0u : min((unsigned)NW, (n_valid - wt0 + 7) / 8);
         if (nw > 0) {
-            const unsigned char* base = pipe_smem + (step % PSTAGES) * L::STAGE;
-            if (nw == 8) pipe_step<Q8, true>(base, wr0, wt0, gid, tig, 8u, acc, zero);
-            else pipe_step<Q8, false>(base, wr0, wt0, gid, tig, nw, acc, zero);
+            const unsigned char* base = pipe_smem + (step % STAGES) * L::STAGE;
+            if (nw == (unsigned)NW) pipe_step<Q8, PM, PN, KBS, true>(base, wr0, wt0, gid, tig, (unsigned)NW, acc, zero);
+            else pipe_step<Q8, PM, PN, KBS, false>(base, wr0, wt0, gid, tig, nw, acc, zero);
         }
     }
     cp_async_wait<0>();
-    // store
+    // store (or add, when the K dimension is split)
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
         #pragma unroll
-        for (int ni = 0; ni < 8; ni++) {
+        for (int ni = 0; ni < NW; ni++) {
             unsigned r = r0 + wr0 + mi * 16 + gid;
             unsigned tt = t0 + wt0 + ni * 8 + tig * 2;
-            if (tt < t) {
-                if (r < rows) C[(size_t)tt * ldc + r] = acc[mi][ni][0];
-                if (r + 8 < rows) C[(size_t)tt * ldc + r + 8] = acc[mi][ni][2];
-            }
-            if (tt + 1 < t) {
-                if (r < rows) C[(size_t)(tt + 1) * ldc + r] = acc[mi][ni][1];
-                if (r + 8 < rows) C[(size_t)(tt + 1) * ldc + r + 8] = acc[mi][ni][3];
+            if (OUT_HALF) {
+                // f16 output (the gate|up rows: SiLU x up reads them once and requantizes)
+                unsigned short* H = (unsigned short*)C;
+                if (tt < t) {
+                    if (r < rows) H[(size_t)tt * ldc + r] = f2h(acc[mi][ni][0]);
+                    if (r + 8 < rows) H[(size_t)tt * ldc + r + 8] = f2h(acc[mi][ni][2]);
+                }
+                if (tt + 1 < t) {
+                    if (r < rows) H[(size_t)(tt + 1) * ldc + r] = f2h(acc[mi][ni][1]);
+                    if (r + 8 < rows) H[(size_t)(tt + 1) * ldc + r + 8] = f2h(acc[mi][ni][3]);
+                }
+            } else if (splits == 1) {
+                if (tt < t) {
+                    if (r < rows) C[(size_t)tt * ldc + r] = acc[mi][ni][0];
+                    if (r + 8 < rows) C[(size_t)tt * ldc + r + 8] = acc[mi][ni][2];
+                }
+                if (tt + 1 < t) {
+                    if (r < rows) C[(size_t)(tt + 1) * ldc + r] = acc[mi][ni][1];
+                    if (r + 8 < rows) C[(size_t)(tt + 1) * ldc + r + 8] = acc[mi][ni][3];
+                }
+            } else {
+                if (tt < t) {
+                    if (r < rows) atomicAdd(C + (size_t)tt * ldc + r, acc[mi][ni][0]);
+                    if (r + 8 < rows) atomicAdd(C + (size_t)tt * ldc + r + 8, acc[mi][ni][2]);
+                }
+                if (tt + 1 < t) {
+                    if (r < rows) atomicAdd(C + (size_t)(tt + 1) * ldc + r, acc[mi][ni][1]);
+                    if (r + 8 < rows) atomicAdd(C + (size_t)(tt + 1) * ldc + r + 8, acc[mi][ni][3]);
+                }
             }
         }
     }
 }
+// 128 x 128, two blocks per stage, three stages (q8 54 KB, fp4 42 KB of shared memory)
 extern "C" __global__ void __launch_bounds__(256, 1) k_gemm_q8_pipe(const i8* __restrict__ wq, const unsigned short* __restrict__ ws, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
-    gemm_pipe_t<true>((const u8*)wq, (const void*)ws, xq, xs, C, rows, cols, t, ldc);
+    gemm_pipe_t<true, 128, 128, 2, PIPE_STAGES, false>((const u8*)wq, (const void*)ws, xq, xs, C, rows, cols, t, ldc);
 }
 extern "C" __global__ void __launch_bounds__(256, 1) k_gemm_fp4_pipe(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
-    gemm_pipe_t<false>(wp, (const void*)wsc, xq, xs, C, rows, cols, t, ldc);
+    gemm_pipe_t<false, 128, 128, 2, PIPE_STAGES, false>(wp, (const void*)wsc, xq, xs, C, rows, cols, t, ldc);
+}
+// f16 output form (the MLP's gate|up projection)
+extern "C" __global__ void __launch_bounds__(256, 1) k_gemm_fp4_pipe_h(const u8* __restrict__ wp, const u8* __restrict__ wsc, const i8* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ C, unsigned rows, unsigned cols, unsigned t, unsigned ldc) {
+    gemm_pipe_t<false, 128, 128, 2, PIPE_STAGES, true>(wp, (const void*)wsc, xq, xs, C, rows, cols, t, ldc);
 }
 
 // ── elementwise ──
@@ -1844,7 +1926,7 @@ extern "C" __global__ void k_add_rmsnorm_quant_rows(float* __restrict__ x, const
     __shared__ float red[32];
     unsigned r = blockIdx.x;
     float* xr = x + (size_t)r * n;
-    float* orow = out + (size_t)r * n;
+    float* orow = out ? out + (size_t)r * n : (float*)0;
     float ss = 0.0f;
     if (add) {
         const float* ar = add + (size_t)r * n;
@@ -1863,7 +1945,7 @@ extern "C" __global__ void k_add_rmsnorm_quant_rows(float* __restrict__ x, const
         unsigned i = b * 32 + lane;
         float ww = one_plus ? (1.0f + w[i]) : w[i];
         float v = xr[i] * inv * ww;
-        orow[i] = v;
+        if (out) orow[i] = v;   // the f32 form is optional (nothing downstream reads it in the graphs)
         float m = warp_max(fabsf(v));
         float dx = m / 127.0f;
         i8 qv = 0;
@@ -1877,6 +1959,31 @@ extern "C" __global__ void k_add_rmsnorm_quant_rows(float* __restrict__ x, const
     }
 }
 // h[t][inter] = silu(gu[t][i]) * gu[t][inter+i], quantized into xq/xs (block per (row, 1024 columns))
+// the same from an f16 gate|up (the pipelined GEMM's f16 output form)
+extern "C" __global__ void k_silu_mul_quant_rows_h(const unsigned short* __restrict__ gu, float* __restrict__ h, i8* __restrict__ xq, float* __restrict__ xs,
+                                                   unsigned rows, unsigned inter) {
+    unsigned r = blockIdx.y;
+    unsigned c0 = blockIdx.x * 1024;
+    unsigned i = c0 + threadIdx.x;
+    const unsigned short* g = gu + (size_t)r * 2 * inter;
+    (void)h;
+    float v = 0.0f;
+    if (i < inter) v = siluf_(h2f(g[i])) * h2f(g[inter + i]);
+    unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    unsigned b = (c0 >> 5) + warp;
+    if (b < (inter >> 5)) {
+        float m = warp_max(fabsf(v));
+        float dx = m / 127.0f;
+        i8 qv = 0;
+        if (dx != 0.0f) {
+            float rr = roundf(v / dx);
+            rr = fminf(fmaxf(rr, -127.0f), 127.0f);
+            qv = (i8)(int)rr;
+        }
+        xq[((size_t)r * (inter >> 5) + b) * 32 + lane] = qv;
+        if (lane == 0) xs[(size_t)r * (inter >> 5) + b] = dx;
+    }
+}
 extern "C" __global__ void k_silu_mul_quant_rows(const float* __restrict__ gu, float* __restrict__ h, i8* __restrict__ xq, float* __restrict__ xs,
                                                  unsigned rows, unsigned inter) {
     // grid: (inter/1024 ceil, rows); block 1024 -> 32 blocks of 32 per CTA
@@ -1884,20 +1991,18 @@ extern "C" __global__ void k_silu_mul_quant_rows(const float* __restrict__ gu, f
     unsigned c0 = blockIdx.x * 1024;
     unsigned i = c0 + threadIdx.x;
     const float* g = gu + (size_t)r * 2 * inter;
-    __shared__ float sh[1024];
+    (void)h; // only the quantized form is consumed downstream
     float v = 0.0f;
-    if (i < inter) { v = siluf_(g[i]) * g[inter + i]; h[(size_t)r * inter + i] = v; }
-    sh[threadIdx.x] = v;
-    __syncthreads();
+    if (i < inter) v = siluf_(g[i]) * g[inter + i];
     // warp w quantizes block w (32 values) via a warp max
     unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     unsigned b = (c0 >> 5) + warp;
     if (b < (inter >> 5)) {
-        float m = warp_max(fabsf(sh[threadIdx.x]));
+        float m = warp_max(fabsf(v));
         float dx = m / 127.0f;
         i8 qv = 0;
         if (dx != 0.0f) {
-            float rr = roundf(sh[threadIdx.x] / dx);
+            float rr = roundf(v / dx);
             rr = fminf(fmaxf(rr, -127.0f), 127.0f);
             qv = (i8)(int)rr;
         }
@@ -1959,14 +2064,31 @@ extern "C" __global__ void k_conv_prefill(const float* __restrict__ x, unsigned 
     if (i >= conv_dim) return;
     float* st = state + (size_t)i * (k - 1);
     const float* wt = w + (size_t)i * k;
-    // k <= 8 taps kept in registers
+    // k <= 8 taps kept in registers; four tokens per iteration with their
+    // loads issued together (one dependent load per token was latency-bound)
     float s[8];
     for (unsigned j = 0; j < k - 1; j++) s[j] = st[j];
-    for (unsigned tok = 0; tok < t; tok++) {
+    float wk[8];
+    for (unsigned j = 0; j < 8; j++) wk[j] = (j < k) ? wt[j] : 0.0f;
+    unsigned tok = 0;
+    for (; tok + 4 <= t; tok += 4) {
+        float x0 = x[(size_t)tok * ldx + i], x1 = x[(size_t)(tok + 1) * ldx + i], x2 = x[(size_t)(tok + 2) * ldx + i], x3 = x[(size_t)(tok + 3) * ldx + i];
+        float xs4[4] = {x0, x1, x2, x3};
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            float acc = 0.0f;
+            for (unsigned j = 0; j < k - 1; j++) acc += s[j] * wk[j];
+            acc += xs4[u] * wk[k - 1];
+            out[(size_t)(tok + u) * ldo + i] = acc / (1.0f + expf(-acc));
+            for (unsigned j = 0; j + 2 < k; j++) s[j] = s[j + 1];
+            s[k - 2] = xs4[u];
+        }
+    }
+    for (; tok < t; tok++) {
         float xi = x[(size_t)tok * ldx + i];
         float acc = 0.0f;
-        for (unsigned j = 0; j < k - 1; j++) acc += s[j] * wt[j];
-        acc += xi * wt[k - 1];
+        for (unsigned j = 0; j < k - 1; j++) acc += s[j] * wk[j];
+        acc += xi * wk[k - 1];
         out[(size_t)tok * ldo + i] = acc / (1.0f + expf(-acc));
         for (unsigned j = 0; j + 2 < k; j++) s[j] = s[j + 1];
         s[k - 2] = xi;
@@ -2095,6 +2217,73 @@ __device__ __forceinline__ void delta_scan_reg(float* __restrict__ state, const 
     }
     #pragma unroll
     for (int i = 0; i < KD; i++) S[(size_t)i * vd + j] = col[i];
+}
+// four thread groups per head (block = 4 * vd threads): group g keeps
+// rows [g*KD/4, (g+1)*KD/4) of its column in registers; the two column
+// reductions of every token combine the groups through shared memory
+// (four times the memory-level parallelism, chains a quarter as long)
+template <int KD>
+__device__ __forceinline__ void delta_scan_reg4(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
+                                                const float* __restrict__ conved, unsigned ldc, const float* __restrict__ beta, const float* __restrict__ decay,
+                                                float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned vd) {
+    constexpr int G = 4;
+    constexpr int KR = KD / G;
+    __shared__ float sq[KD];
+    __shared__ float sk[KD];
+    __shared__ float part[G * 256];
+    unsigned h = blockIdx.x;
+    unsigned tid = threadIdx.x;
+    unsigned grp = tid / vd, j = tid % vd;
+    if (h >= heads) return;
+    unsigned kt = kv_heads * KD;
+    float* S = state + (size_t)h * KD * vd;
+    float col[KR];
+    #pragma unroll
+    for (int i = 0; i < KR; i++) col[i] = S[(size_t)(grp * KR + i) * vd + j];
+    // the next token's q, k, beta, decay and v ride in registers, loaded
+    // during the current token's work (their global latency off the chain)
+    float nq = 0.0f, nk = 0.0f;
+    if (tid < KD) { nq = qn[(size_t)h * KD + tid]; nk = kn[(size_t)h * KD + tid]; }
+    float ndec = decay[h], nbt = beta[h];
+    float nv = (j < vd) ? conved[2 * kt + h * vd + j] : 0.0f;
+    for (unsigned tok = 0; tok < t; tok++) {
+        __syncthreads();
+        if (tid < KD) { sq[tid] = nq; sk[tid] = nk; }
+        float dec = ndec, bt = nbt, vj = nv;
+        __syncthreads();
+        if (tok + 1 < t) {
+            if (tid < KD) { nq = qn[((size_t)(tok + 1) * heads + h) * KD + tid]; nk = kn[((size_t)(tok + 1) * heads + h) * KD + tid]; }
+            ndec = decay[(size_t)(tok + 1) * heads + h];
+            nbt = beta[(size_t)(tok + 1) * heads + h];
+            nv = conved[(size_t)(tok + 1) * ldc + 2 * kt + h * vd + j];
+        }
+        float pred = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < KR; i++) { float s = col[i] * dec; col[i] = s; pred = fmaf(sk[grp * KR + i], s, pred); }
+        part[grp * vd + j] = pred;
+        __syncthreads();
+        pred = ((part[j] + part[vd + j]) + part[2 * vd + j]) + part[3 * vd + j];
+        float delta = (vj - pred) * bt;
+        float o = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < KR; i++) { float s = col[i] + sk[grp * KR + i] * delta; col[i] = s; o = fmaf(sq[grp * KR + i], s, o); }
+        __syncthreads();
+        part[grp * vd + j] = o;
+        __syncthreads();
+        if (grp == 0) out[((size_t)tok * heads + h) * vd + j] = ((part[j] + part[vd + j]) + part[2 * vd + j]) + part[3 * vd + j];
+    }
+    #pragma unroll
+    for (int i = 0; i < KR; i++) S[(size_t)(grp * KR + i) * vd + j] = col[i];
+}
+extern "C" __global__ void __launch_bounds__(1024) k_delta_scan4x128(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
+                                             const float* __restrict__ conved, unsigned ldc, const float* __restrict__ beta, const float* __restrict__ decay,
+                                             float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned vd) {
+    delta_scan_reg4<128>(state, qn, kn, conved, ldc, beta, decay, out, t, heads, kv_heads, vd);
+}
+extern "C" __global__ void __launch_bounds__(1024) k_delta_scan4x64(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
+                                            const float* __restrict__ conved, unsigned ldc, const float* __restrict__ beta, const float* __restrict__ decay,
+                                            float* __restrict__ out, unsigned t, unsigned heads, unsigned kv_heads, unsigned vd) {
+    delta_scan_reg4<64>(state, qn, kn, conved, ldc, beta, decay, out, t, heads, kv_heads, vd);
 }
 extern "C" __global__ void k_delta_scan128(float* __restrict__ state, const float* __restrict__ qn, const float* __restrict__ kn,
                                            const float* __restrict__ conved, unsigned ldc, const float* __restrict__ beta, const float* __restrict__ decay,
@@ -2260,6 +2449,40 @@ extern "C" __global__ void k_gated_norm_rows(float* __restrict__ x, const float*
         xr[i] = xr[i] * inv * w[i] * (g / (1.0f + expf(-g)));
     }
 }
+// rows form + quantization: x[t][heads*vd] normalized per head and gated,
+// then each head's vd outputs quantized (warp per block of 32) into xq/xs
+// laid out as [t][heads*vd/32] - the out projection's input
+extern "C" __global__ void k_gated_norm_quant_rows(float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ z, unsigned ldz,
+                                                   i8* __restrict__ xq, float* __restrict__ xs,
+                                                   unsigned t, unsigned heads, unsigned vd, float eps) {
+    __shared__ float red[32];
+    unsigned tok = blockIdx.x, h = blockIdx.y;
+    if (tok >= t || h >= heads) return;
+    float* xr = x + ((size_t)tok * heads + h) * vd;
+    const float* zr = z + (size_t)tok * ldz + h * vd;
+    unsigned i = threadIdx.x;
+    float v = (i < vd) ? xr[i] : 0.0f;
+    float ss = block_sum(v * v, red);
+    float inv = 1.0f / sqrtf(ss / (float)vd + eps);
+    if (i < vd) {
+        float g = zr[i];
+        float o = v * inv * w[i] * (g / (1.0f + expf(-g)));
+        xr[i] = o;
+        unsigned warp = i >> 5, lane = i & 31;
+        float m = warp_max(fabsf(o));
+        float dx = m / 127.0f;
+        i8 qv = 0;
+        if (dx != 0.0f) {
+            float rr = roundf(o / dx);
+            rr = fminf(fmaxf(rr, -127.0f), 127.0f);
+            qv = (i8)(int)rr;
+        }
+        unsigned nbrow = heads * vd / 32;
+        unsigned blk = (h * vd) / 32 + warp;
+        xq[((size_t)tok * nbrow + blk) * 32 + lane] = qv;
+        if (lane == 0) xs[(size_t)tok * nbrow + blk] = dx;
+    }
+}
 extern "C" __global__ void k_gated_norm(float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ z, unsigned heads, unsigned vd, float eps) {
     __shared__ float red[32];
     unsigned h = blockIdx.x;
@@ -2284,7 +2507,7 @@ extern "C" __global__ void k_gated_norm(float* __restrict__ x, const float* __re
 extern "C" __global__ void k_qk_prep_rows(const float* __restrict__ qkv, unsigned ld_qkv, const float* __restrict__ qw, const float* __restrict__ kw,
                                           float* __restrict__ q_out, float* __restrict__ gate_out,
                                           float* __restrict__ kc, float* __restrict__ vc, unsigned kv_width,
-                                          unsigned t, unsigned pos0, unsigned n_heads, unsigned n_kv, unsigned hd, unsigned rope_dim, float theta, float eps) {
+                                          unsigned t, unsigned pos0, unsigned n_heads, unsigned n_kv, unsigned hd, unsigned rope_dim, const float* __restrict__ rope, float eps) {
     __shared__ float red[32];
     unsigned tok = blockIdx.x, hh = blockIdx.y;
     unsigned i = threadIdx.x;
@@ -2305,17 +2528,14 @@ extern "C" __global__ void k_qk_prep_rows(const float* __restrict__ qkv, unsigne
         sq[i] = qn;
         __syncthreads();
         float outv = qn;
+        const float* rp = rope + (size_t)pos * rope_dim;   // [cos(half) | sin(half)] of this position
         if (i < half) {
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i], c = rp[i];
             float a = sq[i], b = sq[i + half];
             outv = a * c - b * s;
         } else if (i < rope_dim) {
             unsigned i0 = i - half;
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i0 / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i0], c = rp[i0];
             float a = sq[i0], b = sq[i];
             outv = a * s + b * c;
         }
@@ -2333,17 +2553,14 @@ extern "C" __global__ void k_qk_prep_rows(const float* __restrict__ qkv, unsigne
         sk[i] = kn;
         __syncthreads();
         float outv = kn;
+        const float* rp = rope + (size_t)pos * rope_dim;
         if (i < half) {
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i], c = rp[i];
             float a = sk[i], b = sk[i + half];
             outv = a * c - b * s;
         } else if (i < rope_dim) {
             unsigned i0 = i - half;
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i0 / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i0], c = rp[i0];
             float a = sk[i0], b = sk[i];
             outv = a * s + b * c;
         }
@@ -2354,7 +2571,7 @@ extern "C" __global__ void k_qk_prep_rows(const float* __restrict__ qkv, unsigne
 extern "C" __global__ void k_qk_prep(const float* __restrict__ qkv, const float* __restrict__ qw, const float* __restrict__ kw,
                                      float* __restrict__ q_out, float* __restrict__ gate_out,
                                      float* __restrict__ kc, float* __restrict__ vc, unsigned kv_width,
-                                     const unsigned* __restrict__ posp, unsigned n_heads, unsigned n_kv, unsigned hd, unsigned rope_dim, float theta, float eps) {
+                                     const unsigned* __restrict__ posp, unsigned n_heads, unsigned n_kv, unsigned hd, unsigned rope_dim, const float* __restrict__ rope, float eps) {
     // single-token form; the position comes from device memory so that the
     // decode graph is identical from one token to the next
     __shared__ float red[32];
@@ -2376,16 +2593,13 @@ extern "C" __global__ void k_qk_prep(const float* __restrict__ qkv, const float*
         sq[i] = qn;
         __syncthreads();
         float outv = qn;
+        const float* rp = rope + (size_t)pos * rope_dim;
         if (i < half) {
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i], c = rp[i];
             outv = sq[i] * c - sq[i + half] * s;
         } else if (i < rope_dim) {
             unsigned i0 = i - half;
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i0 / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i0], c = rp[i0];
             outv = sq[i0] * s + sq[i] * c;
         }
         q_out[h * hd + i] = outv;
@@ -2402,16 +2616,13 @@ extern "C" __global__ void k_qk_prep(const float* __restrict__ qkv, const float*
         sk[i] = kn;
         __syncthreads();
         float outv = kn;
+        const float* rp = rope + (size_t)pos * rope_dim;
         if (i < half) {
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i], c = rp[i];
             outv = sk[i] * c - sk[i + half] * s;
         } else if (i < rope_dim) {
             unsigned i0 = i - half;
-            double freq = 1.0 / pow((double)theta, 2.0 * (double)i0 / (double)rope_dim);
-            double ang = (double)pos * freq;
-            float s = (float)sin(ang), c = (float)cos(ang);
+            float s = rp[half + i0], c = rp[i0];
             outv = sk[i0] * s + sk[i] * c;
         }
         kc[(size_t)pos * kv_width + h * hd + i] = outv;
@@ -2452,6 +2663,131 @@ extern "C" __global__ void k_attn_decode(const float* __restrict__ q, const floa
         for (unsigned tpos = 0; tpos < len; tpos++) acc = fmaf(sc[tpos] / ssum, vc[(size_t)tpos * kv_width + kh * hd + i], acc);
         float g = gate[(size_t)h * hd + i];
         mixed[(size_t)h * hd + i] = acc * (1.0f / (1.0f + expf(-g)));
+    }
+}
+// prefill attention, grouped: block per (kv head, group of TQ query tokens),
+// serving the `groups` query heads of that kv head at once - every key
+// and value row is read once per block instead of once per (token, head).
+// Scores for the (head, token) pairs of the block live in shared memory
+// (len <= 512: the caller falls back to the per-(token, head) kernel
+// beyond); warp per key for the scores, warp per (head, token) row for
+// the softmax, thread per output element for the mix.
+#define AG_TQ 4
+extern "C" __global__ void k_attn_prefill_grouped(const float* __restrict__ q, const float* __restrict__ gate, const float* __restrict__ kc, const float* __restrict__ vc,
+                                                  float* __restrict__ mixed, i8* __restrict__ xq, float* __restrict__ xs,
+                                                  unsigned kv_width, unsigned pos0, unsigned t, unsigned n_heads, unsigned n_kv, unsigned hd) {
+    extern __shared__ __align__(16) float ash[];
+    unsigned kh = blockIdx.x;                    // kv head
+    unsigned tq0 = blockIdx.y * AG_TQ;           // first query token of the group
+    unsigned groups = n_heads / n_kv;
+    unsigned npairs = groups * AG_TQ;            // (head, token) pairs served
+    unsigned pp4 = (npairs + 3) & ~3u;           // pairs padded to a multiple of four (float4 rows)
+    unsigned len_max = pos0 + min(tq0 + AG_TQ, t); // keys the last token of the group sees
+    unsigned qw_ = n_heads * hd;
+    float* sc = ash;                              // [len_max][pp4] scores, keys outer
+    float* red = sc + len_max * pp4;              // [pp4] softmax sums
+    unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+    float scale = 1.0f / sqrtf((float)hd);
+    // scores: warp w owns pairs [w*PPW, (w+1)*PPW) with their queries in
+    // registers (hd/32 lanes x PPW, straight from global memory) and walks
+    // every key: one key row read per key per warp
+    {
+        constexpr int PPW = 4;                          // pairs per warp (npairs <= 8 * PPW)
+        unsigned p0 = warp * PPW;
+        float qr[PPW][8];
+        #pragma unroll
+        for (int pp = 0; pp < PPW; pp++) {
+            unsigned p = p0 + pp;
+            unsigned g = p / AG_TQ, tk = p % AG_TQ;
+            unsigned tok = tq0 + tk;
+            bool ok = p < npairs && tok < t;
+            const float* qp = q + (size_t)(ok ? tok : 0) * qw_ + (kh * groups + (ok ? g : 0)) * hd;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) qr[pp][j] = (ok && lane + 32 * j < hd) ? qp[lane + 32 * j] : 0.0f;
+        }
+        if (p0 < pp4) {
+            for (unsigned key = 0; key < len_max; key++) {
+                const float* kr = kc + (size_t)key * kv_width + kh * hd;
+                float kv[8];
+                #pragma unroll
+                for (int j = 0; j < 8; j++) kv[j] = (lane + 32 * j < hd) ? kr[lane + 32 * j] : 0.0f;
+                float sv[PPW];
+                #pragma unroll
+                for (int pp = 0; pp < PPW; pp++) {
+                    float s = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) s = fmaf(qr[pp][j], kv[j], s);
+                    sv[pp] = warp_sum(s) * scale;
+                }
+                if (lane == 0) *(float4*)(sc + key * pp4 + p0) = make_float4(sv[0], sv[1], sv[2], sv[3]);
+            }
+        }
+    }
+    __syncthreads();
+    // softmax per pair over its causal window [0, pos0 + tok]; keys past
+    // the window (and the pairs of tokens past the prompt) become zero
+    for (unsigned p = warp; p < pp4; p += nwarps) {
+        unsigned tk = p % AG_TQ;
+        unsigned tok = tq0 + tk;
+        bool live = p < npairs && tok < t;
+        unsigned len = live ? pos0 + tok + 1 : 0;
+        float m = -3.0e38f;
+        for (unsigned k = lane; k < len; k += 32) m = fmaxf(m, sc[k * pp4 + p]);
+        m = warp_max(m);
+        float ssum = 0.0f;
+        for (unsigned k = lane; k < len; k += 32) { float e = expf(sc[k * pp4 + p] - m); sc[k * pp4 + p] = e; ssum += e; }
+        for (unsigned k = len + lane; k < len_max; k += 32) sc[k * pp4 + p] = 0.0f;
+        ssum = warp_sum(ssum);
+        if (lane == 0) red[p] = live ? ssum : 1.0f;
+    }
+    __syncthreads();
+    // mix: thread per dimension d (hd <= 256 = blockDim), all pairs at once -
+    // every value row is read once per block per key; the scores of a key
+    // come from shared memory as float4 warp broadcasts (npairs <= 32)
+    if (tid < hd) {
+        unsigned d = tid;
+        float acc[32];
+        #pragma unroll
+        for (int p = 0; p < 32; p++) acc[p] = 0.0f;
+        for (unsigned key = 0; key < len_max; key++) {
+            float v = vc[(size_t)key * kv_width + kh * hd + d];
+            const float4* row4 = (const float4*)(sc + key * pp4);
+            #pragma unroll
+            for (int p4 = 0; p4 < 8; p4++) {
+                if (p4 * 4 < (int)pp4) {
+                    float4 s4 = row4[p4];
+                    acc[p4 * 4 + 0] = fmaf(s4.x, v, acc[p4 * 4 + 0]);
+                    acc[p4 * 4 + 1] = fmaf(s4.y, v, acc[p4 * 4 + 1]);
+                    acc[p4 * 4 + 2] = fmaf(s4.z, v, acc[p4 * 4 + 2]);
+                    acc[p4 * 4 + 3] = fmaf(s4.w, v, acc[p4 * 4 + 3]);
+                }
+            }
+        }
+        // gate, store, and quantize: the warp's 32 lanes are 32 consecutive
+        // dims of the same (token, head) - one block of 32 (hd multiple of 32)
+        unsigned warp = tid >> 5, lane = tid & 31;
+        unsigned nbrow = qw_ / 32;
+        for (unsigned p = 0; p < npairs; p++) {
+            unsigned g = p / AG_TQ, tk = p % AG_TQ;
+            unsigned tok = tq0 + tk;
+            if (tok >= t) continue;
+            unsigned h = kh * groups + g;
+            float inv = 1.0f / red[p];
+            float gt = gate[(size_t)tok * qw_ + h * hd + d];
+            float o = acc[p] * inv * (1.0f / (1.0f + expf(-gt)));
+            mixed[(size_t)tok * qw_ + h * hd + d] = o;
+            float m = warp_max(fabsf(o));
+            float dx = m / 127.0f;
+            i8 qv = 0;
+            if (dx != 0.0f) {
+                float rr = roundf(o / dx);
+                rr = fminf(fmaxf(rr, -127.0f), 127.0f);
+                qv = (i8)(int)rr;
+            }
+            unsigned blk = (h * hd) / 32 + warp;
+            xq[((size_t)tok * nbrow + blk) * 32 + lane] = qv;
+            if (lane == 0) xs[(size_t)tok * nbrow + blk] = dx;
+        }
     }
 }
 // prefill attention: block per (query token, head); keys [0, pos0 + tok]; q [t][n_heads*hd] (post), gate same
@@ -2625,14 +2961,31 @@ pub fn cudabench_cmd(args: &[String]) {
         let dgp = c.upload_bytes(&gp).unwrap();
         let dgsc = c.upload_bytes(&gsc).unwrap();
         let macs = (gr * gc * gt) as f64;
+        // --copies N: N distinct weight copies cycled so the weights are cold
+        // in L2 as they are in a real prompt (one matrix per layer)
+        let copies: usize = args.iter().position(|a| a == "--copies").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut wq_copies: Vec<(DBuf, DBuf)> = Vec::new();
+        let mut wp_copies: Vec<(DBuf, DBuf)> = Vec::new();
+        for _ in 1..copies {
+            wq_copies.push((c.upload(&gw).unwrap(), c.upload(&gs).unwrap()));
+            wp_copies.push((c.upload_bytes(&gp).unwrap(), c.upload_bytes(&gsc).unwrap()));
+        }
         for round in 0..3 {
-            let ms = c.timed(|| {
-                c.gemm_q8(&dgw, &dgs, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
-            });
-            let ms4 = c.timed(|| {
-                c.gemm_fp4(&dgp, &dgsc, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
-            });
-            println!("gemm {}x{} t={} round {}: q8 {:.0} GMAC/s ({:.3} ms) | fp4 {:.0} GMAC/s ({:.3} ms) | nt {}", gr, gc, gt, round, macs / (ms as f64 * 1e-3) / 1e9, ms, macs / (ms4 as f64 * 1e-3) / 1e9, ms4, c.gemm_nt(gr as u32, gt as u32));
+            let mut ms = 0f32;
+            let mut ms4 = 0f32;
+            for k in 0..copies {
+                let (wq_k, ws_k) = if k == 0 { (&dgw, &dgs) } else { (&wq_copies[k - 1].0, &wq_copies[k - 1].1) };
+                let (wp_k, wsc_k) = if k == 0 { (&dgp, &dgsc) } else { (&wp_copies[k - 1].0, &wp_copies[k - 1].1) };
+                ms += c.timed(|| {
+                    c.gemm_q8(wq_k, ws_k, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
+                });
+                ms4 += c.timed(|| {
+                    c.gemm_fp4(wp_k, wsc_k, &dgx, &dgxs, &dgc, 0, gr as u32, gc as u32, gt as u32, gr as u32);
+                });
+            }
+            ms /= copies as f32;
+            ms4 /= copies as f32;
+            println!("gemm {}x{} t={} round {}: q8 {:.0} GMAC/s ({:.3} ms) | fp4 {:.0} GMAC/s ({:.3} ms) | nt {}{}", gr, gc, gt, round, macs / (ms as f64 * 1e-3) / 1e9, ms, macs / (ms4 as f64 * 1e-3) / 1e9, ms4, c.gemm_nt(gr as u32, gt as u32), if copies > 1 { format!(" | {} copies (cold)", copies) } else { String::new() });
         }
         return;
     }
@@ -2864,6 +3217,9 @@ pub struct CudaDecoder {
     logits_pin: PinBuf, // host [vocab] f32
     /// the token graph, captured on the first step (None = direct launches)
     graph: Option<CUgraphExec>,
+    /// cos | sin of the partial rotary per position, [cap][rope_dim] f32,
+    /// computed on the host exactly as the CPU does (f64 angle, f32 result)
+    rope: DBuf,
     /// prefill workspace, grown to the largest prompt seen
     ws: Option<PrefillWs>,
     max_rows: usize,
@@ -2878,7 +3234,6 @@ unsafe impl Send for CudaDecoder {}
 struct PrefillWs {
     t_cap: usize,
     hidden: DBuf, // [t][d]
-    normed: DBuf, // [t][d]
     xq: DBuf,     // [t][max_cols] i8
     xs: DBuf,     // [t][max_cols/32]
     big_a: DBuf,  // [t][max_rows]
@@ -2945,6 +3300,26 @@ fn upload_q8(c: &CudaCtx, w: &[f32], rows: usize, cols: usize) -> Option<WQ8> {
     // the same way); a scale is max|w|/127, well inside f16's range
     let s16: Vec<u16> = s.iter().map(|&v| crate::quant::f16::f32_to_f16(v)).collect();
     Some(WQ8 { q: c.upload(&q)?, s: c.upload(&s16)?, rows, cols })
+}
+
+/// [cap][rope_dim]: for each position, cos of the `rope_dim/2` angles then
+/// their sin - the numbers `rope_partial` on the CPU computes (f64 angle,
+/// f32 result), so the device rotation matches it.
+fn rope_table(cap: usize, rope_dim: usize, theta: f64) -> Vec<f32> {
+    let half = rope_dim / 2;
+    let mut t = vec![0f32; cap * rope_dim.max(1)];
+    if rope_dim == 0 {
+        return t;
+    }
+    for pos in 0..cap {
+        for i in 0..half {
+            let freq = 1.0 / theta.powf(2.0 * i as f64 / rope_dim as f64);
+            let ang = pos as f64 * freq;
+            t[pos * rope_dim + i] = ang.cos() as f32;
+            t[pos * rope_dim + half + i] = ang.sin() as f32;
+        }
+    }
+    t
 }
 
 /// Concatenated q8 weight: the given (f32 matrix, rows) share `cols`.
@@ -3107,6 +3482,18 @@ pub fn cuda_decoder_new(
         decay: c.alloc(max_heads.max(1) * 4)?,
         logits: c.alloc(m.vocab * 4)?,
         trace_buf: c.alloc(m.layers.len().max(1) * d * 4)?,
+        rope: {
+            let (rd, theta) = m
+                .layers
+                .iter()
+                .find_map(|l| match l {
+                    DecodeLayerRefs::Full { rope_dim, theta, .. } => Some((*rope_dim, *theta as f64)),
+                    _ => None,
+                })
+                .unwrap_or((0, 10000.0));
+            let table = rope_table(kv_cap, rd, theta);
+            c.upload(&table)?
+        },
         pos_dev: c.zeroed(16)?,
         pos_pin: c.pinned(16)?,
         emb_pin: c.pinned(d * 4)?,
@@ -3219,7 +3606,7 @@ impl CudaDecoder {
                     let cd = 2 * kt + vt;
                     // input norm (+ the previous layer's MLP residual)
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, None, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     // fused projections -> big_a [qkv | z | b | a]
                     self.prof(1, || chk(c.matvec_q8(&proj.q, &proj.s, &self.xq, &self.xs, &self.big_a, 0, proj.rows as u32, d as u32)));
@@ -3270,7 +3657,7 @@ impl CudaDecoder {
                     self.prof(1, || chk(c.matvec_q8(&out.q, &out.s, &self.xq, &self.xs, &self.y_d, 0, d as u32, vt as u32)));
                     // residual + post norm
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, Some(&self.y_d), post_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, Some(&self.y_d), post_norm, None, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     // MLP
                     self.prof(6, || chk(c.matvec_fp4(&gu.p, &gu.s, &self.xq, &self.xs, &self.big_a, 0, (2 * inter) as u32, d as u32)));
@@ -3284,13 +3671,14 @@ impl CudaDecoder {
                     let qw = n_heads * hd;
                     let kvw = n_kv * hd;
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, prev, in_norm, None, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     self.prof(1, || chk(c.matvec_q8(&proj.q, &proj.s, &self.xq, &self.xs, &self.big_a, 0, proj.rows as u32, d as u32)));
                     // q/k norms + rope; K/V rows into the cache at pos; attention over [0, pos]
                     self.prof(5, || {
                         let (kvw_, nh, nkv, hdd, rd) = (kvw as u32, *n_heads as u32, *n_kv as u32, *hd as u32, *rope_dim as u32);
-                        let mut a = args!(self.big_a.ptr, q_norm.ptr, k_norm.ptr, self.q_buf.ptr, self.gate_buf.ptr, kc.ptr, vc.ptr, kvw_, self.pos_dev.ptr, nh, nkv, hdd, rd, *theta, eps);
+                        let _ = theta;
+                        let mut a = args!(self.big_a.ptr, q_norm.ptr, k_norm.ptr, self.q_buf.ptr, self.gate_buf.ptr, kc.ptr, vc.ptr, kvw_, self.pos_dev.ptr, nh, nkv, hdd, rd, self.rope.ptr, eps);
                         chk(c.launch("k_qk_prep", (1, (*n_heads + *n_kv) as u32, 1), (*hd as u32, 1, 1), 0, &mut a));
                         let (kvw_, nh, nkv, hdd) = (kvw as u32, *n_heads as u32, *n_kv as u32, *hd as u32);
                         let mut a = args!(self.q_buf.ptr, self.gate_buf.ptr, kc.ptr, vc.ptr, self.mixed.ptr, kvw_, self.pos_dev.ptr, nh, nkv, hdd);
@@ -3299,7 +3687,7 @@ impl CudaDecoder {
                     });
                     self.prof(1, || chk(c.matvec_q8(&o.q, &o.s, &self.xq, &self.xs, &self.y_d, 0, d as u32, qw as u32)));
                     self.prof(0, || {
-                        chk(c.add_rmsnorm_quant_rows(&self.hidden, Some(&self.y_d), post_norm, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+                        chk(c.add_rmsnorm_quant_rows(&self.hidden, Some(&self.y_d), post_norm, None, &self.xq, &self.xs, 1, d as u32, eps, true));
                     });
                     self.prof(6, || chk(c.matvec_fp4(&gu.p, &gu.s, &self.xq, &self.xs, &self.big_a, 0, (2 * inter) as u32, d as u32)));
                     self.prof(7, || chk(c.silu_mul_quant_rows(&self.big_a, &self.big_b, &self.xq, &self.xs, 1, *inter as u32)));
@@ -3316,7 +3704,7 @@ impl CudaDecoder {
         // final norm (+ the last MLP residual) + head, logits out
         let last: Option<&DBuf> = if trace || self.layers.is_empty() { None } else { Some(&self.y_d) };
         self.prof(8, || {
-            chk(c.add_rmsnorm_quant_rows(&self.hidden, last, &self.norm_f, &self.normed, &self.xq, &self.xs, 1, d as u32, eps, true));
+            chk(c.add_rmsnorm_quant_rows(&self.hidden, last, &self.norm_f, None, &self.xq, &self.xs, 1, d as u32, eps, true));
             chk(c.matvec_q8(&self.lm_head.q, &self.lm_head.s, &self.xq, &self.xs, &self.logits, 0, self.vocab as u32, d as u32));
             chk(c.read_async(&self.logits, 0, &self.logits_pin, self.vocab * 4));
         });
@@ -3335,7 +3723,6 @@ impl CudaDecoder {
         let ws = PrefillWs {
             t_cap: cap,
             hidden: c.alloc(cap * d * 4)?,
-            normed: c.alloc(cap * d * 4)?,
             xq: c.alloc(cap * self.max_cols)?,
             xs: c.alloc(cap * self.max_cols / 32 * 4)?,
             big_a: c.alloc(cap * self.max_rows * 4)?,
@@ -3412,7 +3799,7 @@ impl CudaDecoder {
                     let cd = 2 * kt + vt;
                     let pr = proj.rows;
                     // (residual of the previous MLP) + input norm
-                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, &ws.normed, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
+                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, None, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
                     self.prof(1, || chk(c.gemm_q8(&proj.q, &proj.s, &ws.xq, &ws.xs, &ws.big_a, 0, pr as u32, d as u32, tu, pr as u32)));
                     // conv + silu over time -> big_b [t][cd]; q/k norms, beta, decay per (token, head)
                     self.prof(2, || {
@@ -3428,7 +3815,11 @@ impl CudaDecoder {
                     // delta scan per head over time -> mixed [t][heads*vd]
                     self.prof(3, || {
                         let (hh, kvh, kdd, vdd, ldc) = (*heads as u32, *kv_heads as u32, *kd as u32, *vd as u32, cd as u32);
-                        if *kd == 128 || *kd == 64 {
+                        if (*kd == 128 || *kd == 64) && *vd <= 256 {
+                            let name = if *kd == 128 { "k_delta_scan4x128" } else { "k_delta_scan4x64" };
+                            let mut a = args!(scan_state.ptr, ws.q.ptr, ws.gate.ptr, ws.big_b.ptr, ldc, ws.beta.ptr, ws.decay.ptr, ws.mixed.ptr, tu, hh, kvh, vdd);
+                            chk(c.launch(name, (*heads as u32, 1, 1), (4 * *vd as u32, 1, 1), 0, &mut a));
+                        } else if *kd == 128 || *kd == 64 {
                             let name = if *kd == 128 { "k_delta_scan128" } else { "k_delta_scan64" };
                             let mut a = args!(scan_state.ptr, ws.q.ptr, ws.gate.ptr, ws.big_b.ptr, ldc, ws.beta.ptr, ws.decay.ptr, ws.mixed.ptr, tu, hh, kvh, vdd);
                             chk(c.launch(name, (*heads as u32, 1, 1), (*vd as u32, 1, 1), 0, &mut a));
@@ -3441,35 +3832,75 @@ impl CudaDecoder {
                     self.prof(4, || {
                         let zp = ws.big_a.ptr + (cd * 4) as u64;
                         let (hh, vdd, ldz) = (*heads as u32, *vd as u32, pr as u32);
-                        let mut a = args!(ws.mixed.ptr, gated_w.ptr, zp, ldz, tu, hh, vdd, eps);
-                        chk(c.launch("k_gated_norm_rows", (tu, *heads as u32, 1), ((*vd as u32).max(32), 1, 1), 0, &mut a));
-                        chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, vt as u32));
+                        if vd % 32 == 0 && *vd <= 1024 {
+                            let mut a = args!(ws.mixed.ptr, gated_w.ptr, zp, ldz, ws.xq.ptr, ws.xs.ptr, tu, hh, vdd, eps);
+                            chk(c.launch("k_gated_norm_quant_rows", (tu, *heads as u32, 1), (*vd as u32, 1, 1), 0, &mut a));
+                        } else {
+                            let mut a = args!(ws.mixed.ptr, gated_w.ptr, zp, ldz, tu, hh, vdd, eps);
+                            chk(c.launch("k_gated_norm_rows", (tu, *heads as u32, 1), ((*vd as u32).max(32), 1, 1), 0, &mut a));
+                            chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, vt as u32));
+                        }
                     });
                     self.prof(1, || chk(c.gemm_q8(&out.q, &out.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, vt as u32, tu, d as u32)));
-                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, Some(&ws.y), post_norm, &ws.normed, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
-                    self.prof(6, || chk(c.gemm_fp4(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, 0, (2 * inter) as u32, d as u32, tu, (2 * inter) as u32)));
-                    self.prof(7, || chk(c.silu_mul_quant_rows(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32)));
+                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, Some(&ws.y), post_norm, None, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
+                    let half = std::cell::Cell::new(false);
+                    self.prof(6, || {
+                        let (ok, h16) = c.gemm_fp4_gu(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, (2 * inter) as u32, d as u32, tu);
+                        chk(ok);
+                        half.set(h16);
+                    });
+                    self.prof(7, || {
+                        if half.get() {
+                            chk(c.silu_mul_quant_rows_h(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32));
+                        } else {
+                            chk(c.silu_mul_quant_rows(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32));
+                        }
+                    });
                     self.prof(6, || chk(c.gemm_fp4(&dn.p, &dn.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, *inter as u32, tu, d as u32)));
                 }
                 LayerDev::Full { in_norm, post_norm, proj, o, gu, dn, q_norm, k_norm, kc, vc, n_heads, n_kv, hd, rope_dim, theta, inter } => {
                     let qw = n_heads * hd;
                     let kvw = n_kv * hd;
                     let pr = proj.rows;
-                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, &ws.normed, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
+                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, if first { None } else { Some(&ws.y) }, in_norm, None, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
                     self.prof(1, || chk(c.gemm_q8(&proj.q, &proj.s, &ws.xq, &ws.xs, &ws.big_a, 0, pr as u32, d as u32, tu, pr as u32)));
                     self.prof(5, || {
                         let (ldq, kvw_, p0, nh, nkv, hdd, rd) = (pr as u32, kvw as u32, pos0 as u32, *n_heads as u32, *n_kv as u32, *hd as u32, *rope_dim as u32);
-                        let mut a = args!(ws.big_a.ptr, ldq, q_norm.ptr, k_norm.ptr, ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, kvw_, tu, p0, nh, nkv, hdd, rd, *theta, eps);
+                        let _ = theta;
+                        let mut a = args!(ws.big_a.ptr, ldq, q_norm.ptr, k_norm.ptr, ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, kvw_, tu, p0, nh, nkv, hdd, rd, self.rope.ptr, eps);
                         chk(c.launch("k_qk_prep_rows", (tu, (*n_heads + *n_kv) as u32, 1), (*hd as u32, 1, 1), 0, &mut a));
                         let (kvw_, p0, nh, nkv, hdd) = (kvw as u32, pos0 as u32, *n_heads as u32, *n_kv as u32, *hd as u32);
-                        let mut a = args!(ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, ws.mixed.ptr, kvw_, p0, tu, nh, nkv, hdd);
-                        chk(c.launch("k_attn_prefill", (tu, *n_heads as u32, 1), (*hd as u32, 1, 1), ((pos0 + t) * 4) as u32, &mut a));
-                        chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, qw as u32));
+                        let groups = n_heads / n_kv;
+                        let npairs = groups * 4;
+                        let len_max = pos0 + t;
+                        // grouped kernel: shared = queries + scores + sums; per-(token, head) kernel beyond 48 KB
+                        let pp4 = (npairs + 3) & !3;
+                        let shared_g = (len_max * pp4 * 4 + pp4 * 4) as u32;
+                        if *hd <= 256 && hd % 32 == 0 && npairs <= 32 && shared_g <= 96 * 1024 {
+                            // the grouped kernel quantizes its output itself
+                            let mut a = args!(ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, ws.mixed.ptr, ws.xq.ptr, ws.xs.ptr, kvw_, p0, tu, nh, nkv, hdd);
+                            chk(c.launch("k_attn_prefill_grouped", (*n_kv as u32, tu.div_ceil(4), 1), (256, 1, 1), shared_g, &mut a));
+                        } else {
+                            let mut a = args!(ws.q.ptr, ws.gate.ptr, kc.ptr, vc.ptr, ws.mixed.ptr, kvw_, p0, tu, nh, nkv, hdd);
+                            chk(c.launch("k_attn_prefill", (tu, *n_heads as u32, 1), (*hd as u32, 1, 1), ((pos0 + t) * 4) as u32, &mut a));
+                            chk(c.quantize_q8(&ws.mixed, 0, &ws.xq, &ws.xs, tu, qw as u32));
+                        }
                     });
                     self.prof(1, || chk(c.gemm_q8(&o.q, &o.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, qw as u32, tu, d as u32)));
-                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, Some(&ws.y), post_norm, &ws.normed, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
-                    self.prof(6, || chk(c.gemm_fp4(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, 0, (2 * inter) as u32, d as u32, tu, (2 * inter) as u32)));
-                    self.prof(7, || chk(c.silu_mul_quant_rows(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32)));
+                    self.prof(0, || chk(c.add_rmsnorm_quant_rows(&ws.hidden, Some(&ws.y), post_norm, None, &ws.xq, &ws.xs, tu, d as u32, eps, true)));
+                    let half = std::cell::Cell::new(false);
+                    self.prof(6, || {
+                        let (ok, h16) = c.gemm_fp4_gu(&gu.p, &gu.s, &ws.xq, &ws.xs, &ws.big_a, (2 * inter) as u32, d as u32, tu);
+                        chk(ok);
+                        half.set(h16);
+                    });
+                    self.prof(7, || {
+                        if half.get() {
+                            chk(c.silu_mul_quant_rows_h(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32));
+                        } else {
+                            chk(c.silu_mul_quant_rows(&ws.big_a, &ws.big_b, &ws.xq, &ws.xs, tu, *inter as u32));
+                        }
+                    });
                     self.prof(6, || chk(c.gemm_fp4(&dn.p, &dn.s, &ws.xq, &ws.xs, &ws.y, 0, d as u32, *inter as u32, tu, d as u32)));
                 }
             }
